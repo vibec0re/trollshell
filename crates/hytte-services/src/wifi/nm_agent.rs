@@ -16,7 +16,9 @@
 use futures_channel::oneshot;
 use futures_signals::signal::Mutable;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use tokio::sync::Mutex as AsyncMutex;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
 use super::types::{PromptKind, PromptRequest};
@@ -85,8 +87,63 @@ type ConnectionDict = HashMap<String, HashMap<String, OwnedValue>>;
 
 #[derive(Clone)]
 pub(super) struct NmAgent {
-    pub(super) prompts: Mutable<Option<PromptRequest>>,
-    pub(super) waiters: WaitersMap,
+    prompts: Mutable<Option<PromptRequest>>,
+    waiters: WaitersMap,
+    /// Which request each of this agent's in-flight waiters answers, so a
+    /// `CancelGetSecrets` can name the ones it means. Shared across the clones
+    /// the object server takes on every re-mount, like `waiters`.
+    ///
+    /// Only ever locked **while holding `waiters`** when inserting or taking
+    /// entries (see `get_secrets` and `cancel_get_secrets`), so a cancel never
+    /// sees a waiter without its key or a key without its waiter.
+    inflight: Arc<AsyncMutex<HashMap<u64, RequestKey>>>,
+}
+
+impl NmAgent {
+    /// An agent surfacing its prompts on `prompts` and parking their answers
+    /// in `waiters` — the service-wide handles `submit_prompt`/`cancel_prompt`
+    /// resolve.
+    pub(super) fn new(prompts: Mutable<Option<PromptRequest>>, waiters: WaitersMap) -> Self {
+        Self {
+            prompts,
+            waiters,
+            inflight: Arc::default(),
+        }
+    }
+}
+
+/// What NM names a `GetSecrets` request by when it cancels one: the
+/// connection and the setting whose secrets were asked for.
+/// `CancelGetSecrets(connection_path, setting_name)` applies to exactly the
+/// pending requests with that pair, and NM can have several in flight with
+/// one agent at once — a VPN and a Wi-Fi join, say.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RequestKey {
+    connection_path: String,
+    setting_name: String,
+}
+
+/// Remove and return the ids of every in-flight request `key` names.
+fn take_matching(inflight: &mut HashMap<u64, RequestKey>, key: &RequestKey) -> Vec<u64> {
+    inflight
+        .extract_if(|_, pending| *pending == *key)
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// Clear the prompt slot **only if it still shows request `id`'s prompt**.
+///
+/// The slot holds one prompt, and a second `GetSecrets` replaces the first on
+/// screen while the first is still pending. Clearing it unconditionally — as
+/// both the completion path and `CancelGetSecrets` did — let the *earlier*
+/// request ending wipe the *later* one's prompt while it was still waiting for
+/// an answer. A single `lock_mut`, so the check and the clear cannot be split
+/// by another writer, and no change is signalled when the slot is left alone.
+fn clear_prompt_if_shown(prompts: &Mutable<Option<PromptRequest>>, id: u64) {
+    let mut slot = prompts.lock_mut();
+    if slot.as_ref().is_some_and(|shown| shown.id == id) {
+        *slot = None;
+    }
 }
 
 // ── Connection-dict helpers ────────────────────────────────────────────────────
@@ -354,6 +411,10 @@ impl NmAgent {
         let conn_path = connection_path.as_str().to_string();
         let prior_failure = flags & FLAG_REQUEST_NEW != 0;
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let key = RequestKey {
+            connection_path: conn_path.clone(),
+            setting_name: setting_name.clone(),
+        };
 
         // Build the prompt request and remember how to shape the reply, branching
         // on the setting kind. Both kinds share the waiter/oneshot plumbing.
@@ -410,16 +471,29 @@ impl NmAgent {
 
         let (tx, rx) = oneshot::channel::<Result<Vec<String>, String>>();
         {
+            // The key goes in under the waiters lock, so `cancel_get_secrets`
+            // (which takes the same two locks in the same order) sees both or
+            // neither.
             let mut waiters = self.waiters.lock().await;
             waiters.insert(id, tx);
+            self.inflight.lock().await.insert(id, key);
         }
         // Keep the key list: the prompt itself is moved into the signal, but
         // the reply has to be nested under exactly the keys we asked for.
         let secret_keys = prompt.secret_keys.clone();
+        // A second request still *replaces* the first on screen — the slot
+        // holds one prompt. Whether concurrent requests should queue instead
+        // is an open question; what this request must not do is clear a
+        // prompt that is no longer its own when it ends, below.
         self.prompts.set(Some(prompt));
 
-        if let Ok(Ok(secrets)) = rx.await {
-            self.prompts.set(None);
+        let answer = rx.await;
+        // Done, whichever way it ended: no cancel can name it any more, and
+        // its prompt comes down — only if it is still the one on screen.
+        self.inflight.lock().await.remove(&id);
+        clear_prompt_if_shown(&self.prompts, id);
+
+        if let Ok(Ok(secrets)) = answer {
             if secrets.len() != secret_keys.len() {
                 // The overlay's contract is one value per requested key, so a
                 // mismatch is a shell-side bug. Answer what we can (the zip in
@@ -433,25 +507,49 @@ impl NmAgent {
             }
             Ok(reply_shape.build(&secret_keys, &secrets))
         } else {
-            self.prompts.set(None);
             Err(NmAgentError::UserCanceled("user dismissed prompt".into()))
         }
     }
 
     /// Called by NM to abort an in-flight `GetSecrets` (e.g. the activation was
-    /// cancelled). Resolve every outstanding waiter with a cancel and clear the
-    /// prompt so the overlay dismisses.
+    /// cancelled). Resolves the waiter of **each request this names** — the
+    /// ones for `(connection_path, setting_name)` — with a cancel, and takes
+    /// their prompt down if it is the one on screen.
+    ///
+    /// Until this was targeted it drained *every* waiter in the service-wide
+    /// map and cleared the prompt unconditionally, so NM cancelling one
+    /// request (a VPN activation the user aborted) also failed another still
+    /// waiting on the user (a Wi-Fi join), and took its prompt away.
     async fn cancel_get_secrets(&self, connection_path: OwnedObjectPath, setting_name: String) {
+        let key = RequestKey {
+            connection_path: connection_path.as_str().to_string(),
+            setting_name,
+        };
+        let cancelled = {
+            let mut waiters = self.waiters.lock().await;
+            let ids = take_matching(&mut *self.inflight.lock().await, &key);
+            for id in &ids {
+                // Absent when the user's answer won the race: that request is
+                // completing anyway, and NM ignores the reply to a cancelled
+                // one.
+                if let Some(tx) = waiters.remove(id) {
+                    let _ = tx.send(Err("cancelled".into()));
+                }
+            }
+            ids
+        };
+        // The waking `get_secrets` clears its own prompt too; doing it here as
+        // well means a request whose handler is no longer listening still
+        // loses its prompt. Both are no-ops unless that prompt is on screen.
+        for id in &cancelled {
+            clear_prompt_if_shown(&self.prompts, *id);
+        }
         tracing::info!(
-            path = %connection_path.as_str(),
-            setting = %setting_name,
+            path = %key.connection_path,
+            setting = %key.setting_name,
+            cancelled = cancelled.len(),
             "NM SecretAgent::CancelGetSecrets",
         );
-        let mut waiters = self.waiters.lock().await;
-        for (_, tx) in waiters.drain() {
-            let _ = tx.send(Err("cancelled".into()));
-        }
-        self.prompts.set(None);
     }
 
     /// No-op: we never persist secrets — NM stores its own connection profiles.
@@ -909,6 +1007,79 @@ mod tests {
         let conn = vpn_connection("Work VPN", &[]);
         assert!(existing_vpn_secret_keys(&conn).is_empty());
     }
+
+    // -- targeted CancelGetSecrets ---------------------------------------------
+
+    fn key(connection_path: &str, setting_name: &str) -> RequestKey {
+        RequestKey {
+            connection_path: connection_path.to_string(),
+            setting_name: setting_name.to_string(),
+        }
+    }
+
+    fn prompt(id: u64) -> PromptRequest {
+        PromptRequest {
+            id,
+            network_path: "/org/freedesktop/NetworkManager/Settings/1".to_string(),
+            ssid: "FRITZ!Box".to_string(),
+            security: "psk".to_string(),
+            kind: PromptKind::WifiPassphrase,
+            prior_failure: false,
+            secret_keys: vec!["psk".to_string()],
+        }
+    }
+
+    /// A cancel takes exactly the requests it names — same connection *and*
+    /// same setting — and leaves every other one in flight. Before the fix it
+    /// took all of them.
+    #[test]
+    fn a_cancel_takes_only_the_requests_it_names() {
+        let wifi = key("/Settings/1", WIRELESS_SECURITY_SETTING);
+        let mut inflight: HashMap<u64, RequestKey> = HashMap::from([
+            (1, wifi.clone()),
+            (2, key("/Settings/2", VPN_SETTING)),
+            // Same connection, a different setting: not the same request.
+            (3, key("/Settings/1", VPN_SETTING)),
+            // NM re-asking the same pair while the first is pending.
+            (4, wifi.clone()),
+        ]);
+
+        let mut taken = take_matching(&mut inflight, &wifi);
+        taken.sort_unstable();
+        assert_eq!(taken, vec![1, 4]);
+
+        let mut left: Vec<u64> = inflight.keys().copied().collect();
+        left.sort_unstable();
+        assert_eq!(left, vec![2, 3], "the other requests stay in flight");
+    }
+
+    #[test]
+    fn a_cancel_naming_nothing_in_flight_takes_nothing() {
+        let mut inflight = HashMap::from([(7, key("/Settings/2", VPN_SETTING))]);
+        assert!(take_matching(&mut inflight, &key("/Settings/9", VPN_SETTING)).is_empty());
+        assert_eq!(inflight.len(), 1);
+    }
+
+    /// The other half of the fix: a request ending clears the prompt only if
+    /// the prompt shown is still its own. A later request's prompt on screen
+    /// must survive an earlier request completing or being cancelled.
+    #[test]
+    fn a_request_ending_leaves_another_request_s_prompt_on_screen() {
+        let prompts = Mutable::new(Some(prompt(2)));
+        clear_prompt_if_shown(&prompts, 1);
+        assert_eq!(prompts.get_cloned().map(|p| p.id), Some(2));
+    }
+
+    #[test]
+    fn a_request_ending_takes_its_own_prompt_down() {
+        let prompts = Mutable::new(Some(prompt(2)));
+        clear_prompt_if_shown(&prompts, 2);
+        assert!(prompts.get_cloned().is_none());
+
+        // …and is a no-op on an empty slot.
+        clear_prompt_if_shown(&prompts, 2);
+        assert!(prompts.get_cloned().is_none());
+    }
 }
 
 // ── System tests: dbus-daemon-backed GetSecrets round-trip ───────────────────
@@ -1090,10 +1261,7 @@ mod system_tests {
     fn fresh_agent() -> (NmAgent, Mutable<Option<PromptRequest>>, WaitersMap) {
         let waiters: WaitersMap = Arc::new(AsyncMutex::new(HashMap::new()));
         let prompts: Mutable<Option<PromptRequest>> = Mutable::new(None);
-        let agent = NmAgent {
-            prompts: prompts.clone(),
-            waiters: waiters.clone(),
-        };
+        let agent = NmAgent::new(prompts.clone(), waiters.clone());
         (agent, prompts, waiters)
     }
 
@@ -1660,6 +1828,128 @@ mod system_tests {
         assert!(
             prompts.get_cloned().is_none(),
             "prompt should be cleared after cancel"
+        );
+    }
+
+    // -- 4b. CancelGetSecrets is per request ----------------------------------
+
+    /// Two requests in flight — a Wi-Fi join, then a VPN whose prompt replaces
+    /// it on screen — and NM cancels only the first, over the wire. The first
+    /// must resolve `UserCanceled`; the second must keep its waiter **and its
+    /// prompt**, and still complete with the user's secret.
+    ///
+    /// Before the fix the cancel drained every waiter and cleared the slot:
+    /// the VPN request failed `UserCanceled` too and its prompt vanished.
+    /// Falsify by restoring `waiters.drain()` in `cancel_get_secrets`: the
+    /// VPN's waiter is gone and the `contains_key` assertion fails.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_takes_only_the_request_it_names() {
+        let guard = ephemeral_bus().await;
+        let (agent, prompts, waiters) = fresh_agent();
+        let (_server, proxy) = mount_and_proxy(&guard, agent).await;
+        let wifi_path = "/org/freedesktop/NetworkManager/Settings/1";
+        let vpn_path = "/org/freedesktop/NetworkManager/Settings/2";
+
+        let wifi_call: tokio::task::JoinHandle<Result<ConnectionDict, zbus::Error>> = {
+            let proxy = proxy.clone();
+            let conn = wpa_connection(b"FRITZ!Box", "wpa-psk");
+            tokio::spawn(async move {
+                proxy
+                    .call(
+                        "GetSecrets",
+                        &(
+                            conn,
+                            OwnedObjectPath::try_from(wifi_path).unwrap(),
+                            WIRELESS_SECURITY_SETTING.to_string(),
+                            vec!["psk".to_string()],
+                            FLAG_ALLOW_INTERACTION,
+                        ),
+                    )
+                    .await
+            })
+        };
+        let wifi_req = await_prompt(&prompts, DBUS_REPLY_BUDGET).await;
+
+        let vpn_call: tokio::task::JoinHandle<Result<ConnectionDict, zbus::Error>> = {
+            let proxy = proxy.clone();
+            let conn = vpn_connection_dict("Work VPN", "org.freedesktop.NetworkManager.openvpn");
+            tokio::spawn(async move {
+                proxy
+                    .call(
+                        "GetSecrets",
+                        &(
+                            conn,
+                            OwnedObjectPath::try_from(vpn_path).unwrap(),
+                            VPN_SETTING.to_string(),
+                            vec!["password".to_string()],
+                            FLAG_ALLOW_INTERACTION,
+                        ),
+                    )
+                    .await
+            })
+        };
+        // The VPN prompt replaces the Wi-Fi one on screen (one slot).
+        let end = tokio::time::Instant::now() + DBUS_REPLY_BUDGET;
+        let vpn_req = loop {
+            if let Some(req) = prompts.get_cloned().filter(|req| req.id != wifi_req.id) {
+                break req;
+            }
+            assert!(
+                tokio::time::Instant::now() < end,
+                "the VPN prompt never surfaced"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(vpn_req.kind, PromptKind::VpnSecret);
+
+        // NM cancels the Wi-Fi request — and only that one.
+        let cancel: Result<(), zbus::Error> = tokio::time::timeout(
+            DBUS_REPLY_BUDGET,
+            proxy.call(
+                "CancelGetSecrets",
+                &(
+                    OwnedObjectPath::try_from(wifi_path).unwrap(),
+                    WIRELESS_SECURITY_SETTING.to_string(),
+                ),
+            ),
+        )
+        .await
+        .expect("CancelGetSecrets did not return in time");
+        cancel.expect("CancelGetSecrets returned a D-Bus error");
+
+        let wifi_result = tokio::time::timeout(DBUS_REPLY_BUDGET, wifi_call)
+            .await
+            .expect("the cancelled GetSecrets did not resolve")
+            .expect("GetSecrets task panicked");
+        assert_error_name_contains(&wifi_result, "UserCanceled");
+
+        assert!(
+            waiters.lock().await.contains_key(&vpn_req.id),
+            "a cancel naming the Wi-Fi connection must leave the VPN request's waiter alive"
+        );
+        assert_eq!(
+            prompts.get_cloned().map(|req| req.id),
+            Some(vpn_req.id),
+            "the cancelled request must not take another request's prompt off the screen"
+        );
+
+        // The VPN request still completes normally.
+        waiters
+            .lock()
+            .await
+            .remove(&vpn_req.id)
+            .expect("VPN waiter registered")
+            .send(Ok(vec!["vpnpass".to_string()]))
+            .expect("send VPN secret to waiter");
+        let vpn_reply = tokio::time::timeout(DBUS_REPLY_BUDGET, vpn_call)
+            .await
+            .expect("the VPN GetSecrets did not return in time")
+            .expect("GetSecrets task panicked")
+            .expect("the VPN GetSecrets returned a D-Bus error");
+        assert!(vpn_reply.contains_key(VPN_SETTING));
+        assert!(
+            prompts.get_cloned().is_none(),
+            "the VPN request takes its own prompt down when it completes"
         );
     }
 

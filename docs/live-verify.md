@@ -4848,6 +4848,18 @@ color-scheme` → `'prefer-light'`), open the Settings drawer: the "Dark
       **no** later `agent registered` for `mov.vibec0re.trollshell` once the
       switch has happened.
 
+- [ ] **(#1484)** **`CancelGetSecrets` is per request.**
+      Start activating a VPN profile with no stored secret (its prompt opens),
+      then click a never-before-seen secured Wi-Fi network (its prompt
+      replaces the VPN one — queueing the two is still an open question).
+      Cancel only the VPN from a terminal:
+      `nmcli connection down id '<vpn profile>'`. NM sends
+      `CancelGetSecrets` for the VPN's `vpn` setting; the journal shows
+      `NM SecretAgent::CancelGetSecrets … cancelled=1`, the **Wi-Fi prompt
+      stays on screen**, and it still joins when submitted. Before the fix the
+      cancel drained every waiter and cleared the prompt, so the Wi-Fi join
+      failed too.
+
 ## Night light
 
 - [ ] **(#585)** Night light with **no** configured coordinates

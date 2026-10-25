@@ -214,6 +214,12 @@ struct IdleClient {
     /// the spawned dim tasks — and owned by the observer's reconnect loop, so
     /// it outlives any one client incarnation (#431).
     dim: Arc<DimLatch>,
+    /// What an `idled` event does to the host: [`IdleClient::fire_action`] in
+    /// production. It is the one seam a dim, lock or suspend leaves this struct
+    /// through, held as a field so the tests that drive `on_idled` can swap in
+    /// a sink and never reach `brightnessctl`, `loginctl` or `systemctl` on
+    /// whatever machine runs them.
+    fire: fn(&Self, u32),
 }
 
 impl IdleClient {
@@ -224,6 +230,17 @@ impl IdleClient {
             idled: BTreeSet::new(),
             since: None,
             dim,
+            fire: Self::fire_action,
+        }
+    }
+
+    /// [`IdleClient::new`] with `fire` standing in for
+    /// [`IdleClient::fire_action`].
+    #[cfg(test)]
+    fn with_fire(state: Mutable<IdleState>, dim: Arc<DimLatch>, fire: fn(&Self, u32)) -> Self {
+        Self {
+            fire,
+            ..Self::new(state, dim)
         }
     }
 
@@ -243,7 +260,7 @@ impl IdleClient {
             "ext-idle-notify idled"
         );
         self.publish();
-        self.fire_action(secs);
+        (self.fire)(self, secs);
     }
 
     /// Handle a `resumed` event for `secs`: clear it, drop the idle-since when
@@ -758,11 +775,23 @@ impl RetryBackoff {
 /// manually-set brightness; the cycle bump is what makes a dim still in flight
 /// undo itself instead of landing after this returns.
 fn restore_dim_if_dimmed(dim: &DimLatch) {
+    restore_dim_with(dim, spawn_brightness_restore);
+}
+
+/// [`restore_dim_if_dimmed`] with the backlight restore itself injected: `restore`
+/// runs iff a native dim was in effect, and is the only thing here that touches
+/// the host, so a test can observe the decision without a `brightnessctl`.
+fn restore_dim_with(dim: &DimLatch, restore: impl FnOnce()) {
     if dim.resume() {
-        runtime::handle().spawn(async {
-            run_command("brightnessctl", RESTORE_ARGS).await;
-        });
+        restore();
     }
+}
+
+/// Fire-and-forget `brightnessctl -r` on the shared runtime.
+fn spawn_brightness_restore() {
+    runtime::handle().spawn(async {
+        run_command("brightnessctl", RESTORE_ARGS).await;
+    });
 }
 
 /// Recover the observable side effects of a dead observer incarnation before
@@ -774,8 +803,18 @@ fn restore_dim_if_dimmed(dim: &DimLatch) {
 /// dim's cycle as a resume would, so a dim still in flight from the dead
 /// incarnation undoes itself rather than landing after the reset.
 fn reset_after_observer_error(state: &Mutable<IdleState>, dim: &DimLatch) {
+    reset_after_observer_error_with(state, dim, spawn_brightness_restore);
+}
+
+/// [`reset_after_observer_error`] with the backlight restore injected, as
+/// [`restore_dim_with`].
+fn reset_after_observer_error_with(
+    state: &Mutable<IdleState>,
+    dim: &DimLatch,
+    restore: impl FnOnce(),
+) {
     state.set(IdleState::Active);
-    restore_dim_if_dimmed(dim);
+    restore_dim_with(dim, restore);
 }
 
 /// Start the observer on a supervised blocking thread (#1170).
@@ -814,8 +853,22 @@ fn supervise_observer<F>(name: &'static str, state: Mutable<IdleState>, dim: Arc
 where
     F: Fn(&Mutable<IdleState>, &Arc<DimLatch>) + Send + Sync + 'static,
 {
+    supervise_observer_with(name, state, dim, reset_after_observer_error, body);
+}
+
+/// [`supervise_observer`] with the per-start cleanup injected, so a test that
+/// leaves a dim in effect can restart without a real `brightnessctl -r`.
+fn supervise_observer_with<F>(
+    name: &'static str,
+    state: Mutable<IdleState>,
+    dim: Arc<DimLatch>,
+    reset: fn(&Mutable<IdleState>, &DimLatch),
+    body: F,
+) where
+    F: Fn(&Mutable<IdleState>, &Arc<DimLatch>) + Send + Sync + 'static,
+{
     spawn_supervised_blocking_bounded(name, move || {
-        reset_after_observer_error(&state, &dim);
+        reset(&state, &dim);
         body(&state, &dim);
     });
 }
@@ -1007,29 +1060,35 @@ mod tests {
         // than racing the live handles.
         let second: Arc<Mutex<Option<(bool, IdleState)>>> = Arc::new(Mutex::new(None));
 
-        supervise_observer(NAME, state.clone(), Arc::clone(&dim), {
-            let runs = Arc::clone(&runs);
-            let second = Arc::clone(&second);
-            move |state, dim| {
-                if runs.fetch_add(1, Ordering::SeqCst) == 0 {
-                    // Mid-dim, mid-idle — the exact moment #431 cares about.
-                    let generation = dim.generation();
-                    assert!(dim.may_dim(generation));
-                    assert_eq!(dim.applied(generation), Applied::InEffect);
-                    state.set(IdleState::Idle {
-                        deepest_secs: DIM_SECS,
-                        since: Local::now(),
-                    });
-                    panic!("{NAME}: first run panics, deliberately");
+        supervise_observer_with(
+            NAME,
+            state.clone(),
+            Arc::clone(&dim),
+            reset_without_backlight,
+            {
+                let runs = Arc::clone(&runs);
+                let second = Arc::clone(&second);
+                move |state, dim| {
+                    if runs.fetch_add(1, Ordering::SeqCst) == 0 {
+                        // Mid-dim, mid-idle — the exact moment #431 cares about.
+                        let generation = dim.generation();
+                        assert!(dim.may_dim(generation));
+                        assert_eq!(dim.applied(generation), Applied::InEffect);
+                        state.set(IdleState::Idle {
+                            deepest_secs: DIM_SECS,
+                            since: Local::now(),
+                        });
+                        panic!("{NAME}: first run panics, deliberately");
+                    }
+                    *second
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some((dim.is_dimmed(), state.get_cloned()));
+                    // Park so the supervisor stays live and keeps its health row.
+                    std::thread::sleep(Duration::from_secs(30));
                 }
-                *second
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Some((dim.is_dimmed(), state.get_cloned()));
-                // Park so the supervisor stays live and keeps its health row.
-                std::thread::sleep(Duration::from_secs(30));
-            }
-        });
+            },
+        );
 
         let deadline = Instant::now() + Duration::from_secs(15);
         let observed = loop {
@@ -1139,11 +1198,32 @@ mod tests {
         assert_eq!(action_name(42), "none");
     }
 
+    thread_local! {
+        /// The thresholds [`record_fired`] was handed on this thread.
+        static FIRED: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// An [`IdleClient::fire`] that records the threshold instead of dimming,
+    /// locking or suspending. A test driving `on_idled` with the real
+    /// `fire_action` would reach `loginctl lock-session` and `brightnessctl` on
+    /// any host with a live logind — it is the inhibitor read failing in a
+    /// sandbox, not the code, that keeps CI from locking its own session.
+    fn record_fired(_client: &IdleClient, secs: u32) {
+        FIRED.with_borrow_mut(|fired| fired.push(secs));
+    }
+
+    /// [`reset_after_observer_error`] without the `brightnessctl -r` a dim in
+    /// effect would owe: the latch is still ended as a resume would end it.
+    fn reset_without_backlight(state: &Mutable<IdleState>, dim: &DimLatch) {
+        reset_after_observer_error_with(state, dim, || {});
+    }
+
     #[test]
     fn snapshot_tracks_deepest_active_threshold() {
-        let mut client = IdleClient::new(
+        let mut client = IdleClient::with_fire(
             Mutable::new(IdleState::default()),
             Arc::new(DimLatch::default()),
+            record_fired,
         );
         assert_eq!(client.snapshot(), IdleState::Active);
 
@@ -1171,6 +1251,9 @@ mod tests {
         // Resuming the last active threshold returns to Active.
         client.on_resumed(240);
         assert_eq!(client.snapshot(), IdleState::Active);
+
+        // Each idled threshold reached the action seam, and only that.
+        assert_eq!(FIRED.take(), vec![240, 300]);
     }
 
     #[test]

@@ -127,7 +127,7 @@
 //! Playback status is not an input to any of this: expand and collapse are
 //! purely about whether there is room on the bar (Annika's standing correction
 //! on #838). The container's visibility follows `mpris::active_player()` and
-//! [`is_empty_idle`] (#1467: a stopped player with no title has nothing to
+//! `is_empty_idle` (#1467: a stopped player with no title has nothing to
 //! show) and nothing else.
 
 use std::cell::RefCell;

@@ -288,12 +288,33 @@ impl PendingApprovals {
     ///   ascending id *is* oldest-first — and it is a total order over `i64`,
     ///   where `requested_at` is a free-text timestamp the mirror deliberately
     ///   keeps unparsed (the [`AgentStatusRow::status_set_at`] rule).
+    /// - **Drop a row with no usable id.** [`Approval::id`] is
+    ///   `#[serde(default)]` (mirror rule 1), so a row that omits the key
+    ///   decodes as id `0` — and every such row as the *same* `0`. The hive's
+    ///   ids start at 1, so a non-positive one names no row it would act on,
+    ///   and offering it on a card would send `Approve { id: 0 }` for a request
+    ///   the hive never addressed. Dropped with one debug line per answer, and
+    ///   the row is still there on the dashboard.
     #[must_use]
     pub fn new(queue: Vec<Approval>) -> Self {
+        let mut unaddressable = 0_usize;
         let mut queue: Vec<Approval> = queue
             .into_iter()
             .filter(|a| a.status == ApprovalStatus::Pending)
+            .filter(|a| {
+                let usable = a.id > 0;
+                if !usable {
+                    unaddressable += 1;
+                }
+                usable
+            })
             .collect();
+        if unaddressable > 0 {
+            tracing::debug!(
+                rows = unaddressable,
+                "pending approvals with no positive id dropped; answer them on the dashboard"
+            );
+        }
         queue.sort_by_key(|a| a.id);
         Self { queue }
     }
@@ -726,6 +747,30 @@ mod tests {
             vec![6, 9],
             "only `pending`, ascending by id"
         );
+    }
+
+    /// A row with no usable id never reaches the queue. `Approval::id` is
+    /// `#[serde(default)]`, so a row that omits the key decodes as `0` — every
+    /// one of them as the same `0` — and a card for it would send
+    /// `{"cmd":"approve","id":0}` for a request the hive never addressed.
+    ///
+    /// Falsification: drop the `a.id > 0` filter in `PendingApprovals::new`
+    /// and the decoded and the explicit non-positive rows all reappear.
+    #[test]
+    fn a_row_without_a_positive_id_is_dropped() {
+        let missing: Approval =
+            serde_json::from_str(r#"{"agent":"argus","status":"pending"}"#).expect("decodes");
+        assert_eq!(missing.id, 0, "the defaulted id this guards against");
+
+        let q = PendingApprovals::new(vec![
+            missing,
+            queued(0, "argus", ApprovalStatus::Pending),
+            queued(-1, "argus", ApprovalStatus::Pending),
+            queued(4, "argus", ApprovalStatus::Pending),
+        ]);
+        assert_eq!(q.all().iter().map(|a| a.id).collect::<Vec<_>>(), vec![4]);
+        assert_eq!(q.count_for("argus"), 1, "and no badge counts them");
+        assert!(!q.contains(0));
     }
 
     /// An [`ApprovalStatus::Unknown`] is **not** waiting: a build that cannot

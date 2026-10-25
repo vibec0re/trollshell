@@ -312,6 +312,11 @@ pub struct Response {
 pub struct Approval {
     /// The queue id — what [`Request::Approve`] / [`Request::Deny`] name, and
     /// the plugin's dedup key.
+    ///
+    /// `#[serde(default)]` like every field here, so a row that omits it
+    /// decodes rather than failing the queue — as `0`, which no hive row has.
+    /// [`crate::model::PendingApprovals::new`] drops every row with an id that
+    /// is not positive, so a defaulted one never reaches a card or a frame.
     #[serde(default)]
     pub id: i64,
     /// The agent that asked. An `Ident` hive-side, a plain string on the wire
@@ -605,10 +610,11 @@ mod tests {
         assert_eq!(line(&Request::Deny { id: 42 }), r#"{"cmd":"deny","id":42}"#);
     }
 
-    /// The id is `i64` on both sides, so a queue that has run past `u32` — or a
-    /// hive that ever hands back a negative sentinel — still addresses the row
-    /// it means. Pinned because a `u32` here would compile, pass every
-    /// small-number test, and silently refuse the 4-billionth approval.
+    /// The id is `i64` on both sides, so a queue that has run past `u32` still
+    /// addresses the row it means, and the frame carries any `i64` faithfully
+    /// (which rows the *plugin* will address is `PendingApprovals::new`'s call:
+    /// positive ids only). Pinned because a `u32` here would compile, pass
+    /// every small-number test, and silently refuse the 4-billionth approval.
     #[test]
     fn an_approval_id_is_a_full_width_signed_integer_on_the_wire() {
         assert_eq!(

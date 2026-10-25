@@ -22,7 +22,10 @@ use super::super::pipewire::{
     AudioSpectrum, PipewireHandles, PlaybackStream, RecordStream, Sink, Source, Volume,
 };
 use super::graph::{resolve_link_dest, resolve_link_source};
-use super::pod::{avg_volume, build_props_pod, decode_props, parse_default_name, pick_app_name};
+use super::pod::{
+    avg_volume, build_props_pod, decode_props, parse_default_name, pick_app_name,
+    scaled_channel_volumes,
+};
 use super::spectrum::SpectrumUserData;
 use super::types::{
     AudioRole, AudioState, Command, DefaultKind, LinkEdge, MetadataProxy, NodeEntry, NodeProxy,
@@ -787,12 +790,13 @@ fn activate_spectrum(stream: &pw::stream::StreamRc) {
 }
 
 /// Resolve a node by `node.name` and target role, then call the closure
-/// with its pipewire id and current channel count. The closure builds the
-/// appropriate Props pod and calls `set_param`. Returns silently if the
-/// node isn't in the cache yet (e.g. a stale name from a UI race).
+/// with its proxy and its cached per-channel gains (empty until the first
+/// `Props` event). The closure builds the appropriate Props pod and calls
+/// `set_param`. Returns silently if the node isn't in the cache yet (e.g. a
+/// stale name from a UI race).
 fn with_named_node<F>(state: &StateRef, name: &str, role: AudioRole, f: F)
 where
-    F: FnOnce(&pw::node::Node, usize),
+    F: FnOnce(&pw::node::Node, &[f32]),
 {
     let s = state.borrow();
     let Some((id, entry)) = s
@@ -803,49 +807,47 @@ where
         tracing::debug!(name, ?role, "audio_native: target node not in cache");
         return;
     };
-    let channels = entry.channel_volumes.len();
     let Some(proxy) = s.proxies.get(id) else {
         tracing::debug!(name, ?role, "audio_native: target node has no proxy");
         return;
     };
-    f(&proxy.proxy, channels);
+    f(&proxy.proxy, &entry.channel_volumes);
 }
 
 fn with_id_node<F>(state: &StateRef, id: u32, f: F)
 where
-    F: FnOnce(&pw::node::Node, usize),
+    F: FnOnce(&pw::node::Node, &[f32]),
 {
     let s = state.borrow();
     let Some(entry) = s.nodes.get(&id) else {
         tracing::debug!(id, "audio_native: target stream not in cache");
         return;
     };
-    let channels = entry.channel_volumes.len();
     let Some(proxy) = s.proxies.get(&id) else {
         tracing::debug!(id, "audio_native: target stream has no proxy");
         return;
     };
-    f(&proxy.proxy, channels);
+    f(&proxy.proxy, &entry.channel_volumes);
 }
 
 fn apply_volume_by_name(state: &StateRef, name: &str, role: AudioRole, linear: f64) {
-    with_named_node(state, name, role, |node, channels| {
-        send_volume(node, channels, linear);
+    with_named_node(state, name, role, |node, gains| {
+        send_volume(node, gains, linear);
     });
 }
 
 fn apply_volume_by_id(state: &StateRef, id: u32, linear: f64) {
-    with_id_node(state, id, |node, channels| {
-        send_volume(node, channels, linear);
+    with_id_node(state, id, |node, gains| {
+        send_volume(node, gains, linear);
     });
 }
 
 fn apply_mute_by_name(state: &StateRef, name: &str, role: AudioRole, mute: bool) {
-    with_named_node(state, name, role, |node, _channels| send_mute(node, mute));
+    with_named_node(state, name, role, |node, _gains| send_mute(node, mute));
 }
 
 fn apply_mute_by_id(state: &StateRef, id: u32, mute: bool) {
-    with_id_node(state, id, |node, _channels| send_mute(node, mute));
+    with_id_node(state, id, |node, _gains| send_mute(node, mute));
 }
 
 /// Write a user's default pick to the `default` Metadata, on the kind's
@@ -892,17 +894,22 @@ fn default_value_json(name: &str) -> String {
 }
 
 /// Build a `SPA_TYPE_OBJECT_Props` pod carrying just `SPA_PROP_channelVolumes`
-/// (one float per channel, all set to `linear`) and dispatch it via
-/// `node.set_param`. If `channels == 0` the cache hasn't seen a Props event
-/// yet — silently skip rather than publishing a mono array that would
-/// clobber a stereo sink's layout.
-// `linear` gain is in [0,1]; f32 is PipeWire's channelVolumes element type.
-fn send_volume(node: &pw::node::Node, channels: usize, linear: f64) {
-    if channels == 0 {
-        tracing::debug!("audio_native: skip set_volume — channel count unknown");
+/// and dispatch it via `node.set_param`. `linear` is the overall level the
+/// surfaces show — the channel average — and each of the node's cached `gains`
+/// is scaled to it by [`scaled_channel_volumes`], so a sink's balance survives
+/// a volume step instead of being flattened to one value on every channel. If
+/// `gains` is empty the cache hasn't seen a Props event yet — silently skip
+/// rather than publishing a mono array that would clobber a stereo sink's
+/// layout; a non-finite `linear` is skipped too.
+fn send_volume(node: &pw::node::Node, gains: &[f32], linear: f64) {
+    let Some(channel_volumes) = scaled_channel_volumes(gains, linear) else {
+        tracing::debug!(
+            channels = gains.len(),
+            linear,
+            "audio_native: skip set_volume — channel layout unknown or level not finite"
+        );
         return;
-    }
-    let channel_volumes: Vec<f32> = vec![crate::cast::f64_to_f32_gain(linear); channels];
+    };
     let pod = build_props_pod(Some(channel_volumes), None);
     let Some(pod) = pod else {
         tracing::warn!("audio_native: failed to build volume pod");

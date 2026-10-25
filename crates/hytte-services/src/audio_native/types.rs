@@ -189,22 +189,28 @@ impl AudioState {
 // `Set*` prefix on every variant is intentional — this is a command enum.
 #[allow(clippy::enum_variant_names)]
 pub(super) enum Command {
-    /// Set channelVolumes on a sink, identified by `node.name`. The new
-    /// linear gain is replicated across every channel currently in the
-    /// cache so a stereo sink stays stereo. If the cache is empty (no
-    /// Props event received yet) the command is dropped — we'd otherwise
+    /// Set channelVolumes on a sink, identified by `node.name`. `linear` is
+    /// the overall level — the channel average every surface shows — and each
+    /// channel currently in the cache is scaled to it
+    /// (`pod::scaled_channel_volumes`), so the sink keeps both its channel
+    /// count and its balance. It used to write `linear` to every channel,
+    /// which kept a stereo sink two channels wide but flattened L = 1.0,
+    /// R = 0.5 to 0.80/0.80 on the first scroll notch. If the cache is empty
+    /// (no Props event received yet) the command is dropped — we'd otherwise
     /// publish a mono channelVolumes array and clobber the sink's layout.
     SetSinkVolume {
         name: String,
         linear: f64,
     },
-    /// Set channelVolumes on a source (microphone, line-in).
+    /// Set channelVolumes on a source (microphone, line-in), scaled the same
+    /// way as [`Command::SetSinkVolume`].
     SetSourceVolume {
         name: String,
         linear: f64,
     },
     /// Set channelVolumes on a playback stream, identified by pipewire
-    /// global id (streams have no stable `node.name`).
+    /// global id (streams have no stable `node.name`), scaled the same way as
+    /// [`Command::SetSinkVolume`].
     SetStreamVolume {
         id: u32,
         linear: f64,

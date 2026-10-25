@@ -14,8 +14,9 @@
 //! exactly the security-critical wheel not worth reinventing. Both the D-Bus
 //! `Lock()` method and [`lock`] (used by the power menu) run
 //! `loginctl lock-session`, which makes `systemd-logind` emit its `Lock`
-//! signal; the session's configured locker (`swaylock`, driven by logind)
-//! takes it from there.
+//! signal. trollshell does not listen for that signal itself: the session
+//! must carry a `Lock` → locker bridge (e.g. `swayidle` with only `lock` and
+//! `before-sleep` handlers, or `systemd-lock-handler`) that starts `swaylock`.
 //!
 //! ## Inhibitors and idle-pipeline enforcement
 //!
@@ -486,8 +487,9 @@ fn release_manual(shared: &ScreenSaverShared) {
 
 /// Ask the session to lock. trollshell no longer draws its own lock surface;
 /// this runs `loginctl lock-session`, which makes `systemd-logind` emit its
-/// `Lock` signal — the session's configured locker (`swaylock`, or whatever
-/// you've wired) handles it. Safe to call from any thread: it spawns onto the
+/// `Lock` signal. Nothing in trollshell reacts to that signal: a `Lock` →
+/// locker bridge in the session (swayidle's `lock` handler,
+/// `systemd-lock-handler`, …) has to start the locker. Safe to call from any thread: it spawns onto the
 /// shared runtime.
 pub fn lock() {
     runtime::handle().spawn(async {

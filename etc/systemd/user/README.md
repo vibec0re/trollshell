@@ -680,8 +680,10 @@ trollshell.service -b` has the panic / log output. `Restart=on-failure`
 - **swaybg restart-loops.** Almost always a bad / missing
   `~/.config/trollshell/wallpaper.path`. See `../../wallpaper/README.md`.
 - **The idle lock never fires.** The native idle manager runs inside
-  `trollshell.service` and locks via `loginctl lock-session`, which the
-  session's `swaylock` picks up — make sure `/etc/pam.d/swaylock` exists
+  `trollshell.service` and locks via `loginctl lock-session`, which only makes
+  logind emit `Lock`; a bridge (e.g. `swayidle` with just `lock` and
+  `before-sleep` handlers, see `../../README.md`) has to turn that into
+  `swaylock`. Check it is running, and make sure `/etc/pam.d/swaylock` exists
   (NixOS: `security.pam.services.swaylock = {};`), or `swaylock` can never
   verify a password. Check `journalctl --user -u trollshell.service` for the
   `hytte_services::idle_notify` log lines. (Dim needs `brightnessctl` on

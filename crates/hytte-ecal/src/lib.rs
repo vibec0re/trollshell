@@ -1571,6 +1571,8 @@ unsafe fn component_ical_string(comp: *mut sys::ICalComponent) -> String {
 ///   UTC singleton as its own zone, so this is correct for it too (#522).
 /// - **Genuinely floating DATE-TIME:** interpret the wall-clock fields in the
 ///   **local** system zone via chrono's `Local` (DST-correct), not UTC (#388).
+///   A wall clock inside a DST fold or gap still names one instant, by RFC
+///   5545 §3.3.5's rule (see [`WallClock::to_unix_in`]).
 ///   This also covers a `TZID`'d time whose `VTIMEZONE` libical could not
 ///   resolve (it then reports the time as floating) — the local zone is the
 ///   right fallback for the viewer.
@@ -1716,13 +1718,39 @@ impl WallClock {
         }
     }
 
-    /// Interpret these fields as a wall-clock instant in the **local** system
-    /// zone and return POSIX UTC seconds. `None` if the fields don't name a
-    /// real local instant — a value out of range, or one skipped/ambiguous
-    /// across a DST transition (we take `.single()`, so a folded/gapped local
-    /// time yields `None` rather than a guess).
+    /// Interpret these fields as a wall-clock time in the **local** system
+    /// zone and return POSIX UTC seconds — [`to_unix_in`](Self::to_unix_in)
+    /// with chrono's `Local`.
     fn to_local_unix(self) -> Option<i64> {
-        use chrono::{Local, NaiveDate, NaiveTime, TimeZone as _};
+        self.to_unix_in(&chrono::Local)
+    }
+
+    /// Interpret these fields as a wall-clock time in `tz` and return POSIX
+    /// UTC seconds. Parameterised over the zone so the DST edges below are
+    /// testable without touching the process's `TZ`; production only ever
+    /// passes `Local` ([`to_local_unix`](Self::to_local_unix)).
+    ///
+    /// A wall clock that falls on a DST transition still names exactly one
+    /// instant, by the rule RFC 5545 §3.3.5 gives for a `TZID` time (applied
+    /// here to a floating one, which is read in the viewer's zone, #388):
+    ///
+    /// - **Fall-back fold** (the local time occurs twice — 02:30 on
+    ///   2026-10-25 in `Europe/Berlin`): the **first** occurrence, i.e. the
+    ///   earlier instant, still on the pre-transition offset.
+    /// - **Spring-forward gap** (the local time never occurs — 02:30 on
+    ///   2026-03-29): read with **the UTC offset in effect before the gap**,
+    ///   which lands it as far past the gap as it was into it (03:30 CEST).
+    ///
+    /// Before this the conversion took chrono's `.single()`, which is `None`
+    /// on both edges, and `None` is fatal one level up: an undatable
+    /// `DTSTART` drops the whole event, and an undatable occurrence reads as
+    /// "series exhausted" in `expand_component`'s iterator loop, so a
+    /// floating 02:30 daily series silently ended at the first transition.
+    ///
+    /// `None` now means only that the fields do not name a calendar date and
+    /// time at all (a field out of range).
+    fn to_unix_in<Tz: chrono::TimeZone>(self, tz: &Tz) -> Option<i64> {
+        use chrono::{NaiveDate, NaiveTime};
 
         let month = u32::try_from(self.month).ok()?;
         let day = u32::try_from(self.day).ok()?;
@@ -1732,11 +1760,75 @@ impl WallClock {
 
         let date = NaiveDate::from_ymd_opt(self.year, month, day)?;
         let time = NaiveTime::from_hms_opt(hour, minute, second)?;
-        Local
-            .from_local_datetime(&date.and_time(time))
-            .single()
-            .map(|dt| dt.timestamp())
+        wall_clock_to_unix(tz, date.and_time(time))
     }
+}
+
+/// How far [`offset_before_gap`] searches back for the last local time that
+/// exists before a spring-forward gap, and in what steps. Real gaps are 30
+/// minutes (Lord Howe Island) to an hour; the outlier is a whole day (Samoa
+/// skipped 2011-12-30 crossing the date line), which 48 hours covers twice
+/// over. The first existing time the search finds lies less than one step
+/// before the gap, so it carries the gap's pre-transition offset unless a
+/// second transition falls inside that same half hour.
+const GAP_SEARCH_STEP_MINUTES: i64 = 30;
+const GAP_SEARCH_STEPS: i64 = 48 * 60 / GAP_SEARCH_STEP_MINUTES;
+
+/// Map a wall-clock time in `tz` to POSIX UTC seconds, resolving a DST fold
+/// to its first occurrence and a DST gap with the offset in effect before it
+/// (RFC 5545 §3.3.5 — see [`WallClock::to_unix_in`]). `None` only when no
+/// offset before a gap can be found within [`GAP_SEARCH_STEPS`], or the result
+/// does not fit chrono's range.
+fn wall_clock_to_unix<Tz: chrono::TimeZone>(tz: &Tz, naive: chrono::NaiveDateTime) -> Option<i64> {
+    use chrono::{MappedLocalTime, Offset as _};
+
+    match tz.from_local_datetime(&naive) {
+        MappedLocalTime::Single(dt) => Some(dt.timestamp()),
+        // The first occurrence is the earlier *instant*, picked by value and
+        // not by position. chrono documents the pair as `(earliest, latest)`
+        // (and `MappedLocalTime::earliest` just takes the first), but its
+        // Unix `Local` (0.4.44, `tz_info`'s `find_local_time_type_from_local`)
+        // orders it by ascending UTC offset, which for a fall-back fold is
+        // `(latest, earliest)`. Measured under `TZ=Europe/Berlin`:
+        // `.earliest()` reads 02:30 on 2026-10-25 as 01:30Z, the CET repeat.
+        MappedLocalTime::Ambiguous(a, b) => Some(a.timestamp().min(b.timestamp())),
+        MappedLocalTime::None => {
+            let before = offset_before_gap(tz, naive)?;
+            naive
+                .checked_sub_offset(before.fix())
+                .map(|utc| utc.and_utc().timestamp())
+        }
+    }
+}
+
+/// The UTC offset in effect just before the spring-forward gap `naive` falls
+/// in: the offset of the latest local time before it that exists, searched
+/// back in [`GAP_SEARCH_STEP_MINUTES`] steps. Should that time itself be
+/// ambiguous (a fold just before the gap), the offset of its *later* instant
+/// is the one the clock showed when the gap began — the smaller offset, since
+/// the instant is the wall clock minus the offset. Picked by value, for the
+/// reason [`wall_clock_to_unix`] gives.
+fn offset_before_gap<Tz: chrono::TimeZone>(
+    tz: &Tz,
+    naive: chrono::NaiveDateTime,
+) -> Option<Tz::Offset> {
+    use chrono::{MappedLocalTime, Offset as _};
+
+    (1..=GAP_SEARCH_STEPS).find_map(|step| {
+        let probe =
+            naive.checked_sub_signed(chrono::TimeDelta::minutes(step * GAP_SEARCH_STEP_MINUTES))?;
+        match tz.offset_from_local_datetime(&probe) {
+            MappedLocalTime::Single(offset) => Some(offset),
+            MappedLocalTime::Ambiguous(a, b) => {
+                if a.fix().local_minus_utc() <= b.fix().local_minus_utc() {
+                    Some(a)
+                } else {
+                    Some(b)
+                }
+            }
+            MappedLocalTime::None => None,
+        }
+    })
 }
 
 /// True iff the borrowed `ICalTime*` is a DATE (all-day, no time-of-day).
@@ -2508,6 +2600,255 @@ mod tests {
             (11, 30, 0),
             "11:30 floating must render back as 11:30 local, not offset-shifted",
         );
+    }
+
+    // ── Floating times on a DST transition ────────────────────────────────
+    //
+    // `WallClock::to_unix_in` is the zone-parameterised half of
+    // `to_local_unix`, so these drive it with a hermetic zone instead of
+    // `Local`: the process's `TZ` is shared by every test thread, so pinning
+    // `Europe/Berlin` there would race the rest of the suite (the reason
+    // #1472's calendar tests do not do it either). The zone below implements
+    // chrono's `TimeZone` contract the way `Local` does for a host in that
+    // zone, so `to_unix_in` sees the same `Single`/`Ambiguous`/`None`.
+
+    /// The offset a [`TwoOffsetZone`] hands chrono. It carries its zone
+    /// because chrono rebuilds a `TimeZone` from an offset alone
+    /// (`TimeZone::from_offset`).
+    #[derive(Clone, Copy, Debug)]
+    struct TwoOffsetZoneOffset {
+        zone: TwoOffsetZone,
+        fix: chrono::FixedOffset,
+    }
+
+    impl chrono::Offset for TwoOffsetZoneOffset {
+        fn fix(&self) -> chrono::FixedOffset {
+            self.fix
+        }
+    }
+
+    /// A hermetic zone with one shifted stretch: `base` seconds east of UTC
+    /// everywhere except the UTC instants `[from, until)`, where it is
+    /// `shifted`. Enough to model a year of `Europe/Berlin`, or Samoa's 2011
+    /// date-line jump.
+    #[derive(Clone, Copy, Debug)]
+    struct TwoOffsetZone {
+        base: i32,
+        shifted: i32,
+        from: i64,
+        until: i64,
+    }
+
+    impl TwoOffsetZone {
+        /// `Europe/Berlin` in 2026: CET (+01:00), except CEST (+02:00) from
+        /// 2026-03-29T01:00Z to 2026-10-25T01:00Z. So local 2026-03-29
+        /// 02:00–02:59 never happens, and local 2026-10-25 02:00–02:59 happens
+        /// twice.
+        fn berlin_2026() -> Self {
+            Self {
+                base: 3_600,
+                shifted: 7_200,
+                from: utc(2026, 3, 29, 1, 0),
+                until: utc(2026, 10, 25, 1, 0),
+            }
+        }
+
+        /// `Pacific/Apia` across 2011-12-30, which it skipped: −10:00 until
+        /// 2011-12-30T10:00Z (local midnight that night), +14:00 after. The
+        /// whole local day 2011-12-30 never happened — a 24-hour gap.
+        fn samoa_2011() -> Self {
+            Self {
+                base: -36_000,
+                shifted: 50_400,
+                from: utc(2011, 12, 30, 10, 0),
+                until: i64::MAX,
+            }
+        }
+
+        fn offset_at(self, utc_secs: i64) -> i32 {
+            if (self.from..self.until).contains(&utc_secs) {
+                self.shifted
+            } else {
+                self.base
+            }
+        }
+
+        fn offset(self, secs_east: i32) -> TwoOffsetZoneOffset {
+            TwoOffsetZoneOffset {
+                zone: self,
+                fix: chrono::FixedOffset::east_opt(secs_east).unwrap(),
+            }
+        }
+    }
+
+    impl chrono::TimeZone for TwoOffsetZone {
+        type Offset = TwoOffsetZoneOffset;
+
+        fn from_offset(offset: &TwoOffsetZoneOffset) -> Self {
+            offset.zone
+        }
+
+        fn offset_from_local_date(
+            &self,
+            local: &chrono::NaiveDate,
+        ) -> chrono::MappedLocalTime<TwoOffsetZoneOffset> {
+            self.offset_from_local_datetime(&local.and_hms_opt(0, 0, 0).unwrap())
+        }
+
+        /// A wall clock is valid under an offset iff the instant it names
+        /// under that offset is one where the zone really has that offset —
+        /// none valid is a gap, both valid is a fold.
+        ///
+        /// A fold's pair is ordered by **ascending offset**, as chrono
+        /// 0.4.44's Unix `Local` orders it — which for a fall-back fold puts
+        /// the *later* instant first, not the `(earliest, latest)` chrono
+        /// documents. So the fold test below pins that `to_unix_in` picks the
+        /// earlier instant by value rather than trusting the pair's order.
+        fn offset_from_local_datetime(
+            &self,
+            local: &chrono::NaiveDateTime,
+        ) -> chrono::MappedLocalTime<TwoOffsetZoneOffset> {
+            let wall = local.and_utc().timestamp();
+            let valid = |off: i32| self.offset_at(wall - i64::from(off)) == off;
+            let (smaller, larger) = if self.shifted < self.base {
+                (self.shifted, self.base)
+            } else {
+                (self.base, self.shifted)
+            };
+            match (valid(smaller), valid(larger)) {
+                (true, true) => {
+                    chrono::MappedLocalTime::Ambiguous(self.offset(smaller), self.offset(larger))
+                }
+                (true, false) => chrono::MappedLocalTime::Single(self.offset(smaller)),
+                (false, true) => chrono::MappedLocalTime::Single(self.offset(larger)),
+                (false, false) => chrono::MappedLocalTime::None,
+            }
+        }
+
+        fn offset_from_utc_date(&self, utc: &chrono::NaiveDate) -> TwoOffsetZoneOffset {
+            self.offset_from_utc_datetime(&utc.and_hms_opt(0, 0, 0).unwrap())
+        }
+
+        fn offset_from_utc_datetime(&self, utc: &chrono::NaiveDateTime) -> TwoOffsetZoneOffset {
+            self.offset(self.offset_at(utc.and_utc().timestamp()))
+        }
+    }
+
+    /// POSIX seconds of a UTC wall clock.
+    fn utc(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> i64 {
+        use chrono::{TimeZone as _, Utc};
+        Utc.with_ymd_and_hms(year, month, day, hour, minute, 0)
+            .unwrap()
+            .timestamp()
+    }
+
+    /// A floating wall clock at `year-month-day hour:minute:00`.
+    fn wall(year: i32, month: i32, day: i32, hour: i32, minute: i32) -> super::WallClock {
+        super::WallClock {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second: 0,
+        }
+    }
+
+    /// Fixture sanity for the two edge tests: chrono reports exactly the case
+    /// each one is about, so a test zone that drifted into "always `Single`"
+    /// could not make them pass vacuously.
+    fn mapping(zone: TwoOffsetZone, w: super::WallClock) -> &'static str {
+        use chrono::{MappedLocalTime, TimeZone as _};
+        let naive = chrono::NaiveDate::from_ymd_opt(
+            w.year,
+            u32::try_from(w.month).unwrap(),
+            u32::try_from(w.day).unwrap(),
+        )
+        .unwrap()
+        .and_hms_opt(
+            u32::try_from(w.hour).unwrap(),
+            u32::try_from(w.minute).unwrap(),
+            0,
+        )
+        .unwrap();
+        match zone.offset_from_local_datetime(&naive) {
+            MappedLocalTime::Single(_) => "single",
+            MappedLocalTime::Ambiguous(..) => "fold",
+            MappedLocalTime::None => "gap",
+        }
+    }
+
+    /// Today's case (2026-10-25, the EU fall-back day): 02:30 happens twice in
+    /// Berlin, and RFC 5545 §3.3.5 says the value is the **first** one — 02:30
+    /// CEST, 00:30 UTC. The old `.single()` answered `None` here, which drops
+    /// the event (or ends a floating series at this occurrence); chrono's own
+    /// `.earliest()` would answer 01:30Z, the CET repeat, because the test
+    /// zone orders the pair the way Unix `Local` does.
+    #[test]
+    fn a_floating_time_in_the_fall_back_fold_is_its_first_occurrence() {
+        let zone = TwoOffsetZone::berlin_2026();
+        let w = wall(2026, 10, 25, 2, 30);
+        assert_eq!(mapping(zone, w), "fold", "fixture: 02:30 must be ambiguous");
+        assert_eq!(
+            w.to_unix_in(&zone),
+            Some(utc(2026, 10, 25, 0, 30)),
+            "02:30 on the fall-back day is 02:30 CEST (00:30Z), not the CET \
+             repeat (01:30Z) and not dropped",
+        );
+    }
+
+    /// The spring gap: 02:30 on 2026-03-29 never happens in Berlin. RFC 5545
+    /// §3.3.5 reads it with the offset before the gap (+01:00), which is
+    /// 01:30 UTC — 03:30 CEST, as far past the gap as it was into it.
+    #[test]
+    fn a_floating_time_in_the_spring_forward_gap_uses_the_offset_before_it() {
+        let zone = TwoOffsetZone::berlin_2026();
+        let w = wall(2026, 3, 29, 2, 30);
+        assert_eq!(mapping(zone, w), "gap", "fixture: 02:30 must not exist");
+        assert_eq!(
+            w.to_unix_in(&zone),
+            Some(utc(2026, 3, 29, 1, 30)),
+            "02:30 in the gap is read at +01:00 (01:30Z = 03:30 CEST), not dropped",
+        );
+        // The gap's first minute is the transition instant itself.
+        assert_eq!(
+            wall(2026, 3, 29, 2, 0).to_unix_in(&zone),
+            Some(utc(2026, 3, 29, 1, 0))
+        );
+    }
+
+    /// The gap search reaches back far enough for the one gap that is a whole
+    /// day: Samoa's 2011-12-30. Noon that day is read at −10:00, the offset the
+    /// clock showed before it jumped (22:00 UTC).
+    #[test]
+    fn a_floating_time_in_a_whole_skipped_day_still_resolves() {
+        let zone = TwoOffsetZone::samoa_2011();
+        let w = wall(2011, 12, 30, 12, 0);
+        assert_eq!(mapping(zone, w), "gap", "fixture: the day must not exist");
+        assert_eq!(w.to_unix_in(&zone), Some(utc(2011, 12, 30, 22, 0)));
+    }
+
+    /// Everything around the two edges is unchanged: a wall clock that names
+    /// one instant maps to exactly that instant, on either side of either
+    /// transition and well away from both — and fields that name no date at
+    /// all are still `None`.
+    #[test]
+    fn floating_times_off_a_transition_are_unchanged() {
+        let zone = TwoOffsetZone::berlin_2026();
+        for (w, expected) in [
+            (wall(2026, 1, 15, 11, 30), utc(2026, 1, 15, 10, 30)), // CET
+            (wall(2026, 7, 22, 11, 30), utc(2026, 7, 22, 9, 30)),  // CEST
+            (wall(2026, 3, 29, 1, 59), utc(2026, 3, 29, 0, 59)),   // before the gap
+            (wall(2026, 3, 29, 3, 0), utc(2026, 3, 29, 1, 0)),     // after it
+            (wall(2026, 10, 25, 1, 59), utc(2026, 10, 24, 23, 59)), // before the fold
+            (wall(2026, 10, 25, 3, 0), utc(2026, 10, 25, 2, 0)),   // after it
+        ] {
+            assert_eq!(mapping(zone, w), "single", "fixture: {w:?}");
+            assert_eq!(w.to_unix_in(&zone), Some(expected), "{w:?}");
+        }
+        assert_eq!(wall(2026, 13, 1, 0, 0).to_unix_in(&zone), None);
+        assert_eq!(wall(2026, 2, 30, 0, 0).to_unix_in(&zone), None);
+        assert_eq!(wall(2026, 1, 1, 24, 0).to_unix_in(&zone), None);
     }
 
     /// End-to-end through the FFI: a floating `DTSTART` (no `TZID`, no `Z`)

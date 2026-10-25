@@ -25,8 +25,8 @@ use super::graph::{resolve_link_dest, resolve_link_source};
 use super::pod::{avg_volume, build_props_pod, decode_props, parse_default_name, pick_app_name};
 use super::spectrum::SpectrumUserData;
 use super::types::{
-    AudioRole, AudioState, Command, LinkEdge, MetadataProxy, NodeEntry, NodeProxy, SpectrumAction,
-    SpectrumCapture, StateRef, clone_handles,
+    AudioRole, AudioState, Command, DefaultKind, LinkEdge, MetadataProxy, NodeEntry, NodeProxy,
+    SpectrumAction, SpectrumCapture, StateRef, clone_handles,
 };
 use crate::retry;
 
@@ -609,10 +609,14 @@ fn bind_node_for_params(
 }
 
 /// Bind the `default` Metadata global and start listening for property
-/// changes on `default.audio.sink` and `default.audio.source`. Other keys
+/// changes on `default.audio.sink` and `default.audio.source` — the
+/// **effective** keys ([`DefaultKind::effective_key`]). Other keys
 /// (file-chooser default folder, screen-share preferences, etc.) also
 /// live on this object; we filter inside the callback to leave those
-/// untouched.
+/// untouched. That includes the `default.configured.audio.*` pair
+/// [`write_default`] writes: the user's choice is not the default until the
+/// session manager has resolved it, which arrives as a change to the
+/// effective key a moment later.
 fn bind_default_metadata(
     registry: &pw::registry::RegistryRc,
     id: u32,
@@ -641,24 +645,19 @@ fn bind_default_metadata(
                 }
                 return 0;
             };
-            match key {
-                "default.audio.sink" => {
-                    let new_name = value.and_then(parse_default_name);
-                    let mut s = state.borrow_mut();
-                    if s.default_sink_name != new_name {
-                        s.default_sink_name = new_name;
-                        emit_snapshots(&mut s);
-                    }
-                }
-                "default.audio.source" => {
-                    let new_name = value.and_then(parse_default_name);
-                    let mut s = state.borrow_mut();
-                    if s.default_source_name != new_name {
-                        s.default_source_name = new_name;
-                        emit_snapshots(&mut s);
-                    }
-                }
-                _ => {} // ignore unrelated metadata keys
+            // Ignore unrelated metadata keys — the configured pair among them.
+            let Some(kind) = DefaultKind::from_effective_key(key) else {
+                return 0;
+            };
+            let new_name = value.and_then(parse_default_name);
+            let mut s = state.borrow_mut();
+            let slot = match kind {
+                DefaultKind::Sink => &mut s.default_sink_name,
+                DefaultKind::Source => &mut s.default_source_name,
+            };
+            if *slot != new_name {
+                *slot = new_name;
+                emit_snapshots(&mut s);
             }
             0
         })
@@ -694,10 +693,10 @@ fn handle_command(cmd: Command, state: &StateRef, core: &pw::core::CoreRc) {
             apply_mute_by_id(state, id, mute);
         }
         Command::SetDefaultSink { name } => {
-            write_default(state, "default.audio.sink", &name);
+            write_default(state, DefaultKind::Sink, &name);
         }
         Command::SetDefaultSource { name } => {
-            write_default(state, "default.audio.source", &name);
+            write_default(state, DefaultKind::Source, &name);
         }
         Command::SetSpectrumActive { active } => {
             set_spectrum_active(state, core, active);
@@ -849,25 +848,47 @@ fn apply_mute_by_id(state: &StateRef, id: u32, mute: bool) {
     with_id_node(state, id, |node, _channels| send_mute(node, mute));
 }
 
-/// Write `default.audio.{sink,source}` to the `default` Metadata. The C
-/// API expects the value as `Spa:String:JSON` formatted as
-/// `{"name":"<node.name>"}`. Subject 0 targets "any" (global) scope —
-/// matches what `wpctl set-default` does. Silently no-ops if the
+/// Write a user's default pick to the `default` Metadata, on the kind's
+/// **configured** key (`default.configured.audio.{sink,source}`) — the one the
+/// session manager reads a choice from and persists, not the effective key it
+/// answers on; [`DefaultKind`] has the `WirePlumber` scripts that make the
+/// difference matter. The value is [`default_value_json`] as
+/// [`DEFAULT_VALUE_TYPE`] on subject 0 — the key, type, subject and JSON
+/// object `wpctl set-default` writes (`module-default-nodes-api.c`'s
+/// `set_default_configured_node_name`, which `printf`s `{ "name": "%s" }`;
+/// only the whitespace differs). Silently no-ops if the
 /// `default` metadata hasn't been seen yet (e.g. the loop hasn't
 /// reached the metadata global yet on startup).
-fn write_default(state: &StateRef, key: &str, name: &str) {
+fn write_default(state: &StateRef, kind: DefaultKind, name: &str) {
     let s = state.borrow();
     let Some(meta) = s.metadata_default.as_ref() else {
         tracing::warn!(
-            key,
+            key = kind.configured_key(),
             name,
             "audio_native: write_default before default metadata bound",
         );
         return;
     };
-    let value = serde_json::json!({ "name": name }).to_string();
-    meta.proxy
-        .set_property(0, key, Some("Spa:String:JSON"), Some(&value));
+    let value = default_value_json(name);
+    meta.proxy.set_property(
+        0,
+        kind.configured_key(),
+        Some(DEFAULT_VALUE_TYPE),
+        Some(&value),
+    );
+}
+
+/// The SPA type a default-node value is tagged with. `module-default-nodes-api.c`
+/// parses a default key's value only when it carries this type (a `g_strcmp0`
+/// on it guards both the effective and the configured arm).
+const DEFAULT_VALUE_TYPE: &str = "Spa:String:JSON";
+
+/// The JSON a default-node key carries: `{"name":"<node.name>"}`, the shape
+/// [`parse_default_name`] reads back off the effective key. Built with
+/// `serde_json` rather than `format!` so a `node.name` with a quote or a
+/// backslash in it stays one valid JSON string.
+fn default_value_json(name: &str) -> String {
+    serde_json::json!({ "name": name }).to_string()
 }
 
 /// Build a `SPA_TYPE_OBJECT_Props` pod carrying just `SPA_PROP_channelVolumes`
@@ -1147,8 +1168,9 @@ pub(super) fn send_command(cmd: Command) {
 #[cfg(test)]
 mod tests {
     use super::{
-        COMMAND_TX, Command, PW_INIT, SessionEnd, initial_slot, pw, reconnect_after,
-        run_sessions_with, send_command, session_receiver, supervise_sessions,
+        COMMAND_TX, Command, DEFAULT_VALUE_TYPE, PW_INIT, SessionEnd, default_value_json,
+        initial_slot, parse_default_name, pw, reconnect_after, run_sessions_with, send_command,
+        session_receiver, supervise_sessions,
     };
     use crate::retry;
     use hytte_reactive::test_lock::TEST_LOCK;
@@ -1158,6 +1180,26 @@ mod tests {
     use std::sync::{Arc, Mutex, PoisonError};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    /// The value a default pick writes is the one the reader takes back off the
+    /// effective key — `{"name": …}` tagged `Spa:String:JSON`, what `wpctl
+    /// set-default` writes — and a `node.name` with JSON metacharacters in it
+    /// survives as one string rather than as broken JSON the session manager
+    /// would drop.
+    #[test]
+    fn a_default_value_round_trips_through_the_reader() {
+        assert_eq!(DEFAULT_VALUE_TYPE, "Spa:String:JSON");
+        for name in [
+            "alsa_output.pci-0000_00_1f.3.analog-stereo",
+            "bluez_output.AC_C5_8B_11_22_33.1",
+            r#"a "quoted" \ name"#,
+        ] {
+            assert_eq!(
+                parse_default_name(&default_value_json(name)).as_deref(),
+                Some(name),
+            );
+        }
+    }
 
     /// #1170's item 3: a core error — the `Ok(())`-shaped exit — must be paced
     /// exactly like a failed connect. Before this, the quit arm returned

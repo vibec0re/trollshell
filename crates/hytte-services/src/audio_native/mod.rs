@@ -171,7 +171,60 @@ pub fn toggle_mute() {
 
 #[cfg(test)]
 mod tests {
-    use super::types::{AudioRole, SpectrumAction};
+    use super::types::{AudioRole, DefaultKind, SpectrumAction};
+
+    /// A user's pick is **written** to the configured key and the default is
+    /// **read** back off the effective one — the pair `WirePlumber` keeps (see
+    /// `DefaultKind`'s doc for the scripts). Writing the effective key was the
+    /// bug: the default flipped, and the next rescan (a device plugged, a
+    /// Bluetooth sink connecting, a jack's `Route` change) wrote the old choice
+    /// back, and nothing reached the state file.
+    ///
+    /// Falsify by pointing `configured_key` back at `default.audio.*`: the
+    /// write and read keys collapse into one and this fails.
+    #[test]
+    fn a_default_pick_is_written_to_the_configured_key_and_read_off_the_effective_one() {
+        assert_eq!(
+            DefaultKind::Sink.configured_key(),
+            "default.configured.audio.sink",
+        );
+        assert_eq!(
+            DefaultKind::Source.configured_key(),
+            "default.configured.audio.source",
+        );
+        assert_eq!(DefaultKind::Sink.effective_key(), "default.audio.sink");
+        assert_eq!(DefaultKind::Source.effective_key(), "default.audio.source");
+        for kind in [DefaultKind::Sink, DefaultKind::Source] {
+            assert_ne!(
+                kind.configured_key(),
+                kind.effective_key(),
+                "{kind:?}: a pick written where the default is read is overwritten on the next rescan",
+            );
+        }
+    }
+
+    /// The metadata listener follows the effective keys and nothing else — the
+    /// configured key's own change event (which our write produces) must not
+    /// flip `is_default` before the session manager has resolved it.
+    #[test]
+    fn the_listener_follows_only_the_effective_keys() {
+        assert_eq!(
+            DefaultKind::from_effective_key("default.audio.sink"),
+            Some(DefaultKind::Sink),
+        );
+        assert_eq!(
+            DefaultKind::from_effective_key("default.audio.source"),
+            Some(DefaultKind::Source),
+        );
+        for other in [
+            "default.configured.audio.sink",
+            "default.configured.audio.source",
+            "default.video.source",
+            "",
+        ] {
+            assert_eq!(DefaultKind::from_effective_key(other), None, "{other:?}");
+        }
+    }
 
     /// #581: the tap is demand-built, so the (requested, currently-built) truth
     /// table is the whole contract. Pinned here because the effectful half needs a

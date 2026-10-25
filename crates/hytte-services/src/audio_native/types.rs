@@ -127,8 +127,10 @@ pub(super) struct AudioState {
     /// global with `metadata.name = "default"`.
     pub(super) metadata_default: Option<MetadataProxy>,
     /// `default.audio.sink` value — the `node.name` of the current default
-    /// sink. Compared against each Sink's name in `emit_snapshots` to
-    /// flip `is_default`. `None` until the first property event fires.
+    /// sink, as the session manager resolved it ([`DefaultKind`]'s effective
+    /// key; a pick is written to the configured one). Compared against each
+    /// Sink's name in `emit_snapshots` to flip `is_default`. `None` until the
+    /// first property event fires.
     pub(super) default_sink_name: Option<String>,
     /// Same as `default_sink_name` for the default source.
     pub(super) default_source_name: Option<String>,
@@ -220,11 +222,15 @@ pub(super) enum Command {
         id: u32,
         mute: bool,
     },
-    /// Write `default.audio.sink` on the `default` Metadata. Phase 4 wires
-    /// this — for Phase 3 the dispatcher logs and drops the command.
+    /// Make a sink the user's default: written to the `default` Metadata as
+    /// [`DefaultKind::Sink`]'s **configured** key, the one the session manager
+    /// reads a user's choice from — see [`DefaultKind`] for why that is not
+    /// the key the default is read back from.
     SetDefaultSink {
         name: String,
     },
+    /// [`Command::SetDefaultSink`] for a source, on [`DefaultKind::Source`]'s
+    /// configured key.
     SetDefaultSource {
         name: String,
     },
@@ -237,6 +243,65 @@ pub(super) enum Command {
     SetSpectrumActive {
         active: bool,
     },
+}
+
+/// Which default a `default` Metadata key is about, and the **two** keys each
+/// one has.
+///
+/// The session manager keeps a pair per kind, and they are not
+/// interchangeable:
+///
+/// * the **configured** key (`default.configured.audio.sink`) is the user's
+///   choice. It is what `wpctl set-default` and `pactl set-default-sink`
+///   write, what `WirePlumber` persists across restarts and logins
+///   (`default-nodes/state-default-nodes.lua` stores only these), and the
+///   only keys whose change triggers a re-evaluation (`default-nodes/rescan.lua`'s
+///   `metadata-changed` interest names nothing else);
+/// * the **effective** key (`default.audio.sink`) is the session manager's
+///   *answer*: on every rescan `default-nodes/apply-default-node.lua` writes it
+///   from the node `default-nodes/find-selected-default-node.lua` picked,
+///   which is the configured one whenever that node is present.
+///
+/// So a pick is written to the configured key and the default is read back off
+/// the effective one. Writing the effective key directly — what this backend
+/// did until it was found — does flip the default for a moment (the linking
+/// scripts follow the effective key), and the next rescan then writes the old
+/// choice back over it: a device plugged or unplugged, a Bluetooth sink
+/// connecting, a headphone jack's `Route` change. It also never reached the
+/// state file, so it did not survive a `WirePlumber` restart or a re-login.
+/// Checked against `WirePlumber` 0.5.14 (the installed scripts) and 0.5.15
+/// (this flake's nixpkgs pin).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DefaultKind {
+    Sink,
+    Source,
+}
+
+impl DefaultKind {
+    /// The key a user's pick is **written** to.
+    pub(super) const fn configured_key(self) -> &'static str {
+        match self {
+            Self::Sink => "default.configured.audio.sink",
+            Self::Source => "default.configured.audio.source",
+        }
+    }
+
+    /// The key the session manager's resolved default is **read** from.
+    pub(super) const fn effective_key(self) -> &'static str {
+        match self {
+            Self::Sink => "default.audio.sink",
+            Self::Source => "default.audio.source",
+        }
+    }
+
+    /// The kind whose [`effective_key`](Self::effective_key) is `key`, if any —
+    /// the metadata listener's filter. A configured key answers `None`: the
+    /// user's choice is not the default until the session manager says so.
+    pub(super) fn from_effective_key(key: &str) -> Option<Self> {
+        [Self::Sink, Self::Source]
+            .into_iter()
+            .find(|kind| kind.effective_key() == key)
+    }
 }
 
 /// What a [`Command::SetSpectrumActive`] should actually do, given the requested

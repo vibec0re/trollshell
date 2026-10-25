@@ -439,6 +439,10 @@ const SHIPPED: &[(&str, Policy)] = &[
         "nm_registrar::REGISTER_RETRY",
         crate::wifi::nm_registrar::REGISTER_RETRY,
     ),
+    (
+        "fullscreen_inhibit::INHIBIT_RETRY",
+        crate::fullscreen_inhibit::INHIBIT_RETRY,
+    ),
 ];
 
 #[cfg(test)]

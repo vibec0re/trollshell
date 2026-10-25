@@ -25,6 +25,13 @@
 //! (`ManualCaffeine`): a `desired`/`acquiring` handshake so a fast on→off while
 //! the fd is in flight never leaks an inhibitor.
 //!
+//! A failed `Inhibit(idle)` is retried on `INHIBIT_RETRY`'s ramp for as long
+//! as the hold is still wanted. Nothing else would ask again: `reconcile` runs
+//! on an *edge* (a fullscreen toggle, the policy switch, a hot-plug), and a
+//! movie that was already fullscreen when the call failed produces none, so a
+//! single transient logind or system-bus failure used to leave the machine
+//! un-inhibited for the rest of the movie.
+//!
 //! # Visibility
 //!
 //! While the lease is held, a matching `org.freedesktop.ScreenSaver` inhibitor
@@ -46,13 +53,16 @@
 //! never read again.
 
 use crate::config_file;
+use crate::retry;
 use futures_signals::signal::{Mutable, Signal};
 use hytte_bus::FdLease;
 use hytte_config::state;
 use hytte_reactive::{Service, registry, runtime};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 // ── Persistence ────────────────────────────────────────────────────────────
 
@@ -310,16 +320,139 @@ fn reconcile(shared: &'static Shared) {
     }
 }
 
-/// Spawn the async logind fd acquire. On success, re-checks [`desired`] under
-/// the `hold` lock (so a fullscreen-ended / policy-off flip that happened while
-/// the fd was in flight releases it instead of leaking), then registers the
+/// The ramp a failed logind `Inhibit(idle)` is retried on while the hold is
+/// still wanted.
+///
+/// Unbounded, because the condition that ends the retrying is not a budget but
+/// the hold no longer being wanted — a movie that is still fullscreen still
+/// wants it on the hundredth attempt. The numbers are `geoclue`'s
+/// `RESOLVE_RETRY`'s, for the same reasons: a 1 s first retry catches a
+/// system bus that blipped, and a 30 s ceiling keeps a logind that is really
+/// down from becoming a journal flood. Each attempt is one `Inhibit` call on
+/// the system bus.
+pub(crate) const INHIBIT_RETRY: retry::Policy = retry::Policy {
+    max_attempts: None,
+    initial: Duration::from_secs(1),
+    max_backoff: Duration::from_secs(30),
+};
+
+/// How [`acquire_while_wanted`] ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Acquired<T> {
+    /// The lease was taken.
+    Held(T),
+    /// The hold stopped being wanted between attempts. `still_wanted` has
+    /// already released the in-flight claim.
+    NotWanted,
+    /// A bounded policy ran out. Unreachable with [`INHIBIT_RETRY`]; kept so a
+    /// bounded ramp stays one field away, as `retry::Step::GiveUp` is.
+    GaveUp,
+}
+
+/// Try `attempt` until it succeeds, sleeping on `policy`'s ramp between
+/// failures, for as long as `still_wanted` says the result is wanted.
+///
+/// `still_wanted` is asked after every failure and again after every sleep, so
+/// a hold that ends mid-backoff costs no further call. The production closure
+/// (see [`acquire`]) clears `HoldState::acquiring` itself when it answers
+/// `false`, under the same lock it read [`desired`] under: a `reconcile` that
+/// lands after that answer then sees no acquire in flight and starts one,
+/// rather than trusting a loop that has just decided to stop.
+///
+/// The logging is [`retry::FailureLatch`]'s: one `warn!` when a streak opens,
+/// `debug!` while it repeats, and a `warn!` retraction if it recovers.
+///
+/// Everything is injected — the acquire, the check and the sleep — so the loop
+/// is testable without logind or a clock.
+async fn acquire_while_wanted<T, E, Attempt, AFut, Wanted, Sleep, SFut>(
+    mut attempt: Attempt,
+    mut still_wanted: Wanted,
+    mut sleep: Sleep,
+    policy: retry::Policy,
+) -> Acquired<T>
+where
+    Attempt: FnMut() -> AFut,
+    AFut: Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+    Wanted: FnMut() -> bool,
+    Sleep: FnMut(Duration) -> SFut,
+    SFut: Future<Output = ()>,
+{
+    let mut latch = retry::FailureLatch::new();
+    let mut n: u32 = 1;
+    loop {
+        let outcome = attempt().await;
+        let step = policy.step(&outcome, n);
+        let error = match outcome {
+            Ok(lease) => {
+                if latch.record(true) == retry::Report::Recovered {
+                    tracing::warn!(
+                        attempts = n,
+                        "fullscreen-inhibit: logind Inhibit(idle) succeeded after retrying"
+                    );
+                }
+                return Acquired::Held(lease);
+            }
+            Err(e) => e,
+        };
+        let report = latch.record(false);
+        if !still_wanted() {
+            tracing::debug!(error = %error, "fullscreen-inhibit: Inhibit(idle) failed; hold no longer wanted");
+            return Acquired::NotWanted;
+        }
+        let retry::Step::Retry { after } = step else {
+            tracing::error!(error = %error, attempts = n, "fullscreen-inhibit: giving up on Inhibit(idle)");
+            return Acquired::GaveUp;
+        };
+        if report == retry::Report::Opened {
+            tracing::warn!(
+                error = %error,
+                retry_in = ?after,
+                "fullscreen-inhibit: logind Inhibit(idle) failed; retrying while a window stays \
+                 fullscreen (further failures log at debug)"
+            );
+        } else {
+            tracing::debug!(error = %error, attempt = n, retry_in = ?after, "fullscreen-inhibit: Inhibit(idle) still failing");
+        }
+        sleep(after).await;
+        if !still_wanted() {
+            return Acquired::NotWanted;
+        }
+        n = n.saturating_add(1);
+    }
+}
+
+/// After a failed attempt: is the hold still wanted? When it is not, clear
+/// `acquiring` under the same lock [`desired`] was read under — see
+/// [`acquire_while_wanted`] for why that has to be one step.
+fn still_wanted(shared: &Shared) -> bool {
+    let mut h = shared.hold.lock().expect("fullscreen hold poisoned");
+    let wanted = desired(shared);
+    if !wanted {
+        h.acquiring = false;
+    }
+    wanted
+}
+
+/// Spawn the async logind fd acquire, retried on [`INHIBIT_RETRY`] while the
+/// hold is still wanted. On success, re-checks [`desired`] under the `hold`
+/// lock (so a fullscreen-ended / policy-off flip that happened while the fd
+/// was in flight releases it instead of leaking), then registers the
 /// visibility inhibitor and stores the hold.
 fn acquire(shared: &'static Shared) {
     runtime::handle().spawn(async move {
-        let lease = match crate::logind::inhibit_idle().await {
-            Ok(lease) => lease,
-            Err(e) => {
-                tracing::warn!(error = %e, "fullscreen-inhibit: logind Inhibit(idle) failed");
+        let lease = match acquire_while_wanted(
+            crate::logind::inhibit_idle,
+            || still_wanted(shared),
+            tokio::time::sleep,
+            INHIBIT_RETRY,
+        )
+        .await
+        {
+            Acquired::Held(lease) => lease,
+            // `still_wanted` already cleared `acquiring`.
+            Acquired::NotWanted => return,
+            Acquired::GaveUp => {
                 shared
                     .hold
                     .lock()
@@ -349,6 +482,109 @@ fn acquire(shared: &'static Shared) {
 mod tests {
     use super::*;
     use hytte_config::test_support::scratch_home;
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+
+    // ── Retrying a failed Inhibit(idle) ─────────────────────────────────────
+
+    /// The test ramp: `INHIBIT_RETRY`'s shape, with tiny numbers. The real
+    /// sleeps are injected away, so only the recorded durations matter.
+    const TEST_RETRY: retry::Policy = retry::Policy {
+        max_attempts: None,
+        initial: Duration::from_millis(1),
+        max_backoff: Duration::from_millis(4),
+    };
+
+    /// A scripted run: `outcomes` are the acquire results in order, `wanted`
+    /// the `still_wanted` answers in order (an exhausted script answers
+    /// `true`). Returns the result, how many acquires ran, and the sleeps.
+    fn run(
+        outcomes: Vec<Result<u32, &'static str>>,
+        wanted: Vec<bool>,
+        policy: retry::Policy,
+    ) -> (Acquired<u32>, usize, Vec<Duration>) {
+        let outcomes = RefCell::new(VecDeque::from(outcomes));
+        let wanted = RefCell::new(VecDeque::from(wanted));
+        let attempts = RefCell::new(0_usize);
+        let sleeps = RefCell::new(Vec::new());
+        let result = futures_executor::block_on(acquire_while_wanted(
+            || {
+                *attempts.borrow_mut() += 1;
+                let next = outcomes
+                    .borrow_mut()
+                    .pop_front()
+                    .expect("the script ran out of acquire outcomes");
+                std::future::ready(next)
+            },
+            || wanted.borrow_mut().pop_front().unwrap_or(true),
+            |d| {
+                sleeps.borrow_mut().push(d);
+                std::future::ready(())
+            },
+            policy,
+        ));
+        (result, attempts.into_inner(), sleeps.into_inner())
+    }
+
+    /// A transient failure during an already-fullscreen movie is retried
+    /// until it takes, on the ramp — the case that used to leave the machine
+    /// un-inhibited for the whole movie.
+    ///
+    /// Falsifiable: the old `acquire` gave up after the first `Err`, which is
+    /// one attempt and no `Held`.
+    #[test]
+    fn a_failed_inhibit_is_retried_on_the_ramp_while_wanted() {
+        let (result, attempts, sleeps) = run(
+            vec![Err("bus blip"), Err("bus blip"), Ok(7)],
+            vec![],
+            TEST_RETRY,
+        );
+        assert_eq!(result, Acquired::Held(7));
+        assert_eq!(attempts, 3);
+        assert_eq!(
+            sleeps,
+            vec![Duration::from_millis(1), Duration::from_millis(2)]
+        );
+    }
+
+    #[test]
+    fn a_hold_no_longer_wanted_after_a_failure_stops_without_sleeping() {
+        let (result, attempts, sleeps) = run(vec![Err("denied")], vec![false], TEST_RETRY);
+        assert_eq!(result, Acquired::NotWanted);
+        assert_eq!(attempts, 1);
+        assert!(sleeps.is_empty());
+    }
+
+    /// The fullscreen window closed during the backoff: no further `Inhibit`
+    /// call is made just to be dropped.
+    #[test]
+    fn a_hold_that_ends_mid_backoff_makes_no_further_call() {
+        let (result, attempts, sleeps) = run(vec![Err("bus blip")], vec![true, false], TEST_RETRY);
+        assert_eq!(result, Acquired::NotWanted);
+        assert_eq!(attempts, 1);
+        assert_eq!(sleeps.len(), 1);
+    }
+
+    #[test]
+    fn the_first_success_needs_no_retry() {
+        let (result, attempts, sleeps) = run(vec![Ok(1)], vec![], TEST_RETRY);
+        assert_eq!(result, Acquired::Held(1));
+        assert_eq!(attempts, 1);
+        assert!(sleeps.is_empty());
+    }
+
+    /// Unreachable with the shipped (unbounded) ramp, but a bounded policy
+    /// must stop rather than spin.
+    #[test]
+    fn a_bounded_policy_gives_up() {
+        let bounded = retry::Policy {
+            max_attempts: Some(2),
+            ..TEST_RETRY
+        };
+        let (result, attempts, _) = run(vec![Err("down"), Err("down")], vec![], bounded);
+        assert_eq!(result, Acquired::GaveUp);
+        assert_eq!(attempts, 2);
+    }
 
     #[test]
     fn should_hold_requires_both() {

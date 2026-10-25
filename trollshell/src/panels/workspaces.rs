@@ -1120,6 +1120,14 @@ fn drop_plan(
 /// failed (a read-only overlay, no `XDG_CONFIG_HOME`) must not leave the
 /// workspace somewhere the file disagrees with, or the card snaps back on the
 /// next poll having moved the user's windows for nothing.
+///
+/// The two halves are two tasks on the multi-thread runtime, so a drop that is
+/// both a reorder and a screen change runs two read-modify-writes of the same
+/// file at once. `config::workspaces`' `WRITE_LOCK` is what keeps the second
+/// from writing back the value the first one changed. They stay two tasks
+/// because the monitor half is a step inside `move_to_monitor`'s
+/// file-then-niri transaction (behind `Ops`, where its order is tested), and the
+/// order half has no compositor step at all.
 fn perform_drop(action: DropAction) {
     if let Some(order) = action.order {
         workspace_stacks::spawn_set_order(order);

@@ -328,15 +328,36 @@ pub(crate) struct StartPlan {
 /// 1. Pick the output — the stack's, if it is connected; otherwise the focused
 ///    one. (The card says which, so a stack whose screen is unplugged does not
 ///    start somewhere surprising in silence.)
-/// 2. If the **focused** workspace is on that output and has no windows, adopt
-///    it. That is also the ephemeral-just-saved case, where the card *is* the
-///    current workspace.
+/// 2. If the **focused** workspace is on that output, has no windows **and no
+///    name**, adopt it. That is also the ephemeral-just-saved case, where the
+///    card *is* the current workspace.
 /// 3. Otherwise take that output's empty trailing workspace — niri keeps one per
 ///    output, so a stopped stack gets a genuinely new one.
 ///
 /// The name must be free first: `SetWorkspaceName` silently does nothing when it
 /// is taken, so a Start that skipped this check would launch onto whatever was
 /// focused and report success.
+///
+/// # Only an unnamed workspace is ever taken
+///
+/// Both legs take the same kind of workspace: on the output, empty, and
+/// **unnamed**. The name matters as much as the emptiness, because
+/// `SetWorkspaceName` on a workspace that already has a name does not fail. It
+/// *renames* it. Two ordinary workspaces are empty, focused and named:
+///
+/// * **Another stack's, mid-Start.** A Start names and focuses its workspace in
+///   its first batch, and its apps then take up to [`GRACE`] to open a window.
+///   A click on a second card in that gap would have adopted the first stack's
+///   workspace and renamed it, so the first stack's own read-back would find its
+///   name gone and its apps would open on a workspace carrying someone else's.
+///   [`names_to_release`] already keeps a [`STARTING`] stack's name for exactly
+///   this window. Adopting it here would undo that guard.
+/// * **One the user named by hand.** [`names_to_release`] calls that "not ours
+///   to unname", and renaming it is no different.
+///
+/// So neither is adopted, and the Start takes the trailing spare instead, which
+/// is what Annika's "a new workspace is in order" asks for whenever the current
+/// workspace is not free.
 ///
 /// # Errors
 /// [`StartError`], every variant of which is shown on the card rather than
@@ -366,11 +387,17 @@ pub(crate) fn plan_start(
         .to_owned();
 
     let is_empty = |w: &Workspace| !windows.iter().any(|win| win.workspace_id == Some(w.id));
+    // What either leg may take: on that output, empty, and unnamed. One
+    // predicate, so the adopt leg cannot drift from the fallback again — see
+    // "Only an unnamed workspace is ever taken" above.
+    let is_free =
+        |w: &Workspace| w.output.as_deref() == Some(&output) && w.name.is_none() && is_empty(w);
 
-    // Step 2 — adopt, but ONLY when it really is empty. Adopting a workspace
+    // Step 2 — adopt, but ONLY when it really is free. Adopting a workspace
     // with windows on it would drop the stack on top of whatever the user was
-    // doing, which is the #1071 §7 mutation for this line.
-    let adoptable = focused.filter(|w| w.output.as_deref() == Some(&output) && is_empty(w));
+    // doing, which is the #1071 §7 mutation for this line; adopting a named one
+    // would rename another stack's (or the user's) workspace.
+    let adoptable = focused.filter(|w| is_free(w));
     // Step 3 — with nothing to adopt, the trailing empty workspace on that
     // output. Highest `idx`, because that is where niri keeps the spare one.
     let (workspace, adopted) = if let Some(current) = adoptable {
@@ -378,7 +405,7 @@ pub(crate) fn plan_start(
     } else {
         let target = workspaces
             .iter()
-            .filter(|w| w.output.as_deref() == Some(&output) && w.name.is_none() && is_empty(w))
+            .filter(|w| is_free(w))
             .max_by_key(|w| w.idx)
             .ok_or(StartError::NoFreeWorkspace)?;
         (target.id, false)

@@ -670,6 +670,116 @@ fn an_empty_current_workspace_is_adopted() {
     assert!(plan.adopted);
 }
 
+/// …but only when it is also **unnamed**. A workspace the user named by hand is
+/// "not ours to unname" (`names_to_release`), and a `SetName` on it would rename
+/// it. niri does not refuse that.
+///
+/// Both halves are in one test, on layouts that differ only in that one name,
+/// so the contrast is the assertion. **Mutation:** drop `w.name.is_none()` from
+/// `plan_start`'s `is_free` and the named half adopts workspace 1 and reds.
+#[test]
+fn a_named_empty_current_workspace_is_not_adopted_but_an_unnamed_one_is() {
+    let unnamed = [ws_focused(1, 1, LEFT, None), ws(2, 2, LEFT, None, false)];
+    let plan = plan_start("chat", &Stack::default(), &unnamed, &[], &[]).expect("plans");
+    assert_eq!(plan.workspace, 1, "an unnamed empty current one is adopted");
+    assert!(plan.adopted);
+
+    let named = [
+        ws_focused(1, 1, LEFT, Some("notes")),
+        ws(2, 2, LEFT, None, false),
+    ];
+    let plan = plan_start("chat", &Stack::default(), &named, &[], &[]).expect("plans");
+    assert_eq!(
+        plan.workspace, 2,
+        "the trailing spare, not the user's named workspace"
+    );
+    assert!(!plan.adopted);
+    assert!(
+        plan.batch.iter().all(|a| !matches!(
+            a,
+            WorkspaceAction::SetName { workspace: 1, .. }
+                | WorkspaceAction::UnsetName { workspace: 1 }
+        )),
+        "nothing in the batch renames the user's workspace: {:?}",
+        plan.batch
+    );
+}
+
+/// The workspace a stack **mid-Start** just named, focused and is still waiting
+/// on its apps for, is not adopted by a second stack's Start.
+///
+/// That is the shape a Start leaves for up to `GRACE`: named, focused, and
+/// empty. Before this, a click on a second card in that window adopted it and
+/// renamed it to the second stack, so the first stack lost its workspace to the
+/// second while its apps were still opening.
+#[test]
+fn the_workspace_a_starting_stack_just_named_is_not_adopted() {
+    let mid_start = [
+        ws_focused(1, 1, LEFT, Some("chat")),
+        ws(2, 2, LEFT, None, false),
+    ];
+    let plan = plan_start("music", &Stack::default(), &mid_start, &[], &[]).expect("plans");
+
+    assert_eq!(plan.workspace, 2, "a new workspace, not chat's");
+    assert!(!plan.adopted);
+    assert_eq!(
+        plan.batch.first(),
+        Some(&WorkspaceAction::SetName {
+            workspace: 2,
+            name: "music".to_owned()
+        }),
+        "the name lands on the spare: {:?}",
+        plan.batch
+    );
+}
+
+/// The same case as a transaction, with the in-flight mark armed the way
+/// `spawn_start` arms it. Two guards have to agree here: `names_to_release`
+/// keeps the first stack's name, and `plan_start` does not take its workspace.
+///
+/// Before this fix only the first held. The sweep kept the name, and the plan
+/// then adopted the workspace and renamed it anyway.
+///
+/// Names no other test uses, because `STARTING` is process-global and the
+/// suite runs in parallel.
+#[test]
+fn a_second_start_during_the_first_ones_grace_window_takes_a_new_workspace() {
+    let first = "adoptfirst";
+    let second = "adoptsecond";
+    // `first` is named, focused and still empty: its apps have not opened yet.
+    let mid_start = vec![
+        ws_focused(1, 1, LEFT, Some(first)),
+        ws(2, 2, LEFT, None, false),
+    ];
+    let after = vec![
+        ws(1, 1, LEFT, Some(first), false),
+        ws_focused(2, 2, LEFT, Some(second)),
+    ];
+    let script = Script::default()
+        // Housekeeping, then the plan, then the verify.
+        .with_workspaces(&[mid_start.clone(), mid_start, after])
+        .with_windows(&[Vec::new()]);
+    let saved = stacked(&[(first, Stack::default()), (second, Stack::default())]);
+
+    // Both in flight: `first` from its own click, `second` because its caller
+    // marks it before the transaction runs.
+    let _first_mark = StartingMark::hold(first);
+    let _second_mark = StartingMark::hold(second);
+    let plan = run(start(&script, second, &Stack::default(), &saved)).expect("starts");
+
+    assert_eq!(plan.workspace, 2, "a new workspace: {:?}", script.calls());
+    assert!(!plan.adopted);
+    let actions = script.actions();
+    assert!(
+        actions.iter().all(|a| !matches!(
+            a,
+            WorkspaceAction::SetName { workspace: 1, .. }
+                | WorkspaceAction::UnsetName { workspace: 1 }
+        )),
+        "nothing touched the first stack's name: {actions:?}"
+    );
+}
+
 /// **MEDIUM-1.** The *fallback* leg takes an **empty** workspace too, not just
 /// any unnamed one.
 ///

@@ -106,7 +106,21 @@ pub type ICalDatetimeperiod = c_void;
 pub type ICalPeriod = c_void;
 
 /// `ICalRecurIterator *` — libical's core recurrence iterator. Created via
-/// [`i_cal_recur_iterator_new`]; freed with [`i_cal_recur_iterator_free`].
+/// [`i_cal_recur_iterator_new`]; released with [`g_object_unref`], like every
+/// other libical-glib wrapper here.
+///
+/// **Not** with `i_cal_recur_iterator_free`, which this module deliberately
+/// does not bind. In libical-glib 3.0 an `ICalRecurIterator` is an
+/// `ICalObject` (a GObject) wrapping the native `icalrecur_iterator`, built by
+/// `i_cal_object_construct(…, native, icalrecur_iterator_free, FALSE, NULL)`
+/// — so the wrapper's own finalizer frees the native iterator.
+/// `i_cal_recur_iterator_free` is a generated `kind="destructor"` stub
+/// (`api/i-cal-recur-iterator.xml`, `annotation="skip"`) whose whole body is
+/// `icalrecur_iterator_free(i_cal_object_get_native(iter))`: it frees the
+/// native iterator, never drops the GObject's ref and never clears the
+/// native pointer. Calling it leaks the wrapper; calling it *and then*
+/// unref'ing would double-free the native iterator. EDS itself releases these
+/// with `g_clear_object` (`e-cal-recur.c`, `e-cal-util.c`).
 pub type ICalRecurIterator = c_void;
 
 /// `ECalClientView *` — a live, push-based query result. Created via
@@ -543,7 +557,8 @@ unsafe extern "C" {
     pub fn i_cal_period_get_start(period: *mut ICalPeriod) -> *mut ICalTime;
 
     /// Create a libical recurrence iterator for `rule` anchored at
-    /// `dtstart`. Owned — release with [`i_cal_recur_iterator_free`].
+    /// `dtstart`. Owned — release with [`g_object_unref`] (see
+    /// [`ICalRecurIterator`] for why not `i_cal_recur_iterator_free`).
     /// Borrows `rule`/`dtstart`.
     pub fn i_cal_recur_iterator_new(
         rule: *mut ICalRecurrence,
@@ -594,9 +609,6 @@ unsafe extern "C" {
         iter: *mut ICalRecurIterator,
         start: *mut ICalTime,
     ) -> c_int;
-
-    /// Free a recurrence iterator created by [`i_cal_recur_iterator_new`].
-    pub fn i_cal_recur_iterator_free(iter: *mut ICalRecurIterator);
 }
 
 #[link(name = "ical-glib")]
@@ -611,6 +623,21 @@ unsafe extern "C" {
 #[link(name = "gobject-2.0")]
 unsafe extern "C" {
     pub fn g_object_unref(obj: *mut c_void);
+
+    /// `g_object_add_weak_pointer` — make GLib write `NULL` to
+    /// `*weak_pointer_location` when `object` is finalized. Only the tests use
+    /// it: it is how they prove a release really finalized a libical-glib
+    /// wrapper rather than leaking it (see [`ICalRecurIterator`]). The location
+    /// must outlive the object or be unregistered with
+    /// [`g_object_remove_weak_pointer`] first.
+    pub fn g_object_add_weak_pointer(object: *mut c_void, weak_pointer_location: *mut *mut c_void);
+
+    /// `g_object_remove_weak_pointer` — undo [`g_object_add_weak_pointer`]
+    /// for an object that is still alive.
+    pub fn g_object_remove_weak_pointer(
+        object: *mut c_void,
+        weak_pointer_location: *mut *mut c_void,
+    );
 
     /// `g_signal_connect_data` — connect `c_handler` to the named signal on
     /// `instance`, threading `data` (our boxed Rust callback) through to every

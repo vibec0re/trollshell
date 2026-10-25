@@ -914,9 +914,9 @@ enum Truncation {
 /// borrowed values `*iter` was built from ([`sys::i_cal_recur_iterator_new`]),
 /// and must stay alive for as long as the caller keeps using the iterator
 /// this function hands back — a rebuild borrows them again. This function
-/// frees at most the iterator it was given (never `rule`/`dtstart`) and, on a
-/// rebuild, hands back a new owned iterator in `*iter`; the caller frees
-/// whatever `*iter` holds when done, exactly once.
+/// releases at most the iterator it was given (never `rule`/`dtstart`) and, on
+/// a rebuild, hands back a new owned iterator in `*iter`; the caller releases
+/// whatever `*iter` holds when done, exactly once, with `g_object_unref`.
 unsafe fn skip_iterator_to_window(
     iter: &mut *mut sys::ICalRecurIterator,
     rule: *mut sys::ICalRecurrence,
@@ -986,10 +986,14 @@ unsafe fn skip_iterator_to_window(
     // going to spend on the fallback loop.
     //
     // SAFETY: `*iter` is the live iterator this function's contract
-    // guarantees and has not been freed yet; freeing it here (and replacing
-    // it below) is what makes "false ⇒ iterate from DTSTART as before" true
-    // unconditionally rather than only for the `COUNT` refusal.
-    unsafe { sys::i_cal_recur_iterator_free(*iter) }
+    // guarantees and has not been released yet — one GObject ref, owned by
+    // the caller and handed to us here. Dropping it finalizes the wrapper,
+    // whose finalizer frees the native iterator (`sys::ICalRecurIterator`
+    // says why this is `g_object_unref` and never `i_cal_recur_iterator_free`).
+    // Releasing it here (and replacing it below) is what makes "false ⇒
+    // iterate from DTSTART as before" true unconditionally rather than only
+    // for the `COUNT` refusal.
+    unsafe { sys::g_object_unref(*iter) }
     // SAFETY: `rule` and `dtstart` are the same live, borrowed values `*iter`
     // was originally built from (this function's contract); building a new
     // iterator from them is exactly `i_cal_recur_iterator_new`'s contract.
@@ -1162,8 +1166,8 @@ unsafe fn expand_component(
         let rule = unsafe { sys::i_cal_property_get_rrule(rrule_prop) };
         if !rule.is_null() {
             // SAFETY: both arguments are live and borrowed for the iterator's
-            // whole life — `rule` and `dtstart` are released only after
-            // `i_cal_recur_iterator_free` below, which is what libical's
+            // whole life — `rule` and `dtstart` are released only after the
+            // iterator itself is released below, which is what libical's
             // iterator requires of the rule and the start time it is built
             // from.
             let mut iter = unsafe { sys::i_cal_recur_iterator_new(rule, dtstart) };
@@ -1242,9 +1246,13 @@ unsafe fn expand_component(
                     }
                     // SAFETY: `iter` is the non-null iterator this scope now
                     // owns — whether the one created above or the
-                    // replacement `skip_iterator_to_window` built — freed
-                    // exactly once here and never stepped after.
-                    unsafe { sys::i_cal_recur_iterator_free(iter) }
+                    // replacement `skip_iterator_to_window` built — and its
+                    // one GObject ref is released exactly once here and the
+                    // iterator never stepped after. The wrapper's finalizer
+                    // frees the native iterator; `i_cal_recur_iterator_free`
+                    // would free only that and leak the wrapper
+                    // (`sys::ICalRecurIterator`).
+                    unsafe { sys::g_object_unref(iter) }
                 }
             }
             // SAFETY: the new `ICalRecurrence` ref taken above, released
@@ -2231,6 +2239,9 @@ unsafe fn borrowed_cstr(p: *const c_char) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::c_void;
+    use std::ptr;
+
     use super::sys;
 
     /// The integer constants we match `i_cal_component_isa` against must
@@ -3405,60 +3416,52 @@ mod tests {
     /// directly. Change the answer here and `MAX_RECUR_ITERATIONS`'s doc,
     /// `Truncation::IterationGuard` and the residue test below all become
     /// wrong at once.
+    ///
+    /// "Rebuilt" is read off a weak pointer on the original iterator rather
+    /// than by comparing addresses: now that the original is really released
+    /// (`g_object_unref`, not the leaking `i_cal_recur_iterator_free`), the
+    /// allocator is free to hand its block straight back to the replacement.
     #[test]
     fn libical_refuses_to_skip_a_count_rule_and_accepts_one_without() {
         /// Build the iterator `expand_component` builds for a given RRULE and
         /// report what `skip_iterator_to_window` says about skipping it to
         /// June 2026, plus whether it rebuilt the iterator (#1206 MEDIUM-2).
         fn iterator_skips(recurrence_rule: &str) -> (bool, bool) {
-            let ical = format!(
-                "BEGIN:VEVENT\r\nUID:probe\r\nDTSTAMP:20140101T090000Z\r\n\
-                 DTSTART:20140101T090000Z\r\nDTEND:20140101T093000Z\r\n\
-                 SUMMARY:Probe\r\nRRULE:{recurrence_rule}\r\nEND:VEVENT\r\n"
-            );
-            let comp = super::parse_vevent(&ical).unwrap();
-            // SAFETY: `comp.raw` is the live VEVENT just parsed, owned by this
-            // scope until the `drop` below; the accessor returns a **new**
-            // `ICalTime` ref, released at the end.
-            let dtstart = unsafe { sys::i_cal_component_get_dtstart(comp.raw) };
-            // SAFETY: the same live component and libical's RRULE
-            // `ICalPropertyKind` discriminant; a **new** property ref (or
-            // null), released at the end.
-            let prop = unsafe {
-                sys::i_cal_component_get_first_property(comp.raw, sys::I_CAL_RRULE_PROPERTY)
-            };
-            assert!(!prop.is_null(), "fixture has an RRULE");
-            // SAFETY: `prop` is that non-null property; reading its value
-            // yields a **new** `ICalRecurrence` ref, released at the end.
-            let rule = unsafe { sys::i_cal_property_get_rrule(prop) };
-            assert!(!rule.is_null(), "fixture's RRULE parses");
-            // SAFETY: both arguments are live and stay borrowed until after
-            // the iterator is freed below, which is what libical requires of
-            // the rule and start time an iterator is built from.
-            let mut iter = unsafe { sys::i_cal_recur_iterator_new(rule, dtstart) };
-            assert!(!iter.is_null(), "iterator constructs");
-            let original = iter;
+            let fixture = RecurFixture::new(recurrence_rule);
+            let mut iter = fixture.iterator();
+            let mut original: *mut c_void = ptr::null_mut();
+            // SAFETY: `iter` is the live iterator just built, and `original`
+            // is a local of this function, which releases every iterator
+            // before it returns.
+            unsafe { watch_finalization(iter, &raw mut original) }
 
             // SAFETY: `iter` is the live iterator just built and not yet
-            // stepped, and `rule`/`dtstart` are the same live values it was
-            // built from — exactly this callee's contract.
-            let skipped =
-                unsafe { super::skip_iterator_to_window(&mut iter, rule, dtstart, 0, JUN_START) };
-            let rebuilt = iter != original;
+            // stepped, and `fixture.rule`/`fixture.dtstart` are the same live
+            // values it was built from — exactly this callee's contract.
+            let skipped = unsafe {
+                super::skip_iterator_to_window(
+                    &mut iter,
+                    fixture.rule,
+                    fixture.dtstart,
+                    0,
+                    JUN_START,
+                )
+            };
+            // The original was finalized iff the skip released it and built a
+            // replacement.
+            let rebuilt = original.is_null();
 
-            // SAFETY: `iter` is the iterator this scope now owns (whether
-            // the original or a replacement), freed exactly once and never
-            // stepped after.
-            unsafe { sys::i_cal_recur_iterator_free(iter) }
-            // SAFETY: the new `ICalRecurrence` ref above, released exactly
-            // once and only after the iterator built from it is freed.
-            unsafe { sys::g_object_unref(rule) }
-            // SAFETY: the new property ref above, released exactly once.
-            unsafe { sys::g_object_unref(prop) }
-            // SAFETY: the new `ICalTime` ref above, released exactly once and
-            // only after the iterator that borrowed it is freed.
-            unsafe { sys::g_object_unref(dtstart) }
-            drop(comp);
+            let mut current: *mut c_void = ptr::null_mut();
+            // SAFETY: `iter` is the live iterator this scope now owns (the
+            // original or its replacement), and `current` outlives it.
+            unsafe { watch_finalization(iter, &raw mut current) }
+            // SAFETY: that iterator's one ref, released exactly once and never
+            // stepped after; `fixture` (its rule and start) drops after this.
+            unsafe { sys::g_object_unref(iter) }
+            assert!(
+                current.is_null() && original.is_null(),
+                "releasing the iterator did not finalize it — it leaked",
+            );
             (skipped, rebuilt)
         }
 
@@ -3483,7 +3486,180 @@ mod tests {
             "a refused skip must rebuild the iterator (#1206 MEDIUM-2) — \
              \"false ⇒ iterate from DTSTART as before\" is a promise about \
              the iterator returned, not a description of the one the \
-             caller happened to be holding",
+             caller happened to be holding — and must release the original",
+        );
+    }
+
+    // ── Releasing the recurrence iterator ─────────────────────────────────
+    //
+    // An `ICalRecurIterator` is a GObject wrapper around libical's native
+    // iterator, and the wrapper's finalizer is what frees the native half.
+    // These pin that the crate's release (`g_object_unref`) finalizes it, and
+    // that the libical-glib "destructor" it used before does not.
+
+    /// The libical objects `expand_component` builds a recurrence iterator
+    /// from — the parsed VEVENT, its `DTSTART`, its RRULE property and the
+    /// parsed rule — for the tests that drive the iterator directly. Every
+    /// iterator built from it must be released before it drops: an iterator
+    /// borrows `rule` and `dtstart` for its whole life.
+    struct RecurFixture {
+        // Never read: held so the VEVENT outlives the values read out of it.
+        _comp: super::Component,
+        dtstart: *mut sys::ICalTime,
+        prop: *mut sys::ICalProperty,
+        rule: *mut sys::ICalRecurrence,
+    }
+
+    impl RecurFixture {
+        /// A 2014-01-01T09:00Z series with the given `RRULE` value.
+        fn new(recurrence_rule: &str) -> Self {
+            let ical = format!(
+                "BEGIN:VEVENT\r\nUID:probe\r\nDTSTAMP:20140101T090000Z\r\n\
+                 DTSTART:20140101T090000Z\r\nDTEND:20140101T093000Z\r\n\
+                 SUMMARY:Probe\r\nRRULE:{recurrence_rule}\r\nEND:VEVENT\r\n"
+            );
+            let comp = super::parse_vevent(&ical).unwrap();
+            // SAFETY: `comp.raw` is the live VEVENT just parsed, owned by the
+            // fixture; the accessor returns a **new** `ICalTime` ref, released
+            // in `Drop`.
+            let dtstart = unsafe { sys::i_cal_component_get_dtstart(comp.raw) };
+            // SAFETY: the same live component and libical's RRULE
+            // `ICalPropertyKind` discriminant; a **new** property ref (or
+            // null), released in `Drop`.
+            let prop = unsafe {
+                sys::i_cal_component_get_first_property(comp.raw, sys::I_CAL_RRULE_PROPERTY)
+            };
+            assert!(!prop.is_null(), "fixture has an RRULE");
+            // SAFETY: `prop` is that non-null property; reading its value
+            // yields a **new** `ICalRecurrence` ref, released in `Drop`.
+            let rule = unsafe { sys::i_cal_property_get_rrule(prop) };
+            assert!(!rule.is_null(), "fixture's RRULE parses");
+            Self {
+                _comp: comp,
+                dtstart,
+                prop,
+                rule,
+            }
+        }
+
+        /// A fresh iterator over the fixture's rule — one owned GObject ref,
+        /// which the caller releases before the fixture drops.
+        fn iterator(&self) -> *mut sys::ICalRecurIterator {
+            // SAFETY: `rule` and `dtstart` are the fixture's live values and
+            // stay alive until it drops — after every iterator built here is
+            // released, which is what libical requires of them.
+            let iter = unsafe { sys::i_cal_recur_iterator_new(self.rule, self.dtstart) };
+            assert!(!iter.is_null(), "iterator constructs");
+            iter
+        }
+    }
+
+    impl Drop for RecurFixture {
+        fn drop(&mut self) {
+            // SAFETY: the new `ICalRecurrence` ref taken in `new`, released
+            // exactly once, after every iterator built from it.
+            unsafe { sys::g_object_unref(self.rule) }
+            // SAFETY: the new property ref taken in `new`, released exactly
+            // once.
+            unsafe { sys::g_object_unref(self.prop) }
+            // SAFETY: the new `ICalTime` ref taken in `new`, released exactly
+            // once, after every iterator that borrowed it. `_comp` drops after
+            // this body.
+            unsafe { sys::g_object_unref(self.dtstart) }
+        }
+    }
+
+    /// Watch `obj` for finalization: GLib nulls `*slot` when the object is
+    /// finalized (`g_object_add_weak_pointer`).
+    ///
+    /// # Safety
+    ///
+    /// `obj` must be a live GObject, and `slot` must point at a location that
+    /// outlives it — or that is unregistered with
+    /// `g_object_remove_weak_pointer` while the object is still alive.
+    unsafe fn watch_finalization(obj: *mut c_void, slot: *mut *mut c_void) {
+        // SAFETY: `slot` is valid for writes (this function's contract); it is
+        // seeded with the object's address, which GLib nulls on finalize.
+        unsafe { slot.write(obj) }
+        // SAFETY: `obj` is live and `slot` outlives it, both by this
+        // function's contract.
+        unsafe { sys::g_object_add_weak_pointer(obj, slot) }
+    }
+
+    /// The release every iterator in this crate goes through: one
+    /// `g_object_unref` finalizes the `ICalRecurIterator` wrapper, whose
+    /// finalizer frees the native `icalrecur_iterator`. Before this the crate
+    /// called `i_cal_recur_iterator_free` instead, which frees only the native
+    /// half and leaked the wrapper once per recurring component per calendar
+    /// refresh — see the next test.
+    #[test]
+    fn releasing_a_recurrence_iterator_finalizes_it() {
+        let fixture = RecurFixture::new("FREQ=DAILY");
+        let iter = fixture.iterator();
+        // Step it once, as `expand_component` does, so the release is of an
+        // iterator that has done real work.
+        // SAFETY: `iter` is the live iterator just built; the step returns a
+        // **new** `ICalTime` ref, released straight after.
+        let occ = unsafe { sys::i_cal_recur_iterator_next(iter) };
+        assert!(!occ.is_null(), "the daily rule has a first occurrence");
+        // SAFETY: that new ref, released exactly once.
+        unsafe { sys::g_object_unref(occ) }
+
+        let mut alive: *mut c_void = ptr::null_mut();
+        // SAFETY: `iter` is live and `alive` outlives it (released below).
+        unsafe { watch_finalization(iter, &raw mut alive) }
+        // SAFETY: the iterator's one ref, released exactly once; `fixture`
+        // drops after this.
+        unsafe { sys::g_object_unref(iter) }
+        assert!(
+            alive.is_null(),
+            "g_object_unref left the iterator alive: something else holds a ref",
+        );
+    }
+
+    /// The external fact behind the previous test, pinned rather than quoted
+    /// from libical-glib's generator: `i_cal_recur_iterator_free` frees the
+    /// native `icalrecur_iterator` and **leaves the GObject wrapper alive** —
+    /// its whole body is `icalrecur_iterator_free(i_cal_object_get_native(it))`
+    /// (`api/i-cal-recur-iterator.xml`, a `kind="destructor"` stub the GIR
+    /// skips), so it neither drops the ref nor clears the native pointer, and a
+    /// later `g_object_unref` would free the native iterator a second time.
+    /// That is why `sys` does not bind it and this test declares it locally.
+    ///
+    /// The wrapper this test frees is leaked on purpose — releasing it would be
+    /// that double free. If a future libical makes `_free` drop the ref too,
+    /// this goes red; the crate's `g_object_unref` is still correct then, and
+    /// `sys::ICalRecurIterator`'s doc is what needs updating.
+    #[test]
+    fn i_cal_recur_iterator_free_frees_the_native_iterator_but_leaks_the_wrapper() {
+        #[link(name = "ical-glib")]
+        unsafe extern "C" {
+            fn i_cal_recur_iterator_free(iter: *mut sys::ICalRecurIterator);
+        }
+
+        let fixture = RecurFixture::new("FREQ=DAILY");
+        let iter = fixture.iterator();
+        let mut alive: *mut c_void = ptr::null_mut();
+        // SAFETY: `iter` is live; `alive` is unregistered below while the
+        // wrapper is still alive, or nulled by GLib if it was finalized.
+        unsafe { watch_finalization(iter, &raw mut alive) }
+        // SAFETY: `iter` is the live iterator just built, passed to the
+        // libical-glib destructor exactly once and never used as an iterator
+        // again (its native half is gone after this).
+        unsafe { i_cal_recur_iterator_free(iter) }
+        let wrapper_survived = !alive.is_null();
+        if wrapper_survived {
+            // SAFETY: the wrapper is still a live GObject (it was not
+            // finalized — that is what `alive` still being set means), and
+            // unregistering touches only its weak-ref data, never the freed
+            // native iterator. Nothing references `alive` after this.
+            unsafe { sys::g_object_remove_weak_pointer(iter, &raw mut alive) }
+        }
+        assert!(
+            wrapper_survived,
+            "i_cal_recur_iterator_free now finalizes the wrapper too; the \
+             crate's g_object_unref release is still right, but the \
+             `sys::ICalRecurIterator` doc's account of libical is stale",
         );
     }
 }

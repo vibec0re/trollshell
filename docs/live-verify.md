@@ -884,15 +884,35 @@ openssl x509` produces it. Point it at a `trust-bundle.pem` instead and the
   host with a bad certificate still fails in the same window — this window
   never turns TLS checking off.
 
-- [ ] **(#950)** **The view stays on the hive.** With the page loaded, follow a
-      link in the agent's feed that points off the hive (or set
-      `window.location` from WebKit's inspector if the feed has none): the
-      **window must not move** — the link opens in your browser instead, and a
-      journal line says so. Same for a `target="_blank"` link: one browser tab,
-      no second WebKit window, and no silently-dead click. Then follow a link
-      _within_ the hive and confirm that one does load in place. This is the H1
-      guard from #1130's review: the embedded page is agent output, and this
-      window has no address bar to contradict a header that says "agent X".
+- [ ] **(#950)** **The view stays on the hive.** With the page loaded, click a
+      link in the agent's feed that points off the hive: the **window must
+      not move** — the link opens in your browser instead, and a journal line
+      says so. Same for a `target="_blank"` link: one browser tab, no second
+      WebKit window, and no silently-dead click. Then follow a link _within_
+      the hive and confirm that one does load in place. This is the H1 guard
+      from #1130's review: the embedded page is agent output, and this window
+      has no address bar to contradict a header that says "agent X". (Setting
+      `window.location` from the inspector is no longer a substitute for a
+      click — that is the item below.)
+- [ ] **Nothing opens without a click.** CI proves the decision table
+      (`page::decide`'s tests); what it cannot prove is that `WebKit` reports
+      `is_user_gesture` the way that table assumes. With the page loaded and
+      `RUST_LOG=trollshell_agent_window=debug`, make the page leave the hive
+      with nobody clicking — from WebKit's inspector console, with its
+      _Emulate User Gesture_ setting **off** (on, the console's command _is_ a
+      gesture and a tab is the right answer), or from a turn whose rendered
+      output carries the markup, if the hive passes raw HTML through. Try
+      `location = "https://example.org/"`; an
+      `<iframe src="https://example.org/">` appended to the page; a
+      `<meta http-equiv="refresh" content="0;url=https://example.org/">`
+      appended to `<head>`; and
+      `setInterval(() => window.open("https://example.org/"), 500)`. For each,
+      the window must not move, **no browser tab opens**, and the journal
+      carries a `refused: nobody clicked this…` debug line per attempt (the
+      `window.open` loop may log nothing at all — `WebKit`'s own popup blocker
+      can stop it before the window's handlers are asked). Then click an
+      off-hive link in the feed once more and confirm that one still opens in
+      the browser: the fix must not cost the click.
 - [ ] **(#950)** **Without the window, nothing regresses.** Set
       `programs.trollshell.agentWindow.enable = false;`, rebuild, restart the
       plugin, and confirm the card's link and the pill's row both open the

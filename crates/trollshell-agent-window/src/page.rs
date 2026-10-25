@@ -96,9 +96,10 @@ pub fn embed_url(base: &str) -> String {
 /// certificate there loads clean.
 ///
 /// So this window navigates to **exactly one origin**: the one it was opened
-/// for. Everything else is handed to the desktop's default handler and
-/// cancelled in the view, which keeps a legitimate link in the feed working —
-/// just not here.
+/// for. Everything else is cancelled in the view, and a link the operator
+/// actually **clicked** is handed to the desktop's default handler, which
+/// keeps a legitimate link in the feed working — just not here. Which
+/// refusals reach the desktop is [`decide`]'s business, not this function's.
 ///
 /// This is the half of Mara's "never depend on the page's DOM" that the
 /// `?hide=` contract does not cover: the window does not read the DOM, but it
@@ -124,9 +125,141 @@ pub fn navigable_in_place(embedded: &str, candidate: &str) -> bool {
         && crate::tls::host_of(candidate) == crate::tls::host_of(embedded)
 }
 
+/// Where the page asked for a URI to go — the one fact about a request,
+/// besides the URI and its [user gesture](decide), that `webkit6` 0.6 lets
+/// [`decide`] see.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    /// `decide-policy`'s `NavigationAction`: a load in this view's own
+    /// viewport — **the main frame or any subframe**, which this API cannot
+    /// tell apart (see [`decide`]).
+    ThisView,
+    /// `decide-policy`'s `NewWindowAction` (`target="_blank"`), or `create`
+    /// (the request to build the window itself): a window this view will
+    /// never build.
+    NewWindow,
+}
+
+/// What the view does with one request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decision {
+    /// Let `WebKit` load it here: the agent's own origin, in this view.
+    InPlace,
+    /// Cancel it here and hand the URI to the desktop's default handler.
+    Desktop,
+    /// Cancel it here and do nothing else.
+    Refuse(Refusal),
+}
+
+/// Why a [`Decision::Refuse`] went nowhere — the whole of its log line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// Nobody clicked: a script, a `<meta http-equiv=refresh>`, an iframe's
+    /// own load, a `window.open` loop. The case this rule exists for.
+    NoGesture,
+    /// Somebody clicked, on a scheme no launcher should ever be handed — see
+    /// [`may_leave`].
+    Scheme,
+}
+
+/// Load `candidate` here, hand it to the desktop, or drop it?
+///
+/// # Why the desktop needs a click
+///
+/// [`navigable_in_place`] keeps the viewport on the hive, and until a
+/// security review of `main` (October 2026) caught it, every request it
+/// refused went to `launch_default_for_uri`. The page is the
+/// agent's turn stream — content the agent's inputs can influence — so that
+/// made the **desktop** the thing a prompt-injected page could drive:
+/// `<iframe src="https://evil/…">`, a `<meta http-equiv=refresh>`, a
+/// scripted `location =` or a `window.open` loop would each open a browser
+/// tab on an attacker-chosen URL, or a hundred of them, with nobody touching
+/// anything. So a refused request reaches the desktop only when
+/// `WebKit` says a **user gesture** started it, and is otherwise dropped
+/// with one debug line. A click on a link in the feed still opens it in the
+/// browser; nothing else does.
+///
+/// # The rule
+///
+/// 1. [`Target::ThisView`] on the agent's own origin loads **in place**,
+///    gesture or not — the initial `load_uri` carries none, and neither do
+///    the hive's own scripted navigations or its frames.
+/// 2. Anything else with no gesture is [`Refusal::NoGesture`].
+/// 3. A gesture on a scheme [`may_leave`] refuses is [`Refusal::Scheme`]:
+///    `file:`, `javascript:`, `data:`, a custom handler — never a launcher.
+/// 4. Everything left — a click, on http(s), off the hive or asking for a
+///    window — goes to the [desktop](Decision::Desktop).
+///
+/// A [`Target::NewWindow`] never loads in place, even on the hive's own
+/// origin: there is no second window here for it to become, so a clicked one
+/// goes to the browser and an unclicked one goes nowhere.
+///
+/// # Main frame or subframe: `webkit6` 0.6 cannot say
+///
+/// The review asked for "a user-initiated **main-frame** navigation", and
+/// the frame half is not answerable here. `decide-policy`'s
+/// `NavigationAction` fires *"when `WebKit` is about to navigate to a new page
+/// in either the main frame or a subframe"* (`WebKit-6.0.gir`,
+/// `WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION`), and the
+/// `NavigationAction` it carries names no frame: `frame_name` is the
+/// **target** name of a `target=` link and `NULL` *"in all other cases"* —
+/// which is what an unnamed iframe and the main frame both read. The one
+/// main-frame predicate in the API,
+/// `ResponsePolicyDecision::is_main_frame_main_resource`, is on the
+/// *response* decision, which a refused navigation never reaches.
+///
+/// So this rule is written not to need it, and treats every navigation as
+/// though it might be a subframe's. The vector a frame test would close — a
+/// frame's own load, `<iframe src>` — carries no gesture and is refused by
+/// rule 2. What is left, a gesture-bearing navigation *from* a subframe,
+/// needs the operator to click inside a document already in one of this
+/// view's frames — and since rule 2 refuses every off-hive frame load,
+/// whatever is in one was put there by the hive's own page. That is a click
+/// on the hive's content: the main-frame case under another name. The more
+/// conservative reading — refuse every `ThisView` request, frames unknown —
+/// would leave only `target="_blank"` links working and make every plain
+/// link in the feed silently dead, the "small lie" `webview.rs`'s `create`
+/// handler exists to avoid for `_blank`.
+///
+/// What a gesture cannot rule out is a script **on the hive's origin**
+/// spending the operator's click on a URL of its choosing. That still takes
+/// a click, and a script that runs on the hive's origin can already post to
+/// the hive as the operator, so the browser tab is not the worst of it.
+#[must_use]
+pub fn decide(embedded: &str, candidate: &str, target: Target, user_gesture: bool) -> Decision {
+    if target == Target::ThisView && navigable_in_place(embedded, candidate) {
+        return Decision::InPlace;
+    }
+    if !user_gesture {
+        return Decision::Refuse(Refusal::NoGesture);
+    }
+    if !may_leave(candidate) {
+        return Decision::Refuse(Refusal::Scheme);
+    }
+    Decision::Desktop
+}
+
+/// May `uri` be handed to the desktop's launcher at all?
+///
+/// `http`/`https` only — the same judgement the shell's own `OpenUri` broker
+/// makes, minus `file:`, because nothing in an agent's turn stream has a
+/// reason to open a local path and the launcher is the one place a hostile
+/// page's string becomes a program's argument. [`decide`] asks first, and
+/// `webview.rs`'s `elsewhere` asks again at the launcher itself.
+///
+/// Case-sensitive on purpose: `WebKit` hands the policy handlers its own
+/// canonical, lower-cased scheme, so an `HTTPS://` here did not come from
+/// there and is refused rather than guessed at.
+#[must_use]
+pub fn may_leave(uri: &str) -> bool {
+    uri.starts_with("https://") || uri.starts_with("http://")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{HIDE_QUERY, embed_url, navigable_in_place};
+    use super::{
+        Decision, HIDE_QUERY, Refusal, Target, decide, embed_url, may_leave, navigable_in_place,
+    };
 
     /// **Only the agent's own origin loads in our chrome.** The reviewer's
     /// test, taken verbatim and then widened.
@@ -303,5 +436,179 @@ mod tests {
         let url = embed_url("https://hive.local/agent/stray/");
         assert!(!url.contains("input"), "{url}");
         assert_eq!(url, "https://hive.local/agent/stray/?hide=header");
+    }
+
+    /// The agent's page, as the window embeds it.
+    const PAGE: &str = "https://hive.local/agent/stray/?hide=header";
+
+    /// URIs an injected turn stream would aim at — the review's
+    /// `https://evil/…`, its plain-http twin, and the lookalikes
+    /// [`a_lookalike_host_is_not_the_hive`] already refuses in place.
+    const OFF_THE_HIVE: [&str; 5] = [
+        "https://evil.example/phish",
+        "http://evil.example/phish",
+        "https://hive.local.evil.example/login",
+        "https://hive.local@evil.example/login",
+        "http://hive.local/agent/stray/",
+    ];
+
+    /// **Nothing reaches the desktop without a click** — the review's
+    /// finding, as a table: an `<iframe src>`, a `<meta http-equiv=refresh>`
+    /// or a scripted `location =` (all [`Target::ThisView`], no gesture) and a
+    /// `window.open` loop or a script-clicked `target="_blank"` (both
+    /// [`Target::NewWindow`], no gesture) each used to open a browser tab on
+    /// whatever the page chose.
+    ///
+    /// Mutation (run this round, red): make `decide`'s `!user_gesture` test
+    /// `false` — the hand-everything-over behaviour this window shipped with
+    /// — and this reds with `Desktop` on its first row.
+    #[test]
+    fn nothing_reaches_the_desktop_without_a_click() {
+        for uri in OFF_THE_HIVE {
+            for target in [Target::ThisView, Target::NewWindow] {
+                assert_eq!(
+                    decide(PAGE, uri, target, false),
+                    Decision::Refuse(Refusal::NoGesture),
+                    "{target:?} to {uri} with nobody clicking must open nothing"
+                );
+            }
+        }
+    }
+
+    /// …and a click still does: a link in the feed that points off the hive
+    /// opens in the browser, whether it targets this view or a new window.
+    ///
+    /// Mutation (run this round, red): return `Refuse(NoGesture)` where
+    /// `decide` returns `Desktop` — "refuse everything off the hive", the
+    /// over-correction that would make every link in the feed dead — and
+    /// this reds (as does [`a_new_window_never_loads_in_place`]).
+    #[test]
+    fn a_click_off_the_hive_goes_to_the_desktop() {
+        for uri in OFF_THE_HIVE {
+            for target in [Target::ThisView, Target::NewWindow] {
+                assert_eq!(
+                    decide(PAGE, uri, target, true),
+                    Decision::Desktop,
+                    "a clicked {target:?} link to {uri} opens in the browser"
+                );
+            }
+        }
+    }
+
+    /// The hive's own origin loads **in place, gesture or not** — the
+    /// window's first `load_uri` carries no gesture, and neither do the
+    /// hive's own scripted navigations or its frames.
+    ///
+    /// Mutation (run this round, red): require a gesture for the in-place
+    /// answer too (`user_gesture && target == …`), and this reds with
+    /// `Refuse(NoGesture)` on the first ungestured row — a window that never
+    /// loads its own page.
+    #[test]
+    fn the_hive_loads_in_place_with_or_without_a_gesture() {
+        for uri in [
+            PAGE,
+            "https://hive.local/",
+            "https://hive.local/agent/other/",
+            "https://hive.local:8443/agent/stray/turn/3",
+        ] {
+            for gesture in [false, true] {
+                assert_eq!(
+                    decide(PAGE, uri, Target::ThisView, gesture),
+                    Decision::InPlace,
+                    "{uri} (gesture: {gesture}) is the hive"
+                );
+            }
+        }
+    }
+
+    /// A **new window** never loads in place, even on the hive's own origin:
+    /// there is no second window here for it to become. Clicked, it goes to
+    /// the browser — what a `target="_blank"` link into the hive did before
+    /// this, through `create` — and unclicked it goes nowhere.
+    ///
+    /// Mutation (run this round, red): drop `decide`'s
+    /// `target == Target::ThisView` conjunct and this reds with `InPlace` —
+    /// which `create` carries out as nothing at all, so a clicked `_blank`
+    /// link into the hive would silently go nowhere.
+    #[test]
+    fn a_new_window_never_loads_in_place() {
+        let ours = "https://hive.local/agent/other/";
+        assert_eq!(
+            decide(PAGE, ours, Target::NewWindow, true),
+            Decision::Desktop
+        );
+        assert_eq!(
+            decide(PAGE, ours, Target::NewWindow, false),
+            Decision::Refuse(Refusal::NoGesture)
+        );
+    }
+
+    /// Even a click never hands a launcher anything but http(s): the review
+    /// kept `file:` and custom schemes out, and the gesture does not let them
+    /// back in.
+    ///
+    /// Mutation (run this round, red): make `decide`'s `may_leave` test
+    /// `false` and this reds with `Desktop` on `file:///etc/passwd` — at
+    /// which point `elsewhere`'s own check is the only thing between the
+    /// string and the launcher.
+    #[test]
+    fn a_click_hands_the_desktop_only_http() {
+        for uri in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "data:text/html,<h1>hi",
+            "mailto:someone@example.org",
+            "ssh://hive.local/",
+            "steam://run/1",
+            "about:blank",
+            "HTTPS://evil.example/",
+            "",
+        ] {
+            for target in [Target::ThisView, Target::NewWindow] {
+                assert_eq!(
+                    decide(PAGE, uri, target, true),
+                    Decision::Refuse(Refusal::Scheme),
+                    "{uri:?} must never reach a launcher"
+                );
+            }
+            // …and without a click it is the gesture that says no first, so
+            // an `about:blank` frame logs a debug line, not a warning.
+            assert_eq!(
+                decide(PAGE, uri, Target::ThisView, false),
+                Decision::Refuse(Refusal::NoGesture)
+            );
+        }
+        assert!(may_leave("https://evil.example/"));
+        assert!(may_leave("http://evil.example/"));
+    }
+
+    /// The host comparison is **exact** and fails closed: another spelling of
+    /// the hive's name is not the hive, and a URL whose authority two parsers
+    /// read differently has no host at all.
+    ///
+    /// - Upper case never reaches this from the view — `WebKit` lower-cases
+    ///   the host of what it passes `decide-policy` — so the row says only
+    ///   that if one ever does, the answer is "not here" rather than a guess.
+    /// - A trailing dot does reach it, and `hive.local.` is a different
+    ///   origin to `WebKit` as well, so refusing it in place agrees with the
+    ///   engine.
+    /// - The backslash row is the one that matters: RFC 3986 (`GUri`) reads
+    ///   `hive.local` as its host, WHATWG (`WebKit`) reads `evil.example`,
+    ///   so `tls::host_of` answers `None` for it. `WebKit` would hand the
+    ///   policy its canonical form, `https://evil.example/@hive.local/`,
+    ///   which both parsers read the same way — the last row.
+    #[test]
+    fn an_uncanonical_spelling_of_the_hive_is_not_the_hive() {
+        for spelled in [
+            "https://HIVE.local/agent/stray/",
+            "https://hive.local./agent/stray/",
+            "https://evil.example\\@hive.local/",
+            "https://evil.example/@hive.local/",
+        ] {
+            assert!(
+                !navigable_in_place(PAGE, spelled),
+                "{spelled} must not load in this window"
+            );
+        }
     }
 }

@@ -678,7 +678,7 @@ impl Window {
     /// cancelled and names every route, exactly as before — what changed is
     /// that the window was usable the whole time it ran.
     fn begin_probe(&self, embedded: String) {
-        let host = tls::host_of(&embedded).unwrap_or("the hive").to_owned();
+        let host = tls::host_of(&embedded).unwrap_or_else(|| "the hive".to_owned());
         self.fill_page_slot(&webview::verifying(&host));
         *self.probe.borrow_mut() = Some(embedded.clone());
 

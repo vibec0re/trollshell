@@ -13,18 +13,7 @@
 targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
 
 [advisories]
-ignore = [
-  # RUSTSEC-2026-0194 / RUSTSEC-2026-0195: quick-xml 0.39.4 DoS-class findings
-  # (quadratic attribute scan / unbounded namespace-decl allocation). Reached
-  # only via wayland-scanner (a *build-time* codegen dependency of
-  # wayland-client/wayland-protocols that parses the Wayland protocol XML
-  # bundled with those crates, not attacker-controlled input) — not a runtime
-  # dependency, and wayland-scanner's own quick-xml requirement doesn't reach
-  # the fixed 0.41 line yet (`cargo update -p quick-xml` confirmed no bump
-  # available as of #453). Revisit when wayland-scanner updates.
-  { id = "RUSTSEC-2026-0194", reason = "build-time-only codegen (wayland-scanner) parsing trusted, repo-bundled protocol XML; no compatible quick-xml bump available yet" },
-  { id = "RUSTSEC-2026-0195", reason = "same as RUSTSEC-2026-0194 — build-time-only codegen, not exposed to untrusted input" },
-]
+ignore = []
 
 [licenses]
 # Every license actually present in the pruned graph as of #453 (verified via

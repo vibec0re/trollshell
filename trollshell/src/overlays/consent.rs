@@ -41,6 +41,9 @@
 //! wedged UI never leaves a card on screen; whether that teardown *sends* a
 //! decision is the table above. Every prompt resolves **exactly once** — the
 //! first of a button click, `Esc`, or the timeout wins and cancels the rest.
+//! A card taken off the screen unresolved — superseded by a newer request,
+//! closed by a hot-plug — sends **nothing**: its requester falls back to its
+//! own deadline, and no decision is made for a card nobody can see.
 //!
 //! **Focused output.** [`install`] registers each monitor by connector;
 //! [`request`] picks the monitor for niri's focused output via the shared
@@ -248,8 +251,9 @@ thread_local! {
     /// The single live consent window, if any. A fresh [`request`] replaces it
     /// (the superseded one's requester falls back to the broker's own timeout).
     /// Emptied by whichever takes the card down: [`close_all`], the supersede
-    /// step in [`request`], or the card's own resolution (a click, `Esc`, the
-    /// timeout) — so [`is_up`] answers for what is on screen.
+    /// step in [`request`], the card's own resolution (a click, `Esc`, the
+    /// timeout), or its window leaving the screen any other way — so [`is_up`]
+    /// answers for what is on screen.
     static CONSENT_WINDOW: RefCell<Option<gtk::Window>> = const { RefCell::new(None) };
 
     /// Mounted monitors keyed by `Monitor.connector()`, so [`request`] can build
@@ -525,6 +529,34 @@ pub fn request(
             resolve(plan.on_silence);
         });
         timeout.set(Some(id));
+    }
+
+    // ── Leaving the screen unresolved ends the card too ───────────────────────
+    //
+    // A superseding `request` and `close_all` close this window without
+    // resolving it. The timer used to stay armed through both and resolve the
+    // card 60 s after it went up: for a grant that sent `Deny` — which the
+    // infobroker *persists* — for a card nobody could still see, ahead of the
+    // broker's own park timeout, whose transient deny is what
+    // `CONSENT_WINDOW`'s doc promises a superseded requester. Now a card is
+    // over the moment it leaves the screen, by whatever route: `done` latches
+    // so nothing more is sent, the timer is disarmed, and the slot is released
+    // if it is still this card's (the compositor closing the surface on its
+    // own would otherwise strand it). `resolve`'s own `close` lands here after
+    // it has done all three — a no-op. The `prompt` overlay's teardown idiom.
+    {
+        let done = done.clone();
+        let timeout = timeout.clone();
+        window.connect_unmap(move |window| {
+            done.set(true);
+            if let Some(id) = timeout.take() {
+                id.remove();
+            }
+            // Every `close` that unmaps this window releases its own borrow of
+            // the slot first (#631), so this one cannot collide with it.
+            let released = CONSENT_WINDOW.with(|w| w.borrow_mut().take_if(|live| live == window));
+            drop(released);
+        });
     }
 
     window.set_visible(true);
@@ -1036,16 +1068,18 @@ pub(crate) mod gtk_tests {
         );
     }
 
-    /// The other half of the fix, and why it compares windows: a superseded
-    /// card's timer still fires, and its resolution must not release the slot
-    /// the card that replaced it now holds — or a dialog could be raised over
-    /// a live card (#1361 review, HIGH-1).
+    /// A superseded card is over when the newer one replaces it: its timer
+    /// must neither send a late decision for the old request — a grant's
+    /// `Deny`, which the infobroker persists, for a card nobody could still
+    /// see — nor release the slot the replacement now holds, or a dialog could
+    /// be raised over a live card (#1361 review, HIGH-1).
     ///
-    /// Falsified by making the release unconditional (`take()`).
+    /// Falsified by deleting the `connect_unmap` teardown (the late `Deny`
+    /// arrives).
     #[gtk::test]
-    fn a_superseded_cards_timer_keeps_the_live_cards_slot() {
+    fn a_superseded_card_sends_nothing_and_keeps_the_live_cards_slot() {
         let _mounted = Mounted::new();
-        let (tx, _rx) = mpsc::channel(4);
+        let (tx, mut rx) = mpsc::channel(4);
         TIMEOUT.set(Some(SHORT));
         let first = raise(1, ConsentChoices::Grant, &tx);
         TIMEOUT.set(None); // the replacement keeps the real 60 s
@@ -1054,8 +1088,54 @@ pub(crate) mod gtk_tests {
 
         run_for(SHORT * 10);
 
-        assert!(is_up(), "the live card's slot must survive a stale resolve");
+        assert!(
+            rx.try_recv().is_err(),
+            "a superseded card's timer must not send a late decision"
+        );
+        assert!(is_up(), "the live card's slot must survive the old one");
         assert_eq!(CONSENT_WINDOW.with(|w| w.borrow().clone()), Some(second));
         assert!(!a_dialog_may_raise());
+    }
+
+    /// A hot-plug's `close_all` ends the card the same way: nothing sent
+    /// later, nothing left in the slot.
+    #[gtk::test]
+    fn a_hot_plug_ends_the_card_without_a_decision() {
+        let _mounted = Mounted::new();
+        let (tx, mut rx) = mpsc::channel(4);
+        TIMEOUT.set(Some(SHORT));
+        let _card = raise(1, ConsentChoices::Grant, &tx);
+
+        close_all();
+        run_for(SHORT * 10);
+
+        assert!(!is_up());
+        assert!(
+            rx.try_recv().is_err(),
+            "the hot-plug must not send a late Deny"
+        );
+    }
+
+    /// A card whose window is closed out from under it — by the compositor, or
+    /// anything but this module — releases the slot then and there, rather
+    /// than 60 s later or never.
+    ///
+    /// Falsified by deleting the `take_if` in the `connect_unmap` teardown.
+    #[gtk::test]
+    fn a_card_closed_out_from_under_it_releases_its_slot() {
+        let _mounted = Mounted::new();
+        let (tx, mut rx) = mpsc::channel(4);
+        TIMEOUT.set(Some(SHORT));
+        let card = raise(1, ConsentChoices::Grant, &tx);
+
+        card.close();
+
+        assert!(!is_up(), "the slot must not outlive the window");
+        assert!(a_dialog_may_raise());
+        run_for(SHORT * 10);
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing is decided for a card nobody saw out"
+        );
     }
 }

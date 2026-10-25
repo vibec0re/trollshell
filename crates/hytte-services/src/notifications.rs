@@ -1413,31 +1413,124 @@ fn decode_image_data(val: &OwnedValue) -> Option<NotificationImage> {
 
 // ── Helper: strip HTML-like markup ───────────────────────────────────────────
 
-/// Conservatively strip `<...>` tags from notification body text.
+/// Turn a notification body into the plain text the shell renders: strip the
+/// tags of the spec's markup subset, decode XML character references, and
+/// keep everything else — a `<` or `&` that starts neither — literally.
 ///
-/// The freedesktop spec allows a small HTML subset, but v0.4.0 renders
-/// notifications as plain text.
+/// # Why strip at all
+///
+/// [`GetCapabilities`](NotificationsIface::get_capabilities) does **not**
+/// advertise `body-markup`, so by the letter of the spec the body is plain
+/// text and the client should have stripped its own markup. Real clients send
+/// it anyway — mako and dunst both advertise `body-markup`, so apps written
+/// against them assume it — and the spec designs its tags "in a way that
+/// allows them to be stripped out". So tags go; their text stays.
+///
+/// A `<` is a tag only when it is followed by an optional `/`, an ASCII
+/// letter, and then a `>` before any further `<` — the shape every tag in the
+/// spec's subset (`b`, `i`, `u`, `a`, `img`) and every tag a client actually
+/// sends has. Anything else is text. The pre-fix stripper entered "in a tag"
+/// on *any* `<` and left only on a `>`, so `notify-send t "errors < 5 in
+/// foo.rs"` rendered `errors ` and silently dropped the rest of the body.
+///
+/// # Why decode entities too
+///
+/// A client that sends markup escapes its text for markup — that is what
+/// makes it markup — so a body of `<b>Tom &amp; Jerry</b>` *means* "Tom &
+/// Jerry". Stripping its tags but not its entities would render `Tom &amp;
+/// Jerry`: half a decode, strictly worse for exactly the clients this
+/// stripper exists for. The five predefined XML entities are decoded, and so
+/// are numeric character references, because `g_markup_escape_text` —
+/// glib's escaper, the one most C/Python clients here reach for — writes an
+/// apostrophe as `&#39;`, so "it's" arrives as `it&#39;s`. The cost is a
+/// plain-text body that *literally* contains `&amp;` rendering as `&`, which
+/// is the rarer of the two by far. A bare `&` (`Fish & Chips`), an unknown
+/// name (`&nbsp;`), and a reference to no valid character (`&#0;`,
+/// `&#xD800;`) all stay exactly as sent.
+///
+/// One pass, so a decoded `&lt;b&gt;` becomes the text `<b>` and is never
+/// re-read as a tag. Linear in the input: a tag scan stops at the next `<`,
+/// so no two scans overlap, and an entity scan is bounded by
+/// [`MAX_ENTITY_NAME`].
 fn strip_markup(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut in_tag = false;
-    for ch in s.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' if in_tag => in_tag = false,
-            _ if !in_tag => out.push(ch),
-            _ => {}
+    let mut rest = s;
+    while let Some(at) = rest.find(['<', '&']) {
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        if let Some(len) = tag_len(rest) {
+            rest = &rest[len..];
+        } else if let Some((ch, len)) = char_reference(rest) {
+            out.push(ch);
+            rest = &rest[len..];
+        } else {
+            // A `<` or `&` that starts neither — text. Both are one byte.
+            out.push_str(&rest[..1]);
+            rest = &rest[1..];
         }
     }
+    out.push_str(rest);
     out
+}
+
+/// Byte length of the tag `s` starts with, or `None` if `s` does not start
+/// with one — see [`strip_markup`] for the shape that counts.
+fn tag_len(s: &str) -> Option<usize> {
+    let inner = s.strip_prefix('<')?;
+    let name = inner.strip_prefix('/').unwrap_or(inner);
+    if !name.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let end = inner.find(['<', '>'])?;
+    (inner.as_bytes()[end] == b'>').then_some(1 + end + 1)
+}
+
+/// Longest name between `&` and `;` that [`char_reference`] will look at —
+/// `#x10FFFF`, the longest valid reference, is 8. Bounds the scan, so a body
+/// of a million `&`s with no `;` costs a million short looks rather than a
+/// quadratic walk on the D-Bus handler.
+const MAX_ENTITY_NAME: usize = 10;
+
+/// The character the reference `s` starts with stands for, and the
+/// reference's byte length; `None` if `s` does not start with one we decode
+/// (see [`strip_markup`]).
+fn char_reference(s: &str) -> Option<(char, usize)> {
+    let body = s.strip_prefix('&')?;
+    let semi = body
+        .bytes()
+        .take(MAX_ENTITY_NAME + 1)
+        .position(|b| b == b';')?;
+    let name = &body[..semi];
+    let ch = match name {
+        "amp" => '&',
+        "lt" => '<',
+        "gt" => '>',
+        "quot" => '"',
+        "apos" => '\'',
+        _ => {
+            let number = name.strip_prefix('#')?;
+            let (digits, radix) = match number.strip_prefix(['x', 'X']) {
+                Some(hex) => (hex, 16),
+                None => (number, 10),
+            };
+            // `from_str_radix` alone would take a leading `+`.
+            if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+                return None;
+            }
+            let code = u32::from_str_radix(digits, radix).ok()?;
+            char::from_u32(code).filter(|&c| c != '\0')?
+        }
+    };
+    Some((ch, 1 + semi + 1))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_TIMEOUT, LocalActionMap, MIN_RESUME, RateLimitMap, TimerAction, TimerEntry,
-        TimerMap, TimerState, apply_expiry, clear_local_actions, clear_timer,
-        image_data_consistent, rate_limit_check, register_local_action, resolve_timeout,
-        take_local_action,
+        DEFAULT_TIMEOUT, LocalActionMap, MIN_RESUME, Mutable, NotificationsIface, RateLimitMap,
+        TimerAction, TimerEntry, TimerMap, TimerState, apply_expiry, clear_local_actions,
+        clear_timer, image_data_consistent, rate_limit_check, register_local_action,
+        resolve_timeout, strip_markup, take_local_action,
     };
     use std::cell::Cell;
     use std::sync::Arc;
@@ -1488,6 +1581,113 @@ mod tests {
         // Bogus giant dims must be rejected by the sane-bound guard, never panic.
         assert!(!image_data_consistent(i32::MAX, i32::MAX, i32::MAX, 4, 16));
         assert!(!image_data_consistent(1 << 20, 1, 1 << 22, 4, 8));
+    }
+
+    // ── Body markup stripping ────────────────────────────────────────────────
+
+    #[test]
+    fn strip_markup_keeps_a_bare_less_than_and_the_rest_of_the_body() {
+        // The reported repro: the old stripper entered "in a tag" here and
+        // never left, so the body rendered as `errors `.
+        assert_eq!(strip_markup("errors < 5 in foo.rs"), "errors < 5 in foo.rs");
+        // Not a tag either: no letter after the `<`, or no `>` to close it.
+        assert_eq!(strip_markup("a <5 b"), "a <5 b");
+        assert_eq!(strip_markup("see <foo"), "see <foo");
+        assert_eq!(strip_markup("a </ b"), "a </ b");
+        assert_eq!(strip_markup("x < y > z"), "x < y > z");
+        assert_eq!(strip_markup("trailing <"), "trailing <");
+    }
+
+    #[test]
+    fn strip_markup_strips_the_spec_subset_and_keeps_its_text() {
+        assert_eq!(
+            strip_markup("<b>bold</b>, <i>it</i>, <u>un</u>"),
+            "bold, it, un"
+        );
+        assert_eq!(
+            strip_markup(r#"see <a href="https://example.org/?q=1">the page</a>"#),
+            "see the page"
+        );
+        assert_eq!(
+            strip_markup(r#"pic: <img src="/tmp/a.png" alt="a"/>!"#),
+            "pic: !"
+        );
+        assert_eq!(strip_markup("line<br/>line"), "lineline");
+    }
+
+    #[test]
+    fn strip_markup_a_tag_like_run_interrupted_by_another_lt_is_text() {
+        // `<b ` reaches no `>` before the next `<`, so it is text; the `<i>`
+        // after it is still a tag.
+        assert_eq!(strip_markup("a <b <i>x</i>"), "a <b x");
+    }
+
+    #[test]
+    fn strip_markup_leaves_a_literal_ampersand_alone() {
+        assert_eq!(strip_markup("Fish & Chips"), "Fish & Chips");
+        assert_eq!(strip_markup("a && b; c"), "a && b; c");
+        assert_eq!(strip_markup("trailing &"), "trailing &");
+        // Unknown names are not ours to guess at.
+        assert_eq!(strip_markup("a&nbsp;b"), "a&nbsp;b");
+    }
+
+    #[test]
+    fn strip_markup_decodes_the_xml_entities() {
+        assert_eq!(strip_markup("Fish &amp; Chips"), "Fish & Chips");
+        assert_eq!(
+            strip_markup("<b>Tom &amp; Jerry</b>"),
+            "Tom & Jerry",
+            "a markup client's escaped text must come out as the text it meant"
+        );
+        assert_eq!(strip_markup("&lt; &gt; &quot; &apos; &amp;"), "< > \" ' &");
+    }
+
+    #[test]
+    fn strip_markup_decodes_numeric_references() {
+        // `g_markup_escape_text`'s apostrophe.
+        assert_eq!(strip_markup("it&#39;s"), "it's");
+        assert_eq!(strip_markup("&#x27;&#X27;&#x1F600;"), "''\u{1F600}");
+        // Not references to a character: kept as sent.
+        for raw in [
+            "&#0;",
+            "&#xD800;",
+            "&#x110000;",
+            "&#+65;",
+            "&#x;",
+            "&#;",
+            "&#65",
+        ] {
+            assert_eq!(strip_markup(raw), raw);
+        }
+    }
+
+    #[test]
+    fn strip_markup_never_reads_a_decoded_lt_as_a_tag() {
+        // The escaped form of a tag is text the sender wanted shown.
+        assert_eq!(strip_markup("&lt;b&gt;hi&lt;/b&gt;"), "<b>hi</b>");
+    }
+
+    #[test]
+    fn capabilities_do_not_advertise_body_markup() {
+        // `strip_markup`'s whole argument starts here: without `body-markup`
+        // the body is plain text by the spec, and stripping is a courtesy to
+        // clients that send markup regardless. Advertising it would turn that
+        // courtesy into a promise to *render* markup, which nothing does.
+        let iface = NotificationsIface {
+            active: Mutable::new(Vec::new()),
+            next_id: Arc::new(AtomicU32::new(1)),
+            history: Mutable::new(Vec::new()),
+        };
+        let caps = iface.get_capabilities();
+        assert!(caps.iter().any(|c| c == "body"), "{caps:?}");
+        assert!(!caps.iter().any(|c| c == "body-markup"), "{caps:?}");
+    }
+
+    #[test]
+    fn strip_markup_passes_plain_and_non_ascii_text_through() {
+        assert_eq!(strip_markup(""), "");
+        assert_eq!(strip_markup("plain text"), "plain text");
+        assert_eq!(strip_markup("Grüße <b>ü</b> → ok"), "Grüße ü → ok");
     }
 
     #[test]

@@ -35,7 +35,7 @@ pub(crate) use types::AgentReply;
 pub use types::{Adapter, Device, PairPrompt, PromptKind};
 
 use agent::{AGENT_ANCHOR_NAME, AGENT_PATH, PairAgent, run_agent};
-use devices::listen;
+use devices::{ListenEnd, listen, wait_for_bluez};
 use futures_signals::signal::{Mutable, Signal};
 use hytte_bus::BusKind;
 use hytte_reactive::{Service, registry, runtime, spawn_supervised};
@@ -273,8 +273,11 @@ impl Service for BluetoothService {
                     let outcome = listen(&adapter_mutable, &devices_mutable, &path_store).await;
                     let delay = backoff.delay_after_run(started.elapsed());
                     match outcome {
-                        Ok(()) => {
+                        Ok(ListenEnd::StreamClosed) => {
                             tracing::warn!(?delay, "bluetooth watcher closed, reconnecting");
+                        }
+                        Ok(ListenEnd::DaemonExited) => {
+                            tracing::info!("bluetooth watcher: waiting for bluetoothd to return");
                         }
                         Err(e) => {
                             tracing::warn!(?delay, error = %e, "bluetooth watcher error, reconnecting");
@@ -301,6 +304,14 @@ impl Service for BluetoothService {
                     // Also reset the adapter path store so the next listen()
                     // call starts fresh.
                     set_adapter_path_local("").await;
+                    // Reconnect only to a bluetoothd that is running. The
+                    // next listen() calls org.bluez, and that call would
+                    // D-Bus-activate a stopped one. This applies to every
+                    // exit, not only `DaemonExited`: a dying bluetoothd can
+                    // remove its adapter just before it lets go of the name.
+                    // With bluetoothd up, this returns after one round trip
+                    // to the bus.
+                    wait_for_bluez().await;
                     tokio::time::sleep(delay).await;
                 }
             }

@@ -17,9 +17,11 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     let icon = gtk::Image::new();
     btn.set_child(Some(&icon));
 
-    // Last-bound linear volume, kept around so the scroll handler can
-    // compute `current ± step` without a synchronous read-back of the
-    // (async, cross-thread) service state.
+    // The level the next notch steps from, kept around so the scroll handler
+    // can compute `current ± step` without a synchronous read-back of the
+    // (async, cross-thread) service state. The bind below writes PipeWire's
+    // answer into it; the scroll handler writes the level it just *asked
+    // for*, because that answer is a round trip away.
     let current = Rc::new(Cell::new(0.0_f64));
 
     let current_for_bind = Rc::clone(&current);
@@ -31,6 +33,14 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     wire_scroll(&btn, move |direction| {
         let next = scroll_target(current.get(), direction);
         pipewire::set_volume(next);
+        // Step the next notch from here, not from the last level PipeWire
+        // confirmed. `wire_scroll` fires this several times for one fast flick
+        // (one call per whole notch the event's delta crossed), and a quick
+        // wheel lands several events inside one round trip — each of which used
+        // to step from the same stale `current` and send the same level, so
+        // four notches moved the volume by one. The bind still overwrites this
+        // with the real level when it arrives.
+        current.set(next);
     });
 
     let mute_gesture = gtk::GestureClick::new();

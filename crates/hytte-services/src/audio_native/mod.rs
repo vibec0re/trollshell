@@ -171,7 +171,47 @@ pub fn toggle_mute() {
 
 #[cfg(test)]
 mod tests {
-    use super::types::{AudioRole, DefaultKind, SpectrumAction};
+    use super::types::{AudioRole, DefaultKind, PendingDefaults, SpectrumAction};
+
+    /// A pick made before the `default` metadata binds is held, not dropped —
+    /// the last one per kind, since a later pick supersedes an earlier one —
+    /// and handed over exactly once when it binds. Dropping it was what lost
+    /// `bluetooth_audio`'s switch, which never re-sends.
+    ///
+    /// The effectful half — `write_default` parking it and the registry walker
+    /// writing it on bind — needs a bound metadata proxy, i.e. a live daemon;
+    /// it is on the PR's live-verify list.
+    #[test]
+    fn a_default_picked_before_the_metadata_binds_is_held_until_it_does() {
+        let mut pending = PendingDefaults::default();
+        assert!(
+            pending.drain().is_empty(),
+            "nothing parked, nothing written"
+        );
+
+        pending.park(DefaultKind::Sink, "alsa_output.analog".to_owned());
+        pending.park(DefaultKind::Source, "alsa_input.analog".to_owned());
+        pending.park(
+            DefaultKind::Sink,
+            "bluez_output.AC_C5_8B_11_22_33.1".to_owned(),
+        );
+        assert_eq!(
+            pending.drain(),
+            vec![
+                (
+                    DefaultKind::Sink,
+                    "bluez_output.AC_C5_8B_11_22_33.1".to_owned()
+                ),
+                (DefaultKind::Source, "alsa_input.analog".to_owned()),
+            ],
+            "the last pick per kind is the one written",
+        );
+        assert_eq!(
+            pending,
+            PendingDefaults::default(),
+            "a drained pick must not be written a second time on the next bind",
+        );
+    }
 
     /// A user's pick is **written** to the configured key and the default is
     /// **read** back off the effective one — the pair `WirePlumber` keeps (see

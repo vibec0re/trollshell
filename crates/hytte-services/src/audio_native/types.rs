@@ -138,6 +138,9 @@ pub(super) struct AudioState {
     /// Populated lazily when the registry walker first sees a Metadata
     /// global with `metadata.name = "default"`.
     pub(super) metadata_default: Option<MetadataProxy>,
+    /// Default picks made while `metadata_default` was `None`, written out
+    /// when it binds.
+    pub(super) pending_defaults: PendingDefaults,
     /// `default.audio.sink` value — the `node.name` of the current default
     /// sink, as the session manager resolved it ([`DefaultKind`]'s effective
     /// key; a pick is written to the configured one). Compared against each
@@ -175,6 +178,7 @@ impl AudioState {
             nodes: HashMap::new(),
             proxies: HashMap::new(),
             metadata_default: None,
+            pending_defaults: PendingDefaults::default(),
             default_sink_name: None,
             default_source_name: None,
             links: HashMap::new(),
@@ -319,6 +323,49 @@ impl DefaultKind {
         [Self::Sink, Self::Source]
             .into_iter()
             .find(|kind| kind.effective_key() == key)
+    }
+}
+
+/// Default picks that arrived while no `default` Metadata was bound, held
+/// until one is: at most one per [`DefaultKind`], the **last** one, because a
+/// later pick supersedes an earlier one exactly as it would have on the wire.
+///
+/// Before this a pick in that window was logged and dropped. Nothing promises
+/// the window stays shut — the registry walk is not documented to deliver the
+/// metadata global before the sink nodes, a `WirePlumber` restart leaves none
+/// bound for a moment, and a failed bind leaves none at all — and the one
+/// caller that acts on its own, `bluetooth_audio`'s reactor switching to a
+/// Bluetooth sink, records the switch as done (`last_observed_bt_default`) the
+/// moment it sends it and never retries, so a dropped write there was lost for
+/// the whole Bluetooth episode. Now the write lands as soon as the metadata
+/// binds, on the configured key like any other.
+///
+/// It lives in the session's [`AudioState`], so a mainloop restart drops it
+/// along with the rest of the session's view of the graph.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct PendingDefaults {
+    sink: Option<String>,
+    source: Option<String>,
+}
+
+impl PendingDefaults {
+    /// Hold `name` as the pick for `kind`, replacing an earlier one.
+    pub(super) fn park(&mut self, kind: DefaultKind, name: String) {
+        *match kind {
+            DefaultKind::Sink => &mut self.sink,
+            DefaultKind::Source => &mut self.source,
+        } = Some(name);
+    }
+
+    /// Take every held pick, sink first, leaving nothing held.
+    pub(super) fn drain(&mut self) -> Vec<(DefaultKind, String)> {
+        [
+            (DefaultKind::Sink, self.sink.take()),
+            (DefaultKind::Source, self.source.take()),
+        ]
+        .into_iter()
+        .filter_map(|(kind, name)| name.map(|name| (kind, name)))
+        .collect()
     }
 }
 

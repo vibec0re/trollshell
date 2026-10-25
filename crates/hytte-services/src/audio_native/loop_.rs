@@ -465,7 +465,19 @@ pub(super) fn run_once(
                             Rc::clone(&state_add),
                         ) {
                             Ok(proxy) => {
-                                state_add.borrow_mut().metadata_default = Some(proxy);
+                                let mut guard = state_add.borrow_mut();
+                                let s = &mut *guard;
+                                // Picks made while nothing was bound land now.
+                                let pending = s.pending_defaults.drain();
+                                let meta = s.metadata_default.insert(proxy);
+                                for (kind, name) in pending {
+                                    tracing::debug!(
+                                        key = kind.configured_key(),
+                                        name = %name,
+                                        "audio_native: writing a default parked before the metadata bound",
+                                    );
+                                    set_configured_default(meta, kind, &name);
+                                }
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -857,23 +869,37 @@ fn apply_mute_by_id(state: &StateRef, id: u32, mute: bool) {
 /// **configured** key (`default.configured.audio.{sink,source}`) — the one the
 /// session manager reads a choice from and persists, not the effective key it
 /// answers on; [`DefaultKind`] has the `WirePlumber` scripts that make the
-/// difference matter. The value is [`default_value_json`] as
-/// [`DEFAULT_VALUE_TYPE`] on subject 0 — the key, type, subject and JSON
-/// object `wpctl set-default` writes (`module-default-nodes-api.c`'s
-/// `set_default_configured_node_name`, which `printf`s `{ "name": "%s" }`;
-/// only the whitespace differs). Silently no-ops if the
-/// `default` metadata hasn't been seen yet (e.g. the loop hasn't
-/// reached the metadata global yet on startup).
+/// difference matter.
+///
+/// If no `default` metadata is bound yet (the loop hasn't reached that global,
+/// or `WirePlumber` is restarting) the pick is **parked** in
+/// [`PendingDefaults`] and written by the registry walker the moment one
+/// binds. It used to be logged and dropped, which `bluetooth_audio`'s reactor
+/// in particular cannot recover from: it marks its switch done when it sends
+/// it, and never sends it again.
+///
+/// [`PendingDefaults`]: super::types::PendingDefaults
 fn write_default(state: &StateRef, kind: DefaultKind, name: &str) {
-    let s = state.borrow();
-    let Some(meta) = s.metadata_default.as_ref() else {
-        tracing::warn!(
+    let mut guard = state.borrow_mut();
+    let s = &mut *guard;
+    if let Some(meta) = s.metadata_default.as_ref() {
+        set_configured_default(meta, kind, name);
+    } else {
+        tracing::debug!(
             key = kind.configured_key(),
             name,
-            "audio_native: write_default before default metadata bound",
+            "audio_native: default picked before the default metadata bound; parked until it does",
         );
-        return;
-    };
+        s.pending_defaults.park(kind, name.to_owned());
+    }
+}
+
+/// Write `name` to `kind`'s configured key on the bound `default` metadata:
+/// [`default_value_json`] as [`DEFAULT_VALUE_TYPE`] on subject 0 — the key,
+/// type, subject and JSON object `wpctl set-default` writes
+/// (`module-default-nodes-api.c`'s `set_default_configured_node_name`, which
+/// `printf`s `{ "name": "%s" }`; only the whitespace differs).
+fn set_configured_default(meta: &MetadataProxy, kind: DefaultKind, name: &str) {
     let value = default_value_json(name);
     meta.proxy.set_property(
         0,

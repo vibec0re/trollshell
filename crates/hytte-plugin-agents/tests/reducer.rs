@@ -2170,3 +2170,153 @@ fn a_runaway_display_label_cannot_grow_the_card() {
         agent.chars().count()
     );
 }
+
+// ── approval binding: a decision is bound to what the card showed ────────────
+//
+// `Approve`/`Deny` name a bare queue id, and a hive whose store was reset or
+// restored can hand that id to a different request. These pin that an answer
+// only ever reaches the hive for the request its card actually showed.
+
+/// The request a reset store queues under an id the plugin has already seen —
+/// a different agent, kind, timestamp and description from [`approval`]'s.
+fn renumbered(id: i64) -> Approval {
+    Approval {
+        id,
+        agent: "nixos-choom".to_owned(),
+        kind: ApprovalKind::Spawn,
+        requested_at: "2026-10-01T00:00:00Z".to_owned(),
+        status: ApprovalStatus::Pending,
+        description: Some("a request nobody has been shown".to_owned()),
+    }
+}
+
+fn decide(m: &mut Agents, request_id: u64, decision: ConsentDecision) -> Vec<Effect> {
+    m.update(Input::ConsentDecision {
+        request_id,
+        decision,
+    })
+}
+
+/// The scenario itself: a card is up for #7, the hive re-numbers its queue, and
+/// #7 is now somebody else's request. The click on the open card must send
+/// nothing — and the request now under #7 gets a card of its own, so the
+/// operator answers what they are shown.
+///
+/// Falsification: drop the `Standing::Replaced` arm in `fold_pending` (keep
+/// the prompt on a mismatch) and the fresh prompt never comes, because the
+/// stale card still holds the gate; key the dedup set on the bare id again and
+/// it never comes either, because #7 reads as already asked about.
+#[test]
+fn a_renumbered_id_under_an_open_card_sends_no_approve() {
+    let (mut m, mut rx) = model();
+    m.update(status(roster("agent_status_grouped.json")));
+    let mut shown = approval(7, "trollshell-choom");
+    shown.description = Some("bump the meta flake inputs".to_owned());
+    let stale = one_prompt(&m.update(pending(vec![shown])));
+
+    // The store was reset: #7 is a different request now.
+    let fx = m.update(pending(vec![renumbered(7)]));
+    let raised = prompts(&fx);
+    assert_eq!(
+        raised.len(),
+        1,
+        "the request now under #7 gets its own card: {fx:?}"
+    );
+    let (fresh, agent, scope, detail) = raised[0].clone();
+    assert_ne!(fresh, stale, "a fresh correlation token");
+    assert_eq!(agent, "nixos-choom");
+    assert_eq!(scope, "create and start a new agent");
+    assert!(
+        detail.contains("a request nobody has been shown"),
+        "{detail}"
+    );
+
+    // The operator clicks Approve on the card they were looking at.
+    assert_eq!(
+        decide(&mut m, stale, ConsentDecision::AllowOnce),
+        Vec::new()
+    );
+    assert_eq!(
+        lines(&mut rx),
+        Vec::<String>::new(),
+        "an answer to the old card must not approve the new request"
+    );
+
+    // An answer to the card that does show it goes through.
+    decide(&mut m, fresh, ConsentDecision::AllowOnce);
+    assert_eq!(
+        lines(&mut rx),
+        vec![r#"{"cmd":"approve","id":7}"#.to_owned()]
+    );
+}
+
+/// `decide`'s own check, with `fold_pending`'s taken out of the way: the queue
+/// is swapped under the open card directly, the way a decision and a queue
+/// arriving in the other order would leave it.
+///
+/// Falsification: put `decide`'s bare `pending.contains(id)` back and this
+/// sends `{"cmd":"approve","id":7}` for a request the card never showed.
+#[test]
+fn a_decision_is_checked_against_the_request_the_card_showed() {
+    use hytte_plugin_agents::model::PendingApprovals;
+
+    let (mut m, mut rx) = model();
+    m.update(status(roster("agent_status_grouped.json")));
+    let token = one_prompt(&m.update(pending(vec![approval(7, "trollshell-choom")])));
+
+    m.pending = PendingApprovals::new(vec![renumbered(7)]);
+    decide(&mut m, token, ConsentDecision::AllowOnce);
+    assert_eq!(lines(&mut rx), Vec::<String>::new());
+}
+
+/// The dedup set's second effect: an id that was prompted once, then re-used
+/// by the hive for a different request, prompts again — across a `Pending`
+/// refusal and across an unreachable hive alike — while the **same** request
+/// coming back stays quiet, which is #1140's LOW-3 and the "prompt once" rule.
+///
+/// Falsification: key `prompted` on the bare id again and neither re-used id
+/// ever prompts — the operator's only way to that request is a badge they
+/// have no reason to click.
+#[test]
+fn a_reused_id_prompts_again_after_a_refusal_or_an_outage_and_the_same_one_does_not() {
+    let (mut m, mut rx) = model();
+    m.update(status(roster("agent_status_grouped.json")));
+
+    // #7 is asked about and denied; the hive has not processed the deny yet.
+    let token = one_prompt(&m.update(pending(vec![approval(7, "trollshell-choom")])));
+    decide(&mut m, token, ConsentDecision::Deny);
+    assert_eq!(lines(&mut rx), vec![r#"{"cmd":"deny","id":7}"#.to_owned()]);
+
+    // A refusal blip, then the same #7: no second card.
+    m.update(pending_refused());
+    let same = m.update(pending(vec![approval(7, "trollshell-choom")]));
+    assert_eq!(prompts(&same), Vec::new(), "{same:?}");
+
+    // The hive goes away and comes back with the same #7: still no card.
+    m.update(Input::App(Msg::Status(Err(HiveError::Unreachable {
+        reason: "no socket".to_owned(),
+    }))));
+    m.update(status(roster("agent_status_grouped.json")));
+    let same = m.update(pending(vec![approval(7, "trollshell-choom")]));
+    assert_eq!(prompts(&same), Vec::new(), "{same:?}");
+
+    // It comes back from another outage with its store reset: #7 is a
+    // different request, and that one has never been asked about.
+    m.update(Input::App(Msg::Status(Err(HiveError::Unreachable {
+        reason: "no socket".to_owned(),
+    }))));
+    m.update(status(roster("agent_status_grouped.json")));
+    let reused = m.update(pending(vec![renumbered(7)]));
+    assert_eq!(prompts(&reused).len(), 1, "{reused:?}");
+
+    // The same across a refusal blip, for an id re-used a second time.
+    let token = one_prompt(&reused);
+    decide(&mut m, token, ConsentDecision::Deny);
+    m.update(pending_refused());
+    let mut again = approval(7, "stray");
+    again.requested_at = "2026-10-02T00:00:00Z".to_owned();
+    let fx = m.update(pending(vec![again]));
+    let raised = prompts(&fx);
+    assert_eq!(raised.len(), 1, "{fx:?}");
+    assert_eq!(raised[0].1, "stray");
+}

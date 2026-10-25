@@ -4,7 +4,7 @@
 //! and [`crate::view`] projects it. That is what makes the status precedence
 //! and the grouping testable without a socket, a host, or a wall clock.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use crate::config::AgentsConfig;
 use crate::hive::wire::{AgentStatusRow, Approval, ApprovalStatus, VersionMismatch};
@@ -312,7 +312,17 @@ impl PendingApprovals {
     /// "dropped with a debug line, not an error".
     #[must_use]
     pub fn contains(&self, id: i64) -> bool {
-        self.queue.iter().any(|a| a.id == id)
+        self.get(id).is_some()
+    }
+
+    /// The approval queued under `id`, if one is still waiting on a human.
+    ///
+    /// What a decision path compares against what its card showed: an id is
+    /// only the hive's handle for a row, and a hive that re-numbered its queue
+    /// can hand the same one to a different request.
+    #[must_use]
+    pub fn get(&self, id: i64) -> Option<&Approval> {
+        self.queue.iter().find(|a| a.id == id)
     }
 
     /// How many approvals `agent` is waiting on — the badge's count.
@@ -329,12 +339,15 @@ impl PendingApprovals {
 
     /// The oldest approval no prompt has been raised for yet.
     ///
-    /// `prompted` is the dedup set: an approval prompts **once** and then waits
-    /// for a decision or a badge click, so a hive with one unanswered approval
-    /// does not raise a modal every poll.
+    /// `prompted` answers the dedup question for one row: an approval prompts
+    /// **once** and then waits for a decision or a badge click, so a hive with
+    /// one unanswered approval does not raise a modal every poll. It is a
+    /// predicate over the whole row rather than a set of ids so the caller can
+    /// bind "already asked" to the request it asked about, not to an id the
+    /// hive may since have handed to another one.
     #[must_use]
-    pub fn oldest_unprompted<'a>(&'a self, prompted: &BTreeSet<i64>) -> Option<&'a Approval> {
-        self.queue.iter().find(|a| !prompted.contains(&a.id))
+    pub fn oldest_unprompted(&self, prompted: impl Fn(&Approval) -> bool) -> Option<&Approval> {
+        self.queue.iter().find(|a| !prompted(a))
     }
 }
 
@@ -686,12 +699,15 @@ mod tests {
         assert!(q.contains(7) && !q.contains(8));
 
         let mut prompted = BTreeSet::new();
-        assert_eq!(q.oldest_unprompted(&prompted).map(|a| a.id), Some(5));
+        let unasked = |p: &BTreeSet<i64>| q.oldest_unprompted(|a| p.contains(&a.id)).map(|a| a.id);
+        assert_eq!(unasked(&prompted), Some(5));
         prompted.insert(5);
-        assert_eq!(q.oldest_unprompted(&prompted).map(|a| a.id), Some(7));
+        assert_eq!(unasked(&prompted), Some(7));
         prompted.insert(7);
         prompted.insert(9);
-        assert_eq!(q.oldest_unprompted(&prompted), None);
+        assert_eq!(unasked(&prompted), None);
+        assert_eq!(q.get(7).map(|a| a.agent.as_str()), Some("bosun"));
+        assert_eq!(q.get(8), None);
     }
 
     fn agent(name: &str, row: AgentStatusRow) -> Agent {

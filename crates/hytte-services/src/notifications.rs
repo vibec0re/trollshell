@@ -102,11 +102,13 @@ pub struct Action {
 
 /// An image attached to a notification.
 ///
-/// Priority (highest first): `image-data` hint → `image-path` hint →
-/// `app_icon` argument.
+/// Priority (highest first): `image-data` / `image_data` hint →
+/// `image-path` / `image_path` hint → `app_icon` argument → legacy
+/// `icon_data` hint — the spec's single-image order (see `parse_image`).
 #[derive(Clone, Debug)]
 pub enum NotificationImage {
-    /// In-memory raw image from the `image-data` (or legacy `icon_data`) hint.
+    /// In-memory raw image from the `image-data` hint (or its deprecated
+    /// spellings, `image_data` and `icon_data`).
     ///
     /// Bytes are straight (non-premultiplied) RGBA or RGB depending on
     /// `has_alpha`. Pass `rowstride` directly to `gdk::MemoryTexture::new`
@@ -1329,27 +1331,41 @@ fn parse_actions(raw: &[String]) -> Vec<Action> {
 
 /// Resolve the image for a notification.
 ///
-/// Priority: `image-data` hint (or legacy `icon_data`) > `image-path` hint >
-/// `app_icon` argument.
+/// The spec's single-image order ("Icons and Images"), with each hint's
+/// deprecated spec-1.1 spelling straight after its own:
+///
+/// 1. `image-data`, then `image_data` (1.1);
+/// 2. `image-path`, then `image_path` (1.1);
+/// 3. the `app_icon` argument;
+/// 4. `icon_data` (pre-1.1), last — the spec keeps it only "for compatibility",
+///    *after* `app_icon`.
+///
+/// The toast shows one picture (the overlay falls back to `app_icon` only
+/// when this is `None`), so the single-image order is the one that applies.
+/// Before this, `image_data` was not read at all — a 1.1 client's image was
+/// silently dropped — and `icon_data` outranked both `image-path` and
+/// `app_icon`. A hint that is present but unusable (a malformed raw image, an
+/// empty or non-string path) falls through to the next one.
 fn parse_image(hints: &HashMap<String, OwnedValue>, app_icon: &str) -> Option<NotificationImage> {
-    // 1. Try image-data (modern key) then icon_data (legacy underscore key).
-    for key in &["image-data", "icon_data"] {
-        if let Some(val) = hints.get(*key)
-            && let Some(img) = decode_image_data(val)
-        {
-            return Some(img);
-        }
-    }
+    let raw = |key: &str| hints.get(key).and_then(decode_image_data);
+    let path = |key: &str| {
+        hints
+            .get(key)
+            .and_then(|v| String::try_from(v.try_clone().ok()?).ok())
+            .filter(|p| !p.is_empty())
+            .map(NotificationImage::Path)
+    };
+    raw("image-data")
+        .or_else(|| raw("image_data"))
+        .or_else(|| path("image-path"))
+        .or_else(|| path("image_path"))
+        .or_else(|| app_icon_image(app_icon))
+        .or_else(|| raw("icon_data"))
+}
 
-    // 2. Try image-path hint.
-    if let Some(val) = hints.get("image-path")
-        && let Ok(path) = String::try_from(val.try_clone().ok()?)
-        && !path.is_empty()
-    {
-        return Some(NotificationImage::Path(path));
-    }
-
-    // 3. Fall back to app_icon argument.
+/// The `app_icon` argument as an image: a path or `file://` URL, else a
+/// themed icon name; `None` when empty.
+fn app_icon_image(app_icon: &str) -> Option<NotificationImage> {
     if app_icon.is_empty() {
         return None;
     }
@@ -1400,12 +1416,13 @@ fn image_data_consistent(
     i64::try_from(data_len).is_ok_and(|len| len >= needed)
 }
 
-/// Decode an `image-data` / `icon_data` `OwnedValue` of type `(iiibiiay)`.
+/// Decode an `image-data` / `image_data` / `icon_data` `OwnedValue` of type
+/// `(iiibiiay)`.
 ///
 /// Returns `None` for a malformed payload (bad dimensions/stride or a buffer too
-/// short for the declared geometry) so `parse_image` falls through to the
-/// `image-path` / `app_icon` path rather than the shell panicking when the
-/// widget builds the texture.
+/// short for the declared geometry) so `parse_image` falls through to the next
+/// hint in its order rather than the shell panicking when the widget builds
+/// the texture.
 fn decode_image_data(val: &OwnedValue) -> Option<NotificationImage> {
     // The spec defines image-data as (iiibiiay):
     //   width: i32, height: i32, rowstride: i32, has_alpha: bool,
@@ -1427,7 +1444,7 @@ fn decode_image_data(val: &OwnedValue) -> Option<NotificationImage> {
             has_alpha,
             channels,
             data_len = data.len(),
-            "rejecting malformed notification image-data; falling back to image-path/app_icon"
+            "rejecting malformed notification image data; falling back to the next image hint"
         );
         return None;
     }
@@ -1557,15 +1574,97 @@ fn char_reference(s: &str) -> Option<(char, usize)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_TIMEOUT, LocalActionMap, MIN_RESUME, Mutable, Notification, NotificationsIface,
-        RateLimitMap, TimerAction, TimerEntry, TimerMap, TimerState, Urgency, apply_expiry,
-        clear_local_actions, clear_timer, image_data_consistent, notify_id, rate_limit_check,
-        register_local_action, resolve_timeout, strip_markup, take_local_action,
+        DEFAULT_TIMEOUT, HashMap, LocalActionMap, MIN_RESUME, Mutable, Notification,
+        NotificationImage, NotificationsIface, OwnedValue, RateLimitMap, TimerAction, TimerEntry,
+        TimerMap, TimerState, Urgency, apply_expiry, clear_local_actions, clear_timer,
+        image_data_consistent, notify_id, parse_image, rate_limit_check, register_local_action,
+        resolve_timeout, strip_markup, take_local_action,
     };
     use std::cell::Cell;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::time::{Duration, Instant};
+    use zbus::zvariant::{Str, Structure, Value};
+
+    // ── Image hint precedence ────────────────────────────────────────────────
+
+    /// An `(iiibiiay)` raw-image hint: `side`×`side` RGBA, tightly packed. The
+    /// side length is how a test tells which hint won; `side = 0` is a
+    /// malformed payload `decode_image_data` rejects.
+    fn raw_hint(side: i32) -> OwnedValue {
+        let len = usize::try_from(side * side * 4).expect("non-negative side");
+        let tuple = (side, side, side * 4, true, 8_i32, 4_i32, vec![0_u8; len]);
+        OwnedValue::try_from(Value::from(Structure::from(tuple))).expect("no fds in an image")
+    }
+
+    fn str_hint(s: &str) -> OwnedValue {
+        OwnedValue::from(Str::from(s))
+    }
+
+    fn hints(pairs: &[(&str, OwnedValue)]) -> HashMap<String, OwnedValue> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.try_clone().expect("no fds")))
+            .collect()
+    }
+
+    /// Which hint `parse_image` picked, as something `assert_eq!` can print.
+    fn picked(hints: &HashMap<String, OwnedValue>, app_icon: &str) -> String {
+        match parse_image(hints, app_icon) {
+            None => "none".to_string(),
+            Some(NotificationImage::Raw { width, .. }) => format!("raw {width}"),
+            Some(NotificationImage::Path(p)) => format!("path {p}"),
+            Some(NotificationImage::IconName(n)) => format!("icon {n}"),
+        }
+    }
+
+    #[test]
+    fn image_data_spec_1_1_spelling_is_read() {
+        // The reported gap: a spec-1.1 client's `image_data` was ignored and
+        // the toast showed its app icon (or nothing) instead.
+        let h = hints(&[("image_data", raw_hint(2))]);
+        assert_eq!(picked(&h, ""), "raw 2");
+        assert_eq!(picked(&h, "firefox"), "raw 2");
+        let h = hints(&[("image_path", str_hint("/tmp/b.png"))]);
+        assert_eq!(picked(&h, "firefox"), "path /tmp/b.png");
+    }
+
+    #[test]
+    fn image_hints_follow_the_spec_order() {
+        // Peel the winner off one at a time, from all five down to none:
+        // image-data > image_data > image-path > image_path > app_icon >
+        // icon_data.
+        let mut all = vec![
+            ("image-data", raw_hint(1)),
+            ("image_data", raw_hint(2)),
+            ("image-path", str_hint("/tmp/a.png")),
+            ("image_path", str_hint("/tmp/b.png")),
+            ("icon_data", raw_hint(3)),
+        ];
+        let expected = ["raw 1", "raw 2", "path /tmp/a.png", "path /tmp/b.png"];
+        for want in expected {
+            assert_eq!(picked(&hints(&all), "firefox"), want);
+            all.remove(0);
+        }
+        // Only `icon_data` left: the spec ranks it *below* `app_icon`…
+        assert_eq!(picked(&hints(&all), "firefox"), "icon firefox");
+        // …so it is shown only when there is no `app_icon` either.
+        assert_eq!(picked(&hints(&all), ""), "raw 3");
+        assert_eq!(picked(&hints(&[]), ""), "none");
+    }
+
+    #[test]
+    fn an_unusable_image_hint_falls_through_to_the_next() {
+        // Malformed raw data, an empty path, a non-string path: each costs
+        // only its own rank.
+        let h = hints(&[("image-data", raw_hint(0)), ("image_data", raw_hint(2))]);
+        assert_eq!(picked(&h, ""), "raw 2");
+        let h = hints(&[
+            ("image-path", str_hint("")),
+            ("image_path", OwnedValue::from(7_u32)),
+        ]);
+        assert_eq!(picked(&h, "/usr/share/a.svg"), "path /usr/share/a.svg");
+    }
 
     // ── image-data validation (the #425 panic guard) ─────────────────────────
 

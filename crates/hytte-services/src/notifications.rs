@@ -1122,13 +1122,6 @@ impl NotificationsIface {
         hints: HashMap<String, OwnedValue>,
         expire_timeout: i32,
     ) -> u32 {
-        // Determine id: honour replaces_id or allocate a new one.
-        let id = if replaces_id != 0 {
-            replaces_id
-        } else {
-            self.next_id.fetch_add(1, Ordering::Relaxed)
-        };
-
         // Parse urgency from hints (key "urgency", type u8).
         let urgency = hints
             .get("urgency")
@@ -1158,22 +1151,15 @@ impl NotificationsIface {
             .unwrap_or_default()
             .as_secs();
 
-        let notification = Notification {
-            id,
-            app_name: app_name.to_string(),
-            app_icon: app_icon.to_string(),
-            summary: summary.to_string(),
-            body: body_clean,
-            urgency,
-            timeout,
-            actions: parsed_actions,
-            image,
-            created_at,
-        };
-
-        // Record the resolved timeout on the hover-pausable expiry bookkeeping,
-        // then update the active list (replace in-place if same id, else push) —
-        // both under the one `active` write guard, expiry FIRST.
+        // Decide the id, record the resolved timeout on the hover-pausable
+        // expiry bookkeeping, then update the active list (replace in-place if
+        // the id is live, else push) — all under the one `active` write guard,
+        // in that order.
+        //
+        // The id is decided *inside* the guard because it depends on what is
+        // live (see `notify_id`): decided outside, the notification `replaces_id`
+        // names could expire between the check and the write, and the re-post
+        // would land as a new notification under an id that is no longer live.
         //
         // `set_expiry` arms the auto-dismiss sleep for a finite timeout; for a
         // sticky one (`timeout == None`) it stands the countdown down —
@@ -1192,17 +1178,31 @@ impl NotificationsIface {
         // notification is in the list at all, which would strand it on screen
         // with no timer. Both mutexes are taken in the `active` → `timers` order
         // `dismiss` uses, so the pair cannot invert.
-        {
+        let id = {
             let mut list = self.active.lock_mut();
+            let id = notify_id(&list, replaces_id, &self.next_id);
             crate::notifications::set_expiry(id, timeout);
+            let notification = Notification {
+                id,
+                app_name: app_name.to_string(),
+                app_icon: app_icon.to_string(),
+                summary: summary.to_string(),
+                body: body_clean,
+                urgency,
+                timeout,
+                actions: parsed_actions,
+                image,
+                created_at,
+            };
             if let Some(existing) = list.iter_mut().find(|n| n.id == id) {
-                *existing = notification.clone();
+                *existing = notification;
             } else {
-                list.push(notification.clone());
+                list.push(notification);
             }
-        }
+            id
+        };
 
-        tracing::debug!(id, app_name, summary, "notification added");
+        tracing::debug!(id, replaces_id, app_name, summary, "notification added");
 
         id
     }
@@ -1249,6 +1249,36 @@ impl NotificationsIface {
         id: u32,
         action_key: &str,
     ) -> zbus::Result<()>;
+}
+
+// ── Helper: resolve id ────────────────────────────────────────────────────────
+
+/// The id a `Notify` call's notification takes: `replaces_id` when it names a
+/// notification that is **live** in `live`, a fresh one from `next_id`
+/// otherwise — `0` ("replace nothing") included.
+///
+/// The spec says "if `replaces_id` is not 0, the returned value is the same
+/// value as `replaces_id`", but that sentence presupposes something to replace.
+/// Honouring it for an id that is not live is how two notifications came to
+/// share one: `Notify(replaces_id = 5000)` returned 5000 for something this
+/// daemon never issued and left the counter where it was, so when the counter
+/// later reached 5000 a different app's notification replaced the first in
+/// place — inheriting its timer entry — and each sender read the other's
+/// `NotificationClosed` as its own. A `replaces_id` naming a notification that
+/// already *closed* (the common case: a progress update arriving just after
+/// the toast expired) is the same bug in miniature, minus the counter.
+///
+/// mako makes the same call ("either we had no `replaces_id`, or the id given
+/// was invalid. Either way, make a new notification"), and libnotify adopts
+/// whatever id `Notify` returns, so a client's later update finds the fresh
+/// one. Must be called under the `active` write guard the result is written
+/// back under: the answer is only as current as `live`.
+fn notify_id(live: &[Notification], replaces_id: u32, next_id: &AtomicU32) -> u32 {
+    if replaces_id != 0 && live.iter().any(|n| n.id == replaces_id) {
+        replaces_id
+    } else {
+        next_id.fetch_add(1, Ordering::Relaxed)
+    }
 }
 
 // ── Helper: resolve timeout ───────────────────────────────────────────────────
@@ -1527,10 +1557,10 @@ fn char_reference(s: &str) -> Option<(char, usize)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_TIMEOUT, LocalActionMap, MIN_RESUME, Mutable, NotificationsIface, RateLimitMap,
-        TimerAction, TimerEntry, TimerMap, TimerState, apply_expiry, clear_local_actions,
-        clear_timer, image_data_consistent, rate_limit_check, register_local_action,
-        resolve_timeout, strip_markup, take_local_action,
+        DEFAULT_TIMEOUT, LocalActionMap, MIN_RESUME, Mutable, Notification, NotificationsIface,
+        RateLimitMap, TimerAction, TimerEntry, TimerMap, TimerState, Urgency, apply_expiry,
+        clear_local_actions, clear_timer, image_data_consistent, notify_id, rate_limit_check,
+        register_local_action, resolve_timeout, strip_markup, take_local_action,
     };
     use std::cell::Cell;
     use std::sync::Arc;
@@ -1759,6 +1789,76 @@ mod tests {
         let c = iface_side.fetch_add(1, Ordering::Relaxed); // another Notify
         assert_eq!((a, b, c), (1, 2, 3));
         assert!(a != b && b != c && a != c);
+    }
+
+    // ── Notify id resolution: `replaces_id` is honoured only when live ──────
+
+    /// A live notification with `id` and nothing else worth reading.
+    fn live(id: u32) -> Notification {
+        Notification {
+            id,
+            app_name: String::new(),
+            app_icon: String::new(),
+            summary: String::new(),
+            body: String::new(),
+            urgency: Urgency::Normal,
+            timeout: Some(DEFAULT_TIMEOUT),
+            actions: Vec::new(),
+            image: None,
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn replaces_id_zero_allocates_fresh_ids() {
+        let counter = AtomicU32::new(1);
+        assert_eq!(notify_id(&[], 0, &counter), 1);
+        assert_eq!(notify_id(&[live(1)], 0, &counter), 2);
+        assert_eq!(counter.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn replaces_id_of_a_live_notification_keeps_its_id() {
+        let counter = AtomicU32::new(4);
+        let list = [live(1), live(3)];
+        assert_eq!(notify_id(&list, 3, &counter), 3);
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            4,
+            "an in-place replace must not burn a counter value"
+        );
+    }
+
+    #[test]
+    fn replaces_id_never_issued_gets_a_fresh_id_and_cannot_collide_later() {
+        // The reported repro: `Notify(app, 5000, …)` used to return 5000 —
+        // never issued — without moving the counter, so the 5000th ordinary
+        // notification replaced it in place and shared its timer entry.
+        let counter = AtomicU32::new(2); // id 1 was issued, and is live
+        let mut list = vec![live(1)];
+        let bogus = notify_id(&list, 5000, &counter);
+        assert_eq!(bogus, 2, "a non-live replaces_id must allocate, not echo");
+        list.push(live(bogus));
+
+        // Walk the counter all the way past 5000: nothing it hands out may
+        // equal an id that is already live.
+        counter.store(4999, Ordering::Relaxed);
+        for _ in 0..3 {
+            let next = notify_id(&list, 0, &counter);
+            assert!(
+                list.iter().all(|n| n.id != next),
+                "fresh id {next} collides with a live notification"
+            );
+            list.push(live(next));
+        }
+    }
+
+    #[test]
+    fn replaces_id_of_a_closed_notification_gets_a_fresh_id() {
+        // A progress update arriving just after its toast expired: id 7 was
+        // real, but it is gone, so the update is a new notification.
+        let counter = AtomicU32::new(8);
+        assert_eq!(notify_id(&[live(6)], 7, &counter), 8);
     }
 
     #[test]

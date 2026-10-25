@@ -22,7 +22,7 @@
 //! against a real `App` + `Bar` + drawer under a display server instead.
 //!
 //! Falsified the intended way: reverting `switch_active` to its pre-#799 body
-//! leaves the drawer closed and fails the `drawer_open` assertion below.
+//! leaves the drawer closed and fails the `drawer_page` assertion below.
 //!
 //! ## Shape
 //!
@@ -50,20 +50,20 @@ use hytte::prelude::*;
 use hytte::services::{calendar, clock};
 use trollshell::modal::{self, Page};
 
-/// The drawer-open state `monitor`'s panel currently reports, read through
-/// `modal`'s own public signal.
+/// The built-in page `monitor`'s drawer currently reports showing (`None`
+/// while it is closed), read through `modal`'s own public signal.
 ///
 /// A `Mutable`'s signal always delivers its current value on the first poll
 /// regardless of whether anything changed, so one poll of a fresh subscription
 /// is a plain read. `Waker::noop()` is enough because this never polls a second
 /// time — nothing here needs to be woken for a *later* change, unlike the
 /// sibling reentrancy tests whose whole subject is the wake.
-fn drawer_open(monitor: &Monitor) -> bool {
+fn drawer_page(monitor: &Monitor) -> Option<Page> {
     let mut cx = Context::from_waker(Waker::noop());
-    let mut signal = std::pin::pin!(modal::drawer_open_signal(monitor));
+    let mut signal = std::pin::pin!(modal::drawer_page_signal(monitor));
     match signal.as_mut().poll_change(&mut cx) {
-        Poll::Ready(Some(open)) => open,
-        Poll::Ready(None) => panic!("drawer_open_signal ended before delivering a value"),
+        Poll::Ready(Some(page)) => page,
+        Poll::Ready(None) => panic!("drawer_page_signal ended before delivering a value"),
         Poll::Pending => {
             panic!("a fresh Mutable signal must deliver its current value on the first poll")
         }
@@ -122,7 +122,7 @@ fn switch_active_opens_the_target_when_no_drawer_is_open_anywhere() {
             // drawer *closed*. If this ever stopped holding, the deep-link below
             // would take the ordinary in-place-swap path and the test would pass
             // without exercising #799's branch at all.
-            closed_before_in.store(!drawer_open(&monitor), Ordering::SeqCst);
+            closed_before_in.store(drawer_page(&monitor).is_none(), Ordering::SeqCst);
 
             // The deep-link, fired with every drawer closed. Note that
             // `components::focused_output::install()` is deliberately *not*
@@ -132,7 +132,10 @@ fn switch_active_opens_the_target_when_no_drawer_is_open_anywhere() {
             modal::switch_active(Page::Calendar);
             while ctx.iteration(false) {}
 
-            open_after_in.store(drawer_open(&monitor), Ordering::SeqCst);
+            open_after_in.store(
+                drawer_page(&monitor) == Some(Page::Calendar),
+                Ordering::SeqCst,
+            );
             reached_in.store(true, Ordering::SeqCst);
 
             app.quit();
@@ -151,7 +154,7 @@ fn switch_active_opens_the_target_when_no_drawer_is_open_anywhere() {
     );
     assert!(
         open_after.load(Ordering::SeqCst),
-        "`switch_active` with no drawer open anywhere left every drawer closed — \
-         the deep-link was a silent no-op (#799)"
+        "`switch_active` with no drawer open anywhere did not leave the drawer \
+         showing its target — the deep-link was a silent no-op (#799)"
     );
 }

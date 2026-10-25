@@ -146,8 +146,13 @@ impl Default for PipewireHandles {
     }
 }
 
-/// Default-sink volume + mute. The bar chip binds this for its icon and
-/// the OSD overlay reads it on every wheel/key event.
+/// Default-sink volume + mute. The bar chip binds this for its icon.
+///
+/// Reads [`Volume::default()`] while no sink is the default — before the
+/// backend's first report included — which is indistinguishable from a real
+/// 0 % sink here. A consumer that must tell the two apart (the shell's OSD,
+/// which must not take the first real reading for a change) derives the
+/// default sink from [`sinks`] instead, where that state is an absent entry.
 pub fn default_sink() -> impl Signal<Item = Volume> {
     registry::with(|r| {
         r.get::<PipewireHandles>()

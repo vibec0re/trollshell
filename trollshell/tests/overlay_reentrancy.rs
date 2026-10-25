@@ -52,8 +52,8 @@
 //!   teardown — GTK keeps its own reference to a mapped toplevel, so
 //!   dropping the Rust handle emits nothing. There is no reentrant path to
 //!   provoke even in principle.
-//! * `modal::reset_drawer_open_states` (#631) — already covered, hermetically,
-//!   by `reset_drawer_open_states_does_not_reenter_the_borrow` in `modal.rs`'s
+//! * `modal::reset_drawer_page_states` (#631) — already covered, hermetically,
+//!   by `reset_drawer_page_states_does_not_reenter_the_borrow` in `modal.rs`'s
 //!   own `mod tests`.
 //! * `overlays::notifications::apply_emission` (#673's headline) and
 //!   `components::reactive_list` (#663, backs eight panels) — both private

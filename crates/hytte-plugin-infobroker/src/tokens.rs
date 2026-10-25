@@ -1,9 +1,12 @@
 //! The ephemeral half of the design (issue #487): in-memory session tokens.
 //!
 //! A token is a bearer "session cookie" the CLI exports into an agent's
-//! environment (`HYTTE_INFOBROKER_TOKEN`). It carries no policy of its own — it
-//! merely proves "this is agent X"; the durable [`grants`](crate::grants) decide
-//! what X may read. A token dies at the **first** of: an explicit revoke
+//! environment (`HYTTE_INFOBROKER_TOKEN`). It proves "this is agent X", and
+//! the durable [`grants`](crate::grants) decide what X may read — plus, for a
+//! token minted by an `AllowSession`/`AllowOnce` consent, the **one
+//! datasource that prompt named** ([`TokenScope`]), and nothing else. A token
+//! never reaches a datasource the human has not consented to for that agent.
+//! A token dies at the **first** of: an explicit revoke
 //! ([`TokenStore::revoke_agent`], driven by the panel), a broker/shell restart
 //! (this store is never persisted), or the [`DEFAULT_TTL_SECS`] backstop.
 //!
@@ -16,24 +19,58 @@ use std::fmt::Write as _;
 /// nothing revokes it and the shell never restarts.
 pub const DEFAULT_TTL_SECS: i64 = 12 * 60 * 60;
 
-/// The data-access authority a token carries — decided by the consent choice
-/// that minted it (#487 phase 1b). Identity (which agent the token *is*) is
-/// orthogonal; this is what a `get` request the token authenticates may fetch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+/// The data-access authority a token carries of its **own** — decided by the
+/// consent choice that minted it (#487 phase 1b). Identity (which agent the
+/// token *is*) is orthogonal, and so are the durable grants, which a `get`
+/// consults for every token whatever its scope; this is what the token adds on
+/// top of them.
+///
+/// The two consent scopes carry the datasource their prompt named, and cover
+/// that datasource only. Before they did, an `AllowSession` click on a prompt
+/// reading "claude wants: read access from departures" minted a token that
+/// also read the calendar and the weather: a `get` took `Session` as
+/// "everything", and the prompt could not have named anything else. Carrying
+/// the datasource in the variant makes a consent token with no datasource
+/// unrepresentable, rather than a default to remember.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum TokenScope {
-    /// Backed by a durable `always` grant (a phase-1a silent mint, or an
-    /// `AllowAlways` consent): data access is authorized by the grant store and
-    /// this token is pure identity. The default — a token minted the 1a way.
+    /// No authority of its own: data access is whatever the grant store
+    /// authorizes for the agent, and this token is pure identity. Minted on a
+    /// silent `always`-grant auth or an `AllowAlways` consent (which wrote that
+    /// grant first). The default — a token minted the 1a way.
     #[default]
     Grant,
-    /// `AllowSession`: this token itself authorizes data access for its whole
+    /// `AllowSession`: this token itself authorizes `datasource` for its whole
     /// life, with no durable grant. Dies with the session (restart / revoke /
     /// TTL) like every token.
-    Session,
-    /// `AllowOnce`: authorizes exactly one fetch, then its data authority is
-    /// spent — a further fetch on the same token is denied until the agent
-    /// re-auths and the human re-decides. The token still identifies the agent.
-    Once,
+    Session {
+        /// The one datasource the consent prompt named.
+        datasource: String,
+    },
+    /// `AllowOnce`: authorizes exactly one fetch of `datasource`, then its data
+    /// authority is spent — a further fetch on the same token is denied until
+    /// the agent re-auths and the human re-decides. The token still identifies
+    /// the agent.
+    Once {
+        /// The one datasource the consent prompt named.
+        datasource: String,
+    },
+}
+
+impl TokenScope {
+    /// Whether this scope's **own** authority reaches `datasource`: the
+    /// prompt-named datasource for [`Session`](TokenScope::Session) /
+    /// [`Once`](TokenScope::Once), never anything for
+    /// [`Grant`](TokenScope::Grant) (whose authority lives in the grant store).
+    /// Says nothing about whether a `Once` is already spent — see
+    /// [`TokenAuthority::spent`].
+    #[must_use]
+    pub fn covers(&self, datasource: &str) -> bool {
+        match self {
+            Self::Grant => false,
+            Self::Session { datasource: d } | Self::Once { datasource: d } => d == datasource,
+        }
+    }
 }
 
 /// One live session token.
@@ -143,7 +180,7 @@ impl TokenStore {
             .find(|t| tokens_match(&t.value, value))
             .map(|t| TokenAuthority {
                 agent: t.agent.clone(),
-                scope: t.scope,
+                scope: t.scope.clone(),
                 spent: t.spent,
             })
     }
@@ -153,11 +190,9 @@ impl TokenStore {
     /// only counts a genuine consumption). A no-op — returning `false` — for an
     /// unknown token or any non-`Once` / already-spent one.
     pub fn spend_once(&mut self, value: &str) -> bool {
-        if let Some(t) = self
-            .tokens
-            .iter_mut()
-            .find(|t| tokens_match(&t.value, value) && t.scope == TokenScope::Once && !t.spent)
-        {
+        if let Some(t) = self.tokens.iter_mut().find(|t| {
+            tokens_match(&t.value, value) && matches!(t.scope, TokenScope::Once { .. }) && !t.spent
+        }) {
             t.spent = true;
             true
         } else {
@@ -404,6 +439,20 @@ mod tests {
         assert_eq!(store.active(NOW + 200).len(), 0, "all expired");
     }
 
+    /// A session scope naming `datasource` — test shorthand.
+    fn session(datasource: &str) -> TokenScope {
+        TokenScope::Session {
+            datasource: datasource.to_owned(),
+        }
+    }
+
+    /// A once scope naming `datasource` — test shorthand.
+    fn once(datasource: &str) -> TokenScope {
+        TokenScope::Once {
+            datasource: datasource.to_owned(),
+        }
+    }
+
     #[test]
     fn mint_defaults_to_grant_scope_and_mint_scoped_records_the_choice() {
         let mut store = TokenStore::with_ttl(100);
@@ -411,23 +460,49 @@ mod tests {
         let g = store.mint("claude", NOW);
         assert_eq!(g.scope, TokenScope::Grant);
         assert!(!g.spent);
-        // The consent shapes carry their scope.
-        let s = store.mint_scoped("claude", NOW, TokenScope::Session);
-        assert_eq!(s.scope, TokenScope::Session);
-        let o = store.mint_scoped("claude", NOW, TokenScope::Once);
-        assert_eq!(o.scope, TokenScope::Once);
+        // The consent shapes carry their scope, datasource included.
+        let s = store.mint_scoped("claude", NOW, session("departures"));
+        assert_eq!(s.scope, session("departures"));
+        let o = store.mint_scoped("claude", NOW, once("calendar"));
+        assert_eq!(o.scope, once("calendar"));
+    }
+
+    /// The consent scopes cover the one datasource their prompt named and
+    /// nothing else; a `Grant` token covers nothing of its own (the grant
+    /// store answers for it). This is the token's half of "a token never
+    /// grants more than the prompt the human saw".
+    ///
+    /// Mutation: make either consent arm of `covers` answer `true` (the old
+    /// `TokenScope::Session => true`) and the cross-datasource asserts go red.
+    #[test]
+    fn a_consent_scope_covers_only_the_datasource_its_prompt_named() {
+        for scope in [session("departures"), once("departures")] {
+            assert!(scope.covers("departures"), "{scope:?} covers its own");
+            assert!(
+                !scope.covers("calendar"),
+                "{scope:?} must not reach calendar"
+            );
+            assert!(!scope.covers("weather"), "{scope:?} must not reach weather");
+            assert!(!scope.covers(""), "{scope:?} must not match an empty name");
+        }
+        for ds in ["departures", "calendar", "weather"] {
+            assert!(
+                !TokenScope::Grant.covers(ds),
+                "a Grant token has no authority of its own over {ds}"
+            );
+        }
     }
 
     #[test]
     fn resolve_returns_agent_scope_and_spent() {
         let mut store = TokenStore::with_ttl(100);
-        let tok = store.mint_scoped("claude", NOW, TokenScope::Session);
+        let tok = store.mint_scoped("claude", NOW, session("departures"));
         let auth = store.resolve(&tok.value, NOW + 10).expect("resolves");
         assert_eq!(
             auth,
             TokenAuthority {
                 agent: "claude".to_owned(),
-                scope: TokenScope::Session,
+                scope: session("departures"),
                 spent: false,
             }
         );
@@ -439,28 +514,33 @@ mod tests {
     #[test]
     fn spend_once_is_single_use_and_only_touches_once_tokens() {
         let mut store = TokenStore::with_ttl(1000);
-        let once = store.mint_scoped("claude", NOW, TokenScope::Once);
+        let once_tok = store.mint_scoped("claude", NOW, once("departures"));
         // First spend flips it; the second is a no-op (already spent).
         assert!(
-            store.spend_once(&once.value),
+            store.spend_once(&once_tok.value),
             "first fetch consumes the once"
         );
         assert!(
-            !store.spend_once(&once.value),
+            !store.spend_once(&once_tok.value),
             "a spent once-token can't be spent again"
         );
         // The resolved authority now reports it spent.
         assert!(
             store
-                .resolve(&once.value, NOW)
+                .resolve(&once_tok.value, NOW)
                 .expect("still resolves")
                 .spent
         );
 
         // A session/grant token is never a once — spend_once leaves it alone.
-        let session = store.mint_scoped("claude", NOW, TokenScope::Session);
-        assert!(!store.spend_once(&session.value));
-        assert!(!store.resolve(&session.value, NOW).expect("resolves").spent);
+        let session_tok = store.mint_scoped("claude", NOW, session("departures"));
+        assert!(!store.spend_once(&session_tok.value));
+        assert!(
+            !store
+                .resolve(&session_tok.value, NOW)
+                .expect("resolves")
+                .spent
+        );
         // Unknown token: no-op.
         assert!(!store.spend_once("not-a-token"));
     }

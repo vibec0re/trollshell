@@ -46,31 +46,39 @@ finds it on PATH automatically — no per-skill setup needed.
 - **Tokens are ephemeral, grants are durable.** A token lives ≤ 12 h and dies on
   a desktop restart or an explicit revoke — re-auth is cheap. The _grant_ (your
   agent × a datasource) is what persists; a human sets it once.
-- **Consent is required.** If no grant covers you, `auth` (and `get`) are
-  **denied** with a hint, and the human gets a desktop toast about your knock.
-  Interactive "Allow this once?" prompting is not in this phase — a denial means
-  the human must grant you first (in the infobroker panel, or by editing
-  `grants.toml`). Don't retry in a loop; surface the hint and move on.
+- **Consent is per datasource.** `auth` asks for **one** datasource
+  (`--datasource`, `departures` if you leave it out). If the human has granted
+  you that datasource, the token is minted silently; if they have refused it,
+  `auth` is denied with a hint. Otherwise they get a prompt on screen naming
+  you and that datasource — _Allow once_, _This session_, _Always_ or _Deny_ —
+  and `auth` waits for the answer. A token from _Allow once_ or _This session_
+  reads **that datasource only** (plus anything you already hold a durable
+  grant for): to read another one, `auth` again naming it, which asks the
+  human again. Don't retry a denial in a loop; surface the hint and move on.
 
 ## The flow
 
 ```sh
-# 1. Authenticate once per session (pick a stable agent name):
-eval "$(hytte-infobroker auth --agent claude)"
+# 1. Authenticate for the datasource you need (pick a stable agent name):
+eval "$(hytte-infobroker auth --agent claude --datasource departures)"
 
 # 2. Read scoped data (uses $HYTTE_INFOBROKER_TOKEN):
 hytte-infobroker get departures            # next catchable S-Bahn departures (JSON)
 hytte-infobroker get departures --limit 3  # just the next few
-hytte-infobroker get weather               # current conditions (one JSON object)
+
+# Another datasource is another ask (unless a durable grant already covers it):
+eval "$(hytte-infobroker auth --agent claude --datasource calendar)"
 hytte-infobroker get calendar --limit 5    # upcoming calendar events (JSON)
+hytte-infobroker get weather               # current conditions (one JSON object) — needs its own ask too
 
 # 3. See what you're allowed to read:
 hytte-infobroker grants list
 ```
 
-### `auth --agent <name>`
+### `auth --agent <name> [--datasource <departures|weather|calendar>]`
 
-Mints a session token. On success, stdout is exactly one eval-able line:
+Mints a session token for the datasource you name (`departures` if you name
+none). On success, stdout is exactly one eval-able line:
 
 ```
 export HYTTE_INFOBROKER_TOKEN=3be6622c0256634e6839949e9631063e
@@ -143,8 +151,9 @@ what you may read before you `get`.
 
 - **Ask for the minimum.** Only `get` the datasource the task actually needs.
   Don't speculatively pull everything.
-- **Auth once per session**, then reuse the env token. Don't re-`auth` before
-  every `get`.
+- **Auth once per datasource you need**, then reuse the env token. Don't
+  re-`auth` before every `get` — each ask for a datasource you hold no grant
+  for puts a prompt in front of the human.
 - **Handle denial gracefully.** If `auth`/`get` is denied, tell the human what
   you tried and that they can allow it in the _infobroker panel_ (the infobroker
   chip on the trollshell bar → the drawer's "Pending requests") or by adding a
@@ -160,8 +169,10 @@ newline-delimited JSON over `$XDG_RUNTIME_DIR/hytte-infobroker.sock` (0600,
 same-user-only). One request object per line in, one response per line out:
 
 ```text
-→ {"op":"auth","agent":"claude"}
+→ {"op":"auth","agent":"claude","datasource":"departures"}
 ← {"ok":true,"token":"…","expires_unix":1750000000,"agent":"claude"}
+  ("datasource" is optional and defaults to "departures"; a request line is
+   at most 64 KiB)
 
 → {"op":"get","token":"…","datasource":"departures","limit":5}
 ← {"ok":true,"datasource":"departures","departures":[ … ]}

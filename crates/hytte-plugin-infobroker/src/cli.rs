@@ -5,12 +5,16 @@
 //! ([`hytte_plugin_infobroker::wire`]):
 //!
 //! ```text
-//! hytte-infobroker auth --agent <name>          # → `export HYTTE_INFOBROKER_TOKEN=…`
+//! hytte-infobroker auth --agent <name> [--datasource <ds>]  # → `export HYTTE_INFOBROKER_TOKEN=…`
 //! hytte-infobroker get <datasource> [--limit N] # uses $HYTTE_INFOBROKER_TOKEN → JSON
 //! hytte-infobroker grants list                  # the durable grants (introspection)
 //! ```
 //!
-//! `<datasource>` is `departures` / `weather` / `calendar` (#509/#484).
+//! `<datasource>` is `departures` / `weather` / `calendar` (#509/#484). `auth`
+//! asks for one of them (`departures` when `--datasource` is left out), and the
+//! human's consent prompt names it: a token minted by an "Allow once" / "This
+//! session" answer reads that datasource and no other, so an agent that needs
+//! two asks twice.
 //!
 //! The auth line is meant to be `eval`'d:
 //! `eval "$(hytte-infobroker auth --agent claude)"`. Blocking std sockets only —
@@ -42,7 +46,7 @@ const ENV_TOKEN: &str = "HYTTE_INFOBROKER_TOKEN";
 const LONG_ABOUT: &str = "hytte-infobroker — the trollshell data broker CLI (issue #487)\n\
 \n\
 Typical agent flow:\n\
-    eval \"$(hytte-infobroker auth --agent claude)\"\n\
+    eval \"$(hytte-infobroker auth --agent claude --datasource departures)\"\n\
     hytte-infobroker get departures --limit 5";
 
 #[derive(Parser, Debug)]
@@ -60,6 +64,10 @@ enum Command {
         /// The agent name the minted token identifies as
         #[arg(long)]
         agent: String,
+        /// The datasource to ask for — what the consent prompt names, and all
+        /// a once/session token it mints can read [default: departures]
+        #[arg(long)]
+        datasource: Option<Datasource>,
     },
     /// Fetch scoped data (needs the env token from a prior `auth`)
     Get {
@@ -151,7 +159,7 @@ fn run(cli: Cli) -> Result<(), String> {
             println!();
             Ok(())
         }
-        Some(Command::Auth { agent }) => cmd_auth(&agent),
+        Some(Command::Auth { agent, datasource }) => cmd_auth(&agent, datasource),
         Some(Command::Get { datasource, limit }) => cmd_get(datasource, limit),
         Some(Command::Grants {
             action: GrantsAction::List,
@@ -163,11 +171,14 @@ fn run(cli: Cli) -> Result<(), String> {
     }
 }
 
-/// `auth --agent <name>` → an eval-able export line on stdout (a human note on
-/// stderr), or the denial (with its how-to-grant hint) as an error.
-fn cmd_auth(agent: &str) -> Result<(), String> {
+/// `auth --agent <name> [--datasource <ds>]` → an eval-able export line on
+/// stdout (a human note on stderr), or the denial (with its how-to-grant hint)
+/// as an error. An omitted `--datasource` leaves the field off the wire, so the
+/// broker's own default (departures) applies — one definition, not two.
+fn cmd_auth(agent: &str, datasource: Option<Datasource>) -> Result<(), String> {
     let resp = call(&Request::Auth {
         agent: agent.to_owned(),
+        datasource: datasource.map(|d| d.as_wire().to_owned()),
     })?;
     if !resp.ok {
         return Err(deny_message(&resp));
@@ -179,9 +190,10 @@ fn cmd_auth(agent: &str) -> Result<(), String> {
     println!("export {ENV_TOKEN}={token}");
     // stderr: the human-facing note.
     if let Some(exp) = resp.expires_unix {
+        let asked = datasource.map_or(DATASOURCE_DEPARTURES, Datasource::as_wire);
         eprintln!(
-            "hytte-infobroker: session token for '{agent}' minted (expires at unix {exp}); \
-             eval the line above to use it."
+            "hytte-infobroker: session token for '{agent}' ({asked}) minted (expires at unix \
+             {exp}); eval the line above to use it."
         );
     }
     Ok(())
@@ -324,10 +336,42 @@ mod tests {
     #[test]
     fn auth_takes_the_agent_flag_spaced_or_equals() {
         let spaced = parse(&["auth", "--agent", "claude"]).expect("spaced form parses");
-        assert!(matches!(spaced.command, Some(Command::Auth { agent }) if agent == "claude"));
+        assert!(matches!(
+            spaced.command,
+            Some(Command::Auth { agent, datasource: None }) if agent == "claude"
+        ));
 
         let equals = parse(&["auth", "--agent=claude"]).expect("equals form parses");
-        assert!(matches!(equals.command, Some(Command::Auth { agent }) if agent == "claude"));
+        assert!(matches!(
+            equals.command,
+            Some(Command::Auth { agent, datasource: None }) if agent == "claude"
+        ));
+    }
+
+    /// `--datasource` is optional (absent = the broker's departures default)
+    /// and takes exactly the three datasources `get` does.
+    #[test]
+    fn auth_takes_an_optional_datasource_from_the_known_three() {
+        for (token, want) in [
+            ("departures", "departures"),
+            ("weather", "weather"),
+            ("calendar", "calendar"),
+        ] {
+            let cli = parse(&["auth", "--agent", "claude", "--datasource", token])
+                .unwrap_or_else(|e| panic!("{token}: {e}"));
+            let Some(Command::Auth {
+                datasource: Some(ds),
+                ..
+            }) = cli.command
+            else {
+                panic!("{token}: expected an auth naming a datasource");
+            };
+            assert_eq!(ds.as_wire(), want);
+        }
+        assert!(
+            parse(&["auth", "--agent", "claude", "--datasource", "moonphase"]).is_err(),
+            "an unknown datasource is refused before it reaches the broker"
+        );
     }
 
     #[test]

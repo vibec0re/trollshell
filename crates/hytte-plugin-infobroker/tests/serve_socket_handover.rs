@@ -79,9 +79,10 @@ const CHILD_GIVE_UP: Duration = Duration::from_secs(30);
 const BACKOFF_BASE: Duration = Duration::from_millis(100);
 
 /// There is no in-process observable for "the server has called `accept()`
-/// on this exact connection and is now blocked reading its request line" —
-/// seeing that would mean instrumenting `broker::handle_conn`'s private
-/// state, out of this issue's lane. A generous, named, timing-based sleep is
+/// on this exact connection" (and, in scenario C, "has read its request and is
+/// now blocked writing the reply") — seeing that would mean instrumenting
+/// `broker::run_session`'s private state, out of this issue's lane. A
+/// generous, named, timing-based sleep is
 /// the same shape #1004's own review harness used to establish this
 /// precondition (its PR description cites "the harness's 250 ms"). The
 /// scheduler latency this is actually waiting out is single-digit
@@ -89,13 +90,16 @@ const BACKOFF_BASE: Duration = Duration::from_millis(100);
 /// 300 ms leaves ample headroom.
 const PARK_SETTLE: Duration = Duration::from_millis(300);
 
-/// How long session 2 is left running, with nothing unblocking session 1,
-/// before the test moves on to unblock it. Long enough that an unsynchronized
-/// probe (mutation (a): the process-wide mutex replaced by a per-session
-/// local) has certainly already run and observed session 1's still-live
-/// listener — that race is won in microseconds, not milliseconds, so this is
-/// generous headroom, not a tight measurement.
-const PROBE_WINDOW: Duration = Duration::from_millis(300);
+/// Scenario A: the bound on session 2's seed while a silent client is still
+/// connected to session 1 and has never sent a byte. On the fixed tree this
+/// is milliseconds (session 1 ends the moment its lane closes); under
+/// mutation (f) — the request read moved back inline into the accept arm —
+/// session 1 sits in that client's read for the broker's 5 s
+/// `REQUEST_TIMEOUT` and session 2 seeds ≈4.6 s after it starts (5 s less
+/// [`PARK_SETTLE`] and [`BACKOFF_BASE`]). 2 s splits the two with room on
+/// both sides; it is deliberately not derived from `REQUEST_TIMEOUT`, which
+/// is private.
+const SILENT_HANDOVER_BOUND: Duration = Duration::from_secs(2);
 
 /// Upper bound for session 2's seed snapshot to land once session 1 is
 /// unblocked. The real cost here is milliseconds (a mutex handoff); this
@@ -676,21 +680,33 @@ fn seed_large_grants(state_dir: &Path) {
     std::fs::write(dir.join(GRANTS_FILE), toml_text).expect("write the scratch grants.toml");
 }
 
-// ── Scenario A: a session handover while the predecessor is parked ─────────
+// ── Scenario A: a session handover with a silent client connected ──────────
 
 /// #1024 / #995 M1: the exact `systemctl --user restart trollshell` shape —
-/// session 1 binds, a client connects and parks `handle_conn` (never sends
-/// its request line), session 1's `cmds` lane closes while it is still
-/// parked, and session 2 starts within the SDK's `BACKOFF_BASE`. Session 2
-/// must come up `Kept` (never having probed its own predecessor) and the
-/// socket must stay accepting across the handover.
+/// session 1 binds, a client connects and never sends its request line,
+/// session 1's `cmds` lane closes, and session 2 starts within the SDK's
+/// `BACKOFF_BASE`. Session 2 must come up `Kept` and the socket must stay
+/// accepting across the handover.
 ///
-/// RED under mutation (a) — `SOCKET.lock().await` replaced by a per-session
-/// local: session 2 then probes while session 1's listener is still alive,
-/// reads that as a foreign broker, and stands down against itself (the exact
-/// #995 bug this test exists to pin).
+/// The silent client used to **park session 1** inside its request read for
+/// up to the broker's 5 s `REQUEST_TIMEOUT`, so this test had to unblock
+/// session 1 by sending that client's line before session 2 could seed.
+/// Request lines are now read off the session loop, so a silent client holds
+/// nothing: session 1 ends as soon as its lane closes, session 2 seeds without
+/// the silent client ever sending a byte, and the silent client — whose
+/// session has ended — is closed unanswered rather than served by a session
+/// whose tokens are already gone.
+///
+/// RED under mutation (f) — the request read moved back inline into the
+/// accept arm: session 1 then sits in the silent client's read for 5 s, and
+/// session 2's seed misses [`SILENT_HANDOVER_BOUND`].
+///
+/// Mutation (a) — `SOCKET.lock().await` replaced by a per-session local — no
+/// longer shows here, since sessions that do not overlap give an
+/// unsynchronized probe nothing to race. Scenario C still pins it: its
+/// predecessor is held, boundedly, in `write_response`.
 #[tokio::test]
-async fn a_session_handover_survives_a_predecessor_parked_in_read() {
+async fn a_session_handover_survives_a_silent_client() {
     // #1024 review New-6: guard against ever running the outer half inside a
     // re-exec'd child too (structural, not just "the re-exec always passes
     // --exact" — see `run_inner`'s New-6 assertion for that half).
@@ -706,7 +722,7 @@ async fn a_session_handover_survives_a_predecessor_parked_in_read() {
 }
 
 #[tokio::test]
-async fn a_session_handover_survives_a_predecessor_parked_in_read_inner() {
+async fn a_session_handover_survives_a_silent_client_inner() {
     if !in_scenario_child() {
         return;
     }
@@ -730,60 +746,57 @@ async fn a_session_handover_survives_a_predecessor_parked_in_read_inner() {
         snap1.notice,
     );
 
-    // A client connects and sends nothing: parks session 1's `handle_conn`
-    // inside `REQUEST_TIMEOUT`.
-    let mut parked_client = UnixStream::connect(&sock_path)
+    // A client connects and sends nothing — ever. Give session 1 time to
+    // accept it (under mutation (f), to start blocking on it).
+    let mut silent_client = UnixStream::connect(&sock_path)
         .await
         .expect("connect to session 1");
     tokio::time::sleep(PARK_SETTLE).await;
 
-    // Session 1's lane closes while the client is still parked.
+    // Session 1's lane closes with the silent client still connected.
     drop(cmds1_tx);
     tokio::time::sleep(BACKOFF_BASE).await;
 
-    // Session 2 starts — within the SDK's own backoff, while session 1 is
-    // still alive and holding the listener.
+    // Session 2 starts within the SDK's own backoff, and must seed without
+    // anything unblocking session 1: the silent client holds nothing.
+    let started2 = Instant::now();
     let (cmds2_tx, cmds2_rx) = mpsc::unbounded_channel();
     let (out2_tx, mut out2_rx) = mpsc::unbounded_channel::<BrokerMsg>();
     let session2 = spawn_serve(cmds2_rx, out2_tx);
 
-    // Give session 2 a window to attempt (and, under mutation (a), complete)
-    // an unsynchronized probe of session 1's still-live listener before this
-    // test unblocks session 1.
-    tokio::time::sleep(PROBE_WINDOW).await;
-
-    // The socket must keep accepting across the handover, even while session
-    // 1 is still parked servicing the first client.
-    let still_accepting =
-        tokio::time::timeout(Duration::from_secs(1), UnixStream::connect(&sock_path)).await;
-    assert!(
-        matches!(still_accepting, Ok(Ok(_))),
-        "the socket must keep accepting during the handover window: {still_accepting:?}",
-    );
-    // #1024 review L2: this probe connection is never accepted by session 1
-    // (it is busy with `parked_client`) and must not linger — left alive, it
-    // sits in the kernel accept backlog until *session 2* accepts it first,
-    // parking session 2 in `handle_conn` for the full `REQUEST_TIMEOUT` (5 s)
-    // before `fresh_client` below can get an answer. Dropping it here (rather
-    // than at the end of the test) is what keeps this test's wall time down
-    // to session 1's own `PARK_SETTLE`/`BACKOFF_BASE`/`PROBE_WINDOW` sleeps.
-    drop(still_accepting);
-
-    // Unblock session 1's parked client so session 1 observes its closed lane
-    // and returns, releasing the process-wide SOCKET guard for session 2.
-    send_line(&mut parked_client, r#"{"op":"grants"}"#).await;
-    let _ = read_line(&mut parked_client).await;
-
-    let started2 = Instant::now();
-    let snap2 = tokio::time::timeout(GIVE_UP, recv_update(&mut out2_rx))
+    let snap2 = tokio::time::timeout(SILENT_HANDOVER_BOUND, recv_update(&mut out2_rx))
         .await
-        .expect("session 2 must seed within the bounded handover window — RED under mutation (a)")
+        .expect(
+            "session 2 must seed while the silent client is still silent — RED under mutation \
+             (f): the request read back inline holds session 1 for the full request timeout",
+        )
         .expect("session 2's lane produced a snapshot");
-    assert_seeded_within(started2, GIVE_UP, "session 2's seed");
+    assert_seeded_within(started2, SILENT_HANDOVER_BOUND, "session 2's seed");
     assert_eq!(
         snap2.notice, None,
         "session 2 must come up Kept, not stand down against its own predecessor: {:?}",
         snap2.notice,
+    );
+
+    // The socket kept accepting across the handover. Dropped at once: a probe
+    // connection that never sends costs session 2 one reader slot, nothing
+    // more, but there is no reason to hold it.
+    let still_accepting =
+        tokio::time::timeout(Duration::from_secs(1), UnixStream::connect(&sock_path)).await;
+    assert!(
+        matches!(still_accepting, Ok(Ok(_))),
+        "the socket must keep accepting across the handover: {still_accepting:?}",
+    );
+    drop(still_accepting);
+
+    // Session 1 has ended, and its in-flight reader with it: the silent
+    // client is closed unanswered (EOF), not left dangling until its timeout.
+    let closed = tokio::time::timeout(Duration::from_secs(1), read_line(&mut silent_client))
+        .await
+        .expect("the ended session's silent client is closed promptly");
+    assert!(
+        closed.is_none(),
+        "an ended session answers nothing on its in-flight connections: {closed:?}",
     );
 
     // And the socket really is live under session 2: a fresh client gets a
@@ -971,6 +984,13 @@ async fn a_foreign_listener_gets_stood_down_with_the_notice_rendered_inner() {
 /// RED if `write_response`'s internal `tokio::time::timeout` is removed:
 /// session 1 never returns, session 2 never seeds, and this test's own
 /// [`WRITE_PARK_GIVE_UP`] safety net fires — a bounded failure, not a hang.
+///
+/// Also the one scenario left that is RED under mutation (a) — `SOCKET.lock()`
+/// replaced by a per-session local: session 1 is still alive in its blocked
+/// write when session 2 starts, so an unsynchronized session 2 probes
+/// session 1's live listener, stands down against its own process, and seeds
+/// with a notice. (Scenario A pinned this too while a silent client could hold
+/// a session open; since request lines are read off the loop, one cannot.)
 #[tokio::test]
 async fn a_client_that_never_reads_does_not_delay_the_next_sessions_seed() {
     // #1024 review New-6: see the sibling scenario's identical guard.

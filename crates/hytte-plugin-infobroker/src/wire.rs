@@ -8,8 +8,10 @@
 //! and an old client just ignores what it doesn't read.
 //!
 //! ```text
-//! → {"op":"auth","agent":"claude"}
+//! → {"op":"auth","agent":"claude","datasource":"calendar"}
 //! ← {"ok":true,"token":"…","expires_unix":1750000000,"agent":"claude"}
+//!
+//! → {"op":"auth","agent":"claude"}          (no datasource: asks for departures)
 //!
 //! → {"op":"get","token":"…","datasource":"departures","limit":5}
 //! ← {"ok":true,"datasource":"departures","departures":[ … ]}
@@ -45,9 +47,22 @@ pub const DATASOURCE_WEATHER: &str = "weather";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
-    /// Mint a session token for `agent` (identity = the token). Granted silently
-    /// iff an `always` grant already covers the agent; otherwise denied.
-    Auth { agent: String },
+    /// Mint a session token for `agent` (identity = the token), asking for
+    /// `datasource`. Granted silently iff an `always` grant covers
+    /// `(agent, datasource)`, refused silently on a standing `deny` for it, and
+    /// otherwise put to the human as a consent prompt naming that datasource.
+    /// An `AllowSession`/`AllowOnce` answer mints a token that reads the named
+    /// datasource and nothing else (beyond the agent's durable grants).
+    Auth {
+        agent: String,
+        /// The datasource the agent wants. Optional so a client that predates
+        /// the field still parses: absent means [`DATASOURCE_DEPARTURES`] —
+        /// what the consent prompt always named before the field existed — so
+        /// an old client gets the same prompt it always did, and a token
+        /// scoped to exactly that prompt.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        datasource: Option<String>,
+    },
     /// Fetch scoped data from `datasource`, authenticated by a prior `auth`
     /// token. `limit` caps the returned rows (host clamps; `None` = a sane
     /// default).
@@ -208,13 +223,37 @@ mod tests {
 
     #[test]
     fn parse_auth_request() {
+        // The pre-`datasource` line still parses — an old client keeps working
+        // (and the broker reads the absent field as departures).
         let req = parse_request(r#"{"op":"auth","agent":"claude"}"#).expect("parses");
         assert_eq!(
             req,
             Request::Auth {
-                agent: "claude".to_owned()
+                agent: "claude".to_owned(),
+                datasource: None,
             }
         );
+        let named = parse_request(r#"{"op":"auth","agent":"claude","datasource":"calendar"}"#)
+            .expect("parses");
+        assert_eq!(
+            named,
+            Request::Auth {
+                agent: "claude".to_owned(),
+                datasource: Some("calendar".to_owned()),
+            }
+        );
+    }
+
+    /// An auth that names no datasource serializes without the field, so a new
+    /// client talking to an old broker sends exactly the line it always did.
+    #[test]
+    fn an_auth_without_a_datasource_serializes_the_old_line() {
+        let line = serde_json::to_string(&Request::Auth {
+            agent: "claude".to_owned(),
+            datasource: None,
+        })
+        .expect("encodes");
+        assert_eq!(line, r#"{"op":"auth","agent":"claude"}"#);
     }
 
     #[test]

@@ -1704,11 +1704,16 @@ fn an_approval_resolved_elsewhere_is_dropped_not_re_decided() {
 
     // Somebody answered it on the dashboard.
     m.update(pending(Vec::new()));
-    m.update(Input::ConsentDecision {
+    let fx = m.update(Input::ConsentDecision {
         request_id: id,
         decision: ConsentDecision::AllowOnce,
     });
     assert_eq!(lines(&mut rx), Vec::<String>::new());
+    assert_eq!(
+        fx,
+        Vec::new(),
+        "resolved elsewhere is legitimately silent — no toast"
+    );
 }
 
 /// **The timeout (default 2 on #947).** The overlay sends nothing at all when
@@ -2396,4 +2401,77 @@ fn a_reused_id_prompts_again_after_a_refusal_or_an_outage_and_the_same_one_does_
     let raised = prompts(&fx);
     assert_eq!(raised.len(), 1, "{fx:?}");
     assert_eq!(raised[0].1, "stray");
+}
+
+// ── a click while the queue cannot be read ───────────────────────────────────
+
+/// The one `Notify` in `fx`, as `(summary, body)`.
+fn one_toast(fx: &[Effect]) -> (String, String) {
+    match fx {
+        [Effect::Notify { summary, body }] => (summary.clone(), body.clone()),
+        other => panic!("expected exactly one Notify, got {other:?}"),
+    }
+}
+
+/// A click on an open card during a `Pending` refusal blip sends nothing —
+/// the queue it would be checked against is unreadable — and **says so**,
+/// naming the request and where it is answered from next. It used to fall
+/// into the "resolved elsewhere" branch and vanish with a debug line.
+///
+/// Falsification: drop the `queue_known` branch in `decide` and the click is
+/// silent again (the `one_toast` panics on an empty batch).
+#[test]
+fn a_click_during_a_queue_refusal_is_told_it_was_not_sent() {
+    for (decision, what) in [
+        (ConsentDecision::AllowOnce, "approval"),
+        (ConsentDecision::Deny, "denial"),
+    ] {
+        let (mut m, mut rx) = model();
+        m.update(status(roster("agent_status_grouped.json")));
+        let token = one_prompt(&m.update(pending(vec![approval(7, "trollshell-choom")])));
+
+        m.update(pending_refused());
+        let (summary, body) = one_toast(&decide(&mut m, token, decision));
+        assert_eq!(summary, format!("{what} not sent — hive unavailable"));
+        assert!(body.contains("\"merge a reviewed config PR\""), "{body}");
+        assert!(body.contains("trollshell-choom (#7)"), "{body}");
+        assert!(body.contains("badge"), "{body}");
+        assert_eq!(
+            lines(&mut rx),
+            Vec::<String>::new(),
+            "nothing reaches the hive"
+        );
+
+        // The queue answers again: the request is badged again and does not
+        // re-prompt on its own — the badge is the way back, as the toast says.
+        let back = m.update(pending(vec![approval(7, "trollshell-choom")]));
+        assert_eq!(prompts(&back), Vec::new(), "{back:?}");
+        assert_eq!(m.pending.count_for("trollshell-choom"), 1);
+    }
+}
+
+/// The same with no hive at all. The last good queue used to survive an
+/// unreachable poll, so this click sent a bare `{"cmd":"approve","id":7}` at
+/// whatever answered the socket next — possibly a restarted hive holding a
+/// different #7. Now an unreachable (or erroring) hive forgets the queue, and
+/// the click is told it was not sent.
+///
+/// Falsification: drop the `forget_queue` call at the head of `fold_status`
+/// and the approve line goes out.
+#[test]
+fn a_click_while_the_hive_is_unreachable_is_told_it_was_not_sent() {
+    let (mut m, mut rx) = model();
+    m.update(status(roster("agent_status_grouped.json")));
+    let token = one_prompt(&m.update(pending(vec![approval(7, "trollshell-choom")])));
+
+    m.update(Input::App(Msg::Status(Err(HiveError::Unreachable {
+        reason: "no socket".to_owned(),
+    }))));
+    let (summary, _) = one_toast(&decide(&mut m, token, ConsentDecision::AllowOnce));
+    assert_eq!(summary, "approval not sent — hive unavailable");
+    assert_eq!(
+        lines(&mut rx),
+        Vec::<String>::new(),
+        "nothing reaches the hive"
+    );
 }

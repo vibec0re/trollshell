@@ -218,7 +218,9 @@ pub struct Agents {
     /// Absent means the default (open unless the group is all-stopped).
     pub expanded: ExpandedGroups,
     /// The hive's approval queue as of the last `Pending` answer (#947 P3) —
-    /// what the badges count and what a decision is validated against.
+    /// what the badges count and what a decision is validated against. Empty
+    /// while that queue cannot be read (a `Pending` refusal, or no hive) — the
+    /// private `queue_known` flag says which.
     pub pending: PendingApprovals,
     /// The approvals a prompt has already been raised for, by id, each with
     /// what its card showed.
@@ -284,6 +286,16 @@ pub struct Agents {
     /// that costs nothing on screen: the only node it gates also needs a
     /// running agent, which needs a poll to have happened at all.
     window_available: bool,
+    /// Whether [`Agents::pending`] is the hive's latest answer, rather than
+    /// the empty stand-in for a queue this build cannot see right now (a
+    /// `Pending` refusal, or no hive at all).
+    ///
+    /// The difference is invisible on the card — no badges either way — and
+    /// matters only to [`Agents::decide`]: an approval missing from an answered
+    /// queue was resolved elsewhere and is dropped quietly (§6.5), while one
+    /// missing from a queue nobody could read was not sent, and the operator
+    /// who clicked is told so.
+    queue_known: bool,
 }
 
 impl Agents {
@@ -308,7 +320,18 @@ impl Agents {
             cmd_tx,
             window: window::Probe::path(),
             window_available: false,
+            queue_known: false,
         }
+    }
+
+    /// Drop the approval queue this build can no longer vouch for — see
+    /// [`Agents::queue_known`]. `prompted` and the in-flight prompt are left
+    /// alone: both are bound to the request they asked about ([`Shown`]), so
+    /// the same request coming back stays quiet and a different one under a
+    /// re-used id does not.
+    fn forget_queue(&mut self) {
+        self.pending = PendingApprovals::default();
+        self.queue_known = false;
     }
 
     /// Pin whether the companion window is installed, instead of resolving it
@@ -388,6 +411,13 @@ impl Agents {
         // first call (the probe caches), and this is the `&mut self` path that
         // always precedes a card with a roster on it.
         self.window_available = self.window.available();
+        if result.is_err() {
+            // No roster, so no queue either — the same call `on_roster` makes
+            // for a queue that arrives while the hive is down. Keeping the last
+            // good one would let a click on an open card send a bare id to a
+            // hive that may come back holding something else under it.
+            self.forget_queue();
+        }
         match result {
             Err(HiveError::Version(mismatch)) => {
                 self.hive = Hive::Incompatible(mismatch);
@@ -519,6 +549,7 @@ impl Agents {
             }
         }
         self.pending = pending;
+        self.queue_known = true;
         self.raise_next()
     }
 
@@ -707,6 +738,14 @@ impl Agents {
     ///   one — it is what holds if a decision and a queue ever meet in the
     ///   other order.
     ///
+    /// The third guard has two ways to fail, and they are **not** the same
+    /// outcome. An approval missing from a queue the hive *answered* was
+    /// resolved elsewhere, which is legitimately silent. One missing because
+    /// the queue *could not be read* — a `Pending` refusal, or no hive at all
+    /// ([`Agents::queue_known`]) — was simply not sent: the operator clicked a
+    /// button and nothing happened, so that one gets a toast saying so, and
+    /// saying the request is still waiting for them.
+    ///
     /// The mapping is §6.5's, and it is deliberately lossy: **every** `Allow*`
     /// becomes one `Approve { id }` for that one id, and no standing grant is
     /// persisted — which this plugin achieves by having nowhere to persist one.
@@ -723,6 +762,13 @@ impl Agents {
         };
 
         let id = raised.approval;
+        if !self.queue_known {
+            tracing::info!(
+                approval = id,
+                "a consent decision arrived while the approval queue is unreadable; not sent"
+            );
+            return vec![self.unsent(&raised, decision)];
+        }
         match raised.standing(&self.pending) {
             Standing::Queued => {}
             Standing::Gone => {
@@ -749,6 +795,34 @@ impl Agents {
         };
         let _ = self.cmd_tx.send(Cmd::Send(request));
         Vec::new()
+    }
+
+    /// The toast for a decision [`Agents::decide`] could not send because the
+    /// queue was unreadable when it arrived.
+    ///
+    /// Named from what the card **showed** rather than from the queue, which
+    /// is exactly what is missing at this moment ([`Agents::approval_label`]
+    /// would fall back to the bare id). The badge is gone while the queue is
+    /// unreadable and comes back with it, which is where the request is
+    /// answered from next — a badge click re-raises it, and no other prompt
+    /// will (it keeps its `prompted` entry).
+    fn unsent(&self, raised: &RaisedPrompt, decision: ConsentDecision) -> Effect {
+        let what = match decision {
+            ConsentDecision::Deny => "denial",
+            ConsentDecision::AllowOnce
+            | ConsentDecision::AllowSession
+            | ConsentDecision::AllowAlways => "approval",
+        };
+        Effect::Notify {
+            summary: format!("{what} not sent — hive unavailable"),
+            body: format!(
+                "\"{}\" for {} (#{}) is still waiting on you; answer it from its badge once \
+                 the hive is back",
+                raised.shown.kind.human(),
+                self.cfg.label_for(&raised.shown.agent),
+                raised.approval
+            ),
+        }
     }
 
     /// The pause toggle: flip optimistically, then ask the hive.
@@ -1174,9 +1248,11 @@ impl Plugin for Agents {
             // …and a queue the hive refused (#1140's review, LOW-3). The badges
             // go, because they are claims about a queue this build can no
             // longer see; `prompted` and the in-flight prompt stay, so a
-            // one-tick blip cannot re-raise a card the operator already has.
+            // one-tick blip cannot re-raise a card the operator already has —
+            // and a click on that card meanwhile is told it was not sent
+            // (`decide`), rather than dropped as if resolved elsewhere.
             Input::App(Msg::Pending(Err(_))) => {
-                self.pending = PendingApprovals::default();
+                self.forget_queue();
                 Vec::new()
             }
             // #947 P3: the human answered (or the two-button card would have

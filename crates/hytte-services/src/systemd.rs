@@ -1,7 +1,8 @@
 //! systemd service — surfaces the current set of failed units via
-//! `org.freedesktop.systemd1.Manager`. Signal-driven: subscribes to
-//! `JobRemoved` and re-fetches `ListUnitsFiltered(["failed"])` on
-//! each emission.
+//! `org.freedesktop.systemd1.Manager`. Signal-driven, with a slow poll as the
+//! safety net: it re-fetches `ListUnitsFiltered(["failed"])` after a burst of
+//! the triggers below, coalesced over `DEBOUNCE` (250 ms), and every
+//! `POLL_INTERVAL` (60 s) regardless.
 //!
 //! Notes on systemd dbus:
 //! - Uses the **system bus** (`org.freedesktop.systemd1` on the system bus
@@ -9,14 +10,33 @@
 //!   session bus but this service monitors the system manager).
 //! - `Manager.Subscribe()` MUST be called for the daemon to start
 //!   emitting signals to this client. Without it `JobRemoved` never
-//!   fires.
-//! - `JobRemoved` covers every unit transition (start/stop/restart
-//!   complete) regardless of result, so it's a reasonable proxy for
-//!   "the failed-unit set may have changed". Cheaper than per-unit
-//!   `PropertiesChanged` subscriptions for the v0.2.5 fidelity.
+//!   fires. It is tied to the *connection*, so it is issued again whenever
+//!   the `JobRemoved` subscription is rebuilt (a bus reconnect).
 //!
-//! All D-Bus I/O goes through [`hytte_bus::call`] and [`hytte_bus::signals`]
-//! so the shared connection supervisor handles reconnects automatically.
+//! # What re-reads the list
+//!
+//! - **`JobRemoved`**: a start/stop/restart job finished, whatever its result.
+//! - **The manager's `NFailedUnits`**, through [`hytte_bus::property`]. A unit
+//!   can enter or leave `failed` with **no job at all**, so `JobRemoved` alone
+//!   misses it. Measured on systemd 260.5: a running service that exits
+//!   non-zero with no `Restart=`, and a `systemctl reset-failed`, each emit
+//!   exactly one manager `PropertiesChanged` (`NFailedUnits`) and no
+//!   `JobRemoved`. `reset-failed` also emits a `UnitRemoved`, which the count
+//!   already covers. The count is on the manager object itself, so one
+//!   exact-path subscription covers every unit: no manager-wide match rule,
+//!   which `hytte_bus` does not offer, and no per-unit `PropertiesChanged`.
+//! - **A poll every `POLL_INTERVAL` (60 s)**, for what neither signal reports:
+//!   - one unit failing while another clears, so the count does not move;
+//!   - a signal lost while the bus was down;
+//!   - a refresh that failed (retried after `RETRY_AFTER_FAILURE` (5 s), not a
+//!     full interval).
+//!
+//! A daemon-reload or boot finishes hundreds of jobs, so triggers that land
+//! within `DEBOUNCE` (250 ms) of the first are coalesced into one refresh.
+//!
+//! All D-Bus I/O goes through [`hytte_bus::call`], [`hytte_bus::signals`] and
+//! [`hytte_bus::property`] so the shared connection supervisor handles
+//! reconnects automatically.
 //!
 //! # Public API
 //!
@@ -27,7 +47,7 @@
 //! ```
 
 use anyhow::{Context, Result};
-use futures_signals::signal::{Mutable, Signal};
+use futures_signals::signal::{Mutable, Signal, SignalExt};
 use futures_util::StreamExt;
 use hytte_bus::{BusKind, call, signals};
 use hytte_reactive::{Service, registry, spawn_supervised};
@@ -117,37 +137,175 @@ type UnitTuple = (
     zbus::zvariant::OwnedObjectPath,
 );
 
+/// How long a burst of triggers is coalesced into one refresh.
+const DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// The safety-net re-read, for what no signal reports (see the module doc).
+/// Slow on purpose: the two signals carry nearly every change, and this is one
+/// `ListUnitsFiltered` call returning only the failed units.
+const POLL_INTERVAL: Duration = Duration::from_mins(1);
+
+/// How soon a failed refresh is retried, instead of keeping a stale list for a
+/// whole [`POLL_INTERVAL`].
+const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(5);
+
+/// What woke the tracker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Trigger {
+    /// The failed-unit set may have changed: a job finished, the failed-unit
+    /// count moved, or a subscriber fell behind and missed emissions.
+    Changed,
+    /// The `JobRemoved` subscription was rebuilt, i.e. the bus reconnected.
+    /// Emissions while it was down are lost, and the new connection has not
+    /// called `Subscribe()`, so it must, before the re-read.
+    Resubscribed,
+}
+
+/// The [`Trigger`] a `JobRemoved` subscription item stands for.
+fn job_trigger(item: &hytte_bus::SignalItem) -> Trigger {
+    match item {
+        hytte_bus::SignalItem::Resubscribed => Trigger::Resubscribed,
+        hytte_bus::SignalItem::Event(_) | hytte_bus::SignalItem::Lagged { .. } => Trigger::Changed,
+    }
+}
+
 async fn listen(writer: &Mutable<Vec<FailedUnit>>) -> Result<()> {
     // REQUIRED: systemd only emits signals to clients that have called
     // Subscribe(). Without this, JobRemoved never fires.
-    call(BusKind::System, SYSTEMD_NAME)
+    subscribe().await?;
+
+    // Initial fetch of failed units.
+    refresh_failed(writer).await?;
+
+    let job_removed = signals(BusKind::System, SYSTEMD_NAME)
+        .at_path(MANAGER_PATH)
+        .iface(MANAGER_IFACE)
+        .signal("JobRemoved")
+        .start();
+    // Moves when a unit fails or is reset with no job involved; see the
+    // module doc. Every yield counts, the first (`Loading`) and the
+    // reconnect's `Stale` → `Loaded` included: a spare re-read costs one call
+    // and is coalesced with its neighbours anyway.
+    let failed_count = hytte_bus::property::<u32>(BusKind::System, SYSTEMD_NAME)
+        .at_path(MANAGER_PATH)
+        .iface(MANAGER_IFACE)
+        .name("NFailedUnits")
+        .start();
+
+    let triggers = futures_util::stream::select(
+        job_removed.items().map(|item| job_trigger(&item)),
+        failed_count
+            .signal()
+            .to_stream()
+            .map(|_count| Trigger::Changed),
+    );
+    track(
+        triggers,
+        || refresh_failed(writer),
+        || async {
+            subscribe().await?;
+            tracing::debug!("systemd: re-subscribed after the bus reconnected");
+            Ok(())
+        },
+    )
+    .await;
+    Ok(())
+}
+
+/// Keep the failed-unit list current until `triggers` ends.
+///
+/// - **After each burst of `triggers`**: re-read with `refresh`, once the
+///   burst has been coalesced over [`DEBOUNCE`]. A [`Trigger::Resubscribed`]
+///   anywhere in the burst calls `resubscribe` first.
+/// - **Every [`POLL_INTERVAL`] without one**: re-read regardless, counted from
+///   the last refresh.
+/// - **After a failed refresh**: the last list is kept (an empty one would
+///   read as "nothing failed"), and the re-read comes after
+///   [`RETRY_AFTER_FAILURE`] instead.
+///
+/// Generic over the stream and the two calls so the timing is unit-tested
+/// against a fake stream and a paused clock.
+async fn track<S, R, RF, B, BF>(mut triggers: S, mut refresh: R, mut resubscribe: B)
+where
+    S: futures_util::Stream<Item = Trigger> + Unpin,
+    R: FnMut() -> RF,
+    RF: std::future::Future<Output = Result<()>>,
+    B: FnMut() -> BF,
+    BF: std::future::Future<Output = Result<()>>,
+{
+    let mut poll =
+        tokio::time::interval_at(tokio::time::Instant::now() + POLL_INTERVAL, POLL_INTERVAL);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut ended = false;
+    while !ended {
+        let mut resubscribed = false;
+        tokio::select! {
+            first = triggers.next() => {
+                let Some(first) = first else { return };
+                resubscribed = first == Trigger::Resubscribed;
+                let window = tokio::time::Instant::now() + DEBOUNCE;
+                loop {
+                    match tokio::time::timeout_at(window, triggers.next()).await {
+                        Ok(Some(next)) => resubscribed |= next == Trigger::Resubscribed,
+                        // Re-read once more for the burst, then stop.
+                        Ok(None) => {
+                            ended = true;
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+            _ = poll.tick() => {}
+        }
+        if resubscribed && let Err(e) = resubscribe().await {
+            tracing::warn!(error = %e, "systemd: Manager.Subscribe after a reconnect failed");
+        }
+        match refresh().await {
+            Ok(()) => poll.reset(),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "systemd: refreshing the failed units failed; keeping the last list, \
+                     retrying in {}s",
+                    RETRY_AFTER_FAILURE.as_secs(),
+                );
+                poll.reset_after(RETRY_AFTER_FAILURE);
+            }
+        }
+    }
+}
+
+/// The error systemd answers a second `Subscribe()` from a connection it
+/// already tracks with (`BUS_ERROR_ALREADY_SUBSCRIBED`; the name is in
+/// systemd 260's `libsystemd-shared`).
+const ALREADY_SUBSCRIBED: &str = "org.freedesktop.systemd1.AlreadySubscribed";
+
+/// `Manager.Subscribe()`: systemd emits its signals only to subscribed clients.
+/// Being subscribed already counts as success: a rebuilt subscription is not
+/// always a new connection.
+async fn subscribe() -> Result<()> {
+    match call(BusKind::System, SYSTEMD_NAME)
         .at_path(MANAGER_PATH)
         .iface(MANAGER_IFACE)
         .method("Subscribe")
         .args(())
         .send::<()>()
         .await
-        .context("Manager.Subscribe")?;
-
-    // Initial fetch of failed units.
-    refresh_failed(writer).await?;
-
-    // Subscribe to JobRemoved so we re-fetch whenever a job completes
-    // (which may change the failed-unit set).
-    let job_removed = signals(BusKind::System, SYSTEMD_NAME)
-        .at_path(MANAGER_PATH)
-        .iface(MANAGER_IFACE)
-        .signal("JobRemoved")
-        .start();
-
-    let mut events = job_removed.events();
-
-    while events.next().await.is_some() {
-        if let Err(e) = refresh_failed(writer).await {
-            tracing::warn!(error = %e, "systemd refresh after JobRemoved failed");
-        }
+    {
+        Ok(()) => Ok(()),
+        Err(e) if is_already_subscribed(&e) => Ok(()),
+        Err(e) => Err(e).context("Manager.Subscribe"),
     }
-    Ok(())
+}
+
+/// Whether `e` is systemd refusing a `Subscribe()` because this connection is
+/// subscribed already. Pure.
+fn is_already_subscribed(e: &hytte_bus::BusError) -> bool {
+    matches!(
+        e,
+        hytte_bus::BusError::Permanent { dbus_name: Some(name), .. } if name == ALREADY_SUBSCRIBED
+    )
 }
 
 async fn refresh_failed(writer: &Mutable<Vec<FailedUnit>>) -> Result<()> {
@@ -160,7 +318,9 @@ async fn refresh_failed(writer: &Mutable<Vec<FailedUnit>>) -> Result<()> {
         .await
         .context("ListUnitsFiltered")?;
 
-    writer.set(parse_units(units));
+    // `set_neq`: the poll re-reads an unchanged list every interval, and
+    // that should not re-render the chip.
+    writer.set_neq(parse_units(units));
     Ok(())
 }
 
@@ -760,6 +920,224 @@ mod tests {
         assert!(out.is_empty());
     }
 
+    // ── Failed-unit tracking: what re-reads the list, and when ──────────────
+
+    use std::sync::{Arc, Mutex};
+
+    /// [`track`] against a fake trigger stream, with every `refresh` and
+    /// `resubscribe` it makes logged against the paused clock.
+    struct Tracker {
+        tx: tokio::sync::mpsc::UnboundedSender<Trigger>,
+        /// `("refresh" | "subscribe", time since start)`, in call order.
+        log: Arc<Mutex<Vec<(&'static str, Duration)>>>,
+        /// How many of the next refreshes fail.
+        failing: Arc<Mutex<u32>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Tracker {
+        fn start() -> Self {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let triggers = futures_util::stream::poll_fn(move |cx| rx.poll_recv(cx));
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let failing = Arc::new(Mutex::new(0_u32));
+            let start = tokio::time::Instant::now();
+            let (refresh_log, refresh_failing, subscribe_log) =
+                (log.clone(), failing.clone(), log.clone());
+            let task = tokio::spawn(track(
+                triggers,
+                move || {
+                    refresh_log
+                        .lock()
+                        .unwrap()
+                        .push(("refresh", start.elapsed()));
+                    let mut failing = refresh_failing.lock().unwrap();
+                    let fail = *failing > 0;
+                    *failing = (*failing).saturating_sub(1);
+                    async move {
+                        if fail {
+                            anyhow::bail!("the system bus is down");
+                        }
+                        Ok(())
+                    }
+                },
+                move || {
+                    subscribe_log
+                        .lock()
+                        .unwrap()
+                        .push(("subscribe", start.elapsed()));
+                    async { Ok(()) }
+                },
+            ));
+            Self {
+                tx,
+                log,
+                failing,
+                task,
+            }
+        }
+
+        fn send(&self, trigger: Trigger) {
+            self.tx.send(trigger).expect("the tracker is running");
+        }
+
+        fn log(&self) -> Vec<(&'static str, Duration)> {
+            self.log.lock().unwrap().clone()
+        }
+
+        fn refreshes(&self) -> Vec<Duration> {
+            self.log()
+                .into_iter()
+                .filter_map(|(what, at)| (what == "refresh").then_some(at))
+                .collect()
+        }
+    }
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_of_triggers_is_one_refresh() {
+        // A daemon-reload's hundreds of JobRemoved, plus the count moving.
+        let t = Tracker::start();
+        for _ in 0..200 {
+            t.send(Trigger::Changed);
+        }
+        tokio::time::sleep(secs(1)).await;
+        assert_eq!(t.refreshes(), vec![DEBOUNCE]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn triggers_further_apart_than_the_debounce_are_separate_refreshes() {
+        let t = Tracker::start();
+        t.send(Trigger::Changed);
+        tokio::time::sleep(secs(1)).await;
+        t.send(Trigger::Changed);
+        tokio::time::sleep(secs(1)).await;
+        assert_eq!(t.refreshes(), vec![DEBOUNCE, secs(1) + DEBOUNCE]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_poll_re_reads_with_no_signal_at_all() {
+        // A unit that fails while another clears leaves the count where it
+        // was, and finishes no job: only the poll sees it.
+        let t = Tracker::start();
+        tokio::time::sleep(POLL_INTERVAL * 2 + secs(5)).await;
+        assert_eq!(t.refreshes(), vec![POLL_INTERVAL, POLL_INTERVAL * 2]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_poll_interval_counts_from_the_last_refresh() {
+        let t = Tracker::start();
+        tokio::time::sleep(secs(30)).await;
+        t.send(Trigger::Changed);
+        tokio::time::sleep(secs(100)).await;
+        let first = secs(30) + DEBOUNCE;
+        assert_eq!(t.refreshes(), vec![first, first + POLL_INTERVAL]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_refresh_is_retried_soon_and_then_polls_normally() {
+        // The finding: a refresh that failed after JobRemoved only warned, and
+        // the stale list stayed until the next job.
+        let t = Tracker::start();
+        *t.failing.lock().unwrap() = 1;
+        t.send(Trigger::Changed);
+        tokio::time::sleep(DEBOUNCE + RETRY_AFTER_FAILURE + POLL_INTERVAL + secs(1)).await;
+        let retried = DEBOUNCE + RETRY_AFTER_FAILURE;
+        assert_eq!(
+            t.refreshes(),
+            vec![DEBOUNCE, retried, retried + POLL_INTERVAL]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resubscription_subscribes_again_before_the_re_read() {
+        let t = Tracker::start();
+        t.send(Trigger::Changed);
+        t.send(Trigger::Resubscribed);
+        t.send(Trigger::Changed);
+        tokio::time::sleep(secs(1)).await;
+        // Once for the whole burst, and before the refresh it precedes.
+        assert_eq!(
+            t.log(),
+            vec![("subscribe", DEBOUNCE), ("refresh", DEBOUNCE)]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_plain_change_does_not_subscribe_again() {
+        let t = Tracker::start();
+        t.send(Trigger::Changed);
+        tokio::time::sleep(POLL_INTERVAL + secs(1)).await;
+        assert!(t.log().iter().all(|(what, _)| *what == "refresh"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_tracker_ends_with_its_stream_after_re_reading_the_last_burst() {
+        let t = Tracker::start();
+        t.send(Trigger::Changed);
+        drop(t.tx);
+        t.task.await.expect("track returns");
+        assert_eq!(
+            t.log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(what, _)| *what == "refresh")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_ended_stream_with_nothing_pending_ends_without_a_re_read() {
+        let t = Tracker::start();
+        drop(t.tx);
+        t.task.await.expect("track returns");
+        assert!(t.log.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn job_removed_items_map_to_triggers() {
+        let msg = zbus::Message::signal(MANAGER_PATH, MANAGER_IFACE, "JobRemoved")
+            .expect("a signal header")
+            .build(&())
+            .expect("a message");
+        let event = hytte_bus::SignalItem::Event(hytte_bus::SignalEvent {
+            body: msg,
+            sender: None,
+            timestamp: std::time::SystemTime::UNIX_EPOCH,
+        });
+        assert_eq!(job_trigger(&event), Trigger::Changed);
+        // A consumer that fell behind missed emissions: re-read.
+        assert_eq!(
+            job_trigger(&hytte_bus::SignalItem::Lagged { skipped: 3 }),
+            Trigger::Changed
+        );
+        assert_eq!(
+            job_trigger(&hytte_bus::SignalItem::Resubscribed),
+            Trigger::Resubscribed
+        );
+    }
+
+    #[test]
+    fn only_systemds_already_subscribed_refusal_counts_as_subscribed() {
+        let permanent = |name: Option<&str>| hytte_bus::BusError::Permanent {
+            reason: "refused".to_owned(),
+            dbus_name: name.map(str::to_owned),
+        };
+        assert!(is_already_subscribed(&permanent(Some(ALREADY_SUBSCRIBED))));
+        assert!(!is_already_subscribed(&permanent(Some(
+            "org.freedesktop.DBus.Error.AccessDenied"
+        ))));
+        assert!(!is_already_subscribed(&permanent(None)));
+        assert!(!is_already_subscribed(&hytte_bus::BusError::Transient {
+            source: zbus::Error::Failure("disconnected".to_owned()),
+        }));
+    }
+
     // ── Plugin unit management (#348) ────────────────────────────────────────
 
     /// A loaded `ListUnitsByPatterns` tuple for a plugin unit with a given
@@ -1231,6 +1609,110 @@ mod user_manager_tests {
                     .output();
             }
         }
+    }
+
+    /// The next `NFailedUnits` value off `values`, waiting at most 5 s;
+    /// `None` on a timeout.
+    async fn next_count(
+        values: &mut (impl futures_util::Stream<Item = hytte_bus::PropState<u32>> + Unpin),
+    ) -> Option<u32> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(state) = values.next().await {
+                if let hytte_bus::PropState::Loaded(n) = state {
+                    return Some(n);
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// Whether `unit` is `failed` right now.
+    fn is_failed(unit: &str) -> bool {
+        std::process::Command::new("systemctl")
+            .args(["--user", "is-failed", "--quiet", unit])
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    /// The next `NFailedUnits` change seen while [`is_failed`]`(unit)` equals
+    /// `failed`. Other tests here fail and collect units of their own, which
+    /// moves the same count, so a change is only attributed to `unit` when
+    /// `unit` is in the state that change should have put it in.
+    async fn count_change_while(
+        values: &mut (impl futures_util::Stream<Item = hytte_bus::PropState<u32>> + Unpin),
+        unit: &str,
+        failed: bool,
+    ) -> Option<u32> {
+        loop {
+            let n = next_count(values).await?;
+            if is_failed(unit) == failed {
+                return Some(n);
+            }
+        }
+    }
+
+    /// The trigger the failed-unit tracker adds for failures with **no job**:
+    /// the manager's `NFailedUnits`, read through `hytte_bus::property`,
+    /// changes when a running unit fails on its own and again when the unit
+    /// is `reset-failed`, neither of which finishes a job. Run against the
+    /// user manager, whose manager object is the system manager's code.
+    ///
+    /// The unit is `ts-nfailed-<pid>.service`, started **without**
+    /// `--collect` so its failure stays counted until the reset. It fails a
+    /// second after it starts, after the sibling tests' own short-lived units
+    /// have come and gone.
+    #[tokio::test]
+    async fn the_failed_unit_count_moves_for_a_failure_with_no_job() {
+        let unit = format!("ts-nfailed-{}.service", std::process::id());
+        let _cleanup = Cleanup(unit.clone());
+        // systemd emits only to subscribed clients; tolerate an answer either
+        // way, since this connection may already be subscribed.
+        let _ = call(BusKind::Session, SYSTEMD_NAME)
+            .at_path(MANAGER_PATH)
+            .iface(MANAGER_IFACE)
+            .method("Subscribe")
+            .args(())
+            .send::<()>()
+            .await;
+        let count = hytte_bus::property::<u32>(BusKind::Session, SYSTEMD_NAME)
+            .at_path(MANAGER_PATH)
+            .iface(MANAGER_IFACE)
+            .name("NFailedUnits")
+            .start();
+        let mut values = count.signal().to_stream();
+        if next_count(&mut values).await.is_none() {
+            eprintln!("skipping: no user manager answered for NFailedUnits");
+            return;
+        }
+
+        // Fails a second after it starts, so its start job is long finished.
+        let launched = tokio::process::Command::new("systemd-run")
+            .args(["--user", "--quiet", &format!("--unit={unit}"), "--"])
+            .args(["/bin/sh", "-c", "sleep 1; exit 3"])
+            .output()
+            .await;
+        match launched {
+            Ok(out) if out.status.success() => {}
+            other => {
+                eprintln!("skipping: systemd-run --user could not start {unit}: {other:?}");
+                return;
+            }
+        }
+        count_change_while(&mut values, &unit, true)
+            .await
+            .expect("NFailedUnits changes when the unit fails on its own");
+
+        let reset = std::process::Command::new("systemctl")
+            .args(["--user", "reset-failed", &unit])
+            .status()
+            .expect("systemctl");
+        assert!(reset.success());
+        count_change_while(&mut values, &unit, false)
+            .await
+            .expect("NFailedUnits changes when the unit is reset");
     }
 
     /// #1417 item 1: when a restart's stop outlasts its wait, the answer

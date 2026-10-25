@@ -67,7 +67,7 @@
 
 pub mod sys;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::ptr;
 use std::sync::Arc;
@@ -83,7 +83,10 @@ use anyhow::{Context as _, Result, anyhow, bail};
 /// iterator, so a daily meeting yields one `EventInstance` per day in the
 /// window. `ical` is the component's iCalendar serialisation, from which the
 /// caller extracts SUMMARY / LOCATION / UID etc. (the embedded DTSTART still
-/// reflects the series origin — trust `start_unix`/`end_unix`, not it).
+/// reflects the series origin — trust `start_unix`/`end_unix`, not it). An
+/// occurrence someone edited on its own (a detached instance, carrying
+/// `RECURRENCE-ID`) comes back **once**, as that component, in place of the
+/// master's occurrence it replaces.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EventInstance {
     /// iCalendar serialisation of the component this occurrence belongs to.
@@ -91,9 +94,11 @@ pub struct EventInstance {
     /// **Shared, not cloned** (#1179): every occurrence of one series points
     /// at the same allocation, because the string is identical across them by
     /// construction — it is the *master* component's serialisation, the same
-    /// bytes for occurrence 1 and occurrence 60 000. It is an [`Arc`] rather
-    /// than an `Rc` because expansion runs on the EDS worker thread and the
-    /// instances are handed to the UI thread.
+    /// bytes for occurrence 1 and occurrence 60 000. (A detached instance
+    /// carries its own component's, and the occurrences a
+    /// `RANGE=THISANDFUTURE` instance reschedules share that one's.) It is an
+    /// [`Arc`] rather than an `Rc` because expansion runs on the EDS worker
+    /// thread and the instances are handed to the UI thread.
     ///
     /// Read it as a `&str` (`&inst.ical` coerces); construct one from a
     /// `String`/`&str` with `.into()`.
@@ -747,19 +752,30 @@ impl CalClient {
     /// [`MAX_OCCURRENCES_PER_COMPONENT`]/[`EXPANSION_BYTES_BUDGET`] and
     /// truncated with one `warn!` (#1179).
     ///
-    /// Implementation: we fetch every master component (`#t`) and expand
-    /// each one with libical's **core recurrence iterator**
+    /// Implementation: we fetch every component (`#t`) and expand each master
+    /// with libical's **core recurrence iterator**
     /// (`i_cal_recur_iterator_new` / `_next`) over the window — the engine
     /// the higher-level `e_cal_*_generate_instances_*` helpers wrap. Driving
-    /// the iterator directly keeps expansion a pure function of the component
-    /// we already hold, independent of EDS backend state. The component's
-    /// `EXDATE` properties (cancelled occurrences) are excluded and its
-    /// `RDATE` properties (extra one-off occurrences) added — see
-    /// `expand_component`.
+    /// the iterator directly keeps expansion a pure function of the components
+    /// we already hold, independent of EDS backend state. A master's `EXDATE`
+    /// properties (cancelled occurrences) are excluded and its `RDATE`
+    /// properties (extra one-off occurrences) added — see `expand_component`.
+    ///
+    /// **Detached instances.** `#t` does not return masters only: an
+    /// occurrence someone edited on its own ("move just this week's meeting to
+    /// Wednesday") is stored as a second component with the master's `UID`
+    /// and a `RECURRENCE-ID` naming the occurrence it replaces, and EDS hands
+    /// it back as a sibling of its master. It is reconciled with the master
+    /// the way `e_cal_client_generate_instances` does it: the master's
+    /// occurrence at that recurrence id is suppressed, and the detached
+    /// component stands in for it at its own time — shown iff that time
+    /// overlaps the window, whichever side of the window the original
+    /// occurrence was on. See `expand_components`.
     pub fn generate_instances(&self, start_unix: i64, end_unix: i64) -> Result<Vec<EventInstance>> {
-        // Fetch every master component. We need the live `ICalComponent*`
-        // (not the iCal string) to expand, so we walk the GSList ourselves
-        // rather than going through `get_object_strings`.
+        // Fetch every component, masters and detached instances alike. We
+        // need the live `ICalComponent*` (not the iCal string) to expand, so
+        // we walk the GSList ourselves rather than going through
+        // `get_object_strings`.
         let s = CString::new("#t").expect("static sexp has no interior NUL");
         let mut out_list: *mut sys::GSList = ptr::null_mut();
         let mut err: *mut sys::GError = ptr::null_mut();
@@ -778,7 +794,9 @@ impl CalClient {
             return Err(take_error(err).unwrap_or_else(|| anyhow!("get_object_list_sync failed")));
         }
 
-        let mut out: Vec<EventInstance> = Vec::new();
+        // A master can only be expanded once every detached instance of it is
+        // known, so collect the whole list before expanding any of it.
+        let mut comps: Vec<*mut sys::ICalComponent> = Vec::new();
         let mut node = out_list;
         while !node.is_null() {
             // SAFETY: `node` is non-null (loop condition) and names a node of
@@ -786,15 +804,18 @@ impl CalClient {
             // glib's layout `#[repr(C)]`; nothing mutates it, P3).
             let comp = unsafe { (*node).data }.cast::<sys::ICalComponent>();
             if !comp.is_null() {
-                // SAFETY: `expand_component`'s contract is a live, borrowed
-                // `ICalComponent*` — `comp` is a non-null element of this
-                // list, alive until the free below, and the callee frees
-                // nothing it does not itself create.
-                unsafe { expand_component(comp, start_unix, end_unix, &mut out) }
+                comps.push(comp);
             }
             // SAFETY: as the `data` read above.
             node = unsafe { (*node).next };
         }
+
+        let mut out: Vec<EventInstance> = Vec::new();
+        // SAFETY: `expand_components`' contract is a slice of live, borrowed
+        // `ICalComponent*`s — each is a non-null element of the list we own,
+        // alive until the free below, and the callee frees nothing it does
+        // not itself create.
+        unsafe { expand_components(&comps, start_unix, end_unix, &mut out) }
 
         // Free the list AND each ICalComponent — list_sync transferred
         // ownership of every element to us.
@@ -1036,6 +1057,16 @@ unsafe fn skip_iterator_to_window(
 ///   with an `EXDATE` (per RFC, EXDATE wins). RDATE can stand alone (no
 ///   RRULE), adding occurrences alongside DTSTART.
 ///
+/// …and then the series' **detached instances** (`overrides`, gathered from
+/// its sibling components by [`expand_components`]): an occurrence whose
+/// recurrence id — its own start, as the master defines it — is overridden is
+/// not emitted here, because the detached component is emitted in its place;
+/// and an occurrence after a `RANGE=THISANDFUTURE` override is rescheduled by
+/// it ([`FutureOverride`]). Since a rescheduled occurrence may come from
+/// outside the window, the series is expanded over the window widened by the
+/// furthest such shift ([`SeriesOverrides::reach`]); what is *emitted* is
+/// still filtered against the real window.
+///
 /// ## Bounded work (#1179)
 ///
 /// The window is not by itself a bound on *work*: `FREQ=MINUTELY` over the
@@ -1071,6 +1102,7 @@ unsafe fn expand_component(
     comp: *mut sys::ICalComponent,
     start_unix: i64,
     end_unix: i64,
+    overrides: Option<&SeriesOverrides>,
     out: &mut Vec<EventInstance>,
 ) {
     // DTSTART (owned). No DTSTART ⇒ undatable ⇒ skip.
@@ -1092,21 +1124,9 @@ unsafe fn expand_component(
     // SAFETY: as the `ical_time_to_unix` call above — null or live borrow, and
     // `dtstart` is live here (the `else` arm returned).
     let all_day = unsafe { ical_time_is_date(dtstart) };
-
-    // Duration = DTEND − DTSTART when DTEND is present; else 0.
-    // SAFETY: `comp` is live; this returns a new `ICalTime` ref (or null),
-    // released a few lines below.
-    let dtend = unsafe { sys::i_cal_component_get_dtend(comp) };
-    // SAFETY: null or a live borrow, as above.
-    let duration = match unsafe { ical_time_to_unix(dtend) } {
-        Some(e) if e >= dtstart_unix => e - dtstart_unix,
-        _ => 0,
-    };
-    if !dtend.is_null() {
-        // SAFETY: the new ref taken above, released exactly once; `dtend` is
-        // not used again.
-        unsafe { sys::g_object_unref(dtend) }
-    }
+    // SAFETY: `comp` is live by this function's contract, which is all
+    // `component_duration` asks.
+    let duration = unsafe { component_duration(comp, dtstart_unix) };
 
     // The component's iCal serialisation (metadata: UID/SUMMARY/LOCATION/…),
     // identical across a series' occurrences — so it is materialised **once**
@@ -1137,7 +1157,22 @@ unsafe fn expand_component(
     // true` selects the `ICalDatetimeperiod` accessor an RDATE value needs.
     let rdates = unsafe { collect_property_times(comp, sys::I_CAL_RDATE_PROPERTY, true) };
 
-    let mut emit = Emitter::new(ical, exdates, duration, all_day, start_unix, end_unix);
+    // The recurrence ids to expand over: the window, widened by however far
+    // a `THISANDFUTURE` override moves occurrences, so one rescheduled into
+    // the window from outside it is still generated. Zero for every series
+    // without such an override, which is nearly all of them.
+    let (reach_before, reach_after) = overrides.map_or((0, 0), SeriesOverrides::reach);
+    let ids_from = start_unix.saturating_sub(reach_before);
+    let ids_until = end_unix.saturating_add(reach_after);
+
+    let mut emit = Emitter::new(
+        ical,
+        exdates,
+        duration,
+        all_day,
+        (start_unix, end_unix),
+        overrides,
+    );
 
     // Set once the work budget (or the iteration guard) cut the expansion
     // short, so the `warn!` below fires exactly once per component however
@@ -1199,7 +1234,7 @@ unsafe fn expand_component(
                 // not itself create and hands back the iterator this scope
                 // now owns.
                 unsafe {
-                    skip_iterator_to_window(&mut iter, rule, dtstart, dtstart_unix, start_unix);
+                    skip_iterator_to_window(&mut iter, rule, dtstart, dtstart_unix, ids_from);
                 }
                 if !iter.is_null() {
                     // A defensive cap: even with the time-window stop condition, a
@@ -1234,7 +1269,7 @@ unsafe fn expand_component(
                             // the `i64` extracted from it is).
                             unsafe { sys::g_object_unref(occ) }
                         }
-                        if occ_unix >= end_unix {
+                        if occ_unix >= ids_until {
                             break; // past the window ⇒ done
                         }
                         if !emit.emit(out, occ_unix) {
@@ -1299,11 +1334,12 @@ unsafe fn expand_component(
 }
 
 /// Accumulates one component's occurrences into the caller's output vector,
-/// applying — in this order — EXDATE exclusion, the query window, dedup, and
-/// the #1179 work budget. Split out of [`expand_component`] so the budget
-/// lives in one readable place (and so that function stays under clippy's
-/// `too_many_lines`); it holds no raw pointer and needs no `unsafe`.
-struct Emitter {
+/// applying — in this order — EXDATE exclusion, the series' detached
+/// instances, the query window, dedup, and the #1179 work budget. Split out of
+/// [`expand_component`] so the budget lives in one readable place (and so that
+/// function stays under clippy's `too_many_lines`); it holds no raw pointer
+/// and needs no `unsafe`.
+struct Emitter<'a> {
     /// The component's serialisation, shared by every occurrence it emits.
     ical: Arc<str>,
     /// Cancelled starts (EXDATE), hashed because this is probed once per
@@ -1318,19 +1354,23 @@ struct Emitter {
     all_day: bool,
     window_start: i64,
     window_end: i64,
+    /// What the series' detached instances do to its occurrences; `None` for
+    /// a series that has none (and for a detached instance's own emission).
+    overrides: Option<&'a SeriesOverrides>,
     /// Whichever of [`MAX_OCCURRENCES_PER_COMPONENT`] and
     /// [`EXPANSION_BYTES_BUDGET`] binds first for this component's body size.
     max_occurrences: usize,
 }
 
-impl Emitter {
+impl<'a> Emitter<'a> {
+    /// `window` is the query window `[start, end)` in UTC seconds.
     fn new(
         ical: Arc<str>,
         exdates: HashSet<i64>,
         duration: i64,
         all_day: bool,
-        window_start: i64,
-        window_end: i64,
+        (window_start, window_end): (i64, i64),
+        overrides: Option<&'a SeriesOverrides>,
     ) -> Self {
         // At least one occurrence, so a component with an absurdly large body
         // still yields its first instance rather than vanishing.
@@ -1345,16 +1385,19 @@ impl Emitter {
             all_day,
             window_start,
             window_end,
+            overrides,
             max_occurrences,
         }
     }
 
-    /// Push the occurrence starting at `occ_unix`, if it survives the filters.
+    /// Push the occurrence whose recurrence id (its start as the series
+    /// defines it) is `occ_unix`, if it survives the filters.
     ///
     /// Returns `false` **only** once the work budget is spent, so a caller
     /// stops iterating instead of spinning the recurrence iterator for
     /// occurrences it would discard. A merely filtered-out occurrence (EXDATE,
-    /// outside the window, duplicate) returns `true`: it consumed no budget.
+    /// detached, outside the window, duplicate) returns `true`: it consumed no
+    /// budget.
     fn emit(&mut self, out: &mut Vec<EventInstance>, occ_unix: i64) -> bool {
         // EXDATE excludes; the window bounds the rest. An occurrence is kept
         // when it starts before the window end and its end is at/after the
@@ -1362,25 +1405,357 @@ impl Emitter {
         if self.exdates.contains(&occ_unix) {
             return true;
         }
-        let end_unix = occ_unix + self.duration;
-        if occ_unix >= self.window_end || end_unix < self.window_start {
+        // Copied out of `self` so the borrow it hands back is `'a`, not one
+        // of `self` — `self.emitted` is mutated below while it is held.
+        let overrides = self.overrides;
+        // A detached instance stands in for this occurrence; it is emitted on
+        // its own (`expand_components`), at its own time, so emitting this one
+        // too would show the event twice.
+        if overrides.is_some_and(|o| o.replaced.contains(&occ_unix)) {
             return true;
         }
-        if self.emitted.contains(&(occ_unix, end_unix)) {
+        // A `THISANDFUTURE` override before it reschedules it.
+        let rescheduled = overrides.and_then(|o| o.future_for(occ_unix));
+        let (start_unix, duration, all_day) = match rescheduled {
+            Some(f) => (occ_unix.saturating_add(f.shift), f.duration, f.all_day),
+            None => (occ_unix, self.duration, self.all_day),
+        };
+        let end_unix = start_unix.saturating_add(duration);
+        if start_unix >= self.window_end || end_unix < self.window_start {
+            return true;
+        }
+        if self.emitted.contains(&(start_unix, end_unix)) {
             return true;
         }
         if self.emitted.len() >= self.max_occurrences {
             return false;
         }
-        self.emitted.insert((occ_unix, end_unix));
+        self.emitted.insert((start_unix, end_unix));
         out.push(EventInstance {
-            ical: Arc::clone(&self.ical),
-            start_unix: occ_unix,
+            ical: Arc::clone(rescheduled.map_or(&self.ical, |f| &f.ical)),
+            start_unix,
             end_unix,
-            all_day: self.all_day,
+            all_day,
         });
         true
     }
+}
+
+// ── Detached recurrence instances ────────────────────────────────────────────
+//
+// RFC 5545 §3.8.4.4: an occurrence of a recurring event edited on its own —
+// moved, retitled, cancelled — is stored as a second component with the
+// series' `UID` and a `RECURRENCE-ID` naming the occurrence it replaces. EDS
+// hands it back from `get_object_list_sync` as a *sibling* of the master, not
+// inside it (the CalDAV backend's cache keys components by `(uid, rid)`), so
+// nothing about the master says which of its occurrences are overridden.
+// Expanding each component on its own — what this crate did before — shows a
+// weekly meeting moved from Tuesday 10:00 to Wednesday 11:00 at **both**
+// times. `expand_components` reconciles the two the way EDS's own
+// `e_cal_client_generate_instances` (`e-cal-client.c`, `generate_instances` /
+// `process_detached_instances`) does:
+//
+// - the master's occurrence whose recurrence id matches is not emitted;
+// - the detached component is emitted once, at its **own** DTSTART/DTEND, and
+//   never expanded (an RRULE copied onto it by a client is ignored);
+// - each is filtered against the window on its own times, so an occurrence
+//   moved out of the window disappears from it and one moved in appears —
+//   whichever side the original was on;
+// - a detached component whose master is not in the list (or has no UID)
+//   still shows, standing alone.
+//
+// One thing EDS does not do is applied too: a `RANGE=THISANDFUTURE` override
+// also reschedules every later occurrence of its series, as RFC 5545
+// §3.8.4.4 specifies ("all subsequent instances are also rescheduled by the
+// same time difference … [and] modified to have this same duration"), taking
+// its properties as well — see `FutureOverride`. EDS, Thunderbird and Nextcloud
+// all *split* a series rather than write one, so this is rare; it is handled
+// so that, when one does arrive, the rescheduled occurrences are not shown at
+// their old times.
+
+/// A detached recurrence instance, read once, up front, by
+/// [`expand_components`] — the master needs to know its recurrence id before
+/// it is expanded, and emitting it afterwards then needs no FFI.
+struct Detached {
+    /// The series it belongs to. `None` (a component with no `UID`) overrides
+    /// nothing and is just shown.
+    uid: Option<String>,
+    /// The instant its `RECURRENCE-ID` names — the master occurrence it
+    /// replaces — normalised exactly as that occurrence is (through
+    /// [`ical_time_to_unix`], with the `TZID` resolved as DTSTART's is), so
+    /// the two compare equal. `None` if unreadable: it then overrides nothing.
+    recurrence_id: Option<i64>,
+    /// `RANGE=THISANDFUTURE` on the `RECURRENCE-ID`.
+    this_and_future: bool,
+    /// Its own DTSTART, `None` if undatable (it is then not shown, though it
+    /// still suppresses the occurrence it replaces).
+    start: Option<i64>,
+    /// Its own `DTEND − DTSTART` (0 if absent).
+    duration: i64,
+    all_day: bool,
+    /// Its own serialisation — what the calendar shows for it.
+    ical: Arc<str>,
+}
+
+/// What one series' detached instances do to its master's occurrences, keyed
+/// by recurrence id.
+#[derive(Default)]
+struct SeriesOverrides {
+    /// The recurrence id of every detached instance of the series, whatever
+    /// its `RANGE`: the master's occurrence there is not emitted, because the
+    /// detached component is.
+    replaced: HashSet<i64>,
+    /// The series' `RANGE=THISANDFUTURE` instances, sorted by recurrence id.
+    future: Vec<FutureOverride>,
+}
+
+/// A `RANGE=THISANDFUTURE` detached instance's effect on the master's
+/// occurrences **after** it (RFC 5545 §3.8.4.4): each is moved by the same
+/// time difference the detached instance was, takes its duration, and — as
+/// Evolution shows it — its properties. "After" is by recurrence id, and a
+/// later detached instance of either range wins over it ("subsequent
+/// instances defined in separate components are not impacted").
+struct FutureOverride {
+    recurrence_id: i64,
+    /// Detached DTSTART − recurrence id.
+    shift: i64,
+    duration: i64,
+    all_day: bool,
+    ical: Arc<str>,
+}
+
+impl SeriesOverrides {
+    /// The `THISANDFUTURE` instance governing the occurrence with recurrence
+    /// id `occ`: the latest one strictly before it. One *at* `occ` is in
+    /// `replaced`, which the caller checks first.
+    fn future_for(&self, occ: i64) -> Option<&FutureOverride> {
+        let before = self.future.partition_point(|f| f.recurrence_id < occ);
+        before.checked_sub(1).map(|i| &self.future[i])
+    }
+
+    /// How far before and after the window the master's recurrence ids must
+    /// be expanded for every occurrence a `THISANDFUTURE` override moves *into*
+    /// the window to be found: one moved later by `shift` comes from up to
+    /// `shift + duration` before the window start (it still overlaps the
+    /// window if its new end does), one moved earlier from up to `-shift`
+    /// after the window end. `(0, 0)` without such an override.
+    fn reach(&self) -> (i64, i64) {
+        let before = self
+            .future
+            .iter()
+            .map(|f| f.shift.saturating_add(f.duration))
+            .max()
+            .unwrap_or(0)
+            .max(0);
+        let after = self
+            .future
+            .iter()
+            .map(|f| f.shift.saturating_neg())
+            .max()
+            .unwrap_or(0)
+            .max(0);
+        (before, after)
+    }
+}
+
+/// Expand every component `get_object_list_sync` handed back — masters, and
+/// the detached instances that override some of their occurrences — over
+/// `[start_unix, end_unix)`, pushing each occurrence into `out`. See the
+/// "Detached recurrence instances" notes above for the reconciliation.
+///
+/// Two passes: the first reads every component's `RECURRENCE-ID` and indexes
+/// the detached ones by `UID`, because a master may come before or after its
+/// detached instances in the list; the second expands each master with its
+/// series' overrides ([`expand_component`]) and emits each detached instance
+/// once, at its own time.
+///
+/// # Safety
+///
+/// Every pointer in `comps` must be a live `ICalComponent*` (a VEVENT) for
+/// the whole call. Borrowed — none is freed here.
+unsafe fn expand_components(
+    comps: &[*mut sys::ICalComponent],
+    start_unix: i64,
+    end_unix: i64,
+    out: &mut Vec<EventInstance>,
+) {
+    let detached: Vec<Option<Detached>> = comps
+        .iter()
+        // SAFETY: each `comp` is live and borrowed for this call (this
+        // function's contract), which is all `read_detached` asks.
+        .map(|&comp| unsafe { read_detached(comp) })
+        .collect();
+
+    let mut series: HashMap<&str, SeriesOverrides> = HashMap::new();
+    for d in detached.iter().flatten() {
+        let (Some(uid), Some(recurrence_id)) = (d.uid.as_deref(), d.recurrence_id) else {
+            continue;
+        };
+        let overrides = series.entry(uid).or_default();
+        overrides.replaced.insert(recurrence_id);
+        if let (true, Some(start)) = (d.this_and_future, d.start) {
+            overrides.future.push(FutureOverride {
+                recurrence_id,
+                shift: start.saturating_sub(recurrence_id),
+                duration: d.duration,
+                all_day: d.all_day,
+                ical: Arc::clone(&d.ical),
+            });
+        }
+    }
+    for overrides in series.values_mut() {
+        overrides.future.sort_by_key(|f| f.recurrence_id);
+    }
+
+    for (&comp, detached) in comps.iter().zip(&detached) {
+        if let Some(d) = detached {
+            emit_detached(d, start_unix, end_unix, out);
+        } else {
+            // SAFETY: `comp` is live (this function's contract); the UID is
+            // copied out before the borrow ends.
+            let uid = unsafe { component_uid(comp) };
+            let overrides = uid.as_deref().and_then(|uid| series.get(uid));
+            // SAFETY: `comp` is a live, borrowed VEVENT — exactly
+            // `expand_component`'s contract — and that callee frees nothing it
+            // did not create.
+            unsafe { expand_component(comp, start_unix, end_unix, overrides, out) }
+        }
+    }
+}
+
+/// Emit a detached instance once, at its own time, if that overlaps the
+/// window. It is never expanded: a `RECURRENCE-ID` component is one occurrence
+/// by definition, even if a client copied the master's RRULE onto it.
+fn emit_detached(d: &Detached, start_unix: i64, end_unix: i64, out: &mut Vec<EventInstance>) {
+    let Some(start) = d.start else {
+        return;
+    };
+    Emitter::new(
+        Arc::clone(&d.ical),
+        HashSet::new(),
+        d.duration,
+        d.all_day,
+        (start_unix, end_unix),
+        None,
+    )
+    .emit(out, start);
+}
+
+/// The [`Detached`] reading of `comp` if it carries a `RECURRENCE-ID`; `None`
+/// for a master (no `RECURRENCE-ID` property at all).
+///
+/// # Safety
+///
+/// `comp` must be a live `ICalComponent*`. Borrowed — never freed here. Every
+/// libical object this creates is released before it returns.
+unsafe fn read_detached(comp: *mut sys::ICalComponent) -> Option<Detached> {
+    // SAFETY: `comp` is live (this function's contract) and
+    // `I_CAL_RECURRENCEID_PROPERTY` is libical's discriminant for the
+    // property; a **new** property ref (or null), released below.
+    let prop =
+        unsafe { sys::i_cal_component_get_first_property(comp, sys::I_CAL_RECURRENCEID_PROPERTY) };
+    if prop.is_null() {
+        return None;
+    }
+    // Resolved against `comp` exactly as DTSTART is, so a `TZID`'d id compares
+    // equal to the zoned occurrence it names (see the `sys` declaration for
+    // why not `i_cal_component_get_recurrenceid`).
+    //
+    // SAFETY: `prop` is the non-null property just taken and `comp` the live
+    // component it belongs to; both are borrowed, and the time comes back as
+    // a **new** ref (or null), released below.
+    let rid_time = unsafe { sys::i_cal_property_get_datetime_with_component(prop, comp) };
+    // SAFETY: null or a live borrow of the ref just taken.
+    let recurrence_id = unsafe { ical_time_to_unix(rid_time) };
+    if !rid_time.is_null() {
+        // SAFETY: that new ref, released exactly once; only the `i64` read out
+        // of it is used afterwards.
+        unsafe { sys::g_object_unref(rid_time) }
+    }
+    // SAFETY: `prop` is still the live property we hold, and
+    // `I_CAL_RANGE_PARAMETER` is libical's `ICalParameterKind` for `RANGE=`;
+    // a **new** wrapper ref (or null), released below.
+    let range =
+        unsafe { sys::i_cal_property_get_first_parameter(prop, sys::I_CAL_RANGE_PARAMETER) };
+    let this_and_future = !range.is_null()
+        // SAFETY: short-circuit — reached only for the non-null parameter just
+        // taken, read without taking ownership; the `c_int` is compared, never
+        // transmuted.
+        && unsafe { sys::i_cal_parameter_get_range(range.cast_const()) }
+            == sys::I_CAL_RANGE_THISANDFUTURE;
+    if !range.is_null() {
+        // SAFETY: the wrapper ref taken above, released exactly once (the
+        // native parameter is the property's and is not freed by this).
+        unsafe { sys::g_object_unref(range) }
+    }
+    // SAFETY: the property ref taken at the top, released exactly once, after
+    // everything read from it.
+    unsafe { sys::g_object_unref(prop) }
+
+    // SAFETY: `comp` is live; a **new** `ICalTime` ref (or null), released
+    // below.
+    let dtstart = unsafe { sys::i_cal_component_get_dtstart(comp) };
+    // SAFETY: null or a live borrow of the ref just taken.
+    let start = unsafe { ical_time_to_unix(dtstart) };
+    // SAFETY: as above.
+    let all_day = unsafe { ical_time_is_date(dtstart) };
+    if !dtstart.is_null() {
+        // SAFETY: that new ref, released exactly once and not used again.
+        unsafe { sys::g_object_unref(dtstart) }
+    }
+    // SAFETY: `comp` is live, which is all `component_duration` asks.
+    let duration = start.map_or(0, |s| unsafe { component_duration(comp, s) });
+
+    Some(Detached {
+        // SAFETY: `comp` is live; the UID is copied out.
+        uid: unsafe { component_uid(comp) },
+        recurrence_id,
+        this_and_future,
+        start,
+        duration,
+        all_day,
+        // SAFETY: `comp` is live; `component_ical_string` borrows and frees
+        // nothing.
+        ical: Arc::from(unsafe { component_ical_string(comp) }),
+    })
+}
+
+/// `DTEND − DTSTART` of `comp` in seconds, given its DTSTART as
+/// `dtstart_unix`; 0 when DTEND is absent, undatable or before DTSTART (the
+/// calendar service fabricates a UI duration for a zero-length instance).
+/// libical's DTEND accessor already derives the end from a `DURATION`
+/// property when there is no `DTEND`.
+///
+/// # Safety
+///
+/// `comp` must be a live `ICalComponent*`. Borrowed — never freed here.
+unsafe fn component_duration(comp: *mut sys::ICalComponent, dtstart_unix: i64) -> i64 {
+    // SAFETY: `comp` is live (this function's contract); this returns a new
+    // `ICalTime` ref (or null), released below.
+    let dtend = unsafe { sys::i_cal_component_get_dtend(comp) };
+    // SAFETY: null or a live borrow of the ref just taken.
+    let duration = match unsafe { ical_time_to_unix(dtend) } {
+        Some(e) if e >= dtstart_unix => e - dtstart_unix,
+        _ => 0,
+    };
+    if !dtend.is_null() {
+        // SAFETY: the new ref taken above, released exactly once; `dtend` is
+        // not used again.
+        unsafe { sys::g_object_unref(dtend) }
+    }
+    duration
+}
+
+/// The `UID` of `comp`, copied out; `None` if it has none.
+///
+/// # Safety
+///
+/// `comp` must be a live `ICalComponent*`. Borrowed — never freed here.
+unsafe fn component_uid(comp: *mut sys::ICalComponent) -> Option<String> {
+    // SAFETY: `comp` is live (this function's contract); the accessor returns
+    // a `const char*` the component owns (transfer none), which
+    // `borrowed_cstr` copies before this borrow ends and never frees.
+    unsafe { borrowed_cstr(sys::i_cal_component_get_uid(comp)) }
 }
 
 /// The value of the first `UID:` property line in an iCal serialisation, for
@@ -1509,7 +1884,9 @@ unsafe fn rdate_property_to_unix(prop: *mut sys::ICalProperty) -> Option<i64> {
 /// Pure-libical recurrence expansion of an iCalendar VEVENT string over a
 /// UTC window, with **no EDS backend** — exposed so the recurrence path can
 /// be exercised hermetically (the crate's unit tests use it). Parses `ical`,
-/// expands the first VEVENT it finds, and returns the occurrences.
+/// expands the first VEVENT it finds, and returns the occurrences. For a
+/// calendar whose VEVENTs must be expanded together (a master and its
+/// detached instances), use [`expand_calendar_for_test`].
 pub fn expand_ical_for_test(
     ical: &str,
     start_unix: i64,
@@ -1519,9 +1896,31 @@ pub fn expand_ical_for_test(
     let mut out = Vec::new();
     // SAFETY: `comp.raw` is the live VEVENT `parse_vevent` just produced and
     // this scope owns until the `drop` below — exactly the borrowed, live
-    // `ICalComponent*` `expand_component` requires.
-    unsafe { expand_component(comp.raw, start_unix, end_unix, &mut out) }
+    // `ICalComponent*` `expand_components` requires of each element.
+    unsafe { expand_components(&[comp.raw], start_unix, end_unix, &mut out) }
     drop(comp);
+    Ok(out)
+}
+
+/// [`expand_ical_for_test`] for a whole VCALENDAR: **every** VEVENT in `ical`
+/// is expanded together, through the same reconciliation
+/// [`CalClient::generate_instances`] applies to the components EDS hands
+/// back — so a recurring master and its detached instances (same `UID`, one
+/// carrying `RECURRENCE-ID`) come out as a calendar shows them, not each on
+/// its own. A bare VEVENT is a calendar of one.
+pub fn expand_calendar_for_test(
+    ical: &str,
+    start_unix: i64,
+    end_unix: i64,
+) -> Result<Vec<EventInstance>> {
+    let calendar = parse_vevents(ical)?;
+    let comps: Vec<*mut sys::ICalComponent> = calendar.events.iter().map(|c| c.raw).collect();
+    let mut out = Vec::new();
+    // SAFETY: every element is the `raw` of a `Component` `calendar` owns
+    // until the `drop` below — live, borrowed `ICalComponent*`s, which is
+    // `expand_components`' contract.
+    unsafe { expand_components(&comps, start_unix, end_unix, &mut out) }
+    drop(calendar);
     Ok(out)
 }
 
@@ -2283,6 +2682,60 @@ fn parse_vevent(ical: &str) -> Result<Component> {
         return Ok(Component { raw: inner });
     }
     bail!("libical: parsed body had no VEVENT child");
+}
+
+/// Every VEVENT of a parsed iCalendar body, for [`expand_calendar_for_test`].
+/// `events` is declared first so it drops first; each child wrapper also holds
+/// its own ref on `_root` (libical-glib's owner ref), so the order is
+/// belt-and-braces.
+struct ParsedCalendar {
+    events: Vec<Component>,
+    /// Never read: the VCALENDAR the events were taken from, held so the
+    /// parsed tree outlives their handles. `None` for a bare VEVENT body,
+    /// which is its own single event.
+    _root: Option<Component>,
+}
+
+/// Like [`parse_vevent`], but every VEVENT, in document order: a bare VEVENT
+/// body is a list of one, a VCALENDAR the list of its VEVENT children.
+fn parse_vevents(ical: &str) -> Result<ParsedCalendar> {
+    let c = CString::new(ical).context("ical body contained an interior NUL")?;
+    // SAFETY: as `parse_component` — a live `CString` outliving the call, and
+    // a new component ref (or null) adopted below.
+    let raw = unsafe { sys::i_cal_parser_parse_string(c.as_ptr()) };
+    if raw.is_null() {
+        bail!("libical: failed to parse iCalendar body");
+    }
+    let root = Component { raw };
+    // SAFETY: `root.raw` is that live component; `isa` only reads it and its
+    // `c_int` result is compared, never transmuted.
+    if unsafe { sys::i_cal_component_isa(root.raw) } == sys::I_CAL_VEVENT_COMPONENT {
+        return Ok(ParsedCalendar {
+            events: vec![root],
+            _root: None,
+        });
+    }
+    let mut events = Vec::new();
+    // SAFETY: as the loop in `parse_component` — live component, a real
+    // `ICalComponentKind` variant, a new ref or null.
+    let mut child = unsafe {
+        sys::i_cal_component_get_first_component(root.raw, sys::ICalComponentKind::Vevent)
+    };
+    while !child.is_null() {
+        events.push(Component { raw: child });
+        // SAFETY: the same live parent and kind, continuing the walk the
+        // `get_first_component` call above began; a new ref or null.
+        child = unsafe {
+            sys::i_cal_component_get_next_component(root.raw, sys::ICalComponentKind::Vevent)
+        };
+    }
+    if events.is_empty() {
+        bail!("libical: parsed body had no VEVENT child");
+    }
+    Ok(ParsedCalendar {
+        events,
+        _root: Some(root),
+    })
 }
 
 // ── GError helpers ───────────────────────────────────────────────────────────
@@ -3116,6 +3569,417 @@ mod tests {
         let mut starts: Vec<i64> = inst.iter().map(|e| e.start_unix).collect();
         starts.sort_unstable();
         assert_eq!(starts, vec![ANCHOR_0900, ANCHOR_0900 + 4 * 86_400]);
+    }
+
+    // ── Detached recurrence instances (RECURRENCE-ID) ─────────────────────
+    //
+    // A recurring event with one occurrence edited on its own comes back from
+    // EDS as two components with one UID: the master, and a detached instance
+    // carrying `RECURRENCE-ID`. `expand_calendar_for_test` expands every
+    // VEVENT of a VCALENDAR together, through the same `expand_components`
+    // `generate_instances` runs over what EDS hands back, so these drive the
+    // production reconciliation — hermetically, from iCalendar text, with no
+    // EDS. Fixtures carry the Berlin `VTIMEZONE` inline (the shape a synced
+    // CalDAV calendar delivers) so the zoned recurrence ids resolve without
+    // host zoneinfo.
+    //
+    // The series: "Weekly sync", Tuesdays 10:00–11:00 Berlin (08:00Z in
+    // CEST) from 2026-06-02 — so June's occurrences are the 2nd, 9th, 16th,
+    // 23rd and 30th.
+
+    /// The weekly master every fixture below shares.
+    const WEEKLY_MASTER: &str = "UID:weekly-1\r\nDTSTAMP:20260501T000000Z\r\n\
+         DTSTART;TZID=Europe/Berlin:20260602T100000\r\n\
+         DTEND;TZID=Europe/Berlin:20260602T110000\r\n\
+         RRULE:FREQ=WEEKLY\r\nSUMMARY:Weekly sync\r\n";
+
+    /// The usual edit: the 2026-06-09 occurrence moved to Wednesday the 10th,
+    /// 11:00–12:00 Berlin, with its own title.
+    const WEEKLY_MOVED_JUN9: &str = "UID:weekly-1\r\nDTSTAMP:20260601T000000Z\r\n\
+         RECURRENCE-ID;TZID=Europe/Berlin:20260609T100000\r\n\
+         DTSTART;TZID=Europe/Berlin:20260610T110000\r\n\
+         DTEND;TZID=Europe/Berlin:20260610T120000\r\n\
+         SEQUENCE:1\r\nSUMMARY:Weekly sync (moved)\r\n";
+
+    /// A VCALENDAR with the inline Berlin `VTIMEZONE` and one VEVENT per body,
+    /// in the order given.
+    fn berlin_calendar_of(vevent_bodies: &[&str]) -> String {
+        let mut ical = format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//hytte-ecal-test//\r\n{BERLIN_VTIMEZONE}"
+        );
+        for body in vevent_bodies {
+            ical.push_str("BEGIN:VEVENT\r\n");
+            ical.push_str(body);
+            ical.push_str("END:VEVENT\r\n");
+        }
+        ical.push_str("END:VCALENDAR\r\n");
+        ical
+    }
+
+    /// The instances' starts, sorted (emission order is per component, and
+    /// these tests are about the set the calendar shows).
+    fn sorted_starts(instances: &[super::EventInstance]) -> Vec<i64> {
+        let mut starts: Vec<i64> = instances.iter().map(|e| e.start_unix).collect();
+        starts.sort_unstable();
+        starts
+    }
+
+    /// June's five Tuesdays at 08:00Z — the master alone.
+    fn june_tuesdays() -> Vec<i64> {
+        [2, 9, 16, 23, 30]
+            .into_iter()
+            .map(|day| utc(2026, 6, day, 8, 0))
+            .collect()
+    }
+
+    /// Control: expanded on its own, the master is June's five Tuesdays — so
+    /// anything the tests below remove is the detached instance's doing.
+    #[test]
+    fn the_weekly_master_alone_is_junes_five_tuesdays() {
+        let ical = berlin_calendar_of(&[WEEKLY_MASTER]);
+        let inst = super::expand_calendar_for_test(&ical, JUN_START, JUL_START).unwrap();
+        assert_eq!(sorted_starts(&inst), june_tuesdays());
+    }
+
+    /// The finding, as a test: a weekly meeting moved from Tuesday 10:00 to
+    /// Wednesday 11:00 must show **once**, at the new time. Before the fix the
+    /// master and the detached instance were each expanded on their own, so
+    /// the calendar showed it on both days — six instances, Jun 9 among them.
+    #[test]
+    fn a_moved_occurrence_shows_once_at_its_new_time() {
+        let ical = berlin_calendar_of(&[WEEKLY_MASTER, WEEKLY_MOVED_JUN9]);
+        let inst = super::expand_calendar_for_test(&ical, JUN_START, JUL_START).unwrap();
+
+        let jun9 = utc(2026, 6, 9, 8, 0);
+        let moved = utc(2026, 6, 10, 9, 0); // 11:00 CEST
+        let mut expected: Vec<i64> = june_tuesdays().into_iter().filter(|&s| s != jun9).collect();
+        expected.push(moved);
+        expected.sort_unstable();
+        assert_eq!(
+            sorted_starts(&inst),
+            expected,
+            "the Jun 9 occurrence must be replaced by the Jun 10 one, not joined by it",
+        );
+
+        let shown = inst.iter().find(|e| e.start_unix == moved).unwrap();
+        assert_eq!(
+            shown.end_unix,
+            moved + 3_600,
+            "the detached instance's own DTEND"
+        );
+        assert!(
+            shown.ical.contains("Weekly sync (moved)") && shown.ical.contains("RECURRENCE-ID"),
+            "the moved occurrence carries the detached component, not the master",
+        );
+        assert!(
+            inst.iter()
+                .filter(|e| e.start_unix != moved)
+                .all(|e| !e.ical.contains("RECURRENCE-ID")),
+            "every other occurrence is the master's",
+        );
+    }
+
+    /// EDS hands components back in no particular order; a detached instance
+    /// listed before its master must reconcile the same way.
+    #[test]
+    fn a_detached_instance_listed_before_its_master_reconciles_the_same() {
+        let master_first = berlin_calendar_of(&[WEEKLY_MASTER, WEEKLY_MOVED_JUN9]);
+        let detached_first = berlin_calendar_of(&[WEEKLY_MOVED_JUN9, WEEKLY_MASTER]);
+        let a = super::expand_calendar_for_test(&master_first, JUN_START, JUL_START).unwrap();
+        let b = super::expand_calendar_for_test(&detached_first, JUN_START, JUL_START).unwrap();
+        assert_eq!(sorted_starts(&a), sorted_starts(&b));
+        assert_eq!(b.len(), 5);
+    }
+
+    /// The occurrence the override names is inside the window but it was moved
+    /// out of it: the window shows neither — not the old time (suppressed) and
+    /// not the new one (outside).
+    #[test]
+    fn an_occurrence_moved_out_of_the_window_leaves_it() {
+        let moved_out = "UID:weekly-1\r\nDTSTAMP:20260601T000000Z\r\n\
+             RECURRENCE-ID;TZID=Europe/Berlin:20260630T100000\r\n\
+             DTSTART;TZID=Europe/Berlin:20260702T100000\r\n\
+             DTEND;TZID=Europe/Berlin:20260702T110000\r\nSUMMARY:Weekly sync (July)\r\n";
+        let ical = berlin_calendar_of(&[WEEKLY_MASTER, moved_out]);
+
+        let june = super::expand_calendar_for_test(&ical, JUN_START, JUL_START).unwrap();
+        assert_eq!(
+            sorted_starts(&june),
+            june_tuesdays()[..4],
+            "Jun 30 left June; nothing replaces it inside the window",
+        );
+
+        // …and the window it was moved into does show it, once.
+        let jul_8 = utc(2026, 7, 8, 0, 0);
+        let early_july = super::expand_calendar_for_test(&ical, JUL_START, jul_8).unwrap();
+        assert_eq!(
+            sorted_starts(&early_july),
+            vec![utc(2026, 7, 2, 8, 0), utc(2026, 7, 7, 8, 0)],
+            "Jul 2 (the moved one) and the master's Jul 7",
+        );
+    }
+
+    /// The other direction: the occurrence the override names is *outside* the
+    /// window (the first Tuesday of July), but it was moved into it (Monday
+    /// June 29). It shows in June once; July no longer has it.
+    #[test]
+    fn an_occurrence_moved_into_the_window_from_outside_appears_once() {
+        let moved_in = "UID:weekly-1\r\nDTSTAMP:20260601T000000Z\r\n\
+             RECURRENCE-ID;TZID=Europe/Berlin:20260707T100000\r\n\
+             DTSTART;TZID=Europe/Berlin:20260629T150000\r\n\
+             DTEND;TZID=Europe/Berlin:20260629T160000\r\nSUMMARY:Weekly sync (early)\r\n";
+        let ical = berlin_calendar_of(&[WEEKLY_MASTER, moved_in]);
+
+        let june = super::expand_calendar_for_test(&ical, JUN_START, JUL_START).unwrap();
+        let mut expected = june_tuesdays();
+        expected.push(utc(2026, 6, 29, 13, 0));
+        expected.sort_unstable();
+        assert_eq!(sorted_starts(&june), expected);
+
+        let jul_8 = utc(2026, 7, 8, 0, 0);
+        let early_july = super::expand_calendar_for_test(&ical, JUL_START, jul_8).unwrap();
+        assert!(
+            early_july.is_empty(),
+            "Jul 7 was moved into June, so early July shows nothing — got {:?}",
+            sorted_starts(&early_july),
+        );
+    }
+
+    /// The recurrence id is matched as an **instant**, not as text: a server
+    /// that writes it in UTC (`…Z`) for a master zoned in `Europe/Berlin` —
+    /// common in the wild — still names the same occurrence.
+    #[test]
+    fn a_utc_recurrence_id_matches_a_zoned_master_occurrence() {
+        let utc_rid = "UID:weekly-1\r\nDTSTAMP:20260601T000000Z\r\n\
+             RECURRENCE-ID:20260609T080000Z\r\n\
+             DTSTART;TZID=Europe/Berlin:20260610T110000\r\n\
+             DTEND;TZID=Europe/Berlin:20260610T120000\r\nSUMMARY:Weekly sync (moved)\r\n";
+        let ical = berlin_calendar_of(&[WEEKLY_MASTER, utc_rid]);
+        let inst = super::expand_calendar_for_test(&ical, JUN_START, JUL_START).unwrap();
+        assert_eq!(
+            inst.len(),
+            5,
+            "replaced, not duplicated: {:?}",
+            sorted_starts(&inst)
+        );
+        assert!(!sorted_starts(&inst).contains(&utc(2026, 6, 9, 8, 0)));
+    }
+
+    /// One occurrence cancelled the way some servers (Google among them) say
+    /// it — a detached instance with `STATUS:CANCELLED` rather than an
+    /// `EXDATE` on the master. The master's occurrence is suppressed and the
+    /// one instance left at that time carries the cancelled component, which
+    /// `hytte-services`' calendar drops; before the fix the master's copy, not
+    /// cancelled, stayed on screen.
+    #[test]
+    fn a_cancelled_detached_instance_replaces_the_occurrence_it_cancels() {
+        let cancelled = "UID:weekly-1\r\nDTSTAMP:20260601T000000Z\r\n\
+             RECURRENCE-ID;TZID=Europe/Berlin:20260609T100000\r\n\
+             DTSTART;TZID=Europe/Berlin:20260609T100000\r\n\
+             DTEND;TZID=Europe/Berlin:20260609T110000\r\n\
+             STATUS:CANCELLED\r\nSUMMARY:Weekly sync\r\n";
+        let ical = berlin_calendar_of(&[WEEKLY_MASTER, cancelled]);
+        let inst = super::expand_calendar_for_test(&ical, JUN_START, JUL_START).unwrap();
+
+        let jun9 = utc(2026, 6, 9, 8, 0);
+        let at_jun9: Vec<_> = inst.iter().filter(|e| e.start_unix == jun9).collect();
+        assert_eq!(at_jun9.len(), 1, "one instance at Jun 9, not two");
+        assert!(
+            at_jun9[0].ical.contains("STATUS:CANCELLED"),
+            "the instance left at Jun 9 is the cancelled one",
+        );
+        assert_eq!(sorted_starts(&inst), june_tuesdays());
+    }
+
+    /// A detached instance is one occurrence by definition. Some clients copy
+    /// the master's RRULE onto it anyway; it must not grow a second series.
+    #[test]
+    fn a_detached_instance_carrying_an_rrule_is_not_expanded() {
+        let with_rrule = "UID:weekly-1\r\nDTSTAMP:20260601T000000Z\r\n\
+             RECURRENCE-ID;TZID=Europe/Berlin:20260609T100000\r\n\
+             DTSTART;TZID=Europe/Berlin:20260610T110000\r\n\
+             DTEND;TZID=Europe/Berlin:20260610T120000\r\n\
+             RRULE:FREQ=WEEKLY\r\nSUMMARY:Weekly sync (moved)\r\n";
+        let ical = berlin_calendar_of(&[WEEKLY_MASTER, with_rrule]);
+        let inst = super::expand_calendar_for_test(&ical, JUN_START, JUL_START).unwrap();
+        let detached = inst
+            .iter()
+            .filter(|e| e.ical.contains("RECURRENCE-ID"))
+            .count();
+        assert_eq!(detached, 1, "the detached instance shows once, unexpanded");
+        assert_eq!(inst.len(), 5);
+    }
+
+    /// A detached instance whose master is not in the list (deleted, or not
+    /// synced yet) still shows — EDS does the same — and suppresses nothing.
+    #[test]
+    fn a_detached_instance_without_its_master_still_shows() {
+        let ical = berlin_calendar_of(&[WEEKLY_MOVED_JUN9]);
+        let inst = super::expand_calendar_for_test(&ical, JUN_START, JUL_START).unwrap();
+        assert_eq!(sorted_starts(&inst), vec![utc(2026, 6, 10, 9, 0)]);
+    }
+
+    /// The other series in the same calendar are untouched: a detached
+    /// instance only ever suppresses an occurrence of its own `UID`.
+    #[test]
+    fn a_detached_instance_only_overrides_its_own_series() {
+        let other = WEEKLY_MASTER
+            .replace("UID:weekly-1", "UID:weekly-2")
+            .replace("Weekly sync", "Other sync");
+        let ical = berlin_calendar_of(&[WEEKLY_MASTER, &other, WEEKLY_MOVED_JUN9]);
+        let inst = super::expand_calendar_for_test(&ical, JUN_START, JUL_START).unwrap();
+        let other_starts: Vec<i64> = sorted_starts(
+            &inst
+                .iter()
+                .filter(|e| e.ical.contains("UID:weekly-2"))
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(other_starts, june_tuesdays(), "weekly-2 keeps its Jun 9");
+        assert_eq!(inst.len(), 10);
+    }
+
+    /// All-day series: a `VALUE=DATE` recurrence id matches the DATE
+    /// occurrence it names (both anchor to midnight UTC), and the moved day
+    /// keeps the all-day flag.
+    #[test]
+    fn an_all_day_occurrence_moved_to_another_day_shows_once() {
+        let master = "UID:allday-1\r\nDTSTAMP:20260501T000000Z\r\n\
+             DTSTART;VALUE=DATE:20260601\r\nDTEND;VALUE=DATE:20260602\r\n\
+             RRULE:FREQ=DAILY;COUNT=5\r\nSUMMARY:Holiday\r\n";
+        let moved = "UID:allday-1\r\nDTSTAMP:20260501T000000Z\r\n\
+             RECURRENCE-ID;VALUE=DATE:20260603\r\n\
+             DTSTART;VALUE=DATE:20260610\r\nDTEND;VALUE=DATE:20260611\r\n\
+             SUMMARY:Holiday (moved)\r\n";
+        let ical = berlin_calendar_of(&[master, moved]);
+        let inst = super::expand_calendar_for_test(&ical, JUN_START, JUL_START).unwrap();
+        let day = |d: u32| utc(2026, 6, d, 0, 0);
+        assert_eq!(
+            sorted_starts(&inst),
+            vec![day(1), day(2), day(4), day(5), day(10)]
+        );
+        assert!(inst.iter().all(|e| e.all_day));
+    }
+
+    // RANGE=THISANDFUTURE: the detached instance also reschedules every later
+    // occurrence (RFC 5545 §3.8.4.4). Rare in the wild — EDS, Thunderbird and
+    // Nextcloud split the series instead — but when one arrives, the later
+    // occurrences must not stay at their old time.
+
+    /// From Jun 16 on, the meeting moves to Wednesdays 11:00–12:30: the
+    /// override itself shows at its own time, and every later occurrence is
+    /// moved by the same +25 h, with its 90-minute duration and its title.
+    #[test]
+    fn this_and_future_reschedules_every_later_occurrence() {
+        let from_jun16 = "UID:weekly-1\r\nDTSTAMP:20260601T000000Z\r\n\
+             RECURRENCE-ID;RANGE=THISANDFUTURE;TZID=Europe/Berlin:20260616T100000\r\n\
+             DTSTART;TZID=Europe/Berlin:20260617T110000\r\n\
+             DTEND;TZID=Europe/Berlin:20260617T123000\r\nSUMMARY:Weekly sync (new slot)\r\n";
+        let ical = berlin_calendar_of(&[WEEKLY_MASTER, from_jun16]);
+        let inst = super::expand_calendar_for_test(&ical, JUN_START, JUL_START).unwrap();
+
+        // Jun 2 and 9 as before; Jun 17 and 24 in the new slot; the master's
+        // Jun 30 moves to Jul 1, out of June.
+        let wed = |d: u32| utc(2026, 6, d, 9, 0);
+        assert_eq!(
+            sorted_starts(&inst),
+            vec![
+                utc(2026, 6, 2, 8, 0),
+                utc(2026, 6, 9, 8, 0),
+                wed(17),
+                wed(24)
+            ],
+        );
+        let jun24 = inst.iter().find(|e| e.start_unix == wed(24)).unwrap();
+        assert_eq!(
+            jun24.end_unix - jun24.start_unix,
+            5_400,
+            "the override's duration"
+        );
+        assert!(
+            jun24.ical.contains("Weekly sync (new slot)"),
+            "and its properties"
+        );
+        let jun9 = inst
+            .iter()
+            .find(|e| e.start_unix == utc(2026, 6, 9, 8, 0))
+            .unwrap();
+        assert!(
+            !jun9.ical.contains("new slot"),
+            "occurrences before the override are the master's",
+        );
+    }
+
+    /// A single-instance override *after* a `THISANDFUTURE` one is its own
+    /// component and wins for its occurrence ("subsequent instances defined in
+    /// separate components are not impacted").
+    #[test]
+    fn a_later_single_override_wins_over_this_and_future() {
+        let from_jun16 = "UID:weekly-1\r\nDTSTAMP:20260601T000000Z\r\n\
+             RECURRENCE-ID;RANGE=THISANDFUTURE;TZID=Europe/Berlin:20260616T100000\r\n\
+             DTSTART;TZID=Europe/Berlin:20260617T110000\r\n\
+             DTEND;TZID=Europe/Berlin:20260617T123000\r\nSUMMARY:Weekly sync (new slot)\r\n";
+        let jun23_alone = "UID:weekly-1\r\nDTSTAMP:20260601T000000Z\r\n\
+             RECURRENCE-ID;TZID=Europe/Berlin:20260623T100000\r\n\
+             DTSTART;TZID=Europe/Berlin:20260626T090000\r\n\
+             DTEND;TZID=Europe/Berlin:20260626T100000\r\nSUMMARY:Weekly sync (Friday)\r\n";
+        let ical = berlin_calendar_of(&[WEEKLY_MASTER, from_jun16, jun23_alone]);
+        let inst = super::expand_calendar_for_test(&ical, JUN_START, JUL_START).unwrap();
+        assert_eq!(
+            sorted_starts(&inst),
+            vec![
+                utc(2026, 6, 2, 8, 0),
+                utc(2026, 6, 9, 8, 0),
+                utc(2026, 6, 17, 9, 0),
+                utc(2026, 6, 26, 7, 0),
+            ],
+            "Jun 23 is the Friday override, not the THISANDFUTURE Wednesday",
+        );
+    }
+
+    /// An occurrence a `THISANDFUTURE` override moves *earlier* can come from
+    /// past the window's end: the master's Jun 30 occurrence, moved a day
+    /// back, belongs to a window that ends before Jun 30 starts. The iterator
+    /// is run past the window end by the shift so it is still found.
+    #[test]
+    fn this_and_future_moved_earlier_pulls_an_occurrence_in_from_after_the_window() {
+        let a_day_earlier = "UID:weekly-1\r\nDTSTAMP:20260601T000000Z\r\n\
+             RECURRENCE-ID;RANGE=THISANDFUTURE;TZID=Europe/Berlin:20260616T100000\r\n\
+             DTSTART;TZID=Europe/Berlin:20260615T100000\r\n\
+             DTEND;TZID=Europe/Berlin:20260615T110000\r\nSUMMARY:Weekly sync (Mondays)\r\n";
+        let ical = berlin_calendar_of(&[WEEKLY_MASTER, a_day_earlier]);
+        let mon_jun29 = utc(2026, 6, 29, 0, 0);
+        let tue_jun30 = utc(2026, 6, 30, 0, 0);
+        let inst = super::expand_calendar_for_test(&ical, mon_jun29, tue_jun30).unwrap();
+        assert_eq!(
+            sorted_starts(&inst),
+            vec![utc(2026, 6, 29, 8, 0)],
+            "Jun 30's occurrence, rescheduled to Monday Jun 29",
+        );
+    }
+
+    /// The other direction, through the #1195 skip: a series begun in January
+    /// whose occurrences a `THISANDFUTURE` override moved five days *later*.
+    /// The Sunday-June-28 occurrence's recurrence id is Tuesday the 23rd —
+    /// five days before the window, past `SKIP_BACKOFF_SECS`, so the iterator
+    /// must be re-anchored that much earlier for it to be generated at all.
+    #[test]
+    fn this_and_future_moved_later_reaches_back_past_the_skip_backoff() {
+        let master = "UID:weekly-jan\r\nDTSTAMP:20260101T000000Z\r\n\
+             DTSTART:20260106T080000Z\r\nDTEND:20260106T090000Z\r\n\
+             RRULE:FREQ=WEEKLY\r\nSUMMARY:Since January\r\n";
+        let five_days_later = "UID:weekly-jan\r\nDTSTAMP:20260101T000000Z\r\n\
+             RECURRENCE-ID;RANGE=THISANDFUTURE:20260113T080000Z\r\n\
+             DTSTART:20260118T080000Z\r\nDTEND:20260118T090000Z\r\n\
+             SUMMARY:Since January (Sundays)\r\n";
+        // Fixture sanity, checked at compile time: the shift must exceed the
+        // skip's own backoff, or the backoff alone would find the occurrence.
+        const { assert!(5 * 86_400 > super::SKIP_BACKOFF_SECS) };
+        let ical = berlin_calendar_of(&[master, five_days_later]);
+        let sun_jun28 = utc(2026, 6, 28, 0, 0);
+        let mon_jun29 = utc(2026, 6, 29, 0, 0);
+        let inst = super::expand_calendar_for_test(&ical, sun_jun28, mon_jun29).unwrap();
+        assert_eq!(sorted_starts(&inst), vec![utc(2026, 6, 28, 8, 0)]);
     }
 
     // ── MainContext + Waker (issue #33) ───────────────────────────────────

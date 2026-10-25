@@ -92,6 +92,12 @@ pub type ICalTimezone = c_void;
 /// borrowed-or-owned per accessor; we `g_object_unref` the ones we own.
 pub type ICalProperty = c_void;
 
+/// `ICalParameter *` — one parameter of a property (e.g. the `RANGE=` on a
+/// `RECURRENCE-ID`). [`i_cal_property_get_first_parameter`] returns a new
+/// wrapper ref (owned — unref) whose native parameter stays owned by the
+/// property, so releasing the wrapper never frees the property's data.
+pub type ICalParameter = c_void;
+
 /// `ICalRecurrence *` — a parsed RRULE value. Released with [`g_object_unref`].
 pub type ICalRecurrence = c_void;
 
@@ -154,6 +160,24 @@ pub const I_CAL_EXDATE_PROPERTY: c_int = 35;
 /// property (value 62 in `icalderivedproperty.h`). As with EXDATE, libical
 /// surfaces one property per RDATE value, iterated the same way.
 pub const I_CAL_RDATE_PROPERTY: c_int = 62;
+
+/// `ICAL_RECURRENCEID_PROPERTY` — the `ICalPropertyKind` discriminant for a
+/// `RECURRENCE-ID` property (value 66 in `icalderivedproperty.h`). Its presence
+/// is what makes a component a *detached* instance of a recurring series
+/// rather than the series' master (RFC 5545 §3.8.4.4).
+pub const I_CAL_RECURRENCEID_PROPERTY: c_int = 66;
+
+/// `ICAL_RANGE_PARAMETER` — the `ICalParameterKind` discriminant for the
+/// `RANGE=` parameter (value 21 in `icalderivedparameter.h`), which only a
+/// `RECURRENCE-ID` may carry. Passed to [`i_cal_property_get_first_parameter`].
+pub const I_CAL_RANGE_PARAMETER: c_int = 21;
+
+/// `ICAL_RANGE_THISANDFUTURE` — the `ICalParameterRange` value of a
+/// `RANGE=THISANDFUTURE` parameter (20702 in `icalderivedparameter.h`; its
+/// siblings are `ICAL_RANGE_X` 20700, the deprecated `THISANDPRIOR` 20701 and
+/// `ICAL_RANGE_NONE` 20799). Compared against [`i_cal_parameter_get_range`]'s
+/// return.
+pub const I_CAL_RANGE_THISANDFUTURE: c_int = 20_702;
 
 /// `ICalRecurrenceFrequency` discriminants for the three sub-day frequencies
 /// (`icalrecurrencetype_frequency` in `icalrecur.h`, mirrored 1:1 as
@@ -433,6 +457,14 @@ unsafe extern "C" {
         parent: *mut ICalComponent,
         kind: ICalComponentKind,
     ) -> *mut ICalComponent;
+    /// Next child of `kind`, continuing the walk
+    /// [`i_cal_component_get_first_component`] began on `parent`. A new
+    /// wrapper ref (owned — unref) whose native component stays owned by
+    /// `parent` (the wrapper holds a ref on it), or null once exhausted.
+    pub fn i_cal_component_get_next_component(
+        parent: *mut ICalComponent,
+        kind: ICalComponentKind,
+    ) -> *mut ICalComponent;
     /// Returns the component's kind as a raw `ICalComponentKind` C enum
     /// value. Declared as `c_int` (not the [`ICalComponentKind`] Rust
     /// enum) because libical may return any of ~28 kinds — only a subset
@@ -520,6 +552,34 @@ unsafe extern "C" {
     /// The RRULE value of an RRULE [`ICalProperty`] as a new
     /// [`ICalRecurrence`] (owned — unref).
     pub fn i_cal_property_get_rrule(prop: *mut ICalProperty) -> *mut ICalRecurrence;
+
+    /// A DATE or DATE-TIME property's value as a new [`ICalTime`] (owned —
+    /// unref), with its `TZID` resolved the way [`i_cal_component_get_dtstart`]
+    /// resolves DTSTART's: against the `VTIMEZONE`s of `comp` and its parents,
+    /// then libical's builtin zones (`icalproperty_get_datetime_with_component`
+    /// — `icalcomponent_get_dtstart` is exactly this call on the DTSTART
+    /// property). That is why a `RECURRENCE-ID` is read through it rather than
+    /// through `i_cal_component_get_recurrenceid`, which hands a `TZID`'d value
+    /// back with no zone attached (so it would read as floating) and could not
+    /// be compared with the occurrences of a zoned master. Borrows both.
+    pub fn i_cal_property_get_datetime_with_component(
+        prop: *mut ICalProperty,
+        comp: *mut ICalComponent,
+    ) -> *mut ICalTime;
+
+    /// First parameter of `kind` (an `ICalParameterKind` discriminant such as
+    /// [`I_CAL_RANGE_PARAMETER`]) on `prop`, as a new [`ICalParameter`] wrapper
+    /// (owned — unref; the native parameter stays the property's), or null
+    /// if `prop` has none. Borrows `prop`.
+    pub fn i_cal_property_get_first_parameter(
+        prop: *mut ICalProperty,
+        kind: c_int,
+    ) -> *mut ICalParameter;
+
+    /// The value of a `RANGE=` [`ICalParameter`] as a raw `ICalParameterRange`
+    /// (`c_int`, compared against [`I_CAL_RANGE_THISANDFUTURE`] — never
+    /// transmuted into an enum). Borrows `param`; allocates nothing.
+    pub fn i_cal_parameter_get_range(param: *const ICalParameter) -> c_int;
 
     /// The RRULE's `FREQ` as an `ICalRecurrenceFrequency` (`gint`-sized C
     /// enum — see the [`I_CAL_HOURLY_RECURRENCE`] family). Borrows `recur`;

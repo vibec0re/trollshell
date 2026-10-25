@@ -456,17 +456,30 @@ impl Default for Stats {
 ///
 /// Every field is a raw [`toml::Value`]: that is what keeps serde's verdict —
 /// which is **whole-file** — away from a single mistyped key (#1040 T1).
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(default)]
+///
+/// Each is an `Option` because a key can be *absent* — deleted by hand, or
+/// erased by `_unset` — and an absent key falls back to **its own table's**
+/// default, which serde cannot say: one `Default` for the type cannot be both
+/// the bar's and the sidebar's. `Self::parsed` resolves a missing key
+/// against the `fallback` card it is handed.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct CardFile {
-    cpu: toml::Value,
-    per_core: toml::Value,
-    history: toml::Value,
-    temperature: toml::Value,
-    gpu: toml::Value,
-    memory: toml::Value,
-    disk: toml::Value,
-    poll_seconds: toml::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cpu: Option<toml::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    per_core: Option<toml::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    history: Option<toml::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    temperature: Option<toml::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gpu: Option<toml::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    memory: Option<toml::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    disk: Option<toml::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    poll_seconds: Option<toml::Value>,
 }
 
 impl CardFile {
@@ -496,14 +509,14 @@ impl CardFile {
         const _: () = assert!(MAX_POLL_SECONDS == 60, "CEILING mirrors MAX_POLL_SECONDS");
         let secs = i64::try_from(card.poll.as_secs()).unwrap_or(CEILING);
         Self {
-            cpu: card.cpu.into(),
-            per_core: card.per_core.into(),
-            history: card.history.into(),
-            temperature: card.temperature.into(),
-            gpu: card.gpu.into(),
-            memory: card.memory.into(),
-            disk: card.disk.into(),
-            poll_seconds: secs.into(),
+            cpu: Some(card.cpu.into()),
+            per_core: Some(card.per_core.into()),
+            history: Some(card.history.into()),
+            temperature: Some(card.temperature.into()),
+            gpu: Some(card.gpu.into()),
+            memory: Some(card.memory.into()),
+            disk: Some(card.disk.into()),
+            poll_seconds: Some(secs.into()),
         }
     }
 
@@ -515,77 +528,81 @@ impl CardFile {
         // any other bad value: `cpu = 5` is reported as `bar.cpu = 5`, not as a
         // serde message about an integer where a boolean was expected.
         Card {
-            cpu: keep(
-                parse_bool(&spelling(&self.cpu))
-                    .map_err(|()| InvalidValue::of(&knobs.cpu, &self.cpu)),
-                fallback.cpu,
-                rejected,
-            ),
-            per_core: keep(
-                parse_bool(&spelling(&self.per_core))
-                    .map_err(|()| InvalidValue::of(&knobs.per_core, &self.per_core)),
-                fallback.per_core,
-                rejected,
-            ),
-            history: keep(
-                parse_bool(&spelling(&self.history))
-                    .map_err(|()| InvalidValue::of(&knobs.history, &self.history)),
-                fallback.history,
-                rejected,
-            ),
-            temperature: keep(
-                parse_bool(&spelling(&self.temperature))
-                    .map_err(|()| InvalidValue::of(&knobs.temperature, &self.temperature)),
-                fallback.temperature,
-                rejected,
-            ),
-            gpu: keep(
-                parse_bool(&spelling(&self.gpu))
-                    .map_err(|()| InvalidValue::of(&knobs.gpu, &self.gpu)),
-                fallback.gpu,
-                rejected,
-            ),
-            memory: keep(
-                parse_bool(&spelling(&self.memory))
-                    .map_err(|()| InvalidValue::of(&knobs.memory, &self.memory)),
-                fallback.memory,
-                rejected,
-            ),
-            disk: keep(
-                parse_bool(&spelling(&self.disk))
-                    .map_err(|()| InvalidValue::of(&knobs.disk, &self.disk)),
-                fallback.disk,
-                rejected,
-            ),
-            poll: keep(
-                parse_poll(&spelling(&self.poll_seconds))
-                    .map_err(|()| InvalidValue::of(&knobs.poll_seconds, &self.poll_seconds)),
-                fallback.poll,
-                rejected,
-            ),
+            cpu: self.cpu.as_ref().map_or(fallback.cpu, |raw| {
+                keep(
+                    parse_bool(&spelling(raw)).map_err(|()| InvalidValue::of(&knobs.cpu, raw)),
+                    fallback.cpu,
+                    rejected,
+                )
+            }),
+            per_core: self.per_core.as_ref().map_or(fallback.per_core, |raw| {
+                keep(
+                    parse_bool(&spelling(raw)).map_err(|()| InvalidValue::of(&knobs.per_core, raw)),
+                    fallback.per_core,
+                    rejected,
+                )
+            }),
+            history: self.history.as_ref().map_or(fallback.history, |raw| {
+                keep(
+                    parse_bool(&spelling(raw)).map_err(|()| InvalidValue::of(&knobs.history, raw)),
+                    fallback.history,
+                    rejected,
+                )
+            }),
+            temperature: self
+                .temperature
+                .as_ref()
+                .map_or(fallback.temperature, |raw| {
+                    keep(
+                        parse_bool(&spelling(raw))
+                            .map_err(|()| InvalidValue::of(&knobs.temperature, raw)),
+                        fallback.temperature,
+                        rejected,
+                    )
+                }),
+            gpu: self.gpu.as_ref().map_or(fallback.gpu, |raw| {
+                keep(
+                    parse_bool(&spelling(raw)).map_err(|()| InvalidValue::of(&knobs.gpu, raw)),
+                    fallback.gpu,
+                    rejected,
+                )
+            }),
+            memory: self.memory.as_ref().map_or(fallback.memory, |raw| {
+                keep(
+                    parse_bool(&spelling(raw)).map_err(|()| InvalidValue::of(&knobs.memory, raw)),
+                    fallback.memory,
+                    rejected,
+                )
+            }),
+            disk: self.disk.as_ref().map_or(fallback.disk, |raw| {
+                keep(
+                    parse_bool(&spelling(raw)).map_err(|()| InvalidValue::of(&knobs.disk, raw)),
+                    fallback.disk,
+                    rejected,
+                )
+            }),
+            poll: self.poll_seconds.as_ref().map_or(fallback.poll, |raw| {
+                keep(
+                    parse_poll(&spelling(raw))
+                        .map_err(|()| InvalidValue::of(&knobs.poll_seconds, raw)),
+                    fallback.poll,
+                    rejected,
+                )
+            }),
         }
-    }
-}
-
-impl Default for CardFile {
-    /// The sidebar shape — see [`StatsConfig`]'s field attributes for why the
-    /// two tables have different per-field defaults and this one is only ever
-    /// a type-level requirement.
-    fn default() -> Self {
-        Self::sidebar_default()
     }
 }
 
 /// `~/.config/trollshell/stats.toml`.
 ///
-/// The two fields carry **per-field** serde defaults rather than relying on
-/// [`CardFile`]'s own [`Default`], because the two tables genuinely default
-/// differently (a bar chip has no room for a history sweep). In practice
-/// neither is reached: [`DEFAULT_TOML`] is the bottom merge layer and states
-/// every key of both tables, and the merge rule for tables is a *deep* merge,
-/// so by the time serde sees a document every key is present. They are
-/// declared correctly anyway, because "unreachable" is a property of the
-/// current merge rules and not of this type.
+/// A whole table that is absent defaults through a **per-field** serde
+/// default, and a key missing *inside* a table through [`CardFile`]'s
+/// `Option` fields and `CardFile::parsed`'s `fallback` — in both cases to the
+/// default of the table it is missing from, because the two tables genuinely
+/// default differently (a bar chip has no room for a history sweep). A layered
+/// load rarely reaches the first: [`DEFAULT_TOML`] is the bottom merge layer
+/// and states every key of both tables. The second is reached by `_unset` and
+/// by a hand-deleted key, since an erasure runs after the merge.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct StatsConfig {
     #[serde(default = "CardFile::bar_default")]
@@ -1221,5 +1238,95 @@ mod tests {
         assert!(rejected.is_empty(), "{rejected:?}");
         assert_eq!(bar, Card::bar_default());
         assert_eq!(sidebar, Card::sidebar_default());
+    }
+
+    /// Reads one key off a resolved card, as text.
+    type Read = fn(&Card) -> String;
+
+    /// The keys of one table, for the absent-key tests below.
+    const KEYS: [(&str, Read); 8] = [
+        ("cpu", |c| c.cpu.to_string()),
+        ("per_core", |c| c.per_core.to_string()),
+        ("history", |c| c.history.to_string()),
+        ("temperature", |c| c.temperature.to_string()),
+        ("gpu", |c| c.gpu.to_string()),
+        ("memory", |c| c.memory.to_string()),
+        ("disk", |c| c.disk.to_string()),
+        ("poll_seconds", |c| format!("{:?}", c.poll)),
+    ];
+
+    /// A key erased under a table falls back to **that table's** default, not
+    /// the sidebar's (which `CardFile`'s old `Default` was).
+    ///
+    /// **Falsified** by giving `CardFile` a `#[serde(default)]` sidebar-shaped
+    /// `Default` again: `bar.memory` then reads `false` and `bar.per_core`
+    /// `true`.
+    #[test]
+    fn an_erased_key_falls_back_to_its_own_tables_default() {
+        for (table, want) in [
+            ("bar", Card::bar_default()),
+            ("sidebar", Card::sidebar_default()),
+        ] {
+            for (key, read) in KEYS {
+                let (stats, rejected) = resolved(&format!("[{table}]\n_unset = [\"{key}\"]\n"));
+                assert!(rejected.is_empty(), "{table}.{key}: {rejected:?}");
+                let got = if table == "bar" {
+                    stats.bar
+                } else {
+                    stats.sidebar
+                };
+                assert_eq!(read(&got), read(&want), "{table}.{key} erased");
+                assert_eq!(got, want, "{table}.{key} erased");
+            }
+        }
+    }
+
+    /// The `[bar] _unset = ["memory", "per_core"]` repro: `memory` is the
+    /// bar's `true`, `per_core` its `false`.
+    #[test]
+    fn the_bar_repro_reads_the_bars_defaults() {
+        let (stats, rejected) = resolved("[bar]\n_unset = [\"memory\", \"per_core\"]\n");
+        assert!(rejected.is_empty(), "{rejected:?}");
+        assert!(stats.bar.memory, "the bar default, not the sidebar's false");
+        assert!(
+            !stats.bar.per_core,
+            "the bar default, not the sidebar's true"
+        );
+        assert_eq!(stats.bar, Card::bar_default());
+        assert_eq!(stats.sidebar, Card::sidebar_default());
+    }
+
+    /// A table in which only one key is written (no default layer beneath it,
+    /// so every other key is missing): that key applies, the rest take the
+    /// table's own default.
+    #[test]
+    fn one_key_present_and_the_rest_missing() {
+        let file: StatsConfig =
+            toml::from_str("[bar]\ncpu = false\n[sidebar]\ngpu = false\n").expect("parses");
+        let (stats, rejected) = file.parsed();
+        assert!(rejected.is_empty(), "{rejected:?}");
+        assert_eq!(
+            stats.bar,
+            Card {
+                cpu: false,
+                ..Card::bar_default()
+            }
+        );
+        assert_eq!(
+            stats.sidebar,
+            Card {
+                gpu: false,
+                ..Card::sidebar_default()
+            }
+        );
+    }
+
+    /// A whole table that is absent still takes its own default, as before.
+    #[test]
+    fn a_whole_absent_table_is_unchanged() {
+        let file: StatsConfig = toml::from_str("").expect("parses");
+        assert_eq!(file.parsed().0, Stats::default());
+        let file: StatsConfig = toml::from_str("[sidebar]\ncpu = false\n").expect("parses");
+        assert_eq!(file.parsed().0.bar, Card::bar_default());
     }
 }

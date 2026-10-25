@@ -212,7 +212,6 @@ impl Service for NotificationsService {
         let iface = NotificationsIface {
             active: active.clone(),
             next_id: next_id.clone(),
-            history: history.clone(),
         };
 
         // Own the well-known name + mount the interface. The bus layer handles
@@ -327,78 +326,109 @@ pub fn clear_history() {
 /// 4 = undefined.
 ///
 /// Removes the notification from the active list, pushes it to history, and
-/// emits `NotificationClosed` on the session bus.
+/// emits `NotificationClosed` on the session bus — **only if `id` is live**.
+/// For any other id it is a no-op: no history entry, and above all no signal.
+/// The spec invalidates an id "before the signal is sent", so a second
+/// `NotificationClosed` for one id, or one for an id never issued, is a close
+/// event for a notification that does not exist — which a client that
+/// filters the broadcast by id (libnotify does) may take for one of its own.
+/// Pre-fix both happened: `CloseNotification 999` emitted
+/// `NotificationClosed(999, 3)`, and a click landing as the expiry timer fired
+/// emitted the close twice, once per reason.
+///
+/// Every close path funnels through here — auto-expiry, the user, and the
+/// D-Bus `CloseNotification` — so this one gate covers all of them.
 ///
 /// Safe to call from any thread (GTK widget handlers, hytte-tokio workers,
 /// the auto-expire timer in `notify()`). The local mutation runs
 /// synchronously on the calling thread; the bus signal emit is spawned onto
 /// the runtime.
 pub fn dismiss(id: u32, reason: u32) {
-    // Local state mutation. Synchronous — Mutable is thread-safe.
-    if let Some(shared) = shared::get::<NotificationsShared>() {
-        let removed = {
-            let mut list = shared.active.lock_mut();
-            let pos = list.iter().position(|n| n.id == id);
-            pos.map(|i| list.remove(i))
-        };
-        if let Some(n) = removed {
-            let dismissed_at = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let entry = HistoryEntry {
-                id: n.id,
-                app_name: n.app_name,
-                app_icon: n.app_icon,
-                summary: n.summary,
-                body: n.body,
-                urgency: n.urgency,
-                image: n.image,
-                actions: n.actions,
-                reason,
-                created_at: n.created_at,
-                dismissed_at,
-            };
-            let mut hist = shared.history.lock_mut();
-            hist.insert(0, entry);
-            hist.truncate(100);
-        }
+    let Some(shared) = shared::get::<NotificationsShared>() else {
+        return;
+    };
 
-        // Drop any local-dispatch callback still registered for `id` — this
-        // close path (expiry, user dismiss, or `close_notification`'s call
-        // into `dismiss`) means the action can never be invoked again. A
-        // cheap no-op for externally-posted notifications, which never
-        // populate this map.
-        if let Ok(mut map) = shared.local_actions.lock() {
-            clear_local_actions(&mut map, id);
-        }
+    // Local state mutation. Synchronous — Mutable is thread-safe. The
+    // position is read through `Deref` and only a real removal goes through
+    // `DerefMut`, so a no-op close does not wake the toast consumer.
+    let removed = {
+        let mut list = shared.active.lock_mut();
+        closable(&list, id).map(|at| list.remove(at))
+    };
+    let Some(n) = removed else {
+        tracing::debug!(
+            id,
+            reason,
+            "close for an id that is not live; nothing to do"
+        );
+        return;
+    };
 
-        // Cancel and drop any armed expiry timer for this id. Every close path
-        // (auto-expiry, user dismiss, `CloseNotification`) funnels through
-        // `dismiss`, so this is the one place the timer bookkeeping is
-        // reclaimed — no leaked entry or orphaned sleep task (#567). Runs
-        // unconditionally (like the `local_actions` sweep above): a
-        // `close_notification` that already pulled the notification out of the
-        // active list still needs its timer torn down here.
-        if let Ok(mut timers) = shared.timers.lock() {
-            clear_timer(&mut timers, id);
-        }
+    let dismissed_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let entry = HistoryEntry {
+        id: n.id,
+        app_name: n.app_name,
+        app_icon: n.app_icon,
+        summary: n.summary,
+        body: n.body,
+        urgency: n.urgency,
+        image: n.image,
+        actions: n.actions,
+        reason,
+        created_at: n.created_at,
+        dismissed_at,
+    };
+    {
+        let mut hist = shared.history.lock_mut();
+        hist.insert(0, entry);
+        hist.truncate(100);
+    }
+
+    // Drop any local-dispatch callback still registered for `id` — this
+    // close path (expiry, user dismiss, or `close_notification`'s call
+    // into `dismiss`) means the action can never be invoked again. A
+    // cheap no-op for externally-posted notifications, which never
+    // populate this map.
+    if let Ok(mut map) = shared.local_actions.lock() {
+        clear_local_actions(&mut map, id);
+    }
+
+    // Cancel and drop the expiry timer for this id. Every close path
+    // (auto-expiry, user dismiss, `CloseNotification`) funnels through
+    // `dismiss`, so this is the one place the timer bookkeeping is
+    // reclaimed — no leaked entry or orphaned sleep task (#567). Conditional
+    // on the removal above, like everything here: an entry exists exactly
+    // while its notification is live (`set_expiry` creates it under the same
+    // `active` guard that publishes the notification), and an id that is not
+    // live is never re-created (`notify_id`), so a no-op close has nothing to
+    // reclaim.
+    if let Ok(mut timers) = shared.timers.lock() {
+        clear_timer(&mut timers, id);
     }
 
     // Emit the NotificationClosed signal directly on the owned connection.
-    if let Some(shared) = shared::get::<NotificationsShared>() {
-        let ownership = shared.ownership.clone();
-        runtime::handle().spawn(async move {
-            let result = ownership
-                .emit("/org/freedesktop/Notifications", |emitter| async move {
-                    NotificationsIface::notification_closed(&emitter, id, reason).await
-                })
-                .await;
-            if let Err(e) = result {
-                tracing::warn!(error = %e, id, reason, "NotificationClosed emit failed");
-            }
-        });
-    }
+    let ownership = shared.ownership.clone();
+    runtime::handle().spawn(async move {
+        let result = ownership
+            .emit("/org/freedesktop/Notifications", |emitter| async move {
+                NotificationsIface::notification_closed(&emitter, id, reason).await
+            })
+            .await;
+        if let Err(e) = result {
+            tracing::warn!(error = %e, id, reason, "NotificationClosed emit failed");
+        }
+    });
+}
+
+/// Where `id` sits in the live list, if it is there to close; `None` makes
+/// the close a no-op. The one gate on every side effect of [`dismiss`], the
+/// `NotificationClosed` emit included — factored out so the gate itself is
+/// unit-testable without the process-global shared registry or a bus.
+fn closable(live: &[Notification], id: u32) -> Option<usize> {
+    live.iter().position(|n| n.id == id)
 }
 
 /// Dismiss every currently-active notification (reason 2 = dismissed-by-user)
@@ -1058,50 +1088,27 @@ pub fn post_local_with_actions(
 
 // ── D-Bus interface ───────────────────────────────────────────────────────────
 
+/// The mounted `org.freedesktop.Notifications` object. Closing goes through
+/// [`dismiss`] and the shared registry, like every other close path, so the
+/// interface holds only what `Notify` writes: the live list and the id
+/// counter. (It used to carry the history too, for a `close_notification` that
+/// pulled the notification out itself before calling `dismiss` — which is
+/// what left `dismiss` emitting `NotificationClosed` for ids it had not
+/// removed, since from there it could not tell a close it was finishing from
+/// one for an id that was never live.)
 #[derive(Clone)]
 struct NotificationsIface {
     active: Mutable<Vec<Notification>>,
     next_id: Arc<AtomicU32>,
-    history: Mutable<Vec<HistoryEntry>>,
-}
-
-impl NotificationsIface {
-    /// Remove `id` from the active list and push it to history.
-    /// Returns the removed notification if found.
-    fn remove_from_active(&self, id: u32) -> Option<Notification> {
-        let mut list = self.active.lock_mut();
-        let pos = list.iter().position(|n| n.id == id)?;
-        Some(list.remove(pos))
-    }
-
-    fn push_to_history(&self, n: Notification, reason: u32) {
-        let dismissed_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let entry = HistoryEntry {
-            id: n.id,
-            app_name: n.app_name,
-            app_icon: n.app_icon,
-            summary: n.summary,
-            body: n.body,
-            urgency: n.urgency,
-            image: n.image,
-            actions: n.actions,
-            reason,
-            created_at: n.created_at,
-            dismissed_at,
-        };
-        let mut hist = self.history.lock_mut();
-        hist.insert(0, entry);
-        hist.truncate(100);
-    }
 }
 
 // zbus's `#[interface]` macro requires every method to be `async fn` even
-// when the body doesn't await. Allowing at the impl-block keeps the noise
-// out of each method.
-#[allow(clippy::unused_async)]
+// when the body doesn't await, and to take `&self` even when it reaches no
+// state through it (`close_notification` calls the free `dismiss`; the
+// capability/identity handlers return constants). Allowing at the impl-block
+// keeps the noise out of each method — `screensaver.rs`'s and `control.rs`'s
+// shape.
+#[allow(clippy::unused_async, clippy::unused_self)]
 #[zbus::interface(name = "org.freedesktop.Notifications")]
 impl NotificationsIface {
     /// Show a notification. Returns the notification id.
@@ -1210,15 +1217,18 @@ impl NotificationsIface {
     }
 
     /// Close a notification by id (reason 3 = closed by call).
+    ///
+    /// All of it is [`dismiss`]'s, which emits `NotificationClosed` only for an
+    /// id that was live. For any other id this replies success and emits
+    /// nothing — mako's behaviour. The spec asks for "an empty D-Bus Error
+    /// message" there instead; that is a client-visible change (libnotify
+    /// surfaces it as a `GError` from `notify_notification_close`) left for a
+    /// separate decision.
     async fn close_notification(&self, id: u32) {
-        if let Some(n) = self.remove_from_active(id) {
-            self.push_to_history(n, 3);
-        }
         crate::notifications::dismiss(id, 3);
     }
 
     /// Return the capabilities this server implements.
-    #[allow(clippy::unused_self)]
     fn get_capabilities(&self) -> Vec<String> {
         vec![
             "body".to_string(),
@@ -1228,7 +1238,6 @@ impl NotificationsIface {
     }
 
     /// Return server identification tuple.
-    #[allow(clippy::unused_self)]
     fn get_server_information(&self) -> (&str, &str, &str, &str) {
         ("trollshell", "hannig.cc", "0.4.0", "1.2")
     }
@@ -1576,7 +1585,7 @@ mod tests {
     use super::{
         DEFAULT_TIMEOUT, HashMap, LocalActionMap, MIN_RESUME, Mutable, Notification,
         NotificationImage, NotificationsIface, OwnedValue, RateLimitMap, TimerAction, TimerEntry,
-        TimerMap, TimerState, Urgency, apply_expiry, clear_local_actions, clear_timer,
+        TimerMap, TimerState, Urgency, apply_expiry, clear_local_actions, clear_timer, closable,
         image_data_consistent, notify_id, parse_image, rate_limit_check, register_local_action,
         resolve_timeout, strip_markup, take_local_action,
     };
@@ -1805,7 +1814,6 @@ mod tests {
         let iface = NotificationsIface {
             active: Mutable::new(Vec::new()),
             next_id: Arc::new(AtomicU32::new(1)),
-            history: Mutable::new(Vec::new()),
         };
         let caps = iface.get_capabilities();
         assert!(caps.iter().any(|c| c == "body"), "{caps:?}");
@@ -1958,6 +1966,42 @@ mod tests {
         // real, but it is gone, so the update is a new notification.
         let counter = AtomicU32::new(8);
         assert_eq!(notify_id(&[live(6)], 7, &counter), 8);
+    }
+
+    // ── Close gate: `NotificationClosed` only for an id that was live ───────
+    //
+    // `dismiss` returns before its history push, its sweeps and its emit
+    // whenever `closable` says `None`, so these pin what reaches the bus.
+
+    #[test]
+    fn closing_an_id_that_was_never_live_is_a_no_op() {
+        // `gdbus call … CloseNotification 999` used to emit
+        // `NotificationClosed(999, 3)` for an id this daemon never issued.
+        let list = [live(1), live(2)];
+        assert_eq!(closable(&list, 999), None);
+        assert_eq!(closable(&[], 1), None);
+    }
+
+    #[test]
+    fn a_live_id_is_closable_where_it_sits() {
+        let list = [live(1), live(2), live(3)];
+        assert_eq!(closable(&list, 2), Some(1));
+    }
+
+    #[test]
+    fn a_second_close_of_one_id_is_a_no_op() {
+        // A click landing as the expiry timer fires: `dismiss(id, 2)` and
+        // `dismiss(id, 1)` both ran their emit, so the sender saw the one
+        // notification close twice, with two different reasons.
+        let mut list = vec![live(1), live(2)];
+        let at = closable(&list, 2).expect("live on the first close");
+        list.remove(at);
+        assert_eq!(
+            closable(&list, 2),
+            None,
+            "the second close must emit nothing"
+        );
+        assert_eq!(closable(&list, 1), Some(0), "a sibling is untouched");
     }
 
     #[test]

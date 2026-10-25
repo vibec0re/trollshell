@@ -54,8 +54,28 @@ struct Inner {
     /// failure, only clears the cached connection if it is unchanged — so a
     /// late failure from a superseded connection attempt cannot clobber a
     /// newer, already-established connection.
+    ///
+    /// **This is the connection's identity, and the only one.** Both
+    /// invalidation tails — `with_conn`'s and
+    /// [`SharedConnection::invalidate_if_generation`] — compare it, and both
+    /// compare it under this lock, which is what makes the comparison exact:
+    /// it is written in the same critical section as `conn`. The epoch is
+    /// *not* an identity. `supervisor_loop` bumps it after releasing this lock,
+    /// so it can trail the connection it announces; until the proxy tail
+    /// compared this instead, a `BusProxy::call` failing in that gap saw its
+    /// old epoch unchanged and cleared the connection just installed.
     generation: u64,
 }
+
+/// Which installed connection an operation ran on: [`Inner::generation`] as
+/// [`SharedConnection::with_conn_tagged`] read it, under the lock, together
+/// with the connection it handed out.
+///
+/// A newtype rather than a bare `u64` so it cannot be confused with an epoch —
+/// confusing the two is the bug [`SharedConnection::invalidate_if_generation`]
+/// exists to close.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Generation(u64);
 
 /// Process-wide shared connection to one bus. Cloned freely (cheap, Arc).
 ///
@@ -160,6 +180,12 @@ impl SharedConnection {
     /// Current epoch — bumped each time the supervisor successfully
     /// re-establishes the connection. Primitives subscribe to
     /// `epoch_signal()` to know when to re-establish their state.
+    ///
+    /// A notification counter, not a connection identity: it is bumped after
+    /// the new connection is installed and the lock released, so for a moment
+    /// it can still read the previous value with the new connection already in
+    /// place. Never compare it to decide *which* connection a failure belongs
+    /// to — that is the private `Inner::generation`'s job.
     #[must_use]
     pub fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::Acquire)
@@ -178,6 +204,25 @@ impl SharedConnection {
     /// Returns `BusError::Transient` immediately when no cached connection is
     /// available (mid-reconnect).
     pub async fn with_conn<F, R, Fut>(&self, f: F) -> Result<R, BusError>
+    where
+        F: FnOnce(Connection) -> Fut,
+        Fut: std::future::Future<Output = Result<R, zbus::Error>>,
+    {
+        self.with_conn_tagged(f).await.map(|(r, _)| r)
+    }
+
+    /// [`with_conn`](Self::with_conn), additionally reporting the
+    /// [`Generation`] of the connection `f` ran on.
+    ///
+    /// For a primitive that keeps something built on the connection past the
+    /// call that built it — [`BusProxy`](crate::BusProxy)'s cached
+    /// `zbus::Proxy` — and so must later be able to say which connection a
+    /// failure on that thing belongs to, through
+    /// [`invalidate_if_generation`](Self::invalidate_if_generation).
+    pub(crate) async fn with_conn_tagged<F, R, Fut>(
+        &self,
+        f: F,
+    ) -> Result<(R, Generation), BusError>
     where
         F: FnOnce(Connection) -> Fut,
         Fut: std::future::Future<Output = Result<R, zbus::Error>>,
@@ -226,24 +271,54 @@ impl SharedConnection {
                 }
             }
         }
-        result.map_err(BusError::from_zbus)
+        result
+            .map(|r| (r, Generation(generation)))
+            .map_err(BusError::from_zbus)
     }
 
     /// Invalidate the cached connection and wake the supervisor to reconnect,
-    /// but only if the epoch is still `expected` (i.e. no reconnect has
-    /// happened since the caller captured it).
+    /// but only if it is still the connection `issued_on` names (i.e. no
+    /// reconnect has installed another since the caller's call was built on
+    /// it).
     ///
-    /// This mirrors the epoch/generation-guarded invalidate + notify tail of
-    /// [`with_conn`](Self::with_conn), for primitives that issue calls on a
-    /// cached `zbus::Proxy` (notably [`BusProxy`](crate::BusProxy)) and thus
-    /// bypass `with_conn`. Routing their transient failures here keeps them on
-    /// the same shared reconnect path as everything else — a wedged peer's
-    /// connection-level error still kicks the supervisor rather than being
-    /// silently swallowed. Idempotent: a no-op once the connection was already
-    /// replaced or cleared.
-    pub(crate) async fn invalidate_if_epoch(&self, expected: u64) {
+    /// This mirrors the generation-guarded invalidate + notify tail of
+    /// [`with_conn`](Self::with_conn) exactly, for primitives that issue calls
+    /// on a cached `zbus::Proxy` (notably [`BusProxy`](crate::BusProxy)) and
+    /// thus bypass `with_conn`. Routing their transient failures here keeps
+    /// them on the same shared reconnect path as everything else — a wedged
+    /// peer's connection-level error still kicks the supervisor rather than
+    /// being silently swallowed. Idempotent: a no-op once the connection was
+    /// already replaced or cleared.
+    ///
+    /// Until this compared the generation it was `invalidate_if_epoch`,
+    /// guarded by an epoch the caller snapshotted when its call started. That
+    /// cleared a *fresh* connection — a spurious reconnect, and with it an
+    /// epoch bump that sends every subscription on the bus back to re-`Get`
+    /// and re-subscribe — in two windows:
+    ///
+    /// - **The supervisor's install gap.** `supervisor_loop` installs the new
+    ///   connection under the lock and bumps the epoch only after releasing
+    ///   it. A call that snapshotted the old epoch, failing on its old
+    ///   connection in between, found the epoch unchanged and a connection
+    ///   present, and took it.
+    /// - **A stale cache after the bump.** `BusProxy`'s watcher clears its
+    ///   cached proxy when it sees the epoch advance, which is a task wake-up
+    ///   later. A call that started in between snapshotted the *new* epoch but
+    ///   cloned the proxy built on the *old* connection, so its failure there
+    ///   matched.
+    ///
+    /// Both are gone for the same reason: `issued_on` is the generation the
+    /// cached proxy was built on, read by
+    /// [`with_conn_tagged`](Self::with_conn_tagged) in the critical section
+    /// that handed out its connection, and it is compared here in the critical
+    /// section that would clear it. Neither window can be held open by any
+    /// test seam this crate has — `install_fresh_connection_for_test` performs
+    /// the install and the bump back to back, as the supervisor does, and the
+    /// watcher is a task on the shared runtime — so the invariant is stated
+    /// here and on [`Inner::generation`] rather than pinned by a test.
+    pub(crate) async fn invalidate_if_generation(&self, issued_on: Generation) {
         let mut guard = self.inner.lock().await;
-        if self.epoch() == expected && guard.conn.take().is_some() {
+        if Generation(guard.generation) == issued_on && guard.conn.take().is_some() {
             drop(guard);
             log_connection_lost(
                 self.kind,
@@ -520,7 +595,7 @@ pub mod test_support {
 /// disconnect several calls are in flight on the dead connection and every one
 /// of them comes back transient. Both callers gate this on having been the one
 /// that actually cleared the cache (`conn.take().is_some()`, under the
-/// generation or epoch guard), so the losers stay silent and a disconnect costs
+/// generation guard), so the losers stay silent and a disconnect costs
 /// exactly one line however many operations noticed it.
 fn log_connection_lost(kind: BusKind, via: &'static str, reason: &dyn std::fmt::Display) {
     tracing::warn!(
@@ -666,6 +741,11 @@ async fn supervisor_loop(
                     g.conn = Some(conn);
                     g.generation += 1;
                     drop(g);
+                    // Bumped after the lock is released, so for a moment the
+                    // epoch trails the connection it announces. That is safe
+                    // only because nothing identifies a connection by its
+                    // epoch: both invalidation tails compare
+                    // `Inner::generation`, under the lock.
                     let new_epoch = epoch.fetch_add(1, Ordering::AcqRel) + 1;
                     signal.set(new_epoch);
                     backoff.reset();

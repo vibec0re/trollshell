@@ -11,19 +11,19 @@
 //! and asserts what it did.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::{gdk, glib};
 
 use hytte_plugin_agents::config::AgentsConfig;
-use hytte_plugin_agents::hive::wire::{Approval, HiveUrls, Request};
+use hytte_plugin_agents::hive::wire::{HiveUrls, Request};
 use hytte_plugin_agents::model::{AgentName, agent_url};
+use hytte_plugin_agents::plugin::Shown;
 
-use crate::chrome::{self, Controls, Facts, HeaderModel};
+use crate::chrome::{self, Controls, Decision, Facts, HeaderModel, Queue, Verdict};
 use crate::feed::{self, AgentState, Update};
-use crate::ui::Decision;
 use crate::{cli, page, tls, ui, webview};
 
 /// What the window shows before the hive has a page URL for this agent.
@@ -192,16 +192,25 @@ pub struct Window {
     name: AgentName,
     urls: RefCell<Option<HiveUrls>>,
     last: RefCell<AgentState>,
-    /// The agent's `Pending` queue, already narrowed to this agent and
-    /// sorted oldest-first (`chrome::pending_for`) — #1141. What
-    /// `Window::on_decision` checks a click's id against before it becomes a
+    /// The agent's `Pending` queue as this window last read it — #1141 —
+    /// narrowed to this agent and sorted oldest-first (`chrome::pending_for`),
+    /// or the reason it cannot be read (`chrome::Queue`). What
+    /// `Window::on_decision` checks a click against before it becomes a
     /// frame, and what `Window::apply` renders.
-    pending: RefCell<Vec<Approval>>,
+    ///
+    /// Forgotten when the hive stops answering (`Update::State` carrying
+    /// `AgentState::Unreachable`), not kept: the plugin's rule since #1509,
+    /// and for its reason — rows with live buttons that nobody can vouch for
+    /// are rows a click can send a bare id from, to a hive that may come back
+    /// holding something else under it.
+    queue: RefCell<Queue>,
     /// The hive's own reason the **last** decision for an approval was
-    /// refused, keyed by id. Pruned to the ids `pending` still carries on
-    /// every `Update::Approvals` — an approval that left the queue has
-    /// nothing left to keep showing a reason for.
-    approval_refusals: RefCell<BTreeMap<i64, String>>,
+    /// refused, keyed by id, with the request that decision was about.
+    /// Pruned on every `Update::Approvals` to the entries whose id still
+    /// names that same request — an approval that left the queue, or whose
+    /// id the hive handed to another request, has nothing left to keep
+    /// showing a reason for.
+    approval_refusals: RefCell<BTreeMap<i64, (Shown, String)>>,
     /// Approvals this window has sent a decision for and not yet heard the
     /// end of — #1146's review, H1.
     ///
@@ -215,19 +224,16 @@ pub struct Window {
     /// [`Window::on_decision`], so a click already queued on the main loop
     /// cannot slip past the widget state.
     ///
-    /// It empties two ways, both of them the end of the round trip: the id
-    /// leaves the polled queue (pruned on `Update::Approvals`), or the hive
-    /// refuses the write (`Update::Refused`) — which is precisely why the
-    /// refusal path keeps the row, so a retry is possible.
-    in_flight: RefCell<BTreeSet<i64>>,
-    /// The hive's own reason the **queue itself** could not be read, when the
-    /// last `Pending` came back refused (#1146's review, M1).
+    /// It empties two ways, both of them the end of the round trip: the
+    /// request leaves the polled queue (pruned on `Update::Approvals`), or
+    /// the hive refuses the write (`Update::Refused`) — which is precisely
+    /// why the refusal path keeps the row, so a retry is possible.
     ///
-    /// `None` is "the hive answered" — which, with an empty queue, is the
-    /// group hiding itself. A refusal has to look different: without this,
-    /// an older daemon or a permissions change rendered exactly like a
-    /// healthy hive with nothing to decide.
-    approvals_refused: RefCell<Option<String>>,
+    /// Each id carries the request the decision was sent for, so the prune
+    /// is by request rather than by id: a re-numbered queue's new request
+    /// under the same id does not inherit a latch it never earned, and the
+    /// refusal that comes back for the old one has nothing to decorate.
+    in_flight: RefCell<BTreeMap<i64, Shown>>,
     cmds: tokio::sync::mpsc::UnboundedSender<Request>,
 }
 
@@ -375,10 +381,9 @@ impl Window {
             name: name.clone(),
             urls: RefCell::new(None),
             last: RefCell::new(AgentState::Connecting),
-            pending: RefCell::new(Vec::new()),
+            queue: RefCell::new(Queue::default()),
             approval_refusals: RefCell::new(BTreeMap::new()),
-            in_flight: RefCell::new(BTreeSet::new()),
-            approvals_refused: RefCell::new(None),
+            in_flight: RefCell::new(BTreeMap::new()),
             cmds,
         });
 
@@ -425,10 +430,19 @@ impl Window {
     /// Three guards now, all from the spec's own rule for the sidebar's
     /// identical decision path (`hytte_plugin_agents::plugin::Agents::decide`):
     ///
-    /// 1. the id must still be in the last-polled queue
-    ///    ([`chrome::should_send`] — an approval that left `Pending` between
-    ///    the render and the click raced a poll, and is dropped with a debug
-    ///    line, not sent);
+    /// 1. the row queued under the id must still be **the request the row
+    ///    showed** ([`chrome::should_send`], bound to the plugin's own
+    ///    `Shown` the way #1509 binds the consent card). Three ways to fail,
+    ///    and they are not one outcome:
+    ///    - nothing is queued under it any more — it raced a poll and was
+    ///      resolved elsewhere — so it is dropped with a debug line, not sent;
+    ///    - a **different** request is: the hive re-numbered its queue, and
+    ///      an `Approve { id }` would decide something the operator never
+    ///      saw. Dropped unsent, and the view repainted from the queue as it
+    ///      now is;
+    ///    - the queue cannot be read (the hive is unreachable or refused it):
+    ///      not sent, and the banner says so ([`chrome::not_sent`]), because
+    ///      the operator pressed a button and silence would read as success;
     /// 2. **no decision for it may already be in flight** (#1146's review,
     ///    H1). Unlike a lifecycle press there is nothing to flip
     ///    optimistically — `Approve`/`Deny` run immediately on the far side
@@ -443,26 +457,49 @@ impl Window {
     ///    `couldn't answer: agent busy` about a decision that is on the wire
     ///    right now.
     fn on_decision(&self, decision: Decision) {
-        let id = decision.id();
-        if !chrome::should_send(&self.pending.borrow(), id) {
-            tracing::debug!(
-                approval = id,
-                "the approval left the queue before this window could send a decision; dropping it"
-            );
-            return;
+        let id = decision.id;
+        let verdict = chrome::should_send(&self.queue.borrow(), &decision);
+        match verdict {
+            Verdict::Send => {}
+            Verdict::Gone => {
+                tracing::debug!(
+                    approval = id,
+                    "the approval left the queue before this window could send a decision; dropping it"
+                );
+                return;
+            }
+            Verdict::Replaced => {
+                tracing::debug!(
+                    approval = id,
+                    "the queue holds a different request under this id than the row showed; \
+                     dropping the decision unsent"
+                );
+                self.apply();
+                return;
+            }
+            Verdict::Unread => {
+                tracing::info!(
+                    approval = id,
+                    "a decision arrived while the approval queue is unreadable; not sent"
+                );
+                self.banner.set_title(&chrome::not_sent(&decision));
+                self.banner.set_revealed(true);
+                return;
+            }
         }
-        if !self.in_flight.borrow_mut().insert(id) {
+        if self.in_flight.borrow().contains_key(&id) {
             tracing::debug!(
                 approval = id,
                 "a decision for this approval is already in flight; dropping the second one"
             );
             return;
         }
+        let req = decision.request();
+        self.in_flight.borrow_mut().insert(id, decision.shown);
         self.approval_refusals.borrow_mut().remove(&id);
-        let req = match decision {
-            Decision::Approve(id) => feed::approve(id),
-            Decision::Deny(id) => feed::deny(id),
-        };
+        // A decision that does go out retires an earlier "not sent" banner,
+        // the way a lifecycle press retires its own (`on_press`).
+        self.banner.set_revealed(false);
         if self.cmds.send(req).is_err() {
             tracing::warn!("the hive client is gone; this window is no longer live");
         }
@@ -475,6 +512,13 @@ impl Window {
     pub fn update(&self, update: Update) {
         match update {
             Update::State(state) => {
+                // No status answer, so no queue either — the plugin's rule
+                // since #1509. `feed::poll_once` re-sends the queue on the
+                // first poll that answers again, even an unchanged one, so
+                // forgetting it here cannot strand the rows.
+                if matches!(state, AgentState::Unreachable { .. }) {
+                    self.forget_queue(Queue::Unreachable);
+                }
                 *self.last.borrow_mut() = state;
                 self.apply();
             }
@@ -484,30 +528,29 @@ impl Window {
             }
             // The hive answered the queue: rebuild the rows from it.
             Update::Approvals(Ok(queue)) => {
-                let pending = chrome::pending_for(&self.name, queue);
-                // Prune refusal reasons **and in-flight ids** to the ones the
-                // fresh queue still carries — a row that left the queue has
-                // nothing left to explain and nothing left to wait on. That
-                // prune is also how a decision's latch is released: the poll
-                // that takes the approval out of `Pending` is the end of the
-                // round trip (#1146's review, H1/L2).
-                let live: BTreeSet<i64> = pending.iter().map(|a| a.id).collect();
+                let queue = Queue::Read(chrome::pending_for(&self.name, queue));
+                // Prune refusal reasons **and in-flight ids** to the requests
+                // the fresh queue still carries under the same id — a row
+                // that left the queue has nothing left to explain and nothing
+                // left to wait on, and neither has one whose id now names a
+                // different request. That prune is also how a decision's
+                // latch is released: the poll that takes the approval out of
+                // `Pending` is the end of the round trip (#1146's review,
+                // H1/L2).
                 self.approval_refusals
                     .borrow_mut()
-                    .retain(|id, _| live.contains(id));
-                self.in_flight.borrow_mut().retain(|id| live.contains(id));
-                *self.pending.borrow_mut() = pending;
-                *self.approvals_refused.borrow_mut() = None;
+                    .retain(|id, (shown, _)| queue.holds(*id, shown));
+                self.in_flight
+                    .borrow_mut()
+                    .retain(|id, shown| queue.holds(*id, shown));
+                *self.queue.borrow_mut() = queue;
                 self.apply();
             }
             // The hive refused the queue (#1146's review, M1). The rows go —
             // this window can no longer vouch for them — but the group stays,
             // saying so, instead of hiding and looking like an empty queue.
             Update::Approvals(Err(reason)) => {
-                self.approval_refusals.borrow_mut().clear();
-                self.in_flight.borrow_mut().clear();
-                self.pending.borrow_mut().clear();
-                *self.approvals_refused.borrow_mut() = Some(reason);
+                self.forget_queue(Queue::Refused(reason));
                 self.apply();
             }
             Update::Refused { request, reason } => match &request {
@@ -517,20 +560,29 @@ impl Window {
                 // does not say *which* decision failed once more than one is
                 // queued.
                 Request::Approve { id } | Request::Deny { id } => {
-                    // Only record the reason if the row is still pending —
-                    // a refusal that arrives after the row already left the
-                    // queue (the poll pruned it first) has nothing left to
-                    // decorate, and inserting anyway would plant an orphan
-                    // entry that a later poll bringing the same id back would
-                    // read as "the decision just sent for you failed"
-                    // (#1146 re-verify, M-NEW-1).
-                    if self.pending.borrow().iter().any(|a| a.id == *id) {
-                        self.approval_refusals.borrow_mut().insert(*id, reason);
-                    }
                     // The round trip ended in a no, so the row is answerable
                     // again — that is the whole reason a refusal keeps it
                     // (#1146's review, H1).
-                    self.in_flight.borrow_mut().remove(id);
+                    //
+                    // Only record the reason on the row the decision was
+                    // **for**, which is the one still in flight under this
+                    // id: `in_flight` is pruned to the requests still queued
+                    // under their ids on every `Update::Approvals` and
+                    // cleared whenever the queue is forgotten, so an entry
+                    // here *is* the current row. A refusal that arrives after
+                    // that row left the queue (the poll pruned it first), was
+                    // replaced by another request under the id, or was
+                    // forgotten with an unreachable hive finds no entry and
+                    // has nothing left to decorate — and inserting anyway
+                    // would plant an orphan that a later poll bringing the id
+                    // back would read as "the decision just sent for you
+                    // failed" (#1146 re-verify, M-NEW-1), or print request
+                    // A's refusal on request B.
+                    if let Some(shown) = self.in_flight.borrow_mut().remove(id) {
+                        self.approval_refusals
+                            .borrow_mut()
+                            .insert(*id, (shown, reason));
+                    }
                     self.apply();
                 }
                 _ => {
@@ -539,6 +591,15 @@ impl Window {
                 }
             },
         }
+    }
+
+    /// Drop the approval queue this window can no longer vouch for, and
+    /// everything it was tracking about decisions on it, leaving `why` in its
+    /// place for the group to say.
+    fn forget_queue(&self, why: Queue) {
+        self.approval_refusals.borrow_mut().clear();
+        self.in_flight.borrow_mut().clear();
+        *self.queue.borrow_mut() = why;
     }
 
     /// Push the current state through the whole chrome.
@@ -550,24 +611,28 @@ impl Window {
         );
         let refusals = self.approval_refusals.borrow();
         let in_flight = self.in_flight.borrow();
-        let rows: Vec<chrome::ApprovalRow> = self
-            .pending
-            .borrow()
+        let queue = self.queue.borrow();
+        let rows: Vec<chrome::ApprovalRow> = queue
+            .rows()
             .iter()
             .map(|a| {
-                chrome::ApprovalRow::of(a, refusals.get(&a.id).cloned(), in_flight.contains(&a.id))
+                chrome::ApprovalRow::of(
+                    a,
+                    refusals.get(&a.id).map(|(_, reason)| reason.clone()),
+                    in_flight.contains_key(&a.id),
+                )
             })
             .collect();
         drop(in_flight);
         drop(refusals);
-        let refused = self.approvals_refused.borrow();
+        let notice = queue.notice();
+        drop(queue);
         self.settings.apply(
             &Facts::agent(&self.name, &state),
             &Facts::hive(&self.cfg, self.urls.borrow().as_ref()),
             &rows,
-            refused.as_deref(),
+            notice.as_ref(),
         );
-        drop(refused);
         self.badge_settings(rows.len());
         self.load_page(&state);
     }
@@ -858,9 +923,9 @@ mod tests {
 #[cfg(all(test, feature = "system-tests"))]
 mod gtk_tests {
     use super::{NO_PAGE, TrustResolver, Window};
+    use crate::chrome::{ApprovalRow, Decision, Verb};
     use crate::cli::Tab;
     use crate::feed::{AgentState, Update};
-    use crate::ui::Decision;
     use crate::verify::tls_tests::{
         anchors, glib_ready, serve, serve_counting_dribbler, serve_dribbling,
     };
@@ -894,6 +959,14 @@ mod gtk_tests {
             requested_at: "2026-09-12T00:00:00Z".to_owned(),
             ..Approval::default()
         }
+    }
+
+    /// The click a row rendered from `approval` raises — what a queued click
+    /// carries when it arrives after the row has moved on, which is the only
+    /// way a test can deliver one (nothing renders a row for a request the
+    /// window no longer has).
+    fn clicked(approval: &Approval, verb: Verb) -> Decision {
+        Decision::on(&ApprovalRow::of(approval, None, false), verb)
     }
 
     /// An application object, never run — `adw::ApplicationWindow` wants one,
@@ -1346,7 +1419,8 @@ mod gtk_tests {
     /// anything reaches the command lane.
     ///
     /// Mutation (verified red): make `on_decision` build `Request::Deny`
-    /// for `Decision::Approve` and the byte assertion reds.
+    /// for `Verb::Approve` (`chrome::Decision::request`) and the byte
+    /// assertion reds.
     #[gtk::test]
     fn approving_a_pending_row_sends_the_pinned_approve_bytes() {
         let (w, mut rx) = window();
@@ -1390,10 +1464,158 @@ mod gtk_tests {
         w.update(Update::Approvals(Ok(vec![approval(5, "stray")])));
         w.update(Update::Approvals(Ok(Vec::new()))); // resolved elsewhere
 
-        w.on_decision(Decision::Approve(5));
+        w.on_decision(clicked(&approval(5, "stray"), Verb::Approve));
         assert!(
             rx.try_recv().is_err(),
             "an id the last poll no longer carries must not reach the hive"
+        );
+    }
+
+    /// **A re-numbered id gets a fresh row, and a click raised from the old
+    /// one sends nothing.** The hive's store was reset or restored between
+    /// two polls, and id 7 now names a different request. The row the
+    /// operator saw leaves the container (so a press that began on it cannot
+    /// be released onto the new request), the new request gets its own row
+    /// and its own buttons, and a click already queued for the old row —
+    /// carrying the request it showed — is refused by the guard rather than
+    /// sent as an `Approve { id: 7 }` that would decide the new one.
+    ///
+    /// Mutations (verified red): key `ui::Approvals::apply`'s survivor test
+    /// on the id alone (`w.id == a.id`) and the "old row left" assertion
+    /// reds; revert `chrome::should_send` to the id-only check and the
+    /// "nothing sent" one does.
+    #[gtk::test]
+    fn a_renumbered_id_gets_a_fresh_row_and_the_old_rows_click_sends_nothing() {
+        let (w, mut rx) = window();
+        w.update(Update::State(up(row())));
+        let shown = approval(7, "stray");
+        w.update(Update::Approvals(Ok(vec![shown.clone()])));
+        let old = w.settings.tracked_approval_rows();
+        assert_eq!(old.len(), 1);
+
+        let renumbered = Approval {
+            description: Some("merge PR #99 (force-push to main)".to_owned()),
+            ..approval(7, "stray")
+        };
+        w.update(Update::Approvals(Ok(vec![renumbered])));
+        assert!(
+            old.iter().all(|r| r.parent().is_none()),
+            "the row for the request that left must leave the group, not be relabelled"
+        );
+        let text = w.settings.approval_row_text();
+        assert_eq!(text.len(), 1, "{text:?}");
+        assert!(text[0].contains("force-push"), "{text:?}");
+
+        w.on_decision(clicked(&shown, Verb::Approve));
+        assert!(
+            rx.try_recv().is_err(),
+            "a click raised from the old row must not approve the request now under its id"
+        );
+
+        // The request now on screen is answerable on its own row.
+        w.settings.press_approve_for_test(7);
+        assert!(matches!(rx.try_recv(), Ok(Request::Approve { id: 7 })));
+    }
+
+    /// **A re-numbered id inherits neither the old request's latch nor its
+    /// refusal.** A decision was in flight for request A under id 7 when the
+    /// hive re-numbered; request B under the same id was never decided, so
+    /// its buttons are live, and the refusal that comes back for A's
+    /// decision is not printed on B's row.
+    ///
+    /// Mutations (verified red): prune `in_flight` by id alone
+    /// (`queue.rows().iter().any(|a| a.id == *id)`) and the latch assertion
+    /// reds — B's row would sit insensitive until A's answer happened to
+    /// come back; fall back to recording a refusal on whatever request is
+    /// queued under its id when nothing is in flight for it (the guard before
+    /// this change asked only whether the id was still queued) and the
+    /// refusal assertion does.
+    #[gtk::test]
+    fn a_renumbered_id_inherits_neither_the_latch_nor_the_refusal() {
+        let (w, mut rx) = window();
+        w.update(Update::State(up(row())));
+        w.update(Update::Approvals(Ok(vec![approval(7, "stray")])));
+        assert!(w.settings.try_press_approve_for_test(7));
+        assert!(matches!(rx.try_recv(), Ok(Request::Approve { id: 7 })));
+
+        w.update(Update::Approvals(Ok(vec![Approval {
+            description: Some("a different request".to_owned()),
+            ..approval(7, "stray")
+        }])));
+        assert!(
+            w.settings.approve_is_live_for_test(7),
+            "request B never had a decision sent, so it must not hold A's latch"
+        );
+
+        w.update(Update::Refused {
+            request: Request::Approve { id: 7 },
+            reason: "no such approval".to_owned(),
+        });
+        assert!(
+            !w.settings
+                .approval_row_text()
+                .iter()
+                .any(|r| r.contains("no such approval")),
+            "a refusal about request A must not decorate request B: {:?}",
+            w.settings.approval_row_text()
+        );
+        assert!(
+            w.settings.try_press_approve_for_test(7),
+            "request B was never decided, so its row must be answerable"
+        );
+        assert!(matches!(rx.try_recv(), Ok(Request::Approve { id: 7 })));
+    }
+
+    /// **An unreachable hive's queue is forgotten, and a click that arrives
+    /// meanwhile is not sent — and says so.** The rows go (nobody can vouch
+    /// for them), the group says why instead of hiding, a click raised from
+    /// a row that was on screen sends nothing and reveals the banner, and
+    /// the queue the hive answers once it is back is answerable again.
+    ///
+    /// Mutations (verified red): drop the `forget_queue(Queue::Unreachable)`
+    /// in `Window::update`'s `State` arm and the notice assertion reds — the
+    /// stale row is still there, buttons live; drop the banner in
+    /// `on_decision`'s `Unread` arm and the banner assertion does; drop the
+    /// `set_revealed(false)` before a decision is sent and the last one does.
+    #[gtk::test]
+    fn an_unreachable_hive_forgets_the_queue_and_an_unsent_click_says_so() {
+        let (w, mut rx) = window();
+        w.update(Update::State(up(row())));
+        let shown = approval(7, "stray");
+        w.update(Update::Approvals(Ok(vec![shown.clone()])));
+        assert_eq!(w.settings.approval_row_text().len(), 1);
+
+        w.update(Update::State(AgentState::Unreachable {
+            reason: "the hive is not running".to_owned(),
+        }));
+        let text = w.settings.approval_row_text();
+        assert_eq!(text.len(), 1, "only the notice, no stale row: {text:?}");
+        assert!(
+            text[0].starts_with(crate::chrome::APPROVALS_UNREACHABLE),
+            "{text:?}"
+        );
+        assert!(w.settings.approvals_visible());
+
+        w.on_decision(clicked(&shown, Verb::Approve));
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing may be sent against a queue this window cannot read"
+        );
+        let banner = w.banner_text().expect("the operator is told");
+        assert!(
+            banner.contains("not sent") && banner.contains("#7"),
+            "{banner}"
+        );
+
+        // The hive comes back with the same request: answerable again.
+        w.update(Update::State(up(row())));
+        w.update(Update::Approvals(Ok(vec![shown])));
+        assert!(w.settings.try_press_approve_for_test(7));
+        assert!(matches!(rx.try_recv(), Ok(Request::Approve { id: 7 })));
+        assert_eq!(
+            w.banner_text(),
+            None,
+            "a decision that did go out retires the \"not sent\" banner"
         );
     }
 
@@ -1402,9 +1624,11 @@ mod gtk_tests {
     /// the hive's own reason — no global banner for this one (#1141).
     #[gtk::test]
     fn a_refused_approval_keeps_the_row_and_shows_the_reason_inline() {
-        let (w, _rx) = window();
+        let (w, mut rx) = window();
         w.update(Update::State(up(row())));
         w.update(Update::Approvals(Ok(vec![approval(9, "stray")])));
+        w.settings.press_approve_for_test(9);
+        assert!(matches!(rx.try_recv(), Ok(Request::Approve { id: 9 })));
 
         w.update(Update::Refused {
             request: Request::Approve { id: 9 },
@@ -1457,7 +1681,7 @@ mod gtk_tests {
         );
         // …and the guard behind the widget state, for the click GTK had
         // already queued when the buttons went dead.
-        w.on_decision(Decision::Approve(42));
+        w.on_decision(clicked(&approval(42, "stray"), Verb::Approve));
 
         assert!(matches!(rx.try_recv(), Ok(Request::Approve { id: 42 })));
         assert!(
@@ -1484,7 +1708,7 @@ mod gtk_tests {
             !w.settings.try_press_deny_for_test(42),
             "the Deny button of an in-flight row must be dead too"
         );
-        w.on_decision(Decision::Deny(42));
+        w.on_decision(clicked(&approval(42, "stray"), Verb::Deny));
 
         assert!(matches!(rx.try_recv(), Ok(Request::Approve { id: 42 })));
         assert!(
@@ -1550,9 +1774,11 @@ mod gtk_tests {
     /// in the `Update::Approvals(Ok(_))` arm and the last assertion reds.
     #[gtk::test]
     fn a_refusal_is_pruned_when_its_row_leaves_the_queue() {
-        let (w, _rx) = window();
+        let (w, mut rx) = window();
         w.update(Update::State(up(row())));
         w.update(Update::Approvals(Ok(vec![approval(9, "stray")])));
+        w.settings.press_approve_for_test(9);
+        assert!(matches!(rx.try_recv(), Ok(Request::Approve { id: 9 })));
         w.update(Update::Refused {
             request: Request::Approve { id: 9 },
             reason: "agent busy".to_owned(),
@@ -1617,8 +1843,10 @@ mod gtk_tests {
     /// with a reason about a decision that was never sent for it. #1146
     /// re-verify, M-NEW-1.
     ///
-    /// **Fails on HEAD before the guard**; passes with the `pending`-still-
-    /// contains-the-id guard on the insert.
+    /// **Fails on HEAD before the guard**; passes with the guard on the
+    /// insert — first "the id is still pending", and since the decision was
+    /// bound to its request, "a decision for this request is still in
+    /// flight", which the prune that took the row away has already cleared.
     #[gtk::test]
     fn a_refusal_that_arrives_after_its_row_left_the_queue_leaves_nothing_behind() {
         let (w, mut rx) = window();
@@ -1866,7 +2094,7 @@ mod gtk_tests {
         let text = w.settings.approval_row_text();
         assert_eq!(text.len(), 1, "the rows themselves are gone: {text:?}");
         assert!(
-            text[0].starts_with(crate::ui::APPROVALS_REFUSED)
+            text[0].starts_with(crate::chrome::APPROVALS_REFUSED)
                 && text[0].contains("permission denied"),
             "{text:?}"
         );

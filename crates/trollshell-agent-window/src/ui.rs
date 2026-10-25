@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 
-use crate::chrome::{ApprovalRow, Controls, Fact, HeaderModel};
+use crate::chrome::{ApprovalRow, Controls, Decision, Fact, HeaderModel, QueueNotice, Verb};
 
 /// The lifecycle verb a button press asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -342,7 +342,8 @@ impl Settings {
     }
 
     /// Replace every group's rows: the two read-only ones plus the
-    /// approvals group.
+    /// approvals group — or, when the queue cannot be read, the one notice
+    /// row that says why ([`crate::chrome::Queue::notice`]).
     ///
     /// Rebuilt rather than updated in place: the row set is short and fixed,
     /// and a rebuild cannot leave a stale row behind when a field goes from
@@ -356,9 +357,9 @@ impl Settings {
         agent: &[Fact],
         hive: &[Fact],
         approvals: &[ApprovalRow],
-        approvals_refused: Option<&str>,
+        approvals_notice: Option<&QueueNotice>,
     ) {
-        self.approvals.apply(approvals, approvals_refused);
+        self.approvals.apply(approvals, approvals_notice);
         for (group, tracked, facts) in [
             (&self.agent, &self.agent_rows, agent),
             (&self.hive, &self.hive_rows, hive),
@@ -468,14 +469,23 @@ impl Settings {
     /// on a latched row is not a panic, it is a click GTK swallows.
     #[cfg(all(test, feature = "system-tests"))]
     pub fn try_press_approve_for_test(&self, id: i64) -> bool {
-        self.approvals.try_press_for_test(id, Decision::Approve(id))
+        self.approvals.try_press_for_test(id, Verb::Approve)
     }
 
     /// Try to press Deny for `id`. See
     /// [`Settings::try_press_approve_for_test`].
     #[cfg(all(test, feature = "system-tests"))]
     pub fn try_press_deny_for_test(&self, id: i64) -> bool {
-        self.approvals.try_press_for_test(id, Decision::Deny(id))
+        self.approvals.try_press_for_test(id, Verb::Deny)
+    }
+
+    /// Whether Approve for `id` is live — visible and sensitive — **without**
+    /// pressing it, for a test that has to look at a row's latch before the
+    /// event it is about to deliver (a press would set the latch itself).
+    #[cfg(all(test, feature = "system-tests"))]
+    pub fn approve_is_live_for_test(&self, id: i64) -> bool {
+        let (visible, sensitive) = own_flags(&self.approvals.button_for_test(id, Verb::Approve));
+        visible && sensitive
     }
 }
 
@@ -485,45 +495,38 @@ impl Default for Settings {
     }
 }
 
-/// One decision a row's Approve/Deny button asks for (#1141, spec §6.5).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Decision {
-    /// Approve the approval with this id.
-    Approve(i64),
-    /// Deny it.
-    Deny(i64),
-}
-
-impl Decision {
-    /// The id it names, regardless of which button raised it — what the
-    /// window's staleness guard checks before either becomes a frame.
-    #[must_use]
-    pub fn id(self) -> i64 {
-        match self {
-            Self::Approve(id) | Self::Deny(id) => id,
-        }
-    }
-}
-
 /// One approval row's widgets — an `ActionRow` plus the two buttons in its
 /// suffix, tracked together so [`Approvals::apply`] can retarget "the row for
-/// id 42" by id (#1149 N2) and a test can find its Approve button the same
+/// request 42" (#1149 N2) and a test can find its Approve button the same
 /// way, without walking the widget tree.
+///
+/// Keyed on the id **and** what the row shows ([`ApprovalRow::shown`]): the
+/// buttons' closures captured that identity when the row was built, so a row
+/// may only be retargeted onto the same request. An id the hive has handed to
+/// a different request gets a fresh row instead — the old widgets leave the
+/// container, so a press that began on them cannot be released onto the new
+/// request, and a click already queued for them still carries the request
+/// they showed, which [`crate::chrome::should_send`] then refuses.
 struct ApprovalRowWidgets {
     id: i64,
+    shown: hytte_plugin_agents::plugin::Shown,
     row: adw::ActionRow,
     approve: gtk::Button,
     deny: gtk::Button,
 }
 
+impl ApprovalRowWidgets {
+    /// Whether these widgets were built for `row`'s request — the same id
+    /// **and** the same [`ApprovalRow::shown`], which is what their buttons'
+    /// closures carry.
+    fn shows(&self, row: &ApprovalRow) -> bool {
+        self.id == row.id && self.shown == row.shown
+    }
+}
+
 /// The callback slot a row's Approve/Deny buttons close over — named so
 /// `Approvals`'s field escapes `clippy::type_complexity`.
 type DecisionHandler = Rc<dyn Fn(Decision)>;
-
-/// What the approvals group says when the hive refused to hand over the queue
-/// at all (#1146's review, M1) — a state of its own, because the rows are
-/// cleared for this the same way they are cleared for an empty queue.
-pub const APPROVALS_REFUSED: &str = "The hive refused the approval queue";
 
 /// The Settings page's "Approvals" group: the agent's queued decisions,
 /// Approve/Deny per row (#1141, spec §6.5).
@@ -535,10 +538,10 @@ pub struct Approvals {
     /// The widget to mount in the settings page.
     pub root: adw::PreferencesGroup,
     rows: RefCell<Vec<ApprovalRowWidgets>>,
-    /// The one row shown instead of the queue when the hive refused to hand
-    /// it over (#1146's review, M1). Tracked separately from `rows` because
-    /// it carries no id and no buttons — nothing can be decided about a queue
-    /// nobody can read.
+    /// The one row shown instead of the queue when this window cannot read
+    /// it — the hive refused to hand it over (#1146's review, M1) or is
+    /// unreachable. Tracked separately from `rows` because it carries no id
+    /// and no buttons — nothing can be decided about a queue nobody can read.
     refusal: RefCell<Option<adw::ActionRow>>,
     on_decision: RefCell<Option<DecisionHandler>>,
 }
@@ -599,20 +602,25 @@ impl Approvals {
     /// first) falls back to detaching the survivors and re-adding them in the
     /// new order — still the same `GObject`s, just re-parented.
     ///
-    /// The refusal row is a plain take-and-rebuild: it is one row with no id
+    /// The notice row is a plain take-and-rebuild: it is one row with no id
     /// and no buttons, so there is nothing to retarget it *by*. Its presence
     /// forces the fallback path, because it has to be added before the rows
     /// and only an append is available — in practice it never competes with
-    /// any, since a refused queue clears `pending` first (`Window::update`).
-    pub fn apply(&self, approvals: &[ApprovalRow], refused: Option<&str>) {
+    /// any, since a queue the window cannot read renders no rows
+    /// (`chrome::Queue::rows`).
+    ///
+    /// "Survives" means the same **request**, not merely the same id
+    /// ([`ApprovalRow::shown`], which the row's buttons carry): a row whose id
+    /// now names something else is a leaver and an arrival at once.
+    pub fn apply(&self, approvals: &[ApprovalRow], notice: Option<&QueueNotice>) {
         let mut existing = self.rows.borrow_mut();
 
-        // Detach only the rows whose id left the queue. `remove` un-parents a
-        // widget without dropping it; dropping the struct at the end of this
-        // function is what tears a leaver's widgets down.
+        // Detach only the rows whose request left the queue. `remove`
+        // un-parents a widget without dropping it; dropping the struct at the
+        // end of this function is what tears a leaver's widgets down.
         let mut kept: Vec<ApprovalRowWidgets> = Vec::new();
         for w in existing.drain(..) {
-            if approvals.iter().any(|a| a.id == w.id) {
+            if approvals.iter().any(|a| w.shows(a)) {
                 kept.push(w);
             } else {
                 self.root.remove(&w.row);
@@ -622,16 +630,17 @@ impl Approvals {
             self.root.remove(&row);
         }
         self.root
-            .set_visible(!approvals.is_empty() || refused.is_some());
+            .set_visible(!approvals.is_empty() || notice.is_some());
 
         // A hive that will not answer the queue is **not** an empty queue
         // (#1146's review, M1): the rows are gone either way, so without a
         // state of its own an older daemon or a permissions change rendered
-        // exactly like "nothing to decide".
-        if let Some(reason) = refused {
+        // exactly like "nothing to decide". The same holds for a hive that
+        // is not answering at all.
+        if let Some(notice) = notice {
             let row = adw::ActionRow::builder()
-                .title(APPROVALS_REFUSED)
-                .subtitle(reason)
+                .title(notice.title)
+                .subtitle(&notice.detail)
                 .use_markup(false)
                 .subtitle_selectable(true)
                 .build();
@@ -641,7 +650,7 @@ impl Approvals {
             *self.refusal.borrow_mut() = Some(row);
         }
 
-        let in_place = refused.is_none() && Self::appendable(&kept, approvals);
+        let in_place = notice.is_none() && Self::appendable(&kept, approvals);
         if !in_place {
             // A reorder: the survivors have to come back in the new order,
             // and appending is the only placement this container offers.
@@ -652,7 +661,7 @@ impl Approvals {
 
         let mut next = Vec::with_capacity(approvals.len());
         for a in approvals {
-            let widgets = if let Some(pos) = kept.iter().position(|w| w.id == a.id) {
+            let widgets = if let Some(pos) = kept.iter().position(|w| w.shows(a)) {
                 let w = kept.remove(pos);
                 w.row.set_title(&a.title);
                 w.row.set_subtitle(&a.subtitle());
@@ -690,8 +699,8 @@ impl Approvals {
         let mut survivors = kept.iter();
         let mut seen_arrival = false;
         for a in approvals {
-            if kept.iter().any(|w| w.id == a.id) {
-                if seen_arrival || survivors.next().map(|w| w.id) != Some(a.id) {
+            if kept.iter().any(|w| w.shows(a)) {
+                if seen_arrival || !survivors.next().is_some_and(|w| w.shows(a)) {
                     return false;
                 }
             } else {
@@ -712,12 +721,16 @@ impl Approvals {
         deny.set_valign(gtk::Align::Center);
         deny.add_css_class("destructive-action");
 
+        // Each closure captures the decision **as this row shows it** — the
+        // id and the request under it — so a click can only ever ask about
+        // what was on screen when it was built.
         if let Some(cb) = self.on_decision.borrow().clone() {
-            let id = a.id;
             let f = Rc::clone(&cb);
-            approve.connect_clicked(move |_| f(Decision::Approve(id)));
+            let yes = Decision::on(a, Verb::Approve);
+            approve.connect_clicked(move |_| f(yes.clone()));
             let f = Rc::clone(&cb);
-            deny.connect_clicked(move |_| f(Decision::Deny(id)));
+            let no = Decision::on(a, Verb::Deny);
+            deny.connect_clicked(move |_| f(no.clone()));
         }
 
         // See the matching comment in `apply` — the same latch, for a row
@@ -743,6 +756,7 @@ impl Approvals {
 
         ApprovalRowWidgets {
             id: a.id,
+            shown: a.shown.clone(),
             row,
             approve,
             deny,
@@ -790,22 +804,22 @@ impl Approvals {
     /// with nothing of ours on the stack). `gtk::Button` is a refcounted
     /// handle, so the clone is the same widget.
     #[cfg(all(test, feature = "system-tests"))]
-    fn button_for_test(&self, id: i64, which: Decision) -> gtk::Button {
+    fn button_for_test(&self, id: i64, which: Verb) -> gtk::Button {
         let rows = self.rows.borrow();
         let w = rows
             .iter()
             .find(|w| w.id == id)
             .unwrap_or_else(|| panic!("no approval row for id {id}"));
         match which {
-            Decision::Approve(_) => w.approve.clone(),
-            Decision::Deny(_) => w.deny.clone(),
+            Verb::Approve => w.approve.clone(),
+            Verb::Deny => w.deny.clone(),
         }
     }
 
     /// Press one of `id`'s two buttons **if it is pressable**, answering
     /// whether it was — the latch's read-back (#1146's review, H1).
     #[cfg(all(test, feature = "system-tests"))]
-    fn try_press_for_test(&self, id: i64, which: Decision) -> bool {
+    fn try_press_for_test(&self, id: i64, which: Verb) -> bool {
         let button = self.button_for_test(id, which);
         let (visible, sensitive) = own_flags(&button);
         if !(visible && sensitive) {
@@ -821,7 +835,7 @@ impl Approvals {
     #[cfg(all(test, feature = "system-tests"))]
     fn press_approve_for_test(&self, id: i64) {
         assert!(
-            self.try_press_for_test(id, Decision::Approve(id)),
+            self.try_press_for_test(id, Verb::Approve),
             "Approve for {id} is not pressable"
         );
     }
@@ -830,7 +844,7 @@ impl Approvals {
     #[cfg(all(test, feature = "system-tests"))]
     fn press_deny_for_test(&self, id: i64) {
         assert!(
-            self.try_press_for_test(id, Decision::Deny(id)),
+            self.try_press_for_test(id, Verb::Deny),
             "Deny for {id} is not pressable"
         );
     }
@@ -956,7 +970,7 @@ mod tests {
 #[cfg(all(test, feature = "system-tests"))]
 mod gtk_tests {
     use super::{Header, Press, Settings};
-    use crate::chrome::{Controls, Facts, HeaderModel};
+    use crate::chrome::{Controls, Decision, Facts, HeaderModel, Verb};
     use crate::feed::AgentState;
     use gtk::prelude::{ToggleButtonExt as _, WidgetExt as _};
     use hytte_plugin_agents::config::AgentsConfig;
@@ -1237,8 +1251,15 @@ mod gtk_tests {
 
     /// One approval row model, with everything but the id fixed.
     fn approval_row(id: i64) -> crate::chrome::ApprovalRow {
+        let request = hytte_plugin_agents::hive::wire::Approval {
+            id,
+            agent: "stray".to_owned(),
+            description: Some(format!("test approval #{id}")),
+            ..hytte_plugin_agents::hive::wire::Approval::default()
+        };
         crate::chrome::ApprovalRow {
             id,
+            shown: hytte_plugin_agents::plugin::Shown::of(&request),
             title: format!("Approve #{id}"),
             detail: format!("test approval #{id}"),
             refused: None,
@@ -1269,7 +1290,7 @@ mod gtk_tests {
     #[gtk::test]
     fn a_reordered_queue_re_adds_the_same_rows_in_the_new_order() {
         let approvals = super::Approvals::new();
-        let pressed: Rc<RefCell<Vec<super::Decision>>> = Rc::new(RefCell::new(Vec::new()));
+        let pressed: Rc<RefCell<Vec<Decision>>> = Rc::new(RefCell::new(Vec::new()));
         let sink = Rc::clone(&pressed);
         approvals.connect(move |d| sink.borrow_mut().push(d));
 
@@ -1292,10 +1313,10 @@ mod gtk_tests {
             "the container order must follow the model's, not the old one"
         );
 
-        assert!(approvals.try_press_for_test(1, super::Decision::Approve(1)));
+        assert!(approvals.try_press_for_test(1, Verb::Approve));
         assert_eq!(
             *pressed.borrow(),
-            [super::Decision::Approve(1)],
+            [Decision::on(&approval_row(1), Verb::Approve)],
             "the moved row's button must still name its own id"
         );
     }

@@ -110,6 +110,11 @@ pub enum Update {
     /// hive will not tell me". The `Err` arm carries the hive's own sentence
     /// so the group can say which it is. Same shape as the sidebar's
     /// `Msg::Pending(Result<…>)`, for the same reason.
+    ///
+    /// An **unreachable** hive sends no `Approvals` at all: the
+    /// `Update::State` carrying [`AgentState::Unreachable`] is the window's
+    /// cue to forget the queue (the plugin's rule since #1509), and the first
+    /// poll that answers again sends one even if it equals the last.
     Approvals(Result<Vec<Approval>, String>),
     /// A verb this window sent was refused, with the hive's own words.
     Refused {
@@ -156,7 +161,8 @@ pub fn set_paused(name: &AgentName, paused: bool) -> Request {
 /// `Approve` one queued approval by id (#1141, spec §6.5) — the action runs
 /// **immediately** on the far side, so this is sent for a click and nothing
 /// else; [`crate::chrome::should_send`] is the guard the window applies
-/// before it ever reaches [`run`]'s command lane.
+/// before it ever reaches [`run`]'s command lane, and it binds the click to
+/// the request its row showed, since the frame itself can only name the id.
 #[must_use]
 pub fn approve(id: i64) -> Request {
     Request::Approve { id }
@@ -480,7 +486,9 @@ async fn write(socket: &std::path::Path, req: &Request) -> Result<(), String> {
 /// forever. `Update::Approvals` is deduped too, on the **raw** answer — the
 /// per-agent filter runs downstream, in [`crate::chrome::pending_for`], so two
 /// polls that changed only another agent's queue still cost this window
-/// nothing.
+/// nothing. A failed status poll resets that dedup, because the window drops
+/// its queue on one: the first poll that answers again re-sends the queue
+/// even if it is unchanged.
 ///
 /// `Err(())` means the GTK side is gone.
 async fn poll_once(
@@ -532,6 +540,14 @@ async fn poll_once(
         }
         Some(answer)
     } else {
+        // **No status answer, so the window forgets the queue**
+        // (`Window::update`, the plugin's rule since #1509) — and the dedup
+        // has to forget it too. Otherwise a hive that comes back holding the
+        // same queue it went away with answers byte-for-byte what
+        // `last_approvals` already has, nothing is sent, and the window sits
+        // on "the hive is unreachable" under a green header until the queue
+        // next changes.
+        *last_approvals = None;
         None
     };
 

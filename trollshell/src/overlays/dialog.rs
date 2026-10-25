@@ -1100,11 +1100,11 @@ mod tests {
     /// HIGH-1's second half is only a rule if the two shell surfaces actually
     /// call it. A source scan, on `consent.rs`'s own
     /// `request_never_names_a_decision_of_its_own` precedent: the *behaviour* of
-    /// [`super::yield_to_shell_prompt`] is pinned in `gtk_tests`, but
-    /// `consent::request` and `prompt::show_prompt` are not reachable from any
-    /// test — both need a live `Monitor` and a compositor to build their own
-    /// layer surface — so this is what stops the rule from living in a function
-    /// nobody calls.
+    /// [`super::yield_to_shell_prompt`] is pinned in `gtk_tests`, and
+    /// `consent::request` / `prompt::show_prompt` do run under `xvfb-run` —
+    /// their own `gtk_tests` raise them, to pin the slot `may_raise` reads —
+    /// but nothing there observes this call, so this is what stops the rule
+    /// from living in a function nobody calls.
     ///
     /// **Falsification:** delete either call → this reds, naming the file.
     #[test]

@@ -2788,6 +2788,56 @@ node is negotiated, so an older shell gets `Progress` bars instead of lines
      but only by re-coupling the widget to its neighbours, which is the thing
      that failed four times.
 
+- [ ] **(#1487)** Default device, balance and the chip's scroll. Needs a real
+      PipeWire + WirePlumber session with **two** sinks (e.g. laptop speakers
+      plus a USB or Bluetooth headset) and `RUST_LOG=hytte_services=debug`.
+  1. **A pick sticks.** In the Audio drawer, pick the sink that is _not_ the
+     default. `wpctl status` must show it starred, and
+     `pw-metadata -n default | grep configured.audio.sink` must name it (before this
+     PR only `default.audio.sink` changed and the configured key kept the old
+     name). Then make WirePlumber rescan by plugging or unplugging a _third_
+     device — a headphone jack, a USB headset, a Bluetooth device. The picked
+     sink must **stay** default (it used to flip back on exactly these
+     events).
+  2. **A pick survives a restart.**
+     `systemctl --user restart wireplumber`, then re-login: the picked sink is
+     still the default, and `~/.local/state/wireplumber/default-nodes` has a
+     `default.configured.audio.sink=<it>` line (WirePlumber saves it a moment
+     after the pick, and only while `node.restore-default-targets` is on, its
+     default).
+  3. **Balance survives a step.** Set an uneven pair — not with
+     `wpctl set-volume`, which itself writes one value to every channel
+     (`module-mixer-api.c`), but with
+     `pw-cli set-param <sink-id> Props '{ channelVolumes: [ 1.0, 0.5 ] }'` or
+     pavucontrol's unlocked channel sliders. The chip/OSD reads 75 %. Scroll
+     the volume chip **down** one notch:
+     `wpctl inspect @DEFAULT_AUDIO_SINK@` / `pw-dump` should show roughly
+     `[0.933, 0.467]` (still 2:1, averaging 70 %), not `[0.70, 0.70]`. Scroll
+     **up** past 75 %: the loud channel pins at `1.0` and the quiet one rises
+     (80 % is `[1.0, 0.6]`), and at 100 % both read `1.0` — the shown level
+     must reach 100 % in five notches from 75 %, not creep toward it.
+  4. **The chip stops at 100 %.** Scroll the chip up from 90 %: it stops at
+     100 % (it used to keep going). Then boost with the keybind
+     (`XF86AudioRaiseVolume`, `-l 1.5`) to ~130 % and scroll the chip **up**:
+     nothing changes (no drop to 100 %); scroll **down**: 125 %, one notch.
+  5. **A fast flick counts every notch.** From 50 %, flick the wheel hard on
+     the chip (several notches in well under a second): the level moves by
+     roughly as many 5 % steps as notches, not by one.
+  6. **The default metadata comes back after a WirePlumber restart.**
+     `systemctl --user restart wireplumber`: the journal shows
+     `audio_native: - default metadata` (it never did before — the removal
+     compared a client-local proxy id with a global id), then `+ metadata`,
+     and the default sink, its volume and the drawer's radio come back without
+     restarting the shell. Afterwards pick another sink: it must still take
+     effect (a stray id match used to leave the metadata unbound for the rest
+     of the session, with every pick dropped).
+  7. **A pick made while nothing is bound lands.** Hard to time by hand; the
+     reliable trigger is a Bluetooth sink present at shell start with
+     auto-switch on: stop the shell, connect the headset, start the shell.
+     The headset must end up default, and if the switch was sent before the
+     metadata bound the journal shows
+     `writing a default parked before the metadata bound`.
+
 ## Preem raster kit (`hytte-plugin::preem`)
 
 The kit's own widget skins, which CI can only check as byte patterns. Every

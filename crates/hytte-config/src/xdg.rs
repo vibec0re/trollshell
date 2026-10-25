@@ -26,7 +26,8 @@
 //! The XDG spec orders `XDG_CONFIG_DIRS` **most important first**. `merge_all`
 //! (see [`crate::merge`]) applies layers left to right with the later one
 //! winning, so [`Env::config_layers`] hands back the search path *reversed* —
-//! lowest precedence first — with the overlay last. Getting that backwards
+//! lowest precedence first — with the overlay named beside it ([`Layers`]),
+//! and [`Layers::paths`] puts it last. Getting that backwards
 //! would silently make the least important system directory beat the most
 //! important one, which is why [`Env::config_layers`] is a pure function over an
 //! explicit [`Env`] and has a test that names three directories and checks the
@@ -195,8 +196,8 @@ impl Env {
     /// base layer's `_locked` binds the overlay and nothing else
     /// ([`crate::merge::merge_all_locked`]) — so a caller that has to hand the
     /// two halves over as two arguments asks for them as two lists.
-    /// [`Self::config_layers`] is this plus the overlay, and is what a
-    /// [`crate::subsystem::Subsystem`] load wants.
+    /// [`Self::config_layers`] is this plus the overlay slot, as a [`Layers`],
+    /// and is what a [`crate::subsystem::Subsystem`] load wants.
     ///
     /// `places` is the caller that needs the split spelled out (#1227 item 2):
     /// its overlay is [`crate::places::config_path`] — `$HOME/.config`, the
@@ -213,20 +214,32 @@ impl Env {
             .collect()
     }
 
-    /// Every `<subsystem>.toml` layer, **lowest precedence first**: the
-    /// `XDG_CONFIG_DIRS` entries in reverse spec order, then the overlay.
+    /// Every `<subsystem>.toml` layer: the `XDG_CONFIG_DIRS` entries in
+    /// reverse spec order ([`Self::base_config_layers`]), and the overlay slot
+    /// **by name** ([`Self::overlay_path`]).
     ///
-    /// This is the order [`crate::merge::merge_all`] consumes, so a caller
-    /// never has to think about which end wins. Paths are returned whether or
-    /// not the file exists — the loader skips the missing ones.
+    /// [`Layers::paths`] is the order [`crate::merge::merge_all`] consumes —
+    /// lowest precedence first, overlay last — so a caller never has to think
+    /// about which end wins. Paths are returned whether or not the file exists
+    /// — the loader skips the missing ones.
+    ///
+    /// A [`Layers`] rather than one flat list since the overlay-slot fix: with
+    /// neither `$XDG_CONFIG_HOME` nor `$HOME` set there is no overlay slot, and
+    /// the flat list this used to return was then nothing but bases — whose
+    /// last entry every loader read as the operator's overlay, because the
+    /// loaders decide the overlay by position. The highest `XDG_CONFIG_DIRS`
+    /// base then had its own `_locked` dropped from the lock set and had its
+    /// values refused by the locks of the bases below it, the exact
+    /// "base layers do not lock each other" inversion [`crate::merge`]'s module
+    /// doc rules out (#1227, #1331). `places` already took its two halves
+    /// apart for this reason ([`Self::base_config_layers`]'s doc); this is the
+    /// same split, made once, for every [`crate::subsystem::Subsystem`].
     #[must_use]
-    pub fn config_layers(&self, subsystem: &str) -> Vec<PathBuf> {
-        let mut layers = self.base_config_layers(subsystem);
-        layers.extend(
-            self.config_home()
-                .map(|dir| dir.join(APP_DIR).join(file_name(subsystem))),
-        );
-        layers
+    pub fn config_layers(&self, subsystem: &str) -> Layers {
+        Layers {
+            bases: self.base_config_layers(subsystem),
+            overlay: self.overlay_path(subsystem),
+        }
     }
 
     /// The single writable config layer:
@@ -249,6 +262,94 @@ impl Env {
     }
 }
 
+/// One subsystem's config layer **paths**, with the operator's overlay slot
+/// named rather than implied by position — what [`Env::config_layers`]
+/// returns, and what every layered loader in [`crate::subsystem`] reads.
+///
+/// # Why the overlay is a field and not the last element
+///
+/// The loaders treat the overlay differently from every base: the union of the
+/// bases' `_locked` binds it and nothing else, and its own marker binds nothing
+/// ([`crate::merge::merge_all_locked`], #1227/#1331). So "which path is the
+/// overlay" is a question with consequences, and a flat list can only answer it
+/// by position. That answer was wrong in exactly one environment — no
+/// `$XDG_CONFIG_HOME` and no `$HOME`, where there *is* no overlay and the list
+/// was all bases — and right everywhere else, so this type carries the one bit
+/// the list could not: `overlay` is `None` there, and no base is ever promoted
+/// into its slot.
+///
+/// # A bare list still reads positionally
+///
+/// The `From` impls below read a bare list the way the loaders always have —
+/// **its last path is the overlay slot** — because that is what a caller that
+/// builds its own list is saying: a test naming `[base, overlay]` in a
+/// tempdir, or a writer re-reading just the overlay file it is about to patch.
+/// Those callers chose their last path; the one producer that could have had
+/// nothing to put there is the environment, and it now hands back a `Layers`
+/// that says so. A caller holding bases only spells it with `overlay: None`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Layers {
+    /// The nix-written base layers, **lowest precedence first** —
+    /// [`Env::base_config_layers`]. None of them is ever the overlay.
+    pub bases: Vec<PathBuf>,
+    /// The operator's writable overlay slot — [`Env::overlay_path`] — whether
+    /// or not the file exists yet. `None` when there is nowhere an overlay
+    /// could be.
+    pub overlay: Option<PathBuf>,
+}
+
+impl Layers {
+    /// Every path, **lowest precedence first**: the bases, then the overlay
+    /// slot if there is one. What a change-stamp poller watches, and the order
+    /// [`crate::merge::merge_all`] folds in.
+    #[must_use]
+    pub fn paths(&self) -> Vec<PathBuf> {
+        self.bases.iter().chain(&self.overlay).cloned().collect()
+    }
+}
+
+/// A bare list, read positionally: the last path is the overlay slot, every
+/// other path a base — see [`Layers`]' "A bare list still reads positionally".
+/// An empty list is no layers at all.
+impl From<Vec<PathBuf>> for Layers {
+    fn from(mut paths: Vec<PathBuf>) -> Self {
+        let overlay = paths.pop();
+        Self {
+            bases: paths,
+            overlay,
+        }
+    }
+}
+
+/// As `From<Vec<PathBuf>>`.
+impl From<&[PathBuf]> for Layers {
+    fn from(paths: &[PathBuf]) -> Self {
+        paths.to_vec().into()
+    }
+}
+
+/// As `From<Vec<PathBuf>>`.
+impl From<&Vec<PathBuf>> for Layers {
+    fn from(paths: &Vec<PathBuf>) -> Self {
+        paths.as_slice().into()
+    }
+}
+
+/// As `From<Vec<PathBuf>>` — the `&[base, overlay]` literal a test writes.
+impl<const N: usize> From<&[PathBuf; N]> for Layers {
+    fn from(paths: &[PathBuf; N]) -> Self {
+        paths.as_slice().into()
+    }
+}
+
+/// A borrowed `Layers` is the same layers — so `load_from(&config_layers(..))`
+/// reads as it always did, with the overlay slot now named.
+impl From<&Layers> for Layers {
+    fn from(layers: &Layers) -> Self {
+        layers.clone()
+    }
+}
+
 /// `<subsystem>.toml`.
 ///
 /// `subsystem` is a compile-time constant on a [`crate::subsystem::Subsystem`]
@@ -260,7 +361,7 @@ fn file_name(subsystem: &str) -> String {
 
 /// [`Env::config_layers`] against the process environment.
 #[must_use]
-pub fn config_layers(subsystem: &str) -> Vec<PathBuf> {
+pub fn config_layers(subsystem: &str) -> Layers {
     Env::from_process().config_layers(subsystem)
 }
 
@@ -319,7 +420,7 @@ mod tests {
         };
 
         assert_eq!(
-            strs(&env.config_layers("core-leds")),
+            strs(&env.config_layers("core-leds").paths()),
             [
                 // Least important of the two base dirs, so applied first…
                 "/etc/xdg/trollshell/core-leds.toml",
@@ -331,8 +432,9 @@ mod tests {
         );
     }
 
-    /// [`Env::base_config_layers`] is [`Env::config_layers`] with the overlay
-    /// slot removed — same paths, same order, one fewer entry (#1227 item 2).
+    /// [`Env::config_layers`]' two halves are [`Env::base_config_layers`] and
+    /// [`Env::overlay_path`] — same paths, same order (#1227 item 2) — and
+    /// [`Layers::paths`] is the bases with the overlay appended.
     ///
     /// Asserted as a *relationship* rather than as a second literal list, so
     /// the two cannot drift: a change to the reversal or to `APP_DIR` that
@@ -355,30 +457,62 @@ mod tests {
                 "/nix/store/aaa-trollshell-config/trollshell/places.toml",
             ]
         );
-        assert_eq!(all.len(), bases.len() + 1);
-        assert_eq!(&all[..bases.len()], &bases[..]);
-        assert_eq!(all.last(), env.overlay_path("places").as_ref());
+        assert_eq!(all.bases, bases);
+        assert_eq!(all.overlay, env.overlay_path("places"));
+        let paths = all.paths();
+        assert_eq!(paths.len(), bases.len() + 1);
+        assert_eq!(&paths[..bases.len()], &bases[..]);
+        assert_eq!(paths.last(), env.overlay_path("places").as_ref());
     }
 
     /// With no `$HOME` and no `$XDG_CONFIG_HOME` there is no overlay slot at
-    /// all, and [`Env::config_layers`] is then exactly the base list — which is
-    /// why `places` computes its bases from [`Env::base_config_layers`] rather
-    /// than popping the last entry off `config_layers` (that would eat a base
-    /// layer here).
+    /// all: [`Env::config_layers`] is then the base list with `overlay: None`,
+    /// so nothing downstream can promote the top base into the slot — which is
+    /// the whole reason it is a [`Layers`] and not a flat list (the flat list
+    /// was *exactly* the base list here, and every loader read its last entry
+    /// as the overlay). `places` computes its bases from
+    /// [`Env::base_config_layers`] for the same reason.
+    ///
+    /// Red if `config_layers` ever fills the slot from anything but
+    /// [`Env::overlay_path`].
     #[test]
     fn without_a_home_there_is_no_overlay_slot_to_pop() {
         let env = Env {
             home: None,
             config_home: None,
-            config_dirs: Some("/etc/xdg".into()),
+            config_dirs: Some("/nix/store/aaa-trollshell-config:/etc/xdg".into()),
             state_home: None,
         };
 
-        assert_eq!(
-            env.config_layers("places"),
-            env.base_config_layers("places")
-        );
+        let layers = env.config_layers("places");
+        assert_eq!(layers.bases, env.base_config_layers("places"));
+        assert_eq!(layers.bases.len(), 2, "both base dirs, neither eaten");
+        assert_eq!(layers.overlay, None);
         assert_eq!(env.overlay_path("places"), None);
+    }
+
+    /// A bare list reads positionally — its last path is the overlay slot —
+    /// because that is how every explicit-path caller has always meant one
+    /// ([`Layers`]' second section). Pinned so a refactor of the `From` impls
+    /// cannot quietly turn every `[base, overlay]` test list into two bases.
+    #[test]
+    fn a_bare_list_names_its_last_path_the_overlay() {
+        let base = PathBuf::from("/b.toml");
+        let overlay = PathBuf::from("/o.toml");
+        let want = Layers {
+            bases: vec![base.clone()],
+            overlay: Some(overlay.clone()),
+        };
+
+        assert_eq!(Layers::from(&[base.clone(), overlay.clone()]), want);
+        assert_eq!(Layers::from(vec![base.clone(), overlay.clone()]), want);
+        assert_eq!(
+            Layers::from(&[base.clone(), overlay.clone()][..]),
+            want,
+            "a slice"
+        );
+        assert_eq!(Layers::from(&vec![base, overlay]), want);
+        assert_eq!(Layers::from(Vec::new()), Layers::default(), "no layers");
     }
 
     #[test]
@@ -387,10 +521,11 @@ mod tests {
         let layers = env.config_layers("core-leds");
 
         assert_eq!(
-            layers.last(),
+            layers.paths().last(),
             env.overlay_path("core-leds").as_ref(),
             "the writable path must be the highest-precedence layer"
         );
+        assert_eq!(layers.overlay, env.overlay_path("core-leds"));
     }
 
     /// #866's third decision, and the reason this phase exists at all: state
@@ -425,7 +560,7 @@ mod tests {
         };
 
         assert_eq!(
-            strs(&env.config_layers("weather")),
+            strs(&env.config_layers("weather").paths()),
             [
                 "/etc/xdg/trollshell/weather.toml",
                 "/home/annika/.config/trollshell/weather.toml",
@@ -449,7 +584,7 @@ mod tests {
         };
 
         assert_eq!(
-            strs(&env.config_layers("pet")),
+            strs(&env.config_layers("pet").paths()),
             [
                 "/etc/xdg/trollshell/pet.toml",
                 "/home/annika/.config/trollshell/pet.toml",
@@ -501,7 +636,7 @@ mod tests {
         };
 
         assert_eq!(
-            strs(&env.config_layers("caw")),
+            strs(&env.config_layers("caw").paths()),
             [
                 "/usr/local/etc/xdg/trollshell/caw.toml",
                 "/etc/xdg/trollshell/caw.toml",
@@ -558,7 +693,7 @@ mod tests {
         };
 
         assert_eq!(
-            strs(&env.config_layers("usage")),
+            strs(&env.config_layers("usage").paths()),
             ["/etc/xdg/trollshell/usage.toml"]
         );
         assert_eq!(env.overlay_path("usage"), None);

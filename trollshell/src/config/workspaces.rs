@@ -51,7 +51,6 @@
 //! [`DEFAULT_TOML`]: WorkspacesConfig::DEFAULT_TOML
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
 
 use hytte::futures_signals::signal::{Mutable, Signal};
 use hytte::prelude::Service;
@@ -582,12 +581,19 @@ fn edit_context(previous: Option<&str>) -> EditContext {
         .map(|config| config.parsed().0.stacks.into_keys().collect())
         .unwrap_or_default();
 
-    // The layers below the writable one: `config_layers` puts the overlay last.
-    let layers = xdg::config_layers(WorkspacesConfig::NAME);
-    let base = layers.split_last().map_or(&[][..], |(_, base)| base);
+    // The layers below the writable one, **as bases**: `overlay: None` says no
+    // path here is the operator's. This used to `split_last` a flat
+    // `config_layers` and hand the rest over as a bare list — which the loader
+    // reads positionally, so the top base was folded as an overlay (the bases
+    // below it locking it, its own `_locked` dropped), and with no
+    // `$HOME`/`$XDG_CONFIG_HOME` the split ate that base outright.
+    let base = xdg::Layers {
+        bases: xdg::base_config_layers(WorkspacesConfig::NAME),
+        overlay: None,
+    };
     let previous_is_inherited = previous.is_some_and(|previous| {
         normalize_workspace_name(previous).is_some_and(|previous| {
-            hytte_config::subsystem::load_from::<WorkspacesConfig>(base)
+            hytte_config::subsystem::load_from::<WorkspacesConfig>(&base)
                 .is_ok_and(|loaded| loaded.config.parsed().0.stacks.contains_key(&previous))
         })
     });
@@ -908,8 +914,8 @@ pub struct WorkspacesHandles {
 }
 
 pub struct WorkspacesService {
-    /// Layer paths, lowest precedence first.
-    paths: Vec<PathBuf>,
+    /// The layers — bases lowest precedence first, the overlay slot by name.
+    layers: xdg::Layers,
     /// How the (empty) environment layer is read — injected rather than read
     /// from the process because `unsafe_code = "forbid"` rules out
     /// `std::env::set_var`, so a test could not drive the real environment.
@@ -920,7 +926,7 @@ impl Service for WorkspacesService {
     type Handles = WorkspacesHandles;
 
     fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
-        let (resolved, watcher) = watch::boot::<WorkspacesConfig>(&self.paths, &*self.lookup);
+        let (resolved, watcher) = watch::boot::<WorkspacesConfig>(&self.layers, &*self.lookup);
         let stacks = Mutable::new(resolved);
         let Self { lookup, .. } = self;
         let cadence = watch::constant(watch::POLL_INTERVAL);
@@ -942,7 +948,7 @@ impl Service for WorkspacesService {
 #[must_use]
 pub fn service() -> WorkspacesService {
     WorkspacesService {
-        paths: xdg::config_layers(WorkspacesConfig::NAME),
+        layers: xdg::config_layers(WorkspacesConfig::NAME),
         lookup: std::sync::Arc::new(process_env),
     }
 }

@@ -929,22 +929,24 @@ fn parse_layer(body: &str, path: Option<&Path>) -> Result<toml::Table, ConfigErr
 /// these — it is warned and reported in [`Loaded::unknown_keys`].
 ///
 /// The **last** layer is taken to be the operator's writable overlay, which is
-/// the shape [`crate::xdg::Env::config_layers`] produces and the half of
+/// the order [`crate::xdg::Layers::paths`] produces and the half of
 /// #1227's rule that decides which `_locked` markers bind anything (see
 /// [`crate::merge::merge_all_locked`]). Call [`assemble_base_layers`] instead
 /// when every layer given is a nix-written base — including the common case
 /// where `$XDG_CONFIG_HOME/trollshell/<name>.toml` simply does not exist yet,
-/// which is what [`load_from`] does.
+/// or the environment names no overlay slot at all, which is what
+/// [`load_from`] does.
 pub fn assemble<S: Subsystem>(layers: &[(PathBuf, String)]) -> Result<Loaded<S>, ConfigError> {
     assemble_layers::<S>(layers, !layers.is_empty())
 }
 
 /// [`assemble`], told that **no** layer given is the operator's overlay.
 ///
-/// Two callers: [`load_from`], when the overlay file does not exist (the
-/// locks still have to come back, because the editor greys rows from them and
-/// the save that *creates* that file is exactly the one that must not write
-/// nix's values into it), and a test naming a base layer on its own.
+/// Two callers: [`load_from`], when the overlay file does not exist or there
+/// is no overlay slot (the locks still have to come back, because the editor
+/// greys rows from them and the save that *creates* that file is exactly the
+/// one that must not write nix's values into it), and a test naming a base
+/// layer on its own.
 ///
 /// # Errors
 /// As [`assemble`].
@@ -1492,25 +1494,52 @@ fn read_layers(paths: &[PathBuf]) -> Result<Vec<(PathBuf, String)>, ConfigError>
     Ok(out)
 }
 
-/// [`assemble`] over explicit layer paths, lowest precedence first — the shape
+/// Read `layers`' files that exist, lowest precedence first, beside whether
+/// the operator's overlay was among them — the one place both [`load_from`]
+/// and [`load_raw`] decide the overlay slot.
+///
+/// The overlay is the **named** slot, [`xdg::Layers::overlay`], and it counts
+/// only when that file is there: [`read_layers`] skips a missing one, and "no
+/// overlay yet" is the normal case on a fresh machine. Asking the read-back
+/// list which entry came last instead would promote the top base layer into
+/// the overlay slot and its `_locked` would then be dropped from
+/// [`Loaded::locked`], which is the set an editor greys rows from and the set
+/// the very first save skips (#1331 review, HIGH 1 shape, with the sign
+/// flipped).
+///
+/// Named rather than positional since the overlay-slot fix: this used to take
+/// the last *requested* path as the slot, which is right for every list that
+/// has one and wrong for the one that does not — the environment with neither
+/// `$XDG_CONFIG_HOME` nor `$HOME`, whose search path was all bases. The top
+/// `XDG_CONFIG_DIRS` base was then this function's "overlay": its own
+/// `_locked` vanished from the lock set and the bases below it refused its
+/// values, although base layers do not lock each other ([`crate::merge`]).
+fn read_split(layers: &xdg::Layers) -> Result<(Vec<(PathBuf, String)>, bool), ConfigError> {
+    let mut bodies = read_layers(&layers.bases)?;
+    let overlay = match &layers.overlay {
+        Some(path) => read_layers(std::slice::from_ref(path))?.pop(),
+        None => None,
+    };
+    let has_overlay = overlay.is_some();
+    bodies.extend(overlay);
+    Ok((bodies, has_overlay))
+}
+
+/// [`assemble`] over explicit layer paths — the shape
 /// [`crate::xdg::Env::config_layers`] returns. Missing paths are skipped.
+///
+/// `layers` is an [`xdg::Layers`], which names the overlay slot (`None` when
+/// the environment has none), or anything that converts into one: a bare list
+/// of paths, lowest precedence first, reads **positionally** — its last path
+/// is the overlay slot — which is what every explicit-path caller has always
+/// meant by one (see [`xdg::Layers`]).
 ///
 /// # Errors
 /// As [`assemble`], plus [`ConfigError::Unreadable`] for a layer that exists
 /// but cannot be read.
-pub fn load_from<S: Subsystem>(paths: &[PathBuf]) -> Result<Loaded<S>, ConfigError> {
-    let layers = read_layers(paths)?;
-    // The overlay is the last *requested* path, whether or not the file is
-    // there — `read_layers` skips a missing one, and "no overlay yet" is the
-    // normal case on a fresh machine. Asking the read-back list instead would
-    // promote the top base layer into the overlay slot and its `_locked` would
-    // then be dropped from `Loaded::locked`, which is the set an editor greys
-    // rows from and the set the very first save skips (#1331 review, HIGH 1
-    // shape, with the sign flipped).
-    let has_overlay = paths
-        .last()
-        .is_some_and(|want| layers.last().is_some_and(|(got, _)| got == want));
-    assemble_layers::<S>(&layers, has_overlay)
+pub fn load_from<S: Subsystem>(layers: impl Into<xdg::Layers>) -> Result<Loaded<S>, ConfigError> {
+    let (bodies, has_overlay) = read_split(&layers.into())?;
+    assemble_layers::<S>(&bodies, has_overlay)
 }
 
 /// Load `S` from the process environment's XDG search path.
@@ -1518,7 +1547,7 @@ pub fn load_from<S: Subsystem>(paths: &[PathBuf]) -> Result<Loaded<S>, ConfigErr
 /// # Errors
 /// As [`load_from`].
 pub fn load<S: Subsystem>() -> Result<Loaded<S>, ConfigError> {
-    load_from::<S>(&xdg::config_layers(S::NAME))
+    load_from::<S>(xdg::config_layers(S::NAME))
 }
 
 /// [`load`], degrading to [`Subsystem::DEFAULT_TOML`] alone on any failure,
@@ -1569,8 +1598,10 @@ pub fn load_or_default<S: Subsystem>() -> Option<S> {
 ///
 /// # Errors
 /// As [`load_from`].
-pub fn load_layer<S: Subsystem>(paths: &[PathBuf]) -> Result<S::Resolved, ConfigError> {
-    let loaded = load_from::<S>(paths)?;
+pub fn load_layer<S: Subsystem>(
+    layers: impl Into<xdg::Layers>,
+) -> Result<S::Resolved, ConfigError> {
+    let loaded = load_from::<S>(layers)?;
     let (resolved, rejected) = loaded.config.parsed();
     for invalid in &rejected {
         warn_rejected_value(S::NAME, invalid.key(), &invalid.to_string());
@@ -1586,8 +1617,8 @@ pub fn load_layer<S: Subsystem>(paths: &[PathBuf]) -> Result<S::Resolved, Config
 /// paths — because a config file nobody can parse must be visible in the journal
 /// and must not stop the shell from starting.
 #[must_use]
-pub fn initial_load<S: Subsystem>(paths: &[PathBuf]) -> S::Resolved {
-    match load_layer::<S>(paths) {
+pub fn initial_load<S: Subsystem>(layers: impl Into<xdg::Layers>) -> S::Resolved {
+    match load_layer::<S>(layers) {
         Ok(config) => config,
         Err(e) => {
             tracing::error!(
@@ -1690,20 +1721,17 @@ impl Raw {
 /// [`load_from`] stopped before the typed parse: the merged table, the lock
 /// set and per-leaf provenance (#888 P0 §2c).
 ///
-/// `layers` is lowest precedence first, the shape
-/// [`crate::xdg::Env::config_layers`] returns; the **last requested** path is
-/// the operator's overlay whether or not the file exists, exactly as
-/// [`load_from`] decides it and for the same reason.
+/// `layers` is the shape [`crate::xdg::Env::config_layers`] returns, or a bare
+/// list read positionally, exactly as [`load_from`] takes it; the overlay is
+/// its named slot whether or not the file exists, decided by the same
+/// function and for the same reason.
 ///
 /// # Errors
 /// [`ConfigError::Unreadable`] for a layer that exists and cannot be read,
 /// [`ConfigError::Parse`] for one that is not TOML. Nothing else: there is no
 /// typed parse here to fail a schema or a validation.
-pub fn load_raw<S: Subsystem>(layers: &[PathBuf]) -> Result<Raw, ConfigError> {
-    let bodies = read_layers(layers)?;
-    let has_overlay = layers
-        .last()
-        .is_some_and(|want| bodies.last().is_some_and(|(got, _)| got == want));
+pub fn load_raw<S: Subsystem>(layers: impl Into<xdg::Layers>) -> Result<Raw, ConfigError> {
+    let (bodies, has_overlay) = read_split(&layers.into())?;
     let sources: Vec<PathBuf> = bodies.iter().map(|(path, _)| path.clone()).collect();
     let (paths, mut tables) = parsed_layers(S::DEFAULT_TOML, &bodies)?;
 
@@ -6759,6 +6787,157 @@ brightness = 5
             "and the refusal is reported: {:?}",
             loaded.lock_findings
         );
+    }
+
+    // ── the overlay slot is named, not positional ───────────────────────────
+
+    /// The more important of two `XDG_CONFIG_DIRS` bases in the tests below:
+    /// it locks a key of its own and sets one the less important base
+    /// ([`LOCKED_BASE`]) locked.
+    const HIGH_BASE: &str =
+        "_locked = [\"core.color\"]\n\n[core]\ncolor = \"crt\"\nbrightness = 7\n";
+
+    /// An [`xdg::Env`] over `root` whose `XDG_CONFIG_DIRS` names `bases` (most
+    /// important first, the spec's own order), each written as
+    /// `<root>/<dir>/trollshell/core-leds.toml` — and with neither `$HOME` nor
+    /// `$XDG_CONFIG_HOME` unless `home` is given.
+    ///
+    /// The literal [`xdg::Env`] is the seam [`crate::xdg`]'s module doc names for
+    /// this: no `set_var` (the workspace forbids `unsafe`), and the developer's
+    /// own `$HOME` cannot leak in.
+    fn env_over(root: &Path, bases: &[(&str, &str)], home: Option<&Path>) -> xdg::Env {
+        let mut dirs = Vec::new();
+        for (dir, body) in bases {
+            let dir = root.join(dir);
+            std::fs::create_dir_all(dir.join(xdg::APP_DIR)).expect("base dir");
+            std::fs::write(dir.join(xdg::APP_DIR).join("core-leds.toml"), body)
+                .expect("seed a base");
+            dirs.push(dir.display().to_string());
+        }
+        xdg::Env {
+            home: home.map(|h| h.display().to_string()),
+            config_home: None,
+            config_dirs: Some(dirs.join(":")),
+            state_home: None,
+        }
+    }
+
+    /// The overlay-slot fix, through the real load: with neither
+    /// `$XDG_CONFIG_HOME` nor `$HOME` there is no overlay, so two
+    /// `XDG_CONFIG_DIRS` bases fold **as bases** — XDG precedence between them,
+    /// every base's `_locked` in the lock set, nothing refused (#1227's "base
+    /// layers do not lock each other", [`crate::merge`]).
+    ///
+    /// Red if [`xdg::Env::config_layers`] goes back to a flat list, or
+    /// `read_split` back to "the last requested path is the overlay": the more
+    /// important base is then this load's overlay, so the less important base's
+    /// lock refuses its `brightness = 7` (`3` wins, and a refusal is reported
+    /// against a nix file), and its own `core.color` lock vanishes from
+    /// [`Loaded::locked`] — the set an editor greys rows from.
+    #[test]
+    fn with_no_overlay_slot_every_base_folds_as_a_base() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = env_over(
+            dir.path(),
+            &[("high", HIGH_BASE), ("low", LOCKED_BASE)],
+            None,
+        );
+        let layers = env.config_layers(Leds::NAME);
+        assert_eq!(layers.overlay, None, "nowhere an overlay could be");
+        assert_eq!(layers.bases.len(), 2, "both bases, neither in the slot");
+
+        let loaded = load_from::<Leds>(&layers).expect("loads");
+
+        assert_eq!(
+            loaded.config.core.brightness, 7,
+            "the more important base wins, as between bases"
+        );
+        assert_eq!(loaded.config.core.color, "crt");
+        assert_eq!(
+            loaded.locked,
+            BTreeSet::from(["core.brightness".to_owned(), "core.color".to_owned()]),
+            "every base's lock, the top one's included"
+        );
+        assert!(
+            loaded.lock_findings.is_empty(),
+            "a base refuses nothing: {:?}",
+            loaded.lock_findings
+        );
+        assert_eq!(loaded.sources.len(), 2);
+    }
+
+    /// [`load_raw`] — the form's read — decides the slot through the same
+    /// `read_split`, so with no overlay slot nothing is attributed to the
+    /// operator: the top base's leaves come from that base, by name.
+    ///
+    /// Red under the positional rule: `core.color` reads [`Origin::Overlay`]
+    /// ("yours") for a value nix wrote, and `core.color` is not locked.
+    #[test]
+    fn with_no_overlay_slot_load_raw_attributes_nothing_to_the_operator() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = env_over(
+            dir.path(),
+            &[("high", HIGH_BASE), ("low", LOCKED_BASE)],
+            None,
+        );
+        let layers = env.config_layers(Leds::NAME);
+        let high = layers.bases.last().expect("the top base").clone();
+
+        let raw = load_raw::<Leds>(&layers).expect("loads");
+
+        assert_eq!(raw.origin("core.color"), Some(&Origin::Base(high.clone())));
+        assert_eq!(raw.origin("core.brightness"), Some(&Origin::Base(high)));
+        assert!(raw.is_locked("core.color"), "{:?}", raw.locked);
+        assert!(raw.is_locked("core.brightness"), "{:?}", raw.locked);
+        assert!(
+            !raw.origins.values().any(|o| *o == Origin::Overlay),
+            "{:?}",
+            raw.origins
+        );
+    }
+
+    /// The other half of "identical when `$HOME` is set": the same two bases
+    /// with a home, and the named slot is `$HOME/.config/trollshell/…` — the
+    /// overlay the positional rule found there too — so both bases' locks bind
+    /// it, its override is refused and reported once, and nothing else moved.
+    #[test]
+    fn with_a_home_the_named_slot_is_bound_by_every_base_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        let env = env_over(
+            dir.path(),
+            &[("high", HIGH_BASE), ("low", LOCKED_BASE)],
+            Some(&home),
+        );
+        let layers = env.config_layers(Leds::NAME);
+        let overlay = layers.overlay.clone().expect("a home names the slot");
+        assert_eq!(
+            overlay,
+            home.join(".config")
+                .join(xdg::APP_DIR)
+                .join("core-leds.toml")
+        );
+        std::fs::create_dir_all(overlay.parent().expect("parent")).expect("overlay dir");
+        std::fs::write(&overlay, "[core]\ncolor = \"cyan\"\n").expect("seed the overlay");
+
+        let loaded = load_from::<Leds>(&layers).expect("loads");
+
+        assert_eq!(loaded.config.core.color, "crt", "the top base's lock holds");
+        assert_eq!(
+            loaded.config.core.brightness, 7,
+            "bases still fold by precedence"
+        );
+        assert_eq!(
+            loaded.locked,
+            BTreeSet::from(["core.brightness".to_owned(), "core.color".to_owned()])
+        );
+        assert_eq!(
+            loaded.lock_findings.len(),
+            1,
+            "the overlay's override, once: {:?}",
+            loaded.lock_findings
+        );
+        assert_eq!(loaded.lock_findings[0].layer.as_ref(), Some(&overlay));
     }
 
     /// [`assemble_base_layers`] has one call site in the workspace and it is in

@@ -42,9 +42,10 @@
 //! Annika wants toasts from a closed sidebar, the change is a slow hidden
 //! cadence here plus one key in `agents.toml`, and nothing else moves.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::SystemTime;
 
+use hytte_config::xdg::Layers;
 use hytte_plugin::CmdReceiver;
 use hytte_plugin::poll::{Gate, Wake};
 use tokio::sync::mpsc::UnboundedSender;
@@ -118,7 +119,7 @@ pub enum Msg {
 /// process's XDG layers, which a test cannot point at a tempdir without
 /// mutating global environment every other test in the binary shares.
 pub struct ConfigSource {
-    layers: Vec<PathBuf>,
+    layers: Layers,
     stamps: Vec<Option<SystemTime>>,
 }
 
@@ -130,16 +131,19 @@ impl ConfigSource {
         Self::over(hytte_config::xdg::config_layers(config::NAME))
     }
 
-    /// Watch an explicit layer list, lowest precedence first.
+    /// Watch explicit layers: a [`Layers`], whose overlay slot is named, or a
+    /// bare list — lowest precedence first, its last path the overlay slot —
+    /// read the way `hytte_config::subsystem::load_from` reads one.
     #[must_use]
-    pub fn over(layers: Vec<PathBuf>) -> Self {
-        let stamps = layers.iter().map(|p| stamp(p)).collect();
+    pub fn over(layers: impl Into<Layers>) -> Self {
+        let layers = layers.into();
+        let stamps = layers.paths().iter().map(|p| stamp(p)).collect();
         Self { layers, stamps }
     }
 
     /// `true` when any layer's mtime (or existence) moved since the last call.
     fn changed(&mut self) -> bool {
-        let now: Vec<Option<SystemTime>> = self.layers.iter().map(|p| stamp(p)).collect();
+        let now: Vec<Option<SystemTime>> = self.layers.paths().iter().map(|p| stamp(p)).collect();
         let moved = now != self.stamps;
         self.stamps = now;
         moved

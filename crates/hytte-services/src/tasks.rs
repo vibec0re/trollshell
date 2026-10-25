@@ -966,11 +966,17 @@ fn generate_uid() -> String {
 /// the task has no due.
 #[must_use]
 pub fn format_due(task: &Task) -> String {
+    format_due_on(task, Local::now().date_naive())
+}
+
+/// [`format_due`] with "today" supplied, so the labels can be tested
+/// without depending on the real date. Calendar-date arithmetic on
+/// [`chrono::NaiveDate`]s throughout, never elapsed time, so the length of a
+/// DST day cannot shift a label.
+fn format_due_on(task: &Task, today: chrono::NaiveDate) -> String {
     let Some(due) = task.due else {
         return String::new();
     };
-    let now = Local::now();
-    let today = now.date_naive();
     let due_date = due.date_naive();
     let delta_days = due_date.signed_duration_since(today).num_days();
     let day_label_str = day_label(due_date, today);
@@ -1089,12 +1095,24 @@ mod tests {
 
     #[test]
     fn format_due_overdue_prefixed() {
-        let now = Local::now();
-        let s = format_due(&Task {
-            due: Some(now - Duration::days(1)),
-            due_all_day: true,
-            ..task_with(Some(now - Duration::days(1)))
-        });
-        assert!(s.starts_with("Overdue"), "got {s}");
+        // The 2026 EU transitions plus an ordinary day: on the fall-back day
+        // `now - 24 h` can land on the same date, which is what this test
+        // used to build "yesterday" from.
+        for (y, m, d) in [(2026, 3, 29), (2026, 10, 25), (2026, 6, 10)] {
+            let today = chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap();
+            let yesterday = today.pred_opt().unwrap();
+            let due = Local
+                .from_local_datetime(&yesterday.and_hms_opt(12, 0, 0).unwrap())
+                .earliest()
+                .unwrap();
+            let s = format_due_on(
+                &Task {
+                    due_all_day: true,
+                    ..task_with(Some(due))
+                },
+                today,
+            );
+            assert_eq!(s, "Overdue \u{00b7} Yesterday", "today = {today}");
+        }
     }
 }

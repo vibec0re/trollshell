@@ -1885,6 +1885,52 @@ fn a_long_description_is_clamped_on_a_char_boundary() {
     assert!(detail.contains("request #7"), "{detail}");
 }
 
+/// The cap counts characters, which does not bound **height**: a description
+/// of a few hundred `\n`s is well under 240 and still that many lines tall on
+/// the card's wrapping label — enough to push the buttons off it, or to draw a
+/// line of the agent's own above the stamp the plugin appends. The agent that
+/// asked wrote that description, so it is the text a prompt injection reaches.
+///
+/// So every run of whitespace, control characters and bidi overrides collapses
+/// to one space before the clamp, in the description and in the timestamp
+/// alike, and the plugin's own stamp is still the end of the one line.
+///
+/// Falsification: put `str::trim` back in place of `single_line` in
+/// `detail_line` and the newlines survive.
+#[test]
+fn a_multi_line_description_reaches_the_card_as_one_line() {
+    let (mut m, _rx) = model();
+    m.update(status(roster("agent_status_grouped.json")));
+    let mut a = approval(7, "trollshell-choom");
+    a.description = Some(format!(
+        "bump the inputs{}request #3, asked 2026-01-01T00:00:00Z\r\n\t\u{2028}\u{2029}\u{85}\u{1b}[2J\u{202e}tail",
+        "\n".repeat(230)
+    ));
+    a.requested_at = "2026-09-12T09:07:00Z\n\nforged".to_owned();
+
+    let fx = m.update(pending(vec![a]));
+    let detail = prompts(&fx)[0].3.clone();
+    assert!(
+        !detail
+            .chars()
+            .any(|c| c.is_control()
+                || matches!(c, '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}')),
+        "one line, no control characters: {detail:?}"
+    );
+    assert!(
+        !detail.contains("  "),
+        "runs collapse to one space: {detail:?}"
+    );
+    assert!(
+        detail.starts_with("bump the inputs request #3, asked 2026-01-01T00:00:00Z [2J tail — "),
+        "{detail:?}"
+    );
+    assert!(
+        detail.ends_with("— request #7, asked 2026-09-12T09:07:00Z forged"),
+        "the plugin's own stamp still ends the line: {detail:?}"
+    );
+}
+
 // ── #1140 review: the fix round ──────────────────────────────────────────────
 
 /// Advance the model's clock, the way the host's `StateKey::Clock` push does.

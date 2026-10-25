@@ -17,7 +17,9 @@ use tokio::sync::mpsc;
 use crate::config::AgentsConfig;
 use crate::hive::wire::{Approval, ApprovalKind, HiveUrls, Request, Scope};
 use crate::hive::{AgentStatusRow, HiveError};
-use crate::model::{Agent, AgentName, ExpandedGroups, Hive, PendingApprovals, Status, agent_url};
+use crate::model::{
+    Agent, AgentName, ExpandedGroups, Hive, PendingApprovals, Status, agent_url, single_line,
+};
 use crate::poll::{Cmd, Msg, poll_task};
 use crate::view::{self, PanelContext, ids};
 use crate::window;
@@ -1247,10 +1249,12 @@ pub fn card_of(model: &Agents) -> Node {
 ///
 /// The description is what the person who queued the approval wrote about it,
 /// so it is the sentence worth showing — but it is free text from another
-/// process, so it is bounded ([`DETAIL_CHARS`]) before it reaches a 480 px
-/// card. An approval with none still gets a line, because "when was this asked"
-/// is the next thing an operator wants and a blank detail would hide the
-/// overlay's whole second row.
+/// process, so it is flattened to one line ([`single_line`]) and then bounded
+/// ([`DETAIL_CHARS`]) before it reaches a 480 px card. Both halves matter: the
+/// cap counts characters, and a description of a few hundred `\n`s is short by
+/// that count and still hundreds of lines tall. An approval with none still
+/// gets a line, because "when was this asked" is the next thing an operator
+/// wants and a blank detail would hide the overlay's whole second row.
 ///
 /// `pub` since #1141's review (M4). `trollshell-agent-window` renders the same
 /// approval on its Settings page and had a byte-for-byte copy of this body;
@@ -1259,24 +1263,26 @@ pub fn card_of(model: &Agents) -> Node {
 /// that a compile-time fact rather than a reviewer's eyeball.
 #[must_use]
 pub fn detail_line(approval: &Approval) -> String {
-    let stamp = if approval.requested_at.is_empty() {
+    // Flattened and bounded like the description: the mirror keeps
+    // `requested_at` an unparsed wire string on purpose, so nothing else caps
+    // it — in length or in height.
+    let requested_at = single_line(&approval.requested_at);
+    let stamp = if requested_at.is_empty() {
         format!("request #{}", approval.id)
     } else {
-        // Bounded like the description: the mirror keeps `requested_at` an
-        // unparsed wire string on purpose, so nothing else caps it.
         format!(
             "request #{}, asked {}",
             approval.id,
-            clamp(&approval.requested_at, REQUESTED_AT_CHARS)
+            clamp(&requested_at, REQUESTED_AT_CHARS)
         )
     };
     match approval
         .description
         .as_deref()
-        .map(str::trim)
+        .map(single_line)
         .filter(|d| !d.is_empty())
     {
-        Some(description) => format!("{} — {stamp}", clamp(description, DETAIL_CHARS)),
+        Some(description) => format!("{} — {stamp}", clamp(&description, DETAIL_CHARS)),
         None => stamp,
     }
 }

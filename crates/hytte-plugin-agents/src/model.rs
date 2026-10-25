@@ -618,6 +618,49 @@ pub fn model_family(raw: &str) -> Option<String> {
     Some(head.to_uppercase().chain(chars).collect())
 }
 
+/// Flatten free text another process wrote to **one line**: every run of
+/// whitespace, control characters and bidi embedding/override/isolate controls
+/// becomes a single space, and the ends are trimmed.
+///
+/// A character cap alone does not bound how tall a wrapping label gets. 230
+/// `\n`s are well under any cap here and still draw 230 lines, which is enough
+/// to push a consent card's buttons off its surface — or to draw a convincing
+/// line of the agent's own above the stamp the plugin appends. The approval's
+/// description is written by the agent that asked, so it is exactly the text
+/// that can be prompt-injected into doing that. `char::is_whitespace` covers
+/// the Unicode line and paragraph separators (U+2028, U+2029, U+0085) Pango also
+/// breaks on; `char::is_control` covers the rest of C0/C1.
+///
+/// The bidi controls are flattened for the same reason one line is: a
+/// right-to-left override in the description runs on to the end of the
+/// paragraph, so without this it would draw the stamp after it reversed.
+///
+/// Run it **before** [`crate::plugin::clamp`], so the cap counts what is drawn.
+#[must_use]
+pub fn single_line(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut gap = false;
+    for c in s.chars() {
+        if c.is_whitespace() || c.is_control() || is_bidi_control(c) {
+            gap = true;
+            continue;
+        }
+        if gap && !out.is_empty() {
+            out.push(' ');
+        }
+        gap = false;
+        out.push(c);
+    }
+    out
+}
+
+/// The explicit bidi embedding, override and isolate controls (Unicode
+/// UAX #9, §2.1–2.4): LRE/RLE/PDF/LRO/RLO and LRI/RLI/FSI/PDI. The implicit
+/// marks (LRM, RLM, ALM) change no run past their own position, so they stay.
+fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

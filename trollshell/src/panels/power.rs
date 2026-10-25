@@ -146,11 +146,26 @@ fn build_brightness_row() -> gtk::ListBox {
     icon.add_css_class("dim-label");
     inner.append(&icon);
 
-    let slider = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.05, 1.0, 0.05);
+    // The floor is the service's, so the slider's lowest stop is exactly the
+    // lowest level `brightness::set` will write.
+    let slider = gtk::Scale::with_range(
+        gtk::Orientation::Horizontal,
+        brightness::MIN_LEVEL,
+        1.0,
+        0.05,
+    );
     slider.set_draw_value(false);
     slider.set_hexpand(true);
 
-    bind_two_way(
+    // Drag-safe: the service re-reads sysfs every second and the binding
+    // would `set_value` each new reading straight back into the slider —
+    // mid-drag, that yanks the thumb to wherever the backlight had got to.
+    // `bind_two_way_drag_safe` drops those applies while the user holds the
+    // slider (and briefly after), the same fix the media seek bar takes for
+    // its position poller (#445). The writes themselves are coalesced by the
+    // service, so a drag's stream of `value-changed` is not a stream of
+    // `SetBrightness` calls racing each other to logind.
+    bind_two_way_drag_safe(
         brightness::current(),
         &slider,
         |s, b| {

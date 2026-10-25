@@ -8,7 +8,7 @@
 //! shapes, and the unit tests that pin them all live in `hytte-sensors` —
 //! this module owns only what needs `Mutable`/a tokio runtime: the
 //! `SensorsHandles` wrapper, the tick loop, the sparkline history
-//! accumulators, and the `AsyncFd` mount-table watcher.
+//! accumulators, and the `POLLPRI` mount-table watcher.
 //!
 //! # Public API
 //!
@@ -31,8 +31,12 @@ mod warn_latch;
 
 use futures_signals::signal::{Mutable, Signal, SignalExt};
 use futures_util::StreamExt;
-use hytte_reactive::{Service, registry, spawn_supervised};
+use hytte_reactive::{Service, registry, spawn_supervised, spawn_supervised_blocking};
+use nix::errno::Errno;
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use std::collections::{HashMap, VecDeque};
+use std::io;
+use std::os::fd::{AsFd, BorrowedFd};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -119,7 +123,8 @@ pub struct SensorsHandles {
     pub(crate) net_connections: Mutable<NetConnections>,
     pub(crate) process_count: Mutable<u32>,
     /// Live list of real mounts from `/proc/self/mountinfo`. Updated by
-    /// `mount_watch_loop`; consumed by `poll_tick`'s disk branch.
+    /// `watch_mounts`, on the thread `spawn_mount_watch` starts; consumed by
+    /// `poll_tick`'s disk branch.
     pub(crate) mount_list: Mutable<Vec<MountSpec>>,
     // ── Sparkline history (#231) ──────────────────────────────────────────────
     // Process-wide ring buffers (last `HISTORY_CAP` samples) for the Stats-panel
@@ -288,9 +293,7 @@ impl Service for SensorsService {
             };
             poll_loop(writers)
         });
-        spawn_supervised("sensors", move || {
-            mount_watch_loop(mount_list_for_watch.clone())
-        });
+        spawn_mount_watch(mount_list_for_watch);
 
         // Sparkline history accumulators (#231): one ring per Stats graph, fed
         // off the live metric signals — extractors mirror each row's old
@@ -1014,63 +1017,174 @@ fn apply_conn_counts(net_conn: Option<NetConnections>, writer: &Mutable<NetConne
 
 // ── Mount table watcher ──────────────────────────────────────────────────────
 
-/// Background task: keep `mount_list` in sync with `/proc/self/mountinfo`.
-///
-/// Seeds the Mutable once, then waits for `POLLPRI` events on the open file
-/// — the kernel signals POLLPRI on `/proc/self/mountinfo` whenever the mount
-/// table changes (mount, unmount, remount). On each event we re-parse the
-/// file from scratch via [`read_mountlist`].
-///
-/// Failure modes (open error, `AsyncFd` registration error, poll error) all
-/// log a warning and exit. The Mutable then either stays empty (if the
-/// initial open failed) or holds whatever was last successfully read.
-async fn mount_watch_loop(mount_list: Mutable<Vec<MountSpec>>) {
-    use std::os::fd::OwnedFd;
-    use tokio::io::Interest;
-    use tokio::io::unix::AsyncFd;
+/// The file the watcher polls — and the one [`read_mountlist`] re-reads, by
+/// path, on every change the poll reports.
+const MOUNTINFO: &str = "/proc/self/mountinfo";
 
-    // Seed once before we even attempt to register for events. This way a
-    // POLLPRI registration failure still leaves us with a correct list as
-    // of startup.
-    //
-    // `read_mountlist` does blocking file I/O; run it on a blocking thread.
-    mount_list.set(
-        tokio::task::spawn_blocking(read_mountlist)
-            .await
-            .unwrap_or_default(),
-    );
+/// The `poll(2)` mask [`wait_for_change`] waits on: `POLLPRI`, and nothing
+/// else.
+///
+/// The kernel's `poll` for this file (`mounts_poll`, `fs/proc_namespace.c`)
+/// reports `POLLIN | POLLRDNORM` on **every** call — the file is always
+/// readable — and adds `POLLERR | POLLPRI` only when the namespace's mount
+/// event counter has moved since this open file last polled, catching the
+/// file's own copy up as it does. So the poll that reports a change is also
+/// what consumes it, the next one parks until the next change, and a mask
+/// that also asked for `POLLIN` would return at once on every call: a thread
+/// re-reading the mount table in a hot loop. `POLLERR` is not in the mask
+/// because it cannot usefully be — `poll(2)` reports it whatever `events`
+/// says — and [`wait_for_change`] treats one that arrives without `POLLPRI` as
+/// the end of the watch rather than a change.
+/// `the_watch_mask_parks_on_an_unchanged_mount_table` pins both halves of
+/// this against the real file.
+const WATCH_EVENTS: PollFlags = PollFlags::POLLPRI;
 
-    let file = match std::fs::File::open("/proc/self/mountinfo") {
+/// Start the mount-table watcher: [`watch_mounts`] over the real file, on a
+/// supervised **blocking** thread.
+///
+/// # Why a thread and not an `AsyncFd` (RUSTSEC-2026-0386)
+///
+/// Until tokio 1.54 this was an `async fn` that registered the open file with
+/// the reactor through `AsyncFd::with_interest(fd, Interest::PRIORITY)`.
+/// tokio 1.51.6 / 1.53.3 / 1.54.0 deprecate that constructor and its three
+/// siblings (`new`, `try_new`, `try_with_interest`) as unsound — tokio#8587,
+/// RUSTSEC-2026-0386. They are *safe* functions over any `T: AsRawFd`, and
+/// `AsRawFd` is a safe trait any value can implement with any number (a bare
+/// `RawFd` does), so safe code could register an fd it does not own, or one
+/// that is closed and its number reused while the `AsyncFd` lives. That
+/// opens two holes: `AsyncFd`'s own `AsFd` impl manufactures a `BorrowedFd`
+/// for whatever that number is, and the reactor's `epoll` user data is a
+/// pointer to the registration's allocation, so dropping an `AsyncFd` whose
+/// number was recycled deregisters the *new* fd and frees the allocation
+/// while the original file description is still in the `epoll` set — a
+/// use-after-free on its next readiness event. The replacements,
+/// `AsyncFd::register` / `register_with_interest`, are `unsafe fn`s that move
+/// that proof onto the caller, and 1.54 ships no safe constructor beside them
+/// — none bounded on `AsFd` or taking an `OwnedFd`, the one shape that could
+/// carry the proof in the type. (The pipe receiver's
+/// `from_owned_fd_unchecked` is safe, but its contract is the read end of a
+/// pipe and it registers read interest only; a procfs file is neither.)
+///
+/// This call site was never one of the holes: it handed over an `OwnedFd`,
+/// whose `as_raw_fd` is the one fd it owns for as long as it lives. But saying
+/// so now takes an `unsafe` block, this crate sits under the workspace's
+/// `unsafe_code = "forbid"`, and the two islands that may write one
+/// (`hytte-ecal`, `hytte-gl`) are FFI crates — a third is the owner's call
+/// (`checks.lints-tables` pins exactly two), not a dependency bump's.
+///
+/// `poll(2)` through `nix` says the same thing with no `unsafe` on this side:
+/// [`PollFd`] borrows a `BorrowedFd<'_>`, so the borrow checker is what proves
+/// the fd stays open for the wait, and nothing is registered anywhere that
+/// could outlive it. What it costs is a thread parked in `poll` instead of a
+/// reactor registration — one blocking-pool thread for the life of the
+/// process, the same trade `niri`'s IPC listener and `audio_native`'s main
+/// loop already make through [`spawn_supervised_blocking`] (#654), the one
+/// idiom this tree has for a long-lived blocking body. It keeps the async
+/// task's supervision as it was: a panic restarts the body from the top
+/// (re-seed, re-open) on the shared backoff, and a return — every failure
+/// path in [`watch_mounts`] — is the same `warn!` and kept
+/// `TaskState::Returned` health row a returning `spawn_supervised` task left.
+/// The one difference is a [`read_mountlist`] panic, which the async task
+/// swallowed (`spawn_blocking(..).await.unwrap_or_default()` published an
+/// empty list and kept watching) and which now restarts the body, re-seeding
+/// after the backoff instead of publishing nothing.
+///
+/// # Lifetime
+///
+/// Nothing ever stopped the async task — `spawn_supervised` hands back no
+/// handle, and the runtime is a process-wide static that is never dropped —
+/// so the thread has no stop path either, and needs no wake fd to interrupt
+/// `poll` with. What it serves is `mount_list`, a clone of a `Mutable` the
+/// registry holds for the life of the process; it ends with the process,
+/// exactly as the task did.
+fn spawn_mount_watch(mount_list: Mutable<Vec<MountSpec>>) {
+    spawn_supervised_blocking("sensors", move || {
+        watch_mounts(
+            &mount_list,
+            || std::fs::File::open(MOUNTINFO),
+            wait_for_change,
+            read_mountlist,
+        );
+    });
+}
+
+/// Keep `mount_list` in sync with the mount table: seed it once, then re-read
+/// on every change `wait` reports.
+///
+/// The seed comes before the open — the async task's order, kept as it was —
+/// so a failed open or a first `poll` that errors still leaves the list
+/// correct as of startup. (A mount made between the seed and the open is
+/// picked up only at the next change, since the file's event counter starts
+/// at the open; opening first would close that startup-only window, and is
+/// left for its own change.) Every failure — the open, a `poll(2)` error, a
+/// wake without `POLLPRI` — logs one warning and returns, and `mount_list`
+/// then holds whatever was last read: empty only if that read failed too
+/// ([`read_mountlist`] maps a failed read to an empty list).
+///
+/// `open`, `wait` and `read` are seams, because the one thing a hermetic test
+/// cannot do is change the mount table under a real `poll`; production passes
+/// the real file, [`wait_for_change`] and [`read_mountlist`]. Generic over the
+/// list's type only because [`MountSpec`]'s fields are private to
+/// `hytte-sensors`, so a test here cannot build one to compare.
+fn watch_mounts<T, F>(
+    mount_list: &Mutable<T>,
+    open: impl FnOnce() -> io::Result<F>,
+    wait: impl Fn(BorrowedFd<'_>) -> io::Result<()>,
+    read: impl Fn() -> T,
+) where
+    F: AsFd,
+{
+    mount_list.set(read());
+
+    let file = match open() {
         Ok(f) => f,
         Err(e) => {
             tracing::warn!(error = %e, "sensors: failed to open mountinfo for watch");
             return;
         }
     };
-    let fd: OwnedFd = file.into();
-    let async_fd = match AsyncFd::with_interest(fd, Interest::PRIORITY) {
-        Ok(a) => a,
-        Err(e) => {
-            tracing::warn!(error = %e, "sensors: failed to register mountinfo AsyncFd");
-            return;
-        }
-    };
 
     loop {
-        match async_fd.ready(Interest::PRIORITY).await {
-            Ok(mut guard) => {
-                guard.clear_ready();
-                // `read_mountlist` does blocking file I/O; run it on a blocking thread.
-                let new_list = tokio::task::spawn_blocking(read_mountlist)
-                    .await
-                    .unwrap_or_default();
-                mount_list.set(new_list);
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "sensors: mountinfo poll error, exiting watcher");
-                return;
-            }
+        if let Err(e) = wait(file.as_fd()) {
+            tracing::warn!(error = %e, "sensors: mountinfo poll error, exiting watcher");
+            return;
         }
+        mount_list.set(read());
+    }
+}
+
+/// Block until the kernel reports a change to the mount table behind `fd`.
+///
+/// `Ok(())` is one change — or a burst of them since the last call, which the
+/// kernel's per-file counter coalesces into one, and [`watch_mounts`] re-reads
+/// the whole file either way, so a burst costs one re-read as it did through
+/// the reactor. `Err` is the end of the watch.
+///
+/// A signal handled on this thread fails `poll(2)` with `EINTR`, which
+/// `SA_RESTART` never restarts for `poll` (signal(7)), so that is retried here
+/// rather than ending the watch — the reactor's own `epoll_wait` loop
+/// swallowed it for the async task. Any other `poll` error ends the watch, and
+/// so does a wake whose `revents` lacks `POLLPRI`: with no timeout `poll`
+/// returns only with something in `revents`, and `POLLERR`, `POLLHUP` and
+/// `POLLNVAL` are level conditions it reports whether asked for or not, so
+/// treating one as a change would re-read the mount table in a hot loop for as
+/// long as it held. Ending is the old watcher's own rule for a readiness
+/// error, and what it costs is liveness only: the list keeps its last value
+/// and the disk tick keeps sampling it.
+fn wait_for_change(fd: BorrowedFd<'_>) -> io::Result<()> {
+    let mut fds = [PollFd::new(fd, WATCH_EVENTS)];
+    loop {
+        match poll(&mut fds, PollTimeout::NONE) {
+            Ok(_) => break,
+            Err(Errno::EINTR) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    match fds[0].revents() {
+        Some(revents) if revents.contains(PollFlags::POLLPRI) => Ok(()),
+        revents => Err(io::Error::other(format!(
+            "woke poll(2) without POLLPRI (revents: {revents:?})"
+        ))),
     }
 }
 
@@ -1793,5 +1907,142 @@ mod tests {
         let got = writer.get_cloned();
         assert_eq!(got.tcp_established, 7);
         assert_eq!(got.tcp_listen, 3);
+    }
+}
+
+// ── Mount-table watcher tests (RUSTSEC-2026-0386) ────────────────────────────
+//
+// The watcher left `AsyncFd` for a supervised thread parked in `poll(2)` (see
+// `spawn_mount_watch`). The live half — a real `mount`/`umount` waking that
+// `poll` with `POLLPRI` — cannot be produced hermetically: nothing in a test
+// can change the mount namespace it runs in, and no other file a test can
+// make raises `POLLPRI` without `unsafe` or a socket feature this crate does
+// not link. So that half is a `docs/live-verify.md` item, and what is pinned
+// here is everything around it: the mask against the real file, the
+// no-hot-loop rule against a real fd that wakes `poll` without `POLLPRI`, and
+// the loop's seed / re-read / exit order through its seams.
+#[cfg(test)]
+mod mount_watch_tests {
+    use super::{MOUNTINFO, WATCH_EVENTS, wait_for_change, watch_mounts};
+    use futures_signals::signal::Mutable;
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    use std::cell::Cell;
+    use std::io;
+    use std::os::fd::AsFd;
+
+    /// The mask is the whole difference between a parked thread and one
+    /// re-reading the mount table in a hot loop, so it is checked against the
+    /// real `/proc/self/mountinfo` rather than argued: the file reports
+    /// `POLLIN` at once on every poll (the premise — a mask asking for it
+    /// would never park), while [`WATCH_EVENTS`] reports nothing on a mount
+    /// table that has not changed since the open.
+    ///
+    /// A mount or unmount on the host inside the 100 ms window would fail the
+    /// second assertion. The `POLLIN` poll before it already consumes any
+    /// change made since the open (the kernel catches the file's counter up
+    /// on every poll, whatever the mask), so the window is that 100 ms alone.
+    ///
+    /// Falsification: add `POLLIN` to `WATCH_EVENTS` and the second poll
+    /// returns `Ok(1)` immediately.
+    #[test]
+    fn the_watch_mask_parks_on_an_unchanged_mount_table() {
+        let file = std::fs::File::open(MOUNTINFO).expect("open /proc/self/mountinfo");
+
+        let mut readable = [PollFd::new(file.as_fd(), PollFlags::POLLIN)];
+        assert_eq!(
+            poll(&mut readable, PollTimeout::ZERO),
+            Ok(1),
+            "the premise: mountinfo is always readable, so POLLIN never parks",
+        );
+
+        let mut watched = [PollFd::new(file.as_fd(), WATCH_EVENTS)];
+        assert_eq!(
+            poll(&mut watched, PollTimeout::from(100_u8)),
+            Ok(0),
+            "WATCH_EVENTS must park on an unchanged mount table, got revents {:?}",
+            watched[0].revents(),
+        );
+    }
+
+    /// A wake without `POLLPRI` ends the wait instead of reporting a change.
+    /// A pipe's write end whose reader is gone is a standing `POLLERR` —
+    /// `poll(2)` reports it whatever the mask, and it never clears — which is
+    /// exactly the shape that would spin [`watch_mounts`] if it counted as a
+    /// change.
+    ///
+    /// Falsification: make `wait_for_change` return `Ok(())` for any wake and
+    /// this gets `Ok` where it expects the error.
+    #[test]
+    fn a_wake_without_pollpri_ends_the_wait_instead_of_spinning() {
+        let (reader, writer) = io::pipe().expect("pipe");
+        drop(reader);
+
+        let err = wait_for_change(writer.as_fd())
+            .expect_err("a bare POLLERR must end the wait, not report a change");
+        assert!(
+            err.to_string().contains("without POLLPRI"),
+            "the error should name the missing POLLPRI: {err}",
+        );
+    }
+
+    /// The loop's contract: the seed, then exactly one re-read per change
+    /// `wait` reports, and the first error ends the watch with the list at
+    /// its last read.
+    ///
+    /// Falsification: drop the seed and `reads` is 2; keep looping past an
+    /// error and the scripted `wait` (which keeps failing) never lets
+    /// `watch_mounts` return, so the test hangs rather than passing.
+    #[test]
+    fn each_change_re_reads_once_and_the_first_error_ends_the_watch() {
+        let list = Mutable::new(0_u32);
+        let reads = Cell::new(0_u32);
+        let waits = Cell::new(0_u32);
+        // Any open fd will do: the scripted `wait` never polls it.
+        let (reader, _writer) = io::pipe().expect("pipe");
+
+        watch_mounts(
+            &list,
+            || Ok(reader),
+            |_fd| {
+                waits.set(waits.get() + 1);
+                if waits.get() <= 2 {
+                    Ok(())
+                } else {
+                    Err(io::Error::other("scripted end"))
+                }
+            },
+            || {
+                reads.set(reads.get() + 1);
+                reads.get()
+            },
+        );
+
+        assert_eq!(waits.get(), 3, "two changes, then the error");
+        assert_eq!(reads.get(), 3, "the seed plus one re-read per change");
+        assert_eq!(list.get(), 3, "the list holds the last read");
+    }
+
+    /// A failed open still publishes the seed, and never reaches `wait` —
+    /// the order that keeps the list correct as of startup on a host where
+    /// the watch itself cannot start.
+    ///
+    /// Falsification: move the seed after the open and `list` stays `0`.
+    #[test]
+    fn a_failed_open_keeps_the_seed_and_never_waits() {
+        let list = Mutable::new(0_u32);
+        let waits = Cell::new(0_u32);
+
+        watch_mounts(
+            &list,
+            || Err::<std::fs::File, _>(io::Error::from(io::ErrorKind::NotFound)),
+            |_fd| {
+                waits.set(waits.get() + 1);
+                Ok(())
+            },
+            || 7,
+        );
+
+        assert_eq!(list.get(), 7, "the seed is published before the open");
+        assert_eq!(waits.get(), 0, "no fd, nothing to wait on");
     }
 }

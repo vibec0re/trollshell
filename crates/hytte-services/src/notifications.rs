@@ -18,7 +18,7 @@ use hytte_bus::{OwnNameSignal, OwnState};
 use hytte_reactive::{Service, registry, runtime, shared};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::task::AbortHandle;
 use zbus::object_server::SignalEmitter;
@@ -344,6 +344,15 @@ pub fn clear_history() {
 /// synchronously on the calling thread; the bus signal emit is spawned onto
 /// the runtime.
 pub fn dismiss(id: u32, reason: u32) {
+    close(id, reason, None);
+}
+
+/// [`dismiss`], plus the one thing an expiry has to prove first: `expiry` is
+/// the [`TimerEntry::arming`] the firing sleep was armed with, and the close
+/// goes ahead only while that is still the entry's current arming (see
+/// [`closable`]). `None` — the user, `CloseNotification` — closes
+/// unconditionally.
+fn close(id: u32, reason: u32, expiry: Option<u64>) {
     let Some(shared) = shared::get::<NotificationsShared>() else {
         return;
     };
@@ -351,15 +360,34 @@ pub fn dismiss(id: u32, reason: u32) {
     // Local state mutation. Synchronous — Mutable is thread-safe. The
     // position is read through `Deref` and only a real removal goes through
     // `DerefMut`, so a no-op close does not wake the toast consumer.
+    //
+    // `timers` is taken *inside* the `active` guard — the `active` → `timers`
+    // order `notify` / `post_local` already use for `set_expiry` — so the
+    // arming check and the removal are one step against every re-post: a
+    // re-post either ran entirely before this (and its re-arm makes a stale
+    // expiry's arming not current) or runs entirely after (and finds the id
+    // closed, so allocates fresh). The entry is reclaimed in the same step —
+    // no leaked entry or orphaned sleep task (#567) — and only on a real
+    // close: an entry exists exactly while its notification is live
+    // (`set_expiry` creates it under the guard that publishes the
+    // notification) and a non-live id is never re-created (`notify_id`), so a
+    // no-op close has nothing to reclaim. A poisoned `timers` lock is still
+    // read: every critical section on it is plain map surgery, and refusing
+    // here would leave every toast on screen forever.
     let removed = {
         let mut list = shared.active.lock_mut();
-        closable(&list, id).map(|at| list.remove(at))
+        let mut timers = shared.timers.lock().unwrap_or_else(PoisonError::into_inner);
+        closable(&list, &timers, id, expiry).map(|at| {
+            clear_timer(&mut timers, id);
+            list.remove(at)
+        })
     };
     let Some(n) = removed else {
         tracing::debug!(
             id,
             reason,
-            "close for an id that is not live; nothing to do"
+            stale_expiry = expiry.is_some(),
+            "close for an id that is not live, or by a superseded expiry; nothing to do"
         );
         return;
     };
@@ -396,19 +424,6 @@ pub fn dismiss(id: u32, reason: u32) {
         clear_local_actions(&mut map, id);
     }
 
-    // Cancel and drop the expiry timer for this id. Every close path
-    // (auto-expiry, user dismiss, `CloseNotification`) funnels through
-    // `dismiss`, so this is the one place the timer bookkeeping is
-    // reclaimed — no leaked entry or orphaned sleep task (#567). Conditional
-    // on the removal above, like everything here: an entry exists exactly
-    // while its notification is live (`set_expiry` creates it under the same
-    // `active` guard that publishes the notification), and an id that is not
-    // live is never re-created (`notify_id`), so a no-op close has nothing to
-    // reclaim.
-    if let Ok(mut timers) = shared.timers.lock() {
-        clear_timer(&mut timers, id);
-    }
-
     // Emit the NotificationClosed signal directly on the owned connection.
     let ownership = shared.ownership.clone();
     runtime::handle().spawn(async move {
@@ -427,7 +442,28 @@ pub fn dismiss(id: u32, reason: u32) {
 /// the close a no-op. The one gate on every side effect of [`dismiss`], the
 /// `NotificationClosed` emit included — factored out so the gate itself is
 /// unit-testable without the process-global shared registry or a bus.
-fn closable(live: &[Notification], id: u32) -> Option<usize> {
+///
+/// An expiry (`expiry: Some(arming)`) must also still be `id`'s *current*
+/// arming. `AbortHandle::abort` cannot stop a sleep task that is already past
+/// its `sleep` and blocked on the `active` lock inside `close`: there is no
+/// `.await` left in it for the abort to land on. Before this check, such a
+/// task — superseded by a `replaces_id` re-post that held the lock, or by a
+/// hover that paused it — went on to close whatever was live under the id
+/// once the lock came free: the fresh replacement, with reason 1, right
+/// after it appeared. Every re-post and every pause bumps the arming
+/// ([`TimerEntry::disarm`]), so the superseded task's no longer matches; a
+/// missing entry means the notification already closed.
+fn closable(
+    live: &[Notification],
+    timers: &TimerMap,
+    id: u32,
+    expiry: Option<u64>,
+) -> Option<usize> {
+    if let Some(arming) = expiry
+        && timers.get(&id).is_none_or(|entry| entry.arming != arming)
+    {
+        return None;
+    }
     live.iter().position(|n| n.id == id)
 }
 
@@ -661,8 +697,10 @@ enum TimerAction {
 /// preserves: `timeout: Some` with `hover_count == 0` and no `deadline`;
 /// `timeout: None` with an armed `deadline`; `hover_count > 0` with an armed
 /// `deadline`; a `deadline` without its `abort` (or vice versa, save for the
-/// inherent race where a sleep has fired but its `dismiss` — which drops the
-/// whole entry — hasn't run yet).
+/// inherent window where a sleep has fired but its close — which drops the
+/// whole entry — hasn't run yet; harmless, because that close presents its
+/// [`TimerEntry::arming`] and is refused if anything re-armed or paused the
+/// entry in the meantime).
 ///
 /// [`start`]: TimerState::start
 #[derive(Debug, Default)]
@@ -769,18 +807,47 @@ impl TimerState {
 struct TimerEntry {
     state: TimerState,
     abort: Option<AbortHandle>,
+    /// Which arming of this entry the live sleep belongs to. Bumped by every
+    /// [`disarm`](Self::disarm) — so by every re-post, every pausing hover and
+    /// every re-arm — and handed to the task [`arm`](Self::arm) spawns, which
+    /// presents it when it fires; [`closable`] refuses an expiry whose arming
+    /// is no longer this one. `abort` alone cannot be the record: a task past
+    /// its `sleep` has no `.await` left for an abort to land on. Wraps rather
+    /// than overflows; 2⁶⁴ re-arms of one toast are not a concern.
+    arming: u64,
+}
+
+impl TimerEntry {
+    /// Cancel the armed sleep, if any, and supersede it — including a sleep
+    /// that has already fired and whose close is still waiting on the
+    /// `active` lock, which the abort cannot reach.
+    fn disarm(&mut self) {
+        if let Some(handle) = self.abort.take() {
+            handle.abort();
+        }
+        self.arming = self.arming.wrapping_add(1);
+    }
+
+    /// Supersede whatever was armed and arm a fresh sleep through `spawn`,
+    /// which receives the arming the task must present when it fires.
+    fn arm(&mut self, spawn: impl FnOnce(u64) -> Option<AbortHandle>) {
+        self.disarm();
+        self.abort = spawn(self.arming);
+    }
 }
 
 /// Per-id expiry timers backing [`NotificationsShared::timers`].
 type TimerMap = HashMap<u32, TimerEntry>;
 
-/// Spawn the `sleep(dur) → dismiss(id, 1 = expired)` task and return its abort
-/// handle. Runs on the shared runtime so it's callable from any thread.
-fn spawn_expiry(id: u32, dur: Duration) -> AbortHandle {
+/// Spawn the `sleep(dur) → close(id, 1 = expired)` task for `arming` and
+/// return its abort handle. Runs on the shared runtime so it's callable from
+/// any thread. The close is refused if `arming` has been superseded by the
+/// time it gets the `active` lock (see [`closable`]).
+fn spawn_expiry(id: u32, dur: Duration, arming: u64) -> AbortHandle {
     runtime::handle()
         .spawn(async move {
             tokio::time::sleep(dur).await;
-            dismiss(id, 1); // 1 = expired
+            close(id, 1, Some(arming)); // 1 = expired
         })
         .abort_handle()
 }
@@ -788,8 +855,8 @@ fn spawn_expiry(id: u32, dur: Duration) -> AbortHandle {
 /// Record `id`'s resolved timeout — `Some` finite, `None` sticky — creating the
 /// bookkeeping entry on first post and re-arming (or standing down) the sleep on
 /// every `replaces_id` re-post. The one entry point for "what is this
-/// notification's timeout now"; [`dismiss`] is the only thing that removes an
-/// entry.
+/// notification's timeout now"; [`close`] (behind [`dismiss`]) is the only
+/// thing that removes an entry.
 ///
 /// Called synchronously by the D-Bus `Notify` handler / [`post_local`] **while
 /// they hold the `active` write guard**, before the notification becomes
@@ -808,18 +875,19 @@ fn set_expiry(id: u32, timeout: Option<Duration>) {
         return;
     };
     if let Ok(mut timers) = shared.timers.lock() {
-        apply_expiry(&mut timers, id, timeout, Instant::now(), |dur| {
-            Some(spawn_expiry(id, dur))
+        apply_expiry(&mut timers, id, timeout, Instant::now(), |dur, arming| {
+            Some(spawn_expiry(id, dur, arming))
         });
     }
 }
 
 /// Map-level half of [`set_expiry`]: create-or-update `id`'s entry for a
-/// (re-)post that resolved to `timeout`, cancel whatever that entry had armed,
-/// and — when the transition calls for a fresh countdown — install the handle
-/// `spawn` returns for it.
+/// (re-)post that resolved to `timeout`, cancel and supersede whatever that
+/// entry had armed, and — when the transition calls for a fresh countdown —
+/// install the handle `spawn` returns for it. `spawn` gets the duration and
+/// the [`TimerEntry::arming`] the task must present.
 ///
-/// **Never removes an entry.** [`clear_timer`], from [`dismiss`], is the only
+/// **Never removes an entry.** [`clear_timer`], from [`close`], is the only
 /// remover; a sticky re-post stands the countdown down in place, keeping the
 /// hover count a mounted card may still be holding. That is the whole of #619,
 /// so it is asserted directly in the hermetic tests — which is also why the
@@ -831,23 +899,23 @@ fn apply_expiry(
     id: u32,
     timeout: Option<Duration>,
     now: Instant,
-    spawn: impl FnOnce(Duration) -> Option<AbortHandle>,
+    spawn: impl FnOnce(Duration, u64) -> Option<AbortHandle>,
 ) {
     let entry = timers.entry(id).or_default();
-    // Cancel any task already armed for this id (a `replaces_id` re-post) so a
-    // stale sleep can't dismiss the refreshed notification early — or "expire"
-    // one that just turned sticky. Unconditional rather than driven off the
-    // returned action: it must cover `Nothing` too (a re-post arriving while a
-    // hover is held), and aborting an already-cleared handle is free.
-    if let Some(handle) = entry.abort.take() {
-        handle.abort();
-    }
+    // Cancel and supersede any task already armed for this id (a `replaces_id`
+    // re-post) so a stale sleep can't dismiss the refreshed notification early
+    // — or "expire" one that just turned sticky — even if it has already fired
+    // and is waiting on the `active` guard this re-post holds. Unconditional
+    // rather than driven off the returned action: it must cover `Nothing` too
+    // (a re-post arriving while a hover is held), and disarming an
+    // already-cleared entry is free.
+    entry.disarm();
     if let TimerAction::Arm(dur) = entry.state.start(timeout, now) {
-        entry.abort = spawn(dur);
+        entry.arm(|arming| spawn(dur, arming));
     }
 }
 
-/// Remove and cancel the expiry timer for `id`. Called from [`dismiss`] — the
+/// Remove and cancel the expiry timer for `id`. Called from [`close`] — the
 /// funnel for every close path — so a closed toast leaves behind no armed task
 /// or bookkeeping entry. The *only* place an entry is dropped: a notification
 /// that merely turned sticky keeps its entry (and its hover count) via
@@ -880,12 +948,20 @@ pub fn pause_expiry(id: u32) {
     let Some(shared) = shared::get::<NotificationsShared>() else {
         return;
     };
-    if let Ok(mut timers) = shared.timers.lock()
-        && let Some(entry) = timers.get_mut(&id)
-        && entry.state.pause(Instant::now()) == TimerAction::Abort
-        && let Some(handle) = entry.abort.take()
+    if let Ok(mut timers) = shared.timers.lock() {
+        apply_pause(&mut timers, id, Instant::now());
+    }
+}
+
+/// Map-level half of [`pause_expiry`], factored out (like [`apply_expiry`])
+/// so a test drives the real surgery with no runtime.
+fn apply_pause(timers: &mut TimerMap, id: u32, now: Instant) {
+    if let Some(entry) = timers.get_mut(&id)
+        && entry.state.pause(now) == TimerAction::Abort
     {
-        handle.abort();
+        // Superseding, not just aborting: a sleep that fired a moment before
+        // the pointer arrived must not close the toast now under it.
+        entry.disarm();
     }
 }
 
@@ -903,12 +979,9 @@ pub fn resume_expiry(id: u32) {
         && let TimerAction::Arm(dur) = entry.state.resume(Instant::now(), MIN_RESUME)
     {
         // Invariant: `abort` is None here (the matching pause cleared it).
-        // Cancel defensively regardless so a logic drift can never strand a
-        // live task behind a freshly-armed one.
-        if let Some(handle) = entry.abort.take() {
-            handle.abort();
-        }
-        entry.abort = Some(spawn_expiry(id, dur));
+        // `arm` supersedes defensively regardless, so a logic drift can never
+        // strand a live task behind a freshly-armed one.
+        entry.arm(|arming| Some(spawn_expiry(id, dur, arming)));
     }
 }
 
@@ -1186,7 +1259,7 @@ impl NotificationsIface {
         // also stops a 1ms `expire_timeout` from running `dismiss` before the
         // notification is in the list at all, which would strand it on screen
         // with no timer. Both mutexes are taken in the `active` → `timers` order
-        // `dismiss` uses, so the pair cannot invert.
+        // `close` uses for its arming check, so the pair cannot invert.
         let id = {
             let mut list = self.active.lock_mut();
             let id = notify_id(&list, replaces_id, &self.next_id);
@@ -1585,9 +1658,9 @@ mod tests {
     use super::{
         DEFAULT_TIMEOUT, HashMap, LocalActionMap, MIN_RESUME, Mutable, Notification,
         NotificationImage, NotificationsIface, OwnedValue, RateLimitMap, TimerAction, TimerEntry,
-        TimerMap, TimerState, Urgency, apply_expiry, clear_local_actions, clear_timer, closable,
-        image_data_consistent, notify_id, parse_image, rate_limit_check, register_local_action,
-        resolve_timeout, strip_markup, take_local_action,
+        TimerMap, TimerState, Urgency, apply_expiry, apply_pause, clear_local_actions, clear_timer,
+        closable, image_data_consistent, notify_id, parse_image, rate_limit_check,
+        register_local_action, resolve_timeout, strip_markup, take_local_action,
     };
     use std::cell::Cell;
     use std::sync::Arc;
@@ -1978,14 +2051,14 @@ mod tests {
         // `gdbus call … CloseNotification 999` used to emit
         // `NotificationClosed(999, 3)` for an id this daemon never issued.
         let list = [live(1), live(2)];
-        assert_eq!(closable(&list, 999), None);
-        assert_eq!(closable(&[], 1), None);
+        assert_eq!(closable(&list, &TimerMap::new(), 999, None), None);
+        assert_eq!(closable(&[], &TimerMap::new(), 1, None), None);
     }
 
     #[test]
     fn a_live_id_is_closable_where_it_sits() {
         let list = [live(1), live(2), live(3)];
-        assert_eq!(closable(&list, 2), Some(1));
+        assert_eq!(closable(&list, &TimerMap::new(), 2, None), Some(1));
     }
 
     #[test]
@@ -1994,14 +2067,18 @@ mod tests {
         // `dismiss(id, 1)` both ran their emit, so the sender saw the one
         // notification close twice, with two different reasons.
         let mut list = vec![live(1), live(2)];
-        let at = closable(&list, 2).expect("live on the first close");
+        let at = closable(&list, &TimerMap::new(), 2, None).expect("live on the first close");
         list.remove(at);
         assert_eq!(
-            closable(&list, 2),
+            closable(&list, &TimerMap::new(), 2, None),
             None,
             "the second close must emit nothing"
         );
-        assert_eq!(closable(&list, 1), Some(0), "a sibling is untouched");
+        assert_eq!(
+            closable(&list, &TimerMap::new(), 1, None),
+            Some(0),
+            "a sibling is untouched"
+        );
     }
 
     #[test]
@@ -2406,19 +2483,30 @@ mod tests {
     // returns `None` (no `AbortHandle` without a runtime) and records what it was
     // asked to arm, which is the observable that matters.
 
-    /// Collect what [`apply_expiry`] would have armed, without a runtime.
+    /// Collect what [`apply_expiry`] would have armed — the duration, and the
+    /// arming the task would present when it fires — without a runtime.
+    fn armed_with(
+        timers: &mut TimerMap,
+        id: u32,
+        timeout: Option<Duration>,
+        now: Instant,
+    ) -> Option<(Duration, u64)> {
+        let armed = Cell::new(None);
+        apply_expiry(timers, id, timeout, now, |dur, arming| {
+            armed.set(Some((dur, arming)));
+            None
+        });
+        armed.get()
+    }
+
+    /// The duration half of [`armed_with`].
     fn armed_by(
         timers: &mut TimerMap,
         id: u32,
         timeout: Option<Duration>,
         now: Instant,
     ) -> Option<Duration> {
-        let armed = Cell::new(None);
-        apply_expiry(timers, id, timeout, now, |dur| {
-            armed.set(Some(dur));
-            None
-        });
-        armed.get()
+        armed_with(timers, id, timeout, now).map(|(dur, _)| dur)
     }
 
     #[test]
@@ -2529,5 +2617,78 @@ mod tests {
         // Clearing an unknown id is a no-op.
         clear_timer(&mut map, 999);
         assert_eq!(map.len(), 1);
+    }
+
+    // ── Superseded expiries: a fired sleep must still be the current arming ─
+    //
+    // `abort()` cannot reach a sleep task that is past its `sleep` and blocked
+    // on the `active` lock inside `close` — there is no `.await` left for it to
+    // land on — so the arming the task presents is what decides.
+
+    #[test]
+    fn a_superseded_expiry_cannot_close_the_replacement() {
+        // The race: id 7's sleep fires and its close blocks on `active`, held
+        // by a `Notify(replaces_id = 7)`. Pre-fix the close ran as soon as the
+        // re-post released the lock and expired the brand-new replacement,
+        // reason 1, the moment it appeared.
+        let mut map = TimerMap::new();
+        let t0 = Instant::now();
+        let five = Duration::from_secs(5);
+        let (_, fired) = armed_with(&mut map, 7, Some(five), t0).expect("a finite post arms");
+        // The re-post, under the guard the fired close is waiting on.
+        let (_, fresh) =
+            armed_with(&mut map, 7, Some(five), t0 + five).expect("a finite re-post re-arms");
+        let list = [live(7)];
+        assert_eq!(
+            closable(&list, &map, 7, Some(fired)),
+            None,
+            "the superseded expiry must not close the replacement"
+        );
+        assert_eq!(
+            closable(&list, &map, 7, Some(fresh)),
+            Some(0),
+            "the replacement's own expiry still closes it"
+        );
+    }
+
+    #[test]
+    fn a_sticky_repost_supersedes_a_fired_expiry() {
+        // Same race, re-posted sticky: nothing is re-armed, and the fired
+        // sleep still must not "expire" a notification that no longer expires.
+        let mut map = TimerMap::new();
+        let t0 = Instant::now();
+        let (_, fired) = armed_with(&mut map, 7, Some(Duration::from_secs(5)), t0).expect("arms");
+        assert_eq!(armed_with(&mut map, 7, None, t0), None);
+        assert_eq!(closable(&[live(7)], &map, 7, Some(fired)), None);
+    }
+
+    #[test]
+    fn an_expiry_superseded_by_a_hover_cannot_close() {
+        // The pointer lands as the sleep fires: the hover's pause must win, or
+        // the toast closes out from under the pointer that is holding it.
+        let mut map = TimerMap::new();
+        let t0 = Instant::now();
+        let five = Duration::from_secs(5);
+        let (_, fired) = armed_with(&mut map, 7, Some(five), t0).expect("arms");
+        apply_pause(&mut map, 7, t0 + five);
+        assert_eq!(map[&7].state.hover_count, 1);
+        assert_eq!(closable(&[live(7)], &map, 7, Some(fired)), None);
+    }
+
+    #[test]
+    fn an_expiry_for_a_closed_notification_is_a_no_op() {
+        // No entry: another path already closed it and reclaimed the timer.
+        assert_eq!(closable(&[], &TimerMap::new(), 7, Some(0)), None);
+    }
+
+    #[test]
+    fn a_user_or_bus_close_ignores_the_arming() {
+        // Only an expiry has anything to prove; a click or `CloseNotification`
+        // closes whatever is live under the id.
+        let mut map = TimerMap::new();
+        let t0 = Instant::now();
+        armed_with(&mut map, 7, Some(Duration::from_secs(5)), t0);
+        armed_with(&mut map, 7, Some(Duration::from_secs(5)), t0);
+        assert_eq!(closable(&[live(7)], &map, 7, None), Some(0));
     }
 }

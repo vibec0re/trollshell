@@ -95,8 +95,9 @@ pub(super) fn avg_volume(channels: &[f32]) -> f64 {
 /// There is no per-channel bound anywhere else in this module to copy:
 /// `cast::f64_to_f32_gain` is a plain narrowing, and the *level* a caller
 /// requests is bounded by the caller (the drawer's slider tops out at `1.0`,
-/// `plugins::effects::clamp_volume` clamps a plugin's request to `1.0`). What
-/// needs a bound here is new with
+/// `plugins::effects::clamp_volume` clamps a plugin's request to `1.0`, and
+/// the bar chip's scroll stops at that same `MAX_VOLUME`). What needs a bound
+/// here is new with
 /// [`scaled_channel_volumes`]: keeping the balance means a request for 100 %
 /// on an unbalanced sink would otherwise take its loud channel *past* 100 % —
 /// a software boost no surface asked for. The two exceptions keep a step a

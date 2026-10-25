@@ -6,14 +6,14 @@ use hytte_plugin_proto::{
     AudioAction, Capability, ClockState, ConsentChoices, ConsentDecision, DEFAULT_SLIDER_MAX,
     DEFAULT_SLIDER_MIN, DEFAULT_SLIDER_STEP_FRACTION, DatasourceError, DatasourceOutcome, Dir,
     Effect, EffectOutcome, EventKind, HOMOGENEOUS_CLASS, HostMsg, LedStripConfig, LedStripState,
-    LogLevel, MAX_FRAME_LEN, MAX_MULTI_SPARKLINE_POINTS, MAX_MULTI_SPARKLINE_SERIES,
-    MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, MAX_SPARKLINE_SAMPLES, MULTI_SPARKLINE_VOCAB,
-    Manifest, MediaAction, Mount, NiriAction, Node, NodeId, OPEN_URI_VOCAB, PAGE_VISIBLE_VOCAB,
-    PROTO_VERSION, Page, PluginMsg, PreemWidget, ProtoError, ProvidedDatasource, SCROLLED_VOCAB,
-    SHADER_VOCAB, SIDEBAR_RIGHT_VOCAB, SPARKLINE_VOCAB, ShaderData, SliderFloats, StateKey,
-    StateSnapshot, VOCAB, VOCAB_UNCONDITIONAL, decode, decode_body, encode, encode_body,
-    multi_sparkline_keep, sane_fraction, sane_slider_floats, sane_sparkline_max,
-    sane_sparkline_sample,
+    LogLevel, MAX_FRAME_DEPTH, MAX_FRAME_LEN, MAX_FRAME_VALUES, MAX_MULTI_SPARKLINE_POINTS,
+    MAX_MULTI_SPARKLINE_SERIES, MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES,
+    MAX_SPARKLINE_SAMPLES, MULTI_SPARKLINE_VOCAB, Manifest, MediaAction, Mount, NiriAction, Node,
+    NodeId, OPEN_URI_VOCAB, PAGE_VISIBLE_VOCAB, PROTO_VERSION, Page, PluginMsg, PreemWidget,
+    ProtoError, ProvidedDatasource, SCROLLED_VOCAB, SHADER_VOCAB, SIDEBAR_RIGHT_VOCAB,
+    SPARKLINE_VOCAB, ShaderData, SliderFloats, StateKey, StateSnapshot, VOCAB, VOCAB_UNCONDITIONAL,
+    decode, decode_body, encode, encode_body, multi_sparkline_keep, sane_fraction,
+    sane_slider_floats, sane_sparkline_max, sane_sparkline_sample,
 };
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -2660,6 +2660,206 @@ fn oversized_frame_is_rejected() {
         decode::<PluginMsg>(&frame),
         Err(ProtoError::FrameTooLarge { len }) if len == MAX_FRAME_LEN + 1
     ));
+}
+
+// ── Decode cost: the walk before serde ───────────────────────────────────────
+
+std::thread_local! {
+    /// Whether [`Tripwire`]'s deserialiser ran on this thread.
+    static SERDE_RAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A decode target whose deserialiser records that it ran and then refuses,
+/// so it allocates nothing. It is how these tests tell "refused before serde"
+/// from "refused by serde".
+struct Tripwire;
+
+impl<'de> serde::Deserialize<'de> for Tripwire {
+    fn deserialize<D: serde::Deserializer<'de>>(_: D) -> Result<Self, D::Error> {
+        SERDE_RAN.with(|ran| ran.set(true));
+        Err(serde::de::Error::custom("tripwire: serde ran"))
+    }
+}
+
+/// `decode_body::<Tripwire>(body)`'s error, and whether serde ran to get it.
+fn tripwire(body: &[u8]) -> (ProtoError, bool) {
+    SERDE_RAN.with(|ran| ran.set(false));
+    let Err(err) = decode_body::<Tripwire>(body) else {
+        unreachable!("a Tripwire never decodes");
+    };
+    (err, SERDE_RAN.with(std::cell::Cell::get))
+}
+
+/// Frame `body` with its length prefix.
+fn framed(body: &[u8]) -> Vec<u8> {
+    let mut frame = u32::try_from(body.len())
+        .expect("fits u32")
+        .to_be_bytes()
+        .to_vec();
+    frame.extend_from_slice(body);
+    frame
+}
+
+/// A `Render` body built by hand, so a test never holds the nodes it sends:
+/// its tree is a `ListBox` whose `children` header declares `declared`
+/// elements and is followed by the bytes `children`.
+fn render_of(children: &[u8], declared: u32) -> Vec<u8> {
+    fn key(out: &mut Vec<u8>, name: &str) {
+        out.push(0xa0 | u8::try_from(name.len()).expect("a fixstr"));
+        out.extend_from_slice(name.as_bytes());
+    }
+    let mut body = vec![0x81];
+    key(&mut body, "Render");
+    body.push(0x82);
+    key(&mut body, "tree");
+    body.push(0x81);
+    key(&mut body, "ListBox");
+    body.push(0x83);
+    key(&mut body, "id");
+    body.push(0xc0);
+    key(&mut body, "classes");
+    body.push(0x90);
+    key(&mut body, "children");
+    body.push(0xdd);
+    body.extend_from_slice(&declared.to_be_bytes());
+    body.extend_from_slice(children);
+    key(&mut body, "effects");
+    body.push(0x90);
+    body
+}
+
+/// A 16 MiB `Render` of spacers, the cheapest node there is, is refused before
+/// serde sees it. Before `MAX_FRAME_VALUES`, the index-encoded flood decoded
+/// to 16.7 M nodes and 2.3 GiB resident, and the name-encoded one to 2.4 M
+/// nodes and 330 MiB.
+///
+/// **Falsified** by removing the walk from `decode_body`: serde then runs on
+/// the flood, which the tripwire reports before anything decodes it for real.
+#[test]
+fn a_spacer_flood_is_refused_before_serde_runs() {
+    // The control: the tripwire is live, so its silence below means something.
+    let (err, ran) = tripwire(&encode_body(&PluginMsg::Pong { seq: 1 }));
+    assert!(ran && matches!(err, ProtoError::Decode(_)), "{err:?}");
+
+    // `0x0d` really is a whole node: `rmp-serde` decodes a unit variant from
+    // its index, and 13 is `Spacer`'s.
+    let three: PluginMsg = decode_body(&render_of(&[0x0d; 3], 3)).expect("three spacers");
+    assert!(
+        matches!(&three, PluginMsg::Render { tree: Node::ListBox { children, .. }, .. }
+            if children == &[Node::Spacer, Node::Spacer, Node::Spacer]),
+        "{three:?}",
+    );
+
+    let named = encode_body(&Node::Spacer);
+    assert_eq!(named.len(), 7, "a spacer by name is seven bytes");
+    for (spacer, how) in [(&[0x0d_u8][..], "by index"), (&named[..], "by name")] {
+        let count = (MAX_FRAME_LEN - render_of(&[], 0).len()) / spacer.len();
+        let body = render_of(&spacer.repeat(count), u32::try_from(count).expect("fits"));
+        assert!(body.len() <= MAX_FRAME_LEN, "{how}: {} B", body.len());
+        let (err, ran) = tripwire(&body);
+        assert!(!ran, "serde ran on a spacer flood {how}: {err:?}");
+        assert!(
+            matches!(err, ProtoError::TooManyValues { at_least } if at_least > count),
+            "{how}: {err:?}",
+        );
+        assert!(
+            matches!(
+                decode::<PluginMsg>(&framed(&body)),
+                Err(ProtoError::TooManyValues { .. })
+            ),
+            "{how}",
+        );
+    }
+    assert!(
+        ProtoError::TooManyValues {
+            at_least: MAX_FRAME_VALUES + 1
+        }
+        .to_string()
+        .contains("MAX_FRAME_VALUES"),
+        "the refusal names the cap",
+    );
+}
+
+/// A `children` header declaring `u32::MAX` nodes, with three behind it, is
+/// refused at the header as a decode error, before serde reserves room for
+/// any of them.
+#[test]
+fn a_lying_length_header_is_refused_before_serde_runs() {
+    let body = render_of(&[0x0d; 3], u32::MAX);
+    let (err, ran) = tripwire(&body);
+    assert!(!ran, "serde ran on a lying header: {err:?}");
+    assert!(
+        matches!(
+            err,
+            ProtoError::Decode(rmp_serde::decode::Error::LengthMismatch(u32::MAX))
+        ),
+        "{err:?}",
+    );
+    assert!(matches!(
+        decode::<PluginMsg>(&framed(&body)),
+        Err(ProtoError::Decode(_))
+    ));
+}
+
+/// Every truncation of a real render body is refused as a decode error
+/// without serde running, so a short body costs no allocation either.
+#[test]
+fn a_truncated_body_is_refused_before_serde_runs() {
+    let body = encode_body(&PluginMsg::Render {
+        tree: sample_tree(),
+        panel: Some(Box::new(sample_tree())),
+        hidden_on: vec!["DP-2".into()],
+        effects: vec![Effect::OpenPage(Page::PluginSelf)],
+    });
+    for end in 0..body.len() {
+        let (err, ran) = tripwire(&body[..end]);
+        assert!(
+            !ran && matches!(err, ProtoError::Decode(_)),
+            "{end} of {} B: {err:?}",
+            body.len(),
+        );
+    }
+}
+
+/// A chain of buttons nested past `MAX_FRAME_DEPTH`, which `rmp-serde`'s own
+/// limit would still have admitted, is refused before serde recurses into
+/// it. A chain at the host's own `MAX_TREE_DEPTH` still decodes.
+#[test]
+fn deep_nesting_is_refused_before_serde_runs() {
+    let chain = |levels: usize| {
+        (0..levels).fold(Node::Spacer, |child, _| Node::Button {
+            id: "b".into(),
+            classes: Vec::new(),
+            child: Box::new(child),
+        })
+    };
+    let render = |tree| PluginMsg::Render {
+        tree,
+        panel: None,
+        hidden_on: Vec::new(),
+        effects: Vec::new(),
+    };
+    // A button nests two levels and its (empty) `classes` array a third, and
+    // the envelope adds two: 126 buttons reach level 255, and 127 reach 257.
+    let inside = render(chain((MAX_FRAME_DEPTH - 4) / 2));
+    assert_eq!(decode::<PluginMsg>(&encode(&inside)).ok(), Some(inside));
+    let deep = encode_body(&render(chain((MAX_FRAME_DEPTH - 2) / 2)));
+    let (err, ran) = tripwire(&deep);
+    assert!(!ran, "serde ran on an over-deep body: {err:?}");
+    assert!(
+        matches!(
+            err,
+            ProtoError::Decode(rmp_serde::decode::Error::DepthLimitExceeded)
+        ),
+        "{err:?}",
+    );
+    assert!(
+        rmp_serde::from_slice::<PluginMsg>(&deep).is_ok(),
+        "rmp-serde alone admits it"
+    );
+
+    let legal = render(chain(hytte_plugin_proto::wire::MAX_TREE_DEPTH - 1));
+    assert_eq!(decode::<PluginMsg>(&encode(&legal)).ok(), Some(legal));
 }
 
 // ── Schema-compat guarantees ─────────────────────────────────────────────────

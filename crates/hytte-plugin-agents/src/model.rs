@@ -635,7 +635,7 @@ pub fn model_family(raw: &str) -> Option<String> {
 /// right-to-left override in the description runs on to the end of the
 /// paragraph, so without this it would draw the stamp after it reversed.
 ///
-/// Run it **before** [`crate::plugin::clamp`], so the cap counts what is drawn.
+/// Run it **before** [`clamp`], so the cap counts what is drawn.
 #[must_use]
 pub fn single_line(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -652,6 +652,25 @@ pub fn single_line(s: &str) -> String {
         out.push(c);
     }
     out
+}
+
+/// Truncate on a **char** boundary, appending an ellipsis when it bit.
+///
+/// `&s[..n]` would panic mid-codepoint, and a description is arbitrary UTF-8
+/// somebody else wrote — a plugin that panicked on an emoji in a PR title would
+/// take its whole session down.
+///
+/// `pub` since #1141's review (M4), with [`crate::plugin::detail_line`], and
+/// still reachable at `crate::plugin::clamp`; it moved here so the wire mirror
+/// can bound [`ApprovalKind::Unknown`](crate::hive::wire::ApprovalKind::Unknown)'s
+/// wording at its source.
+#[must_use]
+pub fn clamp(s: &str, chars: usize) -> String {
+    if s.chars().count() <= chars {
+        return s.to_owned();
+    }
+    let head: String = s.chars().take(chars).collect();
+    format!("{head}…")
 }
 
 /// The explicit bidi embedding, override and isolate controls (Unicode

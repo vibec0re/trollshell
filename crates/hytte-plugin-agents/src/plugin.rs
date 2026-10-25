@@ -24,6 +24,11 @@ use crate::poll::{Cmd, Msg, poll_task};
 use crate::view::{self, PanelContext, ids};
 use crate::window;
 
+/// Re-exported at the path it was `pub` at since #1141's review (M4), with
+/// [`detail_line`]; it lives in [`crate::model`] now, beside
+/// [`single_line`], so `wire.rs` can bound an unknown approval kind with it.
+pub use crate::model::clamp;
+
 /// Stable plugin id — the host's mount-slot ownership key, the audit-log
 /// subject, and the `programs.trollshell.plugins.<id>` config key.
 ///
@@ -1285,20 +1290,4 @@ pub fn detail_line(approval: &Approval) -> String {
         Some(description) => format!("{} — {stamp}", clamp(&description, DETAIL_CHARS)),
         None => stamp,
     }
-}
-
-/// Truncate on a **char** boundary, appending an ellipsis when it bit.
-///
-/// `&s[..n]` would panic mid-codepoint, and a description is arbitrary UTF-8
-/// somebody else wrote — a plugin that panicked on an emoji in a PR title would
-/// take its whole session down.
-///
-/// `pub` since #1141's review (M4), with [`detail_line`].
-#[must_use]
-pub fn clamp(s: &str, chars: usize) -> String {
-    if s.chars().count() <= chars {
-        return s.to_owned();
-    }
-    let head: String = s.chars().take(chars).collect();
-    format!("{head}…")
 }

@@ -1931,6 +1931,37 @@ fn a_multi_line_description_reaches_the_card_as_one_line() {
     );
 }
 
+/// The card's *"wants:"* clause is the other wrapping label, and for a kind
+/// this build has never heard of it carries the hive's raw token — so that is
+/// flattened and bounded the same way, at `ApprovalKind::human`, where every
+/// renderer of the wording gets it.
+///
+/// Falsification: put back `format!("perform `{raw}`")` and the clause is
+/// 5 000 characters and a dozen lines.
+#[test]
+fn an_unknown_kind_is_flattened_and_clamped_on_the_card() {
+    use hytte_plugin_agents::hive::wire::KIND_CHARS;
+
+    let (mut m, _rx) = model();
+    m.update(status(roster("agent_status_grouped.json")));
+    let mut a = approval(7, "trollshell-choom");
+    a.kind = ApprovalKind::Unknown(format!("teleport_agent{}", "\nx".repeat(5_000)));
+
+    let fx = m.update(pending(vec![a]));
+    let scope = prompts(&fx)[0].2.clone();
+    assert!(!scope.chars().any(char::is_control), "one line: {scope:?}");
+    assert!(
+        scope.starts_with("perform `teleport_agent x x"),
+        "{scope:?}"
+    );
+    assert!(scope.ends_with("…`"), "and says it was cut: {scope:?}");
+    assert!(
+        scope.chars().count() <= KIND_CHARS + "perform ``…".chars().count(),
+        "bounded, got {} chars",
+        scope.chars().count()
+    );
+}
+
 // ── #1140 review: the fix round ──────────────────────────────────────────────
 
 /// Advance the model's clock, the way the host's `StateKey::Clock` push does.

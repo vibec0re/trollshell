@@ -58,6 +58,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::model::{clamp, single_line};
+
 /// The wire-schema version this build speaks, mirroring hyperhive's
 /// `HOST_SOCK_VERSION` (`hive-host-sock/src/lib.rs:543`, currently `1`).
 ///
@@ -375,6 +377,13 @@ impl ApprovalKind {
     /// vocabulary becomes English. An [`Unknown`](ApprovalKind::Unknown) reads
     /// as the hive's own token rather than as "unknown": the operator can act
     /// on `spawn_replica`, and cannot act on a shrug.
+    ///
+    /// That token is a raw wire string, and this sentence is the consent card's
+    /// *"wants:"* clause — a wrapping label, like the detail line — so it is
+    /// flattened to one line and bounded ([`KIND_CHARS`]) exactly the way the
+    /// detail line's free text is. Here rather than at the card, so the
+    /// companion window and the control-center, which render the same
+    /// wording, are bounded too.
     #[must_use]
     pub fn human(&self) -> String {
         match self {
@@ -383,10 +392,17 @@ impl ApprovalKind {
             Self::UpdateMetaInputs => "update the hive's flake inputs".to_owned(),
             Self::SchedulePrompt => "schedule a prompt".to_owned(),
             Self::MergeConfigPr => "merge a reviewed config PR".to_owned(),
-            Self::Unknown(raw) => format!("perform `{raw}`"),
+            Self::Unknown(raw) => format!("perform `{}`", clamp(&single_line(raw), KIND_CHARS)),
         }
     }
 }
+
+/// How much of an [`ApprovalKind::Unknown`] token reaches its wording.
+///
+/// Hyperhive's kinds are `snake_case` enum tokens, the longest known one
+/// (`update_meta_inputs`) 18 characters, so a real new kind is never shortened
+/// and only a value that could not have been one is.
+pub const KIND_CHARS: usize = 40;
 
 /// Where an approval is in its lifecycle.
 ///

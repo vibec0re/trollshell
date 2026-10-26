@@ -21,8 +21,8 @@ use super::{
     StackState, StartError, StopStep, Unresolvable, Workspaces, app_start, app_starting_key,
     autostart_all, autostart_driver, autostart_plan, autostart_tick, column_order_batch, may_stop,
     missing_apps, move_to_monitor, names_to_release, order_index, plan_start,
-    release_lingering_names, run_app_start, run_app_start_bounded, save, start, state_of, stop,
-    stop_plan, stray_moves,
+    release_lingering_names, run_app_start, run_app_start_bounded, run_save, save, start, state_of,
+    stop, stop_plan, stray_moves,
 };
 use crate::launch::Launch;
 
@@ -803,6 +803,10 @@ struct Compositor {
     /// Every stack name `save_stack` was asked to write, in order. Recorded,
     /// never written: see `Ops::save_stack`'s doc.
     saved: RefCell<Vec<String>>,
+    /// Whether a non-empty batch is taken and never answered: what a
+    /// compositor that accepts a request and stops replying looks like to
+    /// `Live::send_actions`, whose socket has no read timeout.
+    stuck: bool,
 }
 
 impl Compositor {
@@ -812,6 +816,15 @@ impl Compositor {
             windows: Vec::new(),
             batch_turns: 1,
             saved: RefCell::default(),
+            stuck: false,
+        }
+    }
+
+    /// The same niri, never answering a non-empty batch.
+    fn stuck(self) -> Self {
+        Self {
+            stuck: true,
+            ..self
         }
     }
 
@@ -857,6 +870,9 @@ impl Compositor {
 
 impl Ops for Compositor {
     async fn send_actions(&self, actions: Vec<WorkspaceAction>) -> Result<(), String> {
+        if self.stuck && !actions.is_empty() {
+            std::future::pending::<()>().await;
+        }
         let turns = if actions.is_empty() {
             1
         } else {
@@ -1101,6 +1117,106 @@ fn a_save_and_a_start_of_one_name_at_once_take_turns() {
         Some(1),
         "the focus left the workspace the user just saved"
     );
+}
+
+/// Give the executor `n` turns, so whatever can make progress without the clock
+/// does.
+async fn turns(n: usize) {
+    for _ in 0..n {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// **#1559, the review of the Save's lock (MEDIUM 1).** A Save that niri never
+/// answers holds `PLAN_AND_NAME` only until [`super::SAVE_CEILING`]. Then it
+/// fails with a line the form can show, and a Start queued behind it gets the
+/// lock and runs.
+///
+/// The Save's `SetName` batch is taken and never answered
+/// ([`Compositor::stuck`]), which is all `Live::send_actions` can see of a
+/// compositor that stops replying: its socket has no read timeout. A Start of
+/// another stack, on a healthy niri, queues behind it. The clock is paused and
+/// stepped by hand, and every step is followed by executor turns before
+/// anything is asserted, because `advance` only marks a timer that came due as
+/// ready: nothing polls it until the next yield.
+///
+/// **Mutations:** call `save` directly in `run_save` (no ceiling) → this fails
+/// on "the stuck Save still held the lock past its ceiling" after a bounded
+/// wall-clock wait, rather than hanging; drop the lock from `save` → it fails
+/// on "the Start ran while the stuck Save held the lock".
+#[test]
+fn a_start_behind_a_stuck_save_runs_once_the_save_gives_up() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("a current-thread runtime");
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        tokio::time::pause();
+        let stuck = Rc::new(Compositor::with(vec![ws_focused(1, 1, LEFT, None)]).stuck());
+        let healthy = Rc::new(Compositor::with(vec![
+            ws_focused(1, 1, LEFT, None),
+            ws(2, 2, LEFT, None, false),
+        ]));
+        let stacks = stacked(&[("afterstuck", Stack::default())]);
+
+        let saving = tokio::task::spawn_local({
+            let stuck = Rc::clone(&stuck);
+            async move { run_save(&*stuck, 1, "stucksave", &Stack::default()).await }
+        });
+        // The Save takes the lock and sends its batch before the Start queues.
+        turns(16).await;
+        let starting = tokio::task::spawn_local({
+            let healthy = Rc::clone(&healthy);
+            async move { start(&*healthy, "afterstuck", &Stack::default(), &stacks).await }
+        });
+        // Far more turns than an uncontended Start of an empty stack needs to
+        // finish, so a Start that is not waiting on the lock is seen finished.
+        turns(128).await;
+        assert!(
+            !starting.is_finished(),
+            "the Start ran while the stuck Save held the lock"
+        );
+
+        tokio::time::advance(super::SAVE_CEILING.saturating_sub(Duration::from_millis(1))).await;
+        turns(128).await;
+        assert!(!saving.is_finished(), "the Save gave up before its ceiling");
+        assert!(
+            !starting.is_finished(),
+            "the Start ran before the stuck Save gave up"
+        );
+
+        tokio::time::advance(Duration::from_millis(2)).await;
+        // Bounded in wall-clock time, so a Save that never lets go fails here
+        // instead of hanging the binary. Yielding, never sleeping, also keeps
+        // the paused clock from auto-advancing while the Start waits out another
+        // test thread's brief hold of the process-wide lock.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !(saving.is_finished() && starting.is_finished()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stuck Save still held the lock past its ceiling \
+                 (Save finished: {}, Start finished: {})",
+                saving.is_finished(),
+                starting.is_finished(),
+            );
+            tokio::task::yield_now().await;
+        }
+
+        let error = saving
+            .await
+            .expect("the Save task")
+            .expect_err("a Save niri never answered");
+        assert!(error.contains("did not answer within 20s"), "{error}");
+        let plan = starting
+            .await
+            .expect("the Start task")
+            .expect("the Start, once the lock came back");
+        assert_eq!(
+            healthy.name_of(plan.workspace).as_deref(),
+            Some("afterstuck")
+        );
+    });
 }
 
 /// **MEDIUM-1.** The *fallback* leg takes an **empty** workspace too, not just

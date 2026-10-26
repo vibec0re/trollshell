@@ -44,7 +44,7 @@
 //! - shown modifier: `.shown` (toggled by Rust to drive CSS transitions)
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -206,7 +206,7 @@ pub fn install(monitor: &Monitor) {
 /// subscription, cancel any pending hide/fade timers, and drop the
 /// per-monitor entries. Called before rebuilding on monitor hot-plug so a
 /// vanished output's `OsdView` doesn't linger in `OSDS` — otherwise
-/// `route_show`'s `map.values().next()` fallback could pop an OSD on a dead
+/// `route_show`'s unknown-focus fallback could pop an OSD on a dead
 /// surface, and the un-aborted drawer subscription would leak per rebuild.
 ///
 /// The module-level singletons (volume / mic / brightness / battery /
@@ -457,11 +457,7 @@ fn route_show(state: &State) {
     // bump.
     let view = OSDS.with(|map| {
         let map = map.borrow();
-        target_name
-            .as_ref()
-            .and_then(|name| map.get(name))
-            .or_else(|| map.values().next())
-            .map(Rc::clone)
+        super::consent::output_for(&map, target_name.as_deref()).map(Rc::clone)
     });
     if let Some(view) = view {
         if drawer_shows_control(state.kind, view.drawer_page.get()) {
@@ -578,8 +574,8 @@ thread_local! {
     /// Mounted OSD instances keyed by `gtk::Monitor.connector()`.
     /// `connector()` matches niri's `Workspace.output` (KMS connector
     /// names like `"DP-1"`, `"eDP-1"`).
-    static OSDS: RefCell<HashMap<String, Rc<OsdView>>> =
-        RefCell::new(HashMap::new());
+    static OSDS: RefCell<BTreeMap<String, Rc<OsdView>>> =
+        const { RefCell::new(BTreeMap::new()) };
 
     /// Set after the first `install()` call to ensure module-level
     /// signal subscriptions are wired exactly once across all
@@ -1224,5 +1220,31 @@ mod tests {
     #[test]
     fn a_seeded_guard_admits_everything_after() {
         assert_eq!(admitted(&[true, false, true]), [false, true, true]);
+    }
+
+    /// #1565: with niri's focus unknown, a volume OSD takes the output an
+    /// `open-page` keybind opens Audio on (the first sorted connector), and
+    /// the "drawer already shows it" suppression reads *that* output's drawer.
+    /// The map stands in for `OSDS`, each value for a view's `drawer_page`.
+    ///
+    /// **Falsification:** `first_key_value` → `last_key_value` in
+    /// `consent::output_for` puts the OSD on a closed-drawer output, so the
+    /// volume OSD shows over the open Audio drawer and this reds. Reverting
+    /// `OSDS` to a `HashMap` does not compile: `output_for` takes a `BTreeMap`.
+    #[test]
+    fn suppression_reads_the_drawer_output_when_focus_is_unknown() {
+        use std::collections::BTreeMap;
+        let connectors = ["HDMI-A-2", "eDP-1", "DP-3", "HDMI-A-1", "DP-2", "DP-1"];
+        for rotation in 0..connectors.len() {
+            let mut order = connectors.to_vec();
+            order.rotate_left(rotation);
+            let map: BTreeMap<String, Option<Page>> = order
+                .iter()
+                .map(|c| ((*c).to_owned(), (*c == "DP-1").then_some(Page::Audio)))
+                .collect();
+            let shown = *crate::overlays::consent::output_for(&map, None).expect("a mounted output");
+            assert_eq!(shown, Some(Page::Audio), "the OSD must read DP-1's drawer");
+            assert!(drawer_shows_control(Kind::Volume, shown));
+        }
     }
 }

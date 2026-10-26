@@ -58,7 +58,7 @@
 //! - detail line: `.ts-consent-detail`
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -259,7 +259,8 @@ thread_local! {
     /// Mounted monitors keyed by `Monitor.connector()`, so [`request`] can build
     /// the prompt on niri's focused output. Re-keyed on each hot-plug via
     /// [`close_all`] + [`install`].
-    static MONITORS: RefCell<HashMap<String, Monitor>> = RefCell::new(HashMap::new());
+    static MONITORS: RefCell<BTreeMap<String, Monitor>> =
+        const { RefCell::new(BTreeMap::new()) };
 }
 
 /// Register `monitor` as a candidate output for consent prompts. Called per
@@ -578,18 +579,27 @@ pub fn request(
     CONSENT_WINDOW.with(|w| *w.borrow_mut() = Some(window));
 }
 
-/// The `Monitor` for niri's focused output, or any mounted one as a fallback
+/// The output an overlay lands on: the focused one when it is mounted, else the
+/// **first connector in sort order**. That is the unknown-focus fallback the
+/// drawer (`modal`), the dialog and the toasts already share (#1547 B3, #1565),
+/// so a keybind page, a consent card and a volume OSD all land on one output.
+/// The `BTreeMap` is what makes "first" mean something (a `HashMap`'s order is
+/// per-process random), and taking that type keeps a hash-ordered map from
+/// being passed in. `overlays::osd` shares this.
+pub(crate) fn output_for<'m, V>(
+    outputs: &'m BTreeMap<String, V>,
+    focused: Option<&str>,
+) -> Option<&'m V> {
+    focused
+        .and_then(|name| outputs.get(name))
+        .or_else(|| outputs.first_key_value().map(|(_, v)| v))
+}
+
+/// The `Monitor` for niri's focused output, or the first mounted one as a fallback
 /// (niri startup / a just-vanished output), or `None` if none are mounted.
 fn focused_monitor() -> Option<Monitor> {
     let focused = focused_output::current();
-    MONITORS.with(|m| {
-        let m = m.borrow();
-        focused
-            .as_ref()
-            .and_then(|name| m.get(name))
-            .or_else(|| m.values().next())
-            .cloned()
-    })
+    MONITORS.with(|m| output_for(&m.borrow(), focused.as_deref()).cloned())
 }
 /// A card as one line per button, `label|decision|class`, plus the keyboard
 /// default and the silence rule — the artifact the goldens compare.
@@ -626,10 +636,41 @@ fn render_card(choices: ConsentChoices) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConsentChoices, ConsentDecision, HostMsg, ask_line, card, keyboard_default, plan,
-        render_card, request,
+        ConsentChoices, ConsentDecision, HostMsg, ask_line, card, keyboard_default, output_for,
+        plan, render_card, request,
     };
+    use std::collections::BTreeMap;
     use tokio::sync::mpsc;
+
+    /// Connectors in an order a sorted map must not echo. Eight names, so a
+    /// hash-ordered map would pick `DP-1` one time in eight, not one in two.
+    const SCRAMBLED: [&str; 8] = [
+        "HDMI-A-2", "eDP-1", "DP-3", "HDMI-A-1", "DP-2", "DVI-D-1", "DP-1", "VGA-1",
+    ];
+
+    /// #1565: with niri's focus unknown (startup, a vanished output) the card
+    /// lands on the first sorted connector, every time, like the drawer.
+    ///
+    /// **Falsification:** `first_key_value` → `last_key_value` in `output_for`
+    /// reds this. Reverting the map to a `HashMap` does not compile:
+    /// `output_for` takes a `BTreeMap`.
+    #[test]
+    fn the_unknown_focus_fallback_is_the_first_connector_every_time() {
+        for rotation in 0..SCRAMBLED.len() {
+            let mut order = SCRAMBLED.to_vec();
+            order.rotate_left(rotation);
+            let map: BTreeMap<String, &str> =
+                order.iter().map(|c| ((*c).to_owned(), *c)).collect();
+            assert_eq!(output_for(&map, None), Some(&"DP-1"));
+            assert_eq!(
+                output_for(&map, Some("DP-9")),
+                Some(&"DP-1"),
+                "a focused output with no mounted monitor falls back too"
+            );
+            assert_eq!(output_for(&map, Some("eDP-1")), Some(&"eDP-1"));
+        }
+        assert_eq!(output_for(&BTreeMap::<String, ()>::new(), None), None);
+    }
 
     /// #1140 review, HIGH-1 — the reviewer's test, verbatim in substance.
     ///

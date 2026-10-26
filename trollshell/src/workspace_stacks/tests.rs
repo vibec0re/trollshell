@@ -790,16 +790,35 @@ fn a_second_start_during_the_first_ones_grace_window_takes_a_new_workspace() {
 /// so they would never overlap. This is the smallest world that shows it: the
 /// three actions a Start's naming sends, applied to a list, behind calls that
 /// yield. Everything else answers as an empty session would.
-struct Compositor(RefCell<Vec<Workspace>>);
+struct Compositor {
+    workspaces: RefCell<Vec<Workspace>>,
+    /// How many executor turns a **non-empty** batch takes to land. An empty
+    /// one connects nothing (`send_actions_over`), so it always takes one.
+    batch_turns: usize,
+}
 
 impl Compositor {
     fn with(workspaces: Vec<Workspace>) -> Self {
-        Self(RefCell::new(workspaces))
+        Self {
+            workspaces: RefCell::new(workspaces),
+            batch_turns: 1,
+        }
+    }
+
+    /// A niri whose batches land slower than another Start's housekeeping and
+    /// snapshot take to read — the timing under which a lock that covered the
+    /// snapshot but not the batch would still let two Starts plan one
+    /// workspace.
+    fn with_slow_batches(workspaces: Vec<Workspace>) -> Self {
+        Self {
+            workspaces: RefCell::new(workspaces),
+            batch_turns: 16,
+        }
     }
 
     /// The name on workspace `id` right now.
     fn name_of(&self, id: u64) -> Option<String> {
-        self.0
+        self.workspaces
             .borrow()
             .iter()
             .find(|w| w.id == id)
@@ -809,8 +828,15 @@ impl Compositor {
 
 impl Ops for Compositor {
     async fn send_actions(&self, actions: Vec<WorkspaceAction>) -> Result<(), String> {
-        tokio::task::yield_now().await;
-        let mut workspaces = self.0.borrow_mut();
+        let turns = if actions.is_empty() {
+            1
+        } else {
+            self.batch_turns
+        };
+        for _ in 0..turns {
+            tokio::task::yield_now().await;
+        }
+        let mut workspaces = self.workspaces.borrow_mut();
         for action in actions {
             match action {
                 // As niri does: a name some other workspace holds is a silent
@@ -847,7 +873,7 @@ impl Ops for Compositor {
 
     async fn workspaces(&self) -> Result<Vec<Workspace>, String> {
         tokio::task::yield_now().await;
-        Ok(self.0.borrow().clone())
+        Ok(self.workspaces.borrow().clone())
     }
 
     async fn windows(&self) -> Result<Vec<Window>, String> {
@@ -942,6 +968,47 @@ fn two_overlapping_starts_take_two_workspaces() {
     let (adopter, other) = if a.adopted { (&a, &b) } else { (&b, &a) };
     assert!(adopter.adopted && adopter.workspace == 1, "{a:?} {b:?}");
     assert!(!other.adopted && other.workspace == 2, "{a:?} {b:?}");
+}
+
+/// **#1559 item 7, the span.** `PLAN_AND_NAME` covers the batch and its
+/// read-back, not only the snapshot (#1576 review, LOW 1).
+///
+/// The test above cannot tell: its niri lands a batch after one executor turn,
+/// before the other Start has finished reading its snapshot, so a lock released
+/// right after the plan passes it too. Here a batch takes longer to land than
+/// the other Start's housekeeping and snapshot take to read. With the lock
+/// covering only the snapshot, both Starts plan the focused workspace, both
+/// read-backs pass before the second name lands, and both report success, while
+/// the first stack's workspace ends up named after the second.
+///
+/// **Mutation:** drop the guard right after `plan_start` (before
+/// `send_actions`) and this reds — "both Starts took one workspace" — while
+/// the test above stays green.
+#[test]
+fn the_plan_and_name_lock_spans_the_batch_as_well_as_the_snapshot() {
+    let first = "spanfirst";
+    let second = "spansecond";
+    let _first_mark = StartingMark::hold(first);
+    let _second_mark = StartingMark::hold(second);
+    let saved = stacked(&[(first, Stack::default()), (second, Stack::default())]);
+    let niri = Compositor::with_slow_batches(vec![
+        ws_focused(1, 1, LEFT, None),
+        ws(2, 2, LEFT, None, false),
+    ]);
+
+    let empty = Stack::default();
+    let (a, b) = run(async {
+        tokio::join!(
+            start(&niri, first, &empty, &saved),
+            start(&niri, second, &empty, &saved),
+        )
+    });
+
+    let a = a.expect("the first Start");
+    let b = b.expect("the second Start");
+    assert_ne!(a.workspace, b.workspace, "both Starts took one workspace");
+    assert_eq!(niri.name_of(a.workspace).as_deref(), Some(first));
+    assert_eq!(niri.name_of(b.workspace).as_deref(), Some(second));
 }
 
 /// **MEDIUM-1.** The *fallback* leg takes an **empty** workspace too, not just

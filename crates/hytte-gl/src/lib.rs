@@ -42,12 +42,33 @@
 //! 1. **A context is current on this thread.** [`Gl::current`] is the token
 //!    that says so, and it is `!Send`/`!Sync`, so it cannot be smuggled to a
 //!    thread where the context is not bound. Every operation takes `&Gl`.
-//! 2. **Handles outlive nothing.** [`Program`], [`Texture`], [`Framebuffer`]
-//!    and [`VertexArray`] are RAII: `Drop` deletes the GL object. They are
-//!    `!Send` for the same reason as the token, and **must be dropped while
-//!    the creating context is still current**. `GtkGLArea` guarantees exactly
-//!    that — it makes the context current before emitting `unrealize` — which
-//!    is where `hytte-ui`'s widget drops them.
+//! 2. **A handle deletes its object only in the context that made it.**
+//!    [`Program`], [`Texture`], [`Framebuffer`] and [`VertexArray`] are RAII,
+//!    `!Send` for the same reason as the token, and *should* be dropped while
+//!    the creating context is still current. `GtkGLArea` does **not**
+//!    guarantee that for a subclass: GTK's own `unrealize` makes the context
+//!    current, but only after a subclass's override has run, which is why
+//!    `hytte-ui`'s widgets call `make_current` themselves before dropping
+//!    theirs. A safe `Drop` cannot rely on a caller having done that, so it
+//!    **checks**: each handle records the context current when it was created
+//!    (glvnd's `eglGetCurrentContext`, through `loader::current_context`), and
+//!    `Drop` issues the `glDelete*` only if that same context is current now.
+//!    Otherwise it logs and **leaks** the object, because the delete is worse
+//!    than the leak both ways it can go wrong: FBOs and VAOs are container
+//!    objects GL does not share between contexts (Mesa happens to keep FBO
+//!    names share-group-wide; VAO names it keeps per context, as specified),
+//!    so a delete under *another* context removes that context's object of
+//!    the same name — possibly GTK's own — and a delete with *no* context
+//!    current can `abort()` on the libepoxy route (see `loader`). A leaked object lives until its context is
+//!    destroyed, and in this tree that is the next thing that happens to it.
+//!
+//!    The check reaches EGL contexts only. A handle created where the probe
+//!    sees none (a GLX context, or a process with no glvnd `libEGL.so.1`)
+//!    records no owner, and its `Drop` keeps the unchecked delete — exactly
+//!    this crate's behaviour before the check existed, resting on the caller's
+//!    `make_current` alone. Using a handle (`bind`, `draw_to`, …) is **not**
+//!    checked: those run per frame, inside the owning area's own `render`,
+//!    where GTK has made its context current by construction.
 //! 3. **Sizes are checked before they reach GL.** Every dimension crossing into
 //!    a `glTexStorage2D`/`glViewport` is converted through `i32::try_from` and
 //!    refused rather than truncated, because a wrapped negative extent is a
@@ -76,11 +97,15 @@ mod loader;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::fmt;
 use std::marker::PhantomData;
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use gl::types::{GLenum, GLint, GLsizei, GLuint};
+
+use loader::ContextId;
 
 /// Anything that can go wrong on the way into GL.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -303,12 +328,86 @@ impl Gl {
     }
 }
 
+// ── ownership: which context may delete a handle's object ───────────────────
+
+/// The context a handle is being created in, which its `Drop` will require to
+/// be current again before it deletes anything (the safety contract's
+/// invariant 2).
+///
+/// The token is the claim that *a* context is current; the probe is what says
+/// *which* one. `None` when the probe can see no context at all — see
+/// [`release`] for what a handle with no recorded owner does.
+fn owner_now(_gl: &Gl) -> Option<ContextId> {
+    loader::current_context()
+}
+
+/// The line a handle writes when it leaks its object instead of deleting it.
+///
+/// Says what was **not** done and why, because the alternative reading — "a
+/// GL object leaked" with no cause — sends a reader hunting a missing `Drop`
+/// that is not missing.
+const LEAKED_OBJECT: &str = "a GL object's handle was dropped while the context that created it \
+    was not current, so the object was leaked instead of deleted: a delete here would have hit \
+    whatever the current context (if any) holds under the same name. The object lives until its \
+    context is destroyed";
+
+/// Run `delete` only if the context current now is `owner` — the whole of a
+/// handle's `Drop`, minus the one `glDelete*` call it guards.
+///
+/// Returns whether `delete` ran. Separate from the four `Drop` impls, and
+/// taking the probe as a closure, so the decision is testable with no GL
+/// context, no driver and no `gl::*` call at all.
+///
+/// * **`owner` is `None`**: the probe saw no context when the handle was made
+///   (a GLX context, or no glvnd `libEGL.so.1` in the process). There is
+///   nothing to compare against, so this keeps the unchecked delete the crate
+///   had before the check — and does not ask the probe, so a `Drop` is never
+///   the first thing to resolve it.
+/// * **`owner` is current**: delete. The normal case, and the one that must
+///   keep working — a check that leaked everything would be a GPU memory leak
+///   per resize.
+/// * **anything else** — another context current, or none: leak, and say so.
+///   The first leak in the process is a `warn`; later ones are `debug`, since
+///   one failed `make_current` drops a whole surface's worth of handles at
+///   once and they share one cause.
+fn release(
+    object: &'static str,
+    name: GLuint,
+    owner: Option<ContextId>,
+    current: impl FnOnce() -> Option<ContextId>,
+    delete: impl FnOnce(),
+) -> bool {
+    /// Whether the process has already written its one `warn` for a leak.
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    let Some(owner) = owner else {
+        delete();
+        return true;
+    };
+    let current = current();
+    if current == Some(owner) {
+        delete();
+        return true;
+    }
+    if WARNED.swap(true, Ordering::Relaxed) {
+        tracing::debug!(object, name, ?owner, ?current, "{LEAKED_OBJECT}");
+    } else {
+        tracing::warn!(
+            object,
+            name,
+            ?owner,
+            ?current,
+            "{LEAKED_OBJECT} (further leaks are logged at debug level)"
+        );
+    }
+    false
+}
+
 // ── programs ────────────────────────────────────────────────────────────────
 
 /// A linked GLSL program, with its uniform locations memoized.
 ///
-/// RAII: `Drop` calls `glDeleteProgram`. See the module's safety contract for
-/// when that must happen.
+/// RAII: `Drop` calls `glDeleteProgram` — under the context that created it
+/// only; see the module's safety contract, invariant 2.
 #[derive(Debug)]
 pub struct Program {
     id: GLuint,
@@ -319,6 +418,8 @@ pub struct Program {
     /// unused uniform is a no-op" behaviour, which is what lets one uniform bag
     /// feed several passes that each use a subset of it.
     locations: RefCell<HashMap<String, GLint>>,
+    /// The context this program was linked in — see [`release`].
+    owner: Option<ContextId>,
     _not_send: PhantomData<*const ()>,
 }
 
@@ -357,6 +458,7 @@ impl Program {
             return Ok(Self {
                 id,
                 locations: RefCell::new(HashMap::new()),
+                owner: owner_now(gl_ctx),
                 _not_send: PhantomData,
             });
         }
@@ -417,16 +519,26 @@ impl Program {
     }
 
     /// This program's location for `name`, resolved once and memoized.
+    ///
+    /// **A name with an interior NUL is `-1`, without asking GL.** GL reads a
+    /// C string, so it would stop at the NUL and resolve the *prefix* —
+    /// `"u_time\0x"` setting `u_time` — and the memo would then file that
+    /// answer under the full name. No uniform name can contain a NUL, so the
+    /// honest answer is GL's own "no such uniform", which every `glUniform*`
+    /// ignores. Not memoized: it is decided without a driver round-trip, so
+    /// there is nothing to save, and a caller cannot grow the memo with
+    /// names GL never saw.
     fn location(&self, name: &str) -> GLint {
         if let Some(found) = self.locations.borrow().get(name) {
             return *found;
         }
-        let mut terminated = String::with_capacity(name.len() + 1);
-        terminated.push_str(name);
-        terminated.push('\0');
+        let Ok(terminated) = CString::new(name) else {
+            return -1;
+        };
         // SAFETY: `self.id` is a live program and the pointer is to a
-        // nul-terminated buffer that outlives the call.
-        let location = unsafe { gl::GetUniformLocation(self.id, terminated.as_ptr().cast::<i8>()) };
+        // nul-terminated buffer, with no NUL before its end, that outlives the
+        // call.
+        let location = unsafe { gl::GetUniformLocation(self.id, terminated.as_ptr()) };
         self.locations
             .borrow_mut()
             .insert(name.to_owned(), location);
@@ -436,10 +548,14 @@ impl Program {
 
 impl Drop for Program {
     fn drop(&mut self) {
-        // SAFETY: `self.id` is this handle's own program and nothing else holds
-        // it. The module's contract requires the creating context to still be
-        // current here — which is what `GtkGLArea::unrealize` guarantees.
-        unsafe { gl::DeleteProgram(self.id) };
+        let id = self.id;
+        release("program", id, self.owner, loader::current_context, || {
+            // SAFETY: `id` is this handle's own program and nothing else holds
+            // it, and `release` runs this only with the context that linked it
+            // current — or, for a handle the probe could not attribute, on the
+            // caller's word (the module contract, invariant 2).
+            unsafe { gl::DeleteProgram(id) };
+        });
     }
 }
 
@@ -480,7 +596,10 @@ impl Drop for Shader {
     fn drop(&mut self) {
         // SAFETY: `self.id` is this handle's own shader. Deleting an attached
         // shader is legal and defers until the program is deleted, which is
-        // exactly the lifetime wanted here.
+        // exactly the lifetime wanted here. No owner check, unlike the public
+        // handles (invariant 2): a `Shader` is private and never outlives the
+        // one `Program::compile` call that created it, so it is always dropped
+        // under the context that call was made in.
         unsafe { gl::DeleteShader(self.id) };
     }
 }
@@ -602,6 +721,8 @@ pub struct Texture {
     width: u32,
     height: u32,
     format: Format,
+    /// The context this texture was allocated in — see [`release`].
+    owner: Option<ContextId>,
     _not_send: PhantomData<*const ()>,
 }
 
@@ -637,7 +758,15 @@ thread_local! {
 /// synchronisation on the path that reads it every allocation.
 ///
 /// A driver answering `<= 0` is treated as *unknown*, not as *zero*: see
-/// [`UNKNOWN_MAX_TEXTURE_SIZE`].
+/// [`UNKNOWN_MAX_TEXTURE_SIZE`]. **And unknown is not memoized** — only a
+/// usable answer is ([`usable_limit`]). The query writes nothing when it is
+/// made with no context bound (a glvnd stub on an unbound thread is a no-op),
+/// so the first ask on a thread can come back `0` for a reason that is gone
+/// by the second. Memoizing it switched the `GL_MAX_TEXTURE_SIZE` check off
+/// for the life of the thread, which is the check that turns an over-limit
+/// grid into [`Error::TextureSize`] — naming the limit — rather than a bare
+/// [`Error::Storage`]. An unusable answer costs one `glGetIntegerv` per
+/// allocation instead, and only for as long as it stays unusable.
 fn max_texture_size(_gl: &Gl) -> u32 {
     MAX_TEXTURE_SIZE.with(|cached| {
         if let Some(known) = cached.get() {
@@ -652,16 +781,23 @@ fn max_texture_size(_gl: &Gl) -> u32 {
         unsafe {
             gl::GetIntegerv(gl::MAX_TEXTURE_SIZE, &raw mut value);
         }
-        let limit = u32::try_from(value).unwrap_or(0);
-        let limit = if limit == 0 {
-            UNKNOWN_MAX_TEXTURE_SIZE
-        } else {
-            limit
+        let Some(limit) = usable_limit(value) else {
+            tracing::debug!(
+                value,
+                "GL_MAX_TEXTURE_SIZE unusable; not enforcing it this time"
+            );
+            return UNKNOWN_MAX_TEXTURE_SIZE;
         };
         cached.set(Some(limit));
         tracing::debug!(limit, "GL_MAX_TEXTURE_SIZE");
         limit
     })
+}
+
+/// A `GL_MAX_TEXTURE_SIZE` answer worth memoizing, or `None` for one that
+/// means the query did not really happen — see [`max_texture_size`].
+fn usable_limit(value: GLint) -> Option<u32> {
+    u32::try_from(value).ok().filter(|&limit| limit > 0)
 }
 
 /// Both extents as positive `GLsizei`s, or the reason they are unusable.
@@ -732,7 +868,20 @@ impl Texture {
         // Anything already queued belongs to whoever queued it; draining first
         // is what makes the check below an answer about *this* allocation
         // rather than about the last thing that went wrong anywhere.
-        let _ = gl_ctx.take_error();
+        //
+        // **The drain is destructive, and that is accepted, not overlooked.**
+        // `glGetError` has no peek, so an error GTK left queued on this
+        // shared context is consumed here and its owner will not see it.
+        // Nothing in GTK/GSK reads `glGetError` to decide anything outside
+        // its debug paths, and the alternative — leaving it queued — is
+        // attributing GTK's error to this allocation and refusing a texture
+        // that was fine. What is discarded is still written down, at debug.
+        if let Some(code) = gl_ctx.take_error() {
+            tracing::debug!(
+                code,
+                "discarded a GL error queued before this texture allocation"
+            );
+        }
         let mut id: GLuint = 0;
         // SAFETY: a context is current. `GenTextures` writes one id through a
         // pointer to a live local; the rest operate on that id while it is
@@ -788,6 +937,7 @@ impl Texture {
             width,
             height,
             format,
+            owner: owner_now(gl_ctx),
             _not_send: PhantomData,
         })
     }
@@ -981,6 +1131,17 @@ impl Texture {
         }
     }
 
+    /// **Test-only.** This texture's raw GL name, so a live-driver test can
+    /// ask GL ([`is_texture_for_test`]) whether the object outlived its
+    /// handle — the only observable difference between `Drop` deleting it and
+    /// leaking it (invariant 2). Gated behind `system-tests` with the other
+    /// seams of that kind.
+    #[cfg(feature = "system-tests")]
+    #[must_use]
+    pub fn name_for_test(&self) -> u32 {
+        self.id
+    }
+
     /// Bind this texture to sampler `unit`.
     pub fn bind_unit(&self, _gl: &Gl, unit: u32) {
         // SAFETY: a context is current and `self.id` is live. `TEXTURE0 + unit`
@@ -995,9 +1156,15 @@ impl Texture {
 
 impl Drop for Texture {
     fn drop(&mut self) {
-        // SAFETY: `self.id` is this handle's own texture; see the module
-        // contract on when a handle may be dropped.
-        unsafe { gl::DeleteTextures(1, &raw const self.id) };
+        let id = self.id;
+        release("texture", id, self.owner, loader::current_context, || {
+            // SAFETY: `id` is this handle's own texture, read into a live local
+            // for the out-pointer, and `release` runs this only under the
+            // context that allocated it (or, for a handle the probe could not
+            // attribute, on the caller's word — the module contract,
+            // invariant 2).
+            unsafe { gl::DeleteTextures(1, &raw const id) };
+        });
     }
 }
 
@@ -1016,6 +1183,11 @@ pub struct Framebuffer {
     /// nothing would point [`draw_to`](Framebuffer::draw_to) at the visible
     /// surface instead of at a texture, with no error anywhere.
     id: NonZeroU32,
+    /// The context this FBO was generated in — see [`release`]. Load-bearing
+    /// here in a way it is not for a texture: an FBO is a container object,
+    /// so another context's FBO of the same name is a *different object*,
+    /// possibly the one GTK composites.
+    owner: Option<ContextId>,
     _not_send: PhantomData<*const ()>,
 }
 
@@ -1028,7 +1200,7 @@ impl Framebuffer {
     /// `glGen*` reports failure no other way, and for this object in
     /// particular the fallback is not "no framebuffer" but "the default
     /// framebuffer" — see that variant.
-    pub fn new(_gl: &Gl) -> Result<Self, Error> {
+    pub fn new(gl_ctx: &Gl) -> Result<Self, Error> {
         let mut id: GLuint = 0;
         // SAFETY: a context is current; the out-pointer is a live local.
         // Whatever GL writes there is only *used* after the `NonZeroU32`
@@ -1038,6 +1210,7 @@ impl Framebuffer {
             id: NonZeroU32::new(id).ok_or(Error::Name {
                 object: "framebuffer",
             })?,
+            owner: owner_now(gl_ctx),
             _not_send: PhantomData,
         })
     }
@@ -1072,10 +1245,21 @@ impl Framebuffer {
 impl Drop for Framebuffer {
     fn drop(&mut self) {
         let id = self.id.get();
-        // SAFETY: `id` is this handle's own FBO, read out of the `NonZeroU32`
-        // into a live local for the out-pointer; see the module contract on
-        // when a handle may be dropped.
-        unsafe { gl::DeleteFramebuffers(1, &raw const id) };
+        release(
+            "framebuffer",
+            id,
+            self.owner,
+            loader::current_context,
+            || {
+                // SAFETY: `id` is this handle's own FBO, read out of the
+                // `NonZeroU32` into a live local for the out-pointer, and
+                // `release` runs this only under the context that generated it —
+                // the one context in which `id` names *this* FBO (or, for a handle
+                // the probe could not attribute, on the caller's word — the module
+                // contract, invariant 2).
+                unsafe { gl::DeleteFramebuffers(1, &raw const id) };
+            },
+        );
     }
 }
 
@@ -1105,6 +1289,9 @@ pub struct VertexArray {
     /// core profile refuses to draw with, so a failed `glGenVertexArrays`
     /// costs the draw rather than redirecting it.
     id: NonZeroU32,
+    /// The context this VAO was generated in — see [`release`], and
+    /// [`Framebuffer::owner`] for why a container object needs it most.
+    owner: Option<ContextId>,
     _not_send: PhantomData<*const ()>,
 }
 
@@ -1114,7 +1301,7 @@ impl VertexArray {
     /// # Errors
     ///
     /// [`Error::Name`] if `glGenVertexArrays` left the reserved name `0`.
-    pub fn new(_gl: &Gl) -> Result<Self, Error> {
+    pub fn new(gl_ctx: &Gl) -> Result<Self, Error> {
         let mut id: GLuint = 0;
         // SAFETY: a context is current; the out-pointer is a live local.
         // Whatever GL writes there is only *used* after the `NonZeroU32`
@@ -1124,6 +1311,7 @@ impl VertexArray {
             id: NonZeroU32::new(id).ok_or(Error::Name {
                 object: "vertex array",
             })?,
+            owner: owner_now(gl_ctx),
             _not_send: PhantomData,
         })
     }
@@ -1134,14 +1322,37 @@ impl VertexArray {
         // by construction, so this never re-binds the default vertex array.
         unsafe { gl::BindVertexArray(self.id.get()) };
     }
+
+    /// **Test-only.** This VAO's raw GL name — [`Texture::name_for_test`]'s
+    /// twin, read back through [`is_vertex_array_for_test`]. The VAO rather
+    /// than the FBO is the container object a live test can catch the
+    /// cross-context hazard on, because Mesa keeps framebuffer names in the
+    /// share group's state (two shared contexts never number their FBOs
+    /// alike there) but vertex-array names per context, as GL specifies.
+    #[cfg(feature = "system-tests")]
+    #[must_use]
+    pub fn name_for_test(&self) -> u32 {
+        self.id.get()
+    }
 }
 
 impl Drop for VertexArray {
     fn drop(&mut self) {
         let id = self.id.get();
-        // SAFETY: `id` is this handle's own VAO, read out of the `NonZeroU32`
-        // into a live local for the out-pointer; see the module contract.
-        unsafe { gl::DeleteVertexArrays(1, &raw const id) };
+        release(
+            "vertex array",
+            id,
+            self.owner,
+            loader::current_context,
+            || {
+                // SAFETY: `id` is this handle's own VAO, read out of the
+                // `NonZeroU32` into a live local for the out-pointer, and `release`
+                // runs this only under the context that generated it (or, for a
+                // handle the probe could not attribute, on the caller's word — the
+                // module contract, invariant 2).
+                unsafe { gl::DeleteVertexArrays(1, &raw const id) };
+            },
+        );
     }
 }
 
@@ -1328,6 +1539,29 @@ pub fn dirty_pack_state_for_test(_gl: &Gl) {
     }
 }
 
+/// **Test-only.** Whether `name` is a texture object in the **current**
+/// context (`glIsTexture`) — how a live-driver test tells a handle that
+/// deleted its object from one that leaked it (invariant 2).
+#[cfg(feature = "system-tests")]
+#[must_use]
+pub fn is_texture_for_test(_gl: &Gl, name: u32) -> bool {
+    // SAFETY: a context is current (the token); `glIsTexture` takes a plain
+    // name, dereferences nothing, and answers `GL_FALSE` for one that is not
+    // a texture.
+    unsafe { gl::IsTexture(name) == gl::TRUE }
+}
+
+/// **Test-only.** Whether `name` is a vertex array object in the **current**
+/// context (`glIsVertexArray`) — [`is_texture_for_test`]'s twin, and the one
+/// that sees the container-object hazard: another context's VAO of the same
+/// name is a different object, so this is asked per context.
+#[cfg(feature = "system-tests")]
+#[must_use]
+pub fn is_vertex_array_for_test(_gl: &Gl, name: u32) -> bool {
+    // SAFETY: as `is_texture_for_test`, for `glIsVertexArray`.
+    unsafe { gl::IsVertexArray(name) == gl::TRUE }
+}
+
 /// Read the bound framebuffer's colour back as RGBA8, row-major, bottom-up (GL
 /// order — the caller flips).
 ///
@@ -1372,9 +1606,11 @@ pub fn read_rgba8(_gl: &Gl, width: u32, height: u32) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Blend, Error, Format, Framebuffer, NonZeroU32, PhantomData, Stage,
-        UNKNOWN_MAX_TEXTURE_SIZE, VertexArray, checked_extent,
+        Blend, ContextId, Error, Format, Framebuffer, HashMap, NonZeroU32, PhantomData, Program,
+        RefCell, Stage, UNKNOWN_MAX_TEXTURE_SIZE, VertexArray, checked_extent, release,
+        usable_limit,
     };
+    use std::cell::Cell;
 
     /// **#977.** The extent decision, which is the half of the driver check a
     /// hermetic test can reach — CI has no GL at all, so `Texture::new`'s
@@ -1445,6 +1681,119 @@ mod tests {
             checked_extent(65_536, 65_536, UNKNOWN_MAX_TEXTURE_SIZE),
             Ok((65_536, 65_536)),
         );
+    }
+
+    /// …and an unknown limit is **not memoized**: only a positive answer is.
+    /// `max_texture_size` used to cache the sentinel for an unusable answer,
+    /// so a first query made with no context bound (which writes nothing and
+    /// leaves the out-parameter at `0`) switched the `GL_MAX_TEXTURE_SIZE`
+    /// check off for the rest of the thread's life.
+    ///
+    /// **Falsified** by having `usable_limit` map `0` (or a negative) to the
+    /// sentinel instead of `None` — which is exactly what memoizing
+    /// "unknown" was.
+    #[test]
+    fn only_a_usable_driver_limit_is_worth_remembering() {
+        assert_eq!(usable_limit(16_384), Some(16_384));
+        assert_eq!(usable_limit(1), Some(1));
+        assert_eq!(usable_limit(0), None, "the no-context answer");
+        assert_eq!(usable_limit(-1), None, "nor a nonsense one");
+    }
+
+    /// **Invariant 2.** A handle deletes its object only under the context
+    /// that made it, and leaks it otherwise — the decision every `Drop` in
+    /// this crate delegates to [`release`], driven here with stand-in
+    /// contexts and a delete that only counts.
+    ///
+    /// The four rows are the whole table: the owning context current (the
+    /// normal case, which must keep deleting — a check that leaked here
+    /// would be a GPU leak per resize); *another* context current (the
+    /// container-object hazard: that context's FBO of the same name is a
+    /// different object); *no* context current (a delete that can abort on
+    /// the libepoxy route); and no recorded owner, which keeps the unchecked
+    /// delete *without asking the probe*, so a `Drop` is never what first
+    /// resolves it.
+    ///
+    /// **Falsified** by reverting any `Drop` to a bare `glDelete*` (not
+    /// visible here — that is the gated `hytte-ui` test's job), or here by
+    /// comparing anything but the owner (rows 2 and 3 delete), or by asking
+    /// the probe before the `None` arm (row 4's probe count goes to 1).
+    #[test]
+    fn a_handle_deletes_only_under_the_context_that_made_it() {
+        let a = ContextId::fake(0xa000);
+        let b = ContextId::fake(0xb000);
+        let deletes = Cell::new(0_u32);
+        let probes = Cell::new(0_u32);
+        let delete = || deletes.set(deletes.get() + 1);
+        let probe = |answer: Option<ContextId>| {
+            let probes = &probes;
+            move || {
+                probes.set(probes.get() + 1);
+                answer
+            }
+        };
+
+        assert!(release("texture", 1, Some(a), probe(Some(a)), delete));
+        assert_eq!(deletes.get(), 1, "the owning context is current: delete");
+
+        assert!(!release("framebuffer", 1, Some(a), probe(Some(b)), delete));
+        assert_eq!(
+            deletes.get(),
+            1,
+            "another context is current: its FBO 1 is not ours, so leak",
+        );
+
+        assert!(!release("vertex array", 1, Some(a), probe(None), delete));
+        assert_eq!(deletes.get(), 1, "no context is current: leak, never abort");
+
+        let asked = probes.get();
+        assert!(release("program", 1, None, probe(None), delete));
+        assert_eq!(
+            deletes.get(),
+            2,
+            "no owner recorded: the pre-check unchecked delete"
+        );
+        assert_eq!(
+            probes.get(),
+            asked,
+            "…decided without asking the probe, so no Drop is ever first to resolve it",
+        );
+    }
+
+    /// The same table, through a **real** `Drop`: handles whose owner no live
+    /// context can match, dropped for real on a thread with no context
+    /// current, must leak — which here means returning without one `gl::*`
+    /// call. Before the owner check this test had to `mem::forget` its
+    /// handles (see the one below's history), because their `Drop` issued a
+    /// `glDelete*` with no context bound.
+    ///
+    /// What makes this an assertion rather than a smoke test is the program's
+    /// memo: `location` on a NUL-carrying name must answer `-1` **without**
+    /// reaching GL — a GL call here would either panic (the `gl` table is not
+    /// loaded in this test binary unless the loader test got there first) or
+    /// return the no-context stub's `0`, and either way the memo would hold
+    /// the name.
+    ///
+    /// **Falsified** by dropping the NUL check from `Program::location` (the
+    /// location is not `-1`, or the memo is not empty, or the call panics).
+    #[test]
+    fn a_uniform_name_with_a_nul_never_reaches_gl_and_unowned_drops_leak() {
+        let program = Program {
+            id: 1,
+            locations: RefCell::new(HashMap::new()),
+            owner: Some(ContextId::fake(0xdead_0000)),
+            _not_send: PhantomData,
+        };
+        assert_eq!(
+            program.location("u_time\0junk"),
+            -1,
+            "GL would stop at the NUL and resolve `u_time`; no uniform is named this",
+        );
+        assert!(
+            program.locations.borrow().is_empty(),
+            "…and the memo must not file a prefix's answer under the full name",
+        );
+        drop(program);
     }
 
     /// The three formats keep the enum triples the shaders are written against
@@ -1549,12 +1898,20 @@ mod tests {
     /// while the type still holds.
     #[test]
     fn a_framebuffer_and_a_vao_can_only_hold_a_non_zero_name() {
+        // An owner no live context can match, so the real `Drop` below leaks
+        // (no context is current on a test thread) instead of issuing a
+        // `glDelete*` with nothing bound. Before invariant 2's owner check
+        // this test had to `mem::forget` both handles to stay inside the
+        // module contract; now the contract is the `Drop`'s to keep.
+        let owner = Some(ContextId::fake(0x7000));
         let fbo = Framebuffer {
             id: NonZeroU32::new(7).expect("7 is not zero"),
+            owner,
             _not_send: PhantomData,
         };
         let vao = VertexArray {
             id: NonZeroU32::new(9).expect("9 is not zero"),
+            owner,
             _not_send: PhantomData,
         };
         assert_eq!(fbo.id.get(), 7);
@@ -1563,12 +1920,8 @@ mod tests {
             NonZeroU32::new(0).is_none(),
             "…and 0, the name glGen* leaves on failure, has no representation here",
         );
-        // Both handles' `Drop` issues a `glDelete*` with no context current,
-        // which is a no-op through glvnd's dispatch on an unbound thread but
-        // is not what this test is about — forget them rather than letting
-        // the contract in the module docs be violated by a test.
-        std::mem::forget(fbo);
-        std::mem::forget(vao);
+        drop(fbo);
+        drop(vao);
     }
 
     /// `Blend` is a two-state knob and both states are named, so a future third

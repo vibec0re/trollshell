@@ -96,8 +96,28 @@
 //! library of its own. It resolves nothing on nixpkgs — which is precisely the
 //! shipped bug — so it is kept as the honest last word rather than the
 //! catch-all the old header claimed it was.
+//!
+//! # Which context is current — [`current_context`]
+//!
+//! Separate from the entry points, and asked of the same library route 1
+//! opens: glvnd's `eglGetCurrentContext`. It is what lets a handle's `Drop`
+//! check that the context it is about to delete in is the one that created the
+//! object (see the crate docs' safety contract, invariant 2). glvnd tracks one
+//! current context per thread in `libGLdispatch` — the same state every
+//! `gl*` stub above dispatches through — so this answers exactly "where would
+//! a GL call made now land", which is the question a delete has to ask.
+//!
+//! It sees **EGL contexts only**. GDK creates EGL contexts on Wayland and, by
+//! preference, on X11; a GDK that fell back to GLX, or a process with no
+//! glvnd `libEGL.so.1` at all (the libepoxy route), reads as "no context the
+//! probe can see", and a handle created there records no owner and keeps the
+//! pre-check behaviour. `glXGetCurrentContext` is not asked for the reason
+//! route 1 does not try `glXGetProcAddressARB`: no GLX context has been
+//! observed here, and opening `libGL.so.1` to look would load a library GTK
+//! may never have mapped.
 
 use std::ffi::{CString, c_char, c_void};
+use std::num::NonZeroUsize;
 use std::sync::OnceLock;
 
 use crate::Error;
@@ -117,6 +137,73 @@ const EPOXY_SONAMES: [&str; 2] = ["libepoxy.so.0", "libepoxy.so"];
 /// nothing here ever calls through it — [`gl::load_with`] stores it, and the
 /// `gl` crate calls it through its own registry-generated signature.
 type GetProcAddress = unsafe extern "C" fn(*const c_char) -> *const c_void;
+
+/// `eglGetCurrentContext`'s C signature: `EGLContext (void)`, where an
+/// `EGLContext` is an opaque `void *` and `EGL_NO_CONTEXT` is null.
+type GetCurrentContext = unsafe extern "C" fn() -> *mut c_void;
+
+/// The identity of one GL context: the `EGLContext` handle glvnd reports as
+/// current on this thread.
+///
+/// Opaque and compared only for equality — never dereferenced, never handed
+/// back to EGL. Non-zero by construction, because `EGL_NO_CONTEXT` is null and
+/// "no context" is spelled `None` wherever this appears.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ContextId(NonZeroUsize);
+
+impl ContextId {
+    /// A context identity made up from a number, for tests that need an owner
+    /// no live context can ever match.
+    #[cfg(test)]
+    pub(crate) fn fake(value: usize) -> Self {
+        Self(NonZeroUsize::new(value).expect("a fake context id is non-zero"))
+    }
+}
+
+/// The context current on this thread, as glvnd's EGL sees it — or `None`
+/// when no EGL context is current, or when there is no glvnd `libEGL.so.1` to
+/// ask (see the module header's last section for what that does and does not
+/// cover).
+///
+/// The library and symbol are resolved **once** for the process and the call
+/// itself is a thread-local read inside glvnd, so this is cheap enough to ask
+/// on every object creation and every drop — which are the only callers, and
+/// neither is per frame.
+///
+/// **Only reached after [`load`]**, in production: a handle records its owner
+/// in its constructor, which takes a `Gl` token, which is what runs `load` —
+/// and `load` always tries route 1's `dlopen` of this same soname first. So the
+/// `open` below never maps anything route 1 had not already mapped (or failed
+/// to): it is the same refcount bump `open`'s own SAFETY note relies on.
+pub(crate) fn current_context() -> Option<ContextId> {
+    let get_current_context = context_probe()?;
+    // SAFETY: calling `eglGetCurrentContext` through the signature EGL defines
+    // for it. It takes no arguments, needs no initialised display and no
+    // current context — with none it returns `EGL_NO_CONTEXT` — and only reads
+    // glvnd's per-thread state. The result is compared, never dereferenced.
+    let context = unsafe { get_current_context() };
+    NonZeroUsize::new(context.addr()).map(ContextId)
+}
+
+/// glvnd's `eglGetCurrentContext`, resolved once for the process, or `None`
+/// when this process has no `libEGL.so.1` that defines it.
+///
+/// Split out of [`current_context`] so a test can tell "the probe answered
+/// *no context*" from "there was no probe to ask" — the two read the same
+/// through `current_context`, and only the first is evidence of anything.
+fn context_probe() -> Option<GetCurrentContext> {
+    static PROBE: OnceLock<Option<GetCurrentContext>> = OnceLock::new();
+    *PROBE.get_or_init(|| {
+        let library = open(Some(GLVND_EGL_SONAME)).ok()?;
+        // SAFETY: reading a symbol's address out of a loaded library and typing
+        // it as EGL's own `eglGetCurrentContext` signature — what glvnd's
+        // `libEGL.so.1` defines under that name. An absent symbol yields `Err`
+        // rather than a wild pointer, and the library is leaked (`'static`),
+        // so the function pointer cannot outlive its mapping.
+        let symbol = unsafe { library.get::<GetCurrentContext>(b"eglGetCurrentContext") }.ok()?;
+        Some(*symbol)
+    })
+}
 
 /// One opened source of entry points, ready to answer [`gl::load_with`].
 ///
@@ -386,7 +473,8 @@ fn glvnd() -> Result<Source, String> {
 /// is no unload hook that could invalidate them, so the handle has to outlive
 /// every GL call the process will ever make. A `'static` leak is the honest
 /// spelling of that; the alternative (a `OnceLock<Library>`) is the same
-/// lifetime with more ceremony. At most three per process, ~a pointer each.
+/// lifetime with more ceremony. At most four per process, ~a pointer each —
+/// the three routes, plus [`current_context`]'s own handle on glvnd's EGL.
 fn open(soname: Option<&str>) -> Result<&'static libloading::Library, String> {
     let library = match soname {
         // SAFETY: `Library::new` runs the library's initialisers, which is the
@@ -406,8 +494,8 @@ fn open(soname: Option<&str>) -> Result<&'static libloading::Library, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        EPOXY_SONAMES, GLVND_EGL_SONAME, GetProcAddress, Source, install, load_once, loader_for,
-        open,
+        EPOXY_SONAMES, GLVND_EGL_SONAME, GetProcAddress, Source, context_probe, current_context,
+        install, load_once, loader_for, open,
     };
 
     /// Map GTK's GL closure into this test binary.
@@ -601,6 +689,51 @@ mod tests {
             load_once().as_deref(),
             Ok(Source::Glvnd(get_proc_address).describe()),
             "the loader must resolve, and route 1 (glvnd) must be the source that wins here",
+        );
+    }
+
+    /// The context probe a handle's `Drop` asks before it deletes anything
+    /// must **resolve** on this platform and must answer **no context** on a
+    /// thread that has none — the answer that turns a would-be delete into a
+    /// logged leak.
+    ///
+    /// The first half is what stops the second being vacuous: a probe that
+    /// failed to resolve also reads as "no context" through
+    /// [`current_context`], and on a live session it would quietly demote
+    /// every handle to "no owner recorded" — the pre-check behaviour — with
+    /// nothing anywhere saying so. The positive half (a real context reads as
+    /// itself, and a different one does not) needs a driver; it is
+    /// `hytte-ui`'s gated `gl_surface` test
+    /// `a_handle_is_deleted_only_under_the_context_that_made_it`.
+    ///
+    /// Touches no `gl::*` entry point, so it does not join
+    /// `the_loader_resolves_entry_points_on_this_platform`'s reason for being
+    /// one function: nothing here reads or writes the `gl` crate's
+    /// process-global table.
+    ///
+    /// **Falsified** by resolving a symbol glvnd does not define (the probe
+    /// comes back `None` and the first assertion reds), or by mapping a null
+    /// `EGLContext` to `Some` (the second does).
+    #[test]
+    fn the_context_probe_resolves_and_sees_no_context_on_a_bare_thread() {
+        map_gtk_gl_closure();
+        if open(Some(GLVND_EGL_SONAME)).is_err() {
+            eprintln!(
+                "SKIP the_context_probe_resolves_and_sees_no_context_on_a_bare_thread: \
+                 {GLVND_EGL_SONAME} is not mapped in this process — the same packaging fact \
+                 the_loader_resolves_entry_points_on_this_platform skips on",
+            );
+            return;
+        }
+        assert!(
+            context_probe().is_some(),
+            "glvnd's libEGL defines eglGetCurrentContext; a probe that did not resolve would \
+             leave every handle with no owner, i.e. back on the unchecked delete",
+        );
+        assert_eq!(
+            current_context(),
+            None,
+            "no context is current on a test thread, and EGL_NO_CONTEXT must read as None",
         );
     }
 }

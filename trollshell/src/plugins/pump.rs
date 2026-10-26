@@ -1467,13 +1467,13 @@ thread_local! {
 }
 
 /// How many slot-visibility edges have been published on this thread.
-#[cfg(test)]
+#[cfg(all(test, feature = "system-tests"))]
 pub(crate) fn visibility_edges() -> u32 {
     VISIBILITY_EDGES.with(Cell::get)
 }
 
 /// Zero the edge counter before a test's own sequence.
-#[cfg(test)]
+#[cfg(all(test, feature = "system-tests"))]
 pub(crate) fn reset_visibility_edges() {
     VISIBILITY_EDGES.with(|c| c.set(0));
 }

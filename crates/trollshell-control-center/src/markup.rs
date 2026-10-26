@@ -99,4 +99,109 @@ pub(crate) mod test_support {
             "no label displays {literal:?} literally; labels show {texts:?}"
         );
     }
+
+    /// The env var that tells a re-executed test binary it is the child of a
+    /// [`child_output`] call.
+    const CHILD_ENV: &str = "TROLLSHELL_CC_MARKUP_WARNING_CHILD";
+
+    /// True inside the child process [`child_output`] spawns. A `*_child` test
+    /// returns early unless this holds, so in a normal run it is a no-op.
+    pub(crate) fn in_child() -> bool {
+        std::env::var_os(CHILD_ENV).is_some()
+    }
+
+    /// Re-run this test binary on the single test `path` (the path `cargo
+    /// test` lists, `module::sub::name`) and return everything it printed.
+    ///
+    /// The shell's `components::markup::test_support` has the same helper
+    /// (#1571), for the same reason: GTK logs through `GLib`'s *structured*
+    /// writer, which skips handlers installed with `g_log_set_handler`, and
+    /// the one hook that does see it, `g_log_set_writer_func`, is a
+    /// once-per-process global that would leak into every other test in the
+    /// binary. A child's stderr is the observable the warning has, and the
+    /// global state stays the child's.
+    #[track_caller]
+    pub(crate) fn child_output(path: &str) -> String {
+        let exe = std::env::current_exe().expect("the test binary's own path");
+        let out = std::process::Command::new(exe)
+            .args([path, "--exact", "--nocapture", "--test-threads=1"])
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("re-running the test binary");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.status.success() && text.contains("1 passed"),
+            "the child run of {path} did not pass exactly one test (a wrong path runs none): \
+             {text}"
+        );
+        text
+    }
+
+    /// The `Gtk-WARNING` a label logs when it is handed hostile text while
+    /// `use-markup` is still on.
+    pub(crate) const MARKUP_WARNING: &str = "from markup due to error parsing markup";
+}
+
+#[cfg(all(test, feature = "system-tests"))]
+mod gtk_tests {
+    use adw::prelude::*;
+
+    use super::plain_text;
+    use super::test_support::{MARKUP_WARNING, child_output, in_child};
+
+    const PROBE: &str = "ORDER-PROBE Tom & <b>Jerry</b>";
+
+    /// Child body: text in the builder, markup switched off in the same
+    /// builder after it — the shape the agents tab used to have.
+    #[gtk::test]
+    fn order_probe_old_child() {
+        if !in_child() {
+            return;
+        }
+        adw::init().expect("libadwaita init");
+        drop(
+            adw::ActionRow::builder()
+                .title(PROBE)
+                .subtitle(PROBE)
+                .use_markup(false)
+                .build(),
+        );
+    }
+
+    /// Child body: [`plain_text`] before any text.
+    #[gtk::test]
+    fn order_probe_new_child() {
+        if !in_child() {
+            return;
+        }
+        adw::init().expect("libadwaita init");
+        let row = adw::ActionRow::new();
+        plain_text(&row);
+        row.set_title(PROBE);
+        row.set_subtitle(PROBE);
+    }
+
+    /// **The premise of every no-warning pin in this crate**, so none of them
+    /// can go green on a capture that sees nothing: the old order *does* log
+    /// the markup warning, and `plain_text` before the text does not (#1564).
+    #[gtk::test]
+    fn the_capture_sees_the_warning_only_for_the_old_order() {
+        if in_child() {
+            return;
+        }
+        let old = child_output("markup::gtk_tests::order_probe_old_child");
+        assert!(
+            old.contains(MARKUP_WARNING),
+            "premise: the old order must log the warning, or the probe sees nothing: {old}"
+        );
+        let new = child_output("markup::gtk_tests::order_probe_new_child");
+        assert!(
+            !new.contains(MARKUP_WARNING),
+            "plain_text first must not warn: {new}"
+        );
+    }
 }

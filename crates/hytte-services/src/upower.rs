@@ -397,7 +397,19 @@ struct WarningWatch {
     /// [`run_warning_watch`] posts it without a body through [`Self::expire`]
     /// once [`PERCENTAGE_HOLD`] has passed, since a `Percentage` whose `Get`
     /// keeps failing stays `Loading` for as long as it fails.
-    pending: Option<WarningLevel>,
+    pending: Option<Held>,
+}
+
+/// A toast [`WarningWatch`] is holding for `Percentage`.
+#[derive(Clone, Copy, Debug)]
+struct Held {
+    /// The level the toast will announce: the latest one, raised by a further
+    /// rise and lowered by a partial fall.
+    level: WarningLevel,
+    /// The tier the level stood at just before the edge that started the
+    /// hold. Nobody has been told about anything above it, so a fall that
+    /// stays above it still owes a toast and only a fall to it ends the hold.
+    floor: u8,
 }
 
 /// How long a held low-battery toast waits for `Percentage` before it is
@@ -431,7 +443,7 @@ fn toast_for(held: WarningLevel, body: String) -> Option<WarningToast> {
 impl WarningWatch {
     /// The hold ran out: post the held toast without a body, if one is held.
     fn expire(&mut self) -> Option<WarningToast> {
-        toast_for(self.pending.take()?, String::new())
+        toast_for(self.pending.take()?.level, String::new())
     }
 
     /// Feed one combined emission; returns the toast to post, if any.
@@ -449,22 +461,31 @@ impl WarningWatch {
             return None;
         };
         let level = WarningLevel::from_u32(*raw);
-        let edge = warning_toast(self.baseline, level);
+        let prev = self.baseline;
+        let edge = warning_toast(prev, level);
         self.baseline = Some(level);
         if edge.is_some() {
-            self.pending = Some(level);
-        } else if self
-            .pending
-            .is_some_and(|held| warning_tier(level) < warning_tier(held))
+            // A further rise keeps the floor the hold started from.
+            let floor = self
+                .pending
+                .map_or_else(|| prev.map_or(0, warning_tier), |held| held.floor);
+            self.pending = Some(Held { level, floor });
+        } else if let Some(held) = self.pending
+            && warning_tier(level) < warning_tier(held.level)
         {
-            // The level fell back before the percentage arrived (charger
-            // plugged in): the condition the held toast announced is over.
-            self.pending = None;
+            // The level fell back before the percentage arrived. A fall to
+            // where the hold started (charger plugged in) ends the condition
+            // it announced; a partial fall, Critical easing back to Low, still
+            // leaves a warning nobody has been told about, at the lower level.
+            self.pending = (warning_tier(level) > held.floor).then_some(Held {
+                level,
+                floor: held.floor,
+            });
         }
         let (PropState::Loaded(p) | PropState::Stale(p)) = percentage else {
             return None;
         };
-        toast_for(self.pending.take()?, format!("{p:.0}% remaining"))
+        toast_for(self.pending.take()?.level, format!("{p:.0}% remaining"))
     }
 }
 
@@ -515,8 +536,8 @@ where
         if let Some(toast) = watch.observe(&level, &percentage) {
             post(toast);
         }
-        // Armed by the edge that starts a hold and kept when a higher level
-        // replaces the held one, so the bound runs from the first edge.
+        // Armed by the edge that starts a hold and kept while the held level
+        // is raised or lowered, so the bound runs from the first edge.
         if watch.pending.is_none() {
             deadline = None;
         } else if deadline.is_none() {
@@ -926,6 +947,38 @@ mod tests {
         );
         assert_eq!(
             watch.observe(&PropState::Loaded(NONE), &PropState::Loaded(80.0)),
+            None
+        );
+    }
+
+    /// A held Critical that eases back to Low before the percentage lands: the
+    /// battery is still Low and nobody has been told, so a Low toast is still
+    /// owed. Only a fall to where the hold started ends the condition (#1574
+    /// review).
+    ///
+    /// Falsifiable: dropping the hold on any fall posts nothing in the first
+    /// half; downgrading without the floor posts a repeat Low in the second.
+    #[test]
+    fn a_held_critical_that_eases_to_low_still_warns_low() {
+        let mut watch = WarningWatch::default();
+        watch.observe(&PropState::Loaded(NONE), &PropState::Loading);
+        watch.observe(&PropState::Loaded(CRITICAL), &PropState::Loading);
+        watch.observe(&PropState::Loaded(LOW), &PropState::Loading);
+        assert_eq!(
+            watch
+                .observe(&PropState::Loaded(LOW), &PropState::Loaded(6.0))
+                .map(|t| (t.summary, t.urgency)),
+            Some(("Battery low", Urgency::Normal))
+        );
+
+        // A hold that started from Low owes nothing once it is back at Low:
+        // the user already lives with Low (a silent seed, or an earlier toast).
+        let mut watch = WarningWatch::default();
+        watch.observe(&PropState::Loaded(LOW), &PropState::Loading);
+        watch.observe(&PropState::Loaded(CRITICAL), &PropState::Loading);
+        watch.observe(&PropState::Loaded(LOW), &PropState::Loading);
+        assert_eq!(
+            watch.observe(&PropState::Loaded(LOW), &PropState::Loaded(6.0)),
             None
         );
     }

@@ -263,7 +263,7 @@ pub struct GlPipeline {
 /// A closed set rather than a `&[u8]` blob so the reconciler's structural
 /// equality — which is what decides whether a re-render touches GTK at all —
 /// is a real comparison and not a byte compare over padding.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub enum GlValue {
     /// `int`.
     Int(i32),
@@ -275,15 +275,31 @@ pub enum GlValue {
     Vec4([f32; 4]),
 }
 
+/// Equality is **bitwise** on the floats: `f32 ==` makes a `NaN` unequal to
+/// itself, so a state carrying one would never settle and the reconciler's
+/// dedup would queue a render on every re-map. `0.0` and `-0.0` differ, which
+/// only errs towards a redundant render.
+impl PartialEq for GlValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Int(a), Self::Int(b)) => a == b,
+            (Self::Float(a), Self::Float(b)) => a.to_bits() == b.to_bits(),
+            (Self::Ivec2(a), Self::Ivec2(b)) => a == b,
+            (Self::Vec4(a), Self::Vec4(b)) => {
+                a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+            }
+            _ => false,
+        }
+    }
+}
+
 /// Everything one render needs that is not the pipeline: the uniforms, the
 /// optional data strip, the logical grid, and how far the animation has run.
 ///
-/// Plain data with a derived `PartialEq`, because the reconciler dedups on it —
-/// see [`GlSurface::set_state`]. Producers are expected to hand only finite
-/// floats (the shell's wire clamp guarantees that before a value ever reaches
-/// here); a `NaN` would simply make the state unequal to itself and cost a
-/// redundant `queue_render` per pass, which is the conservative failure.
-#[derive(Clone, Debug, PartialEq, Default)]
+/// Plain data with a value `PartialEq`, because the reconciler dedups on it —
+/// see [`GlSurface::set_state`]. Floats (in `values` and in `data`) compare
+/// bitwise, so a `NaN` equals itself and a rebuilt equal state still settles.
+#[derive(Clone, Debug, Default)]
 pub struct GlUniforms {
     /// Named scalar/vector uniforms, applied to **every** pass. A name a pass's
     /// program does not declare resolves to location `-1`, which GL ignores —
@@ -303,6 +319,26 @@ pub struct GlUniforms {
     /// Monotonic count of animation steps since this state was built. See the
     /// idempotence rule in the module docs.
     pub step_seq: u64,
+}
+
+impl PartialEq for GlUniforms {
+    fn eq(&self, other: &Self) -> bool {
+        let data_same = match (&self.data, &other.data) {
+            (None, None) => true,
+            (Some(a), Some(b)) => {
+                Arc::ptr_eq(a, b)
+                    || (a.len() == b.len()
+                        && a.iter()
+                            .zip(b.iter())
+                            .all(|(x, y)| x.to_bits() == y.to_bits()))
+            }
+            _ => false,
+        };
+        data_same
+            && self.values == other.values
+            && self.grid == other.grid
+            && self.step_seq == other.step_seq
+    }
 }
 
 // ── the program registry and the failure hook ───────────────────────────────
@@ -3238,6 +3274,28 @@ mod tests {
         let mut d = a.clone();
         d.grid = (144, 49);
         assert_ne!(a, d, "the grid is part of the state");
+    }
+
+    /// A `NaN` uniform or data sample must not make a state unequal to its own
+    /// clone (the reconciler would then re-render on every re-map).
+    ///
+    /// **Falsified** by reverting either impl to float `==`.
+    #[test]
+    fn nan_state_equals_its_clone() {
+        let a = GlUniforms {
+            values: vec![
+                ("u_a", GlValue::Float(f32::NAN)),
+                ("u_b", GlValue::Vec4([0.0, f32::NAN, 1.0, 2.0])),
+            ],
+            data: Some(Arc::from(&[f32::NAN, 1.0][..])),
+            grid: (4, 4),
+            step_seq: 1,
+        };
+        let mut b = a.clone();
+        b.data = Some(Arc::from(&[f32::NAN, 1.0][..]));
+        assert_eq!(a, b);
+        b.values[0].1 = GlValue::Float(0.0);
+        assert_ne!(a, b, "a NaN differs from a number");
     }
 
     /// A program name is a plain `Copy` key: cheap to put on a node, and

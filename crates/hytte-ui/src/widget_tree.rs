@@ -737,6 +737,23 @@ struct RetainedNode {
 /// rule.
 pub const SPARKLINE_CAPACITY: usize = 1024;
 
+/// Whether two sample windows are the same, **bitwise**.
+///
+/// `==` on `f64` makes a `NaN` sample unequal to itself, so a window carrying
+/// one never settled and every re-map (once per monitor per frame) re-set the
+/// samples and queued a draw. `to_bits` is reflexive; the cost is that `0.0`
+/// and `-0.0` differ, which only ever errs towards a redundant redraw. (The
+/// draw code passes a `NaN` through its `clamp` unchanged, so the sample is
+/// not dropped at this seam: what is drawn stays what the node said.)
+fn same_samples(a: &[f64], b: &[f64]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+}
+
+/// [`same_samples`] over a list of windows (`MultiSparkline`'s series).
+fn same_windows(a: &[Vec<f64>], b: &[Vec<f64>]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| same_samples(x, y))
+}
+
 /// A [`Node::Sparkline`]'s retained pieces (see [`RetainedNode::sparkline`]).
 struct SparklineState {
     /// The widget handle — cheap to clone, shares the ring with the draw
@@ -772,7 +789,7 @@ impl SparklineState {
             self.spark.set_domain_max(max);
             self.max = max;
         }
-        if self.values != values {
+        if !same_samples(&self.values, values) {
             self.spark.set_samples(&values.iter().copied().collect());
             values.clone_into(&mut self.values);
         }
@@ -832,7 +849,7 @@ impl MultiSparklineState {
             self.graph.set_domain_max(max);
             self.max = max;
         }
-        if self.series != series {
+        if !same_windows(&self.series, series) {
             self.graph.set_series(series);
             series.clone_into(&mut self.series);
         }
@@ -3082,6 +3099,30 @@ mod diff_tests {
             seen.iter().all(|&c| c == 1),
             "each prev index used exactly once: {seen:?}"
         );
+    }
+}
+
+// ── Sparkline dedup (pure - hermetic) ────────────────────────────────────────
+
+#[cfg(test)]
+mod dedup_tests {
+    use super::{same_samples, same_windows};
+
+    /// **Falsified** by reverting either helper to `==`: a `NaN` window is
+    /// unequal to itself and the first assertion goes red.
+    #[test]
+    fn a_nan_window_equals_itself_but_a_moved_one_does_not() {
+        let a = vec![0.1, f64::NAN, 0.3];
+        assert!(same_samples(&a, &a.clone()));
+        assert!(!same_samples(&a, &[0.1, f64::NAN]));
+        assert!(!same_samples(&a, &[0.1, 0.2, 0.3]));
+        let s = vec![a.clone(), vec![f64::NAN]];
+        assert!(same_windows(&s, &s.clone()));
+        assert!(!same_windows(&s, &[a]));
+        assert!(!same_windows(
+            &s,
+            &[vec![0.1, f64::NAN, 0.4], vec![f64::NAN]]
+        ));
     }
 }
 

@@ -63,6 +63,14 @@ const ROWS: usize = 8;
 const PAD: usize = 3;
 /// Integer upscale baked into the screen buffer (chunky, crisp pixels).
 const SCALE: usize = 2;
+/// Longest submitted line the model stores, in chars: four screen rows' worth.
+/// A row shows [`COLS`] chars and cuts the rest with `…`, so nothing past one
+/// row is ever visible; the cap only bounds the work, since the `TextBox`
+/// word-wraps its *whole* input on the SDK's runtime thread before the
+/// one-line cut, and a pasted megabyte would otherwise be wrapped in full.
+/// Four rows keeps plenty of headroom over what can be seen (and over a
+/// word-wrap's choice of break point) while staying O(`COLS`).
+const MAX_LINE_CHARS: usize = COLS * 4;
 /// The entry's greyed placeholder — phrased to avoid implying execution.
 const PLACEHOLDER: &str = "type a line, press enter…";
 
@@ -75,6 +83,17 @@ struct Terminal {
     /// tracks no keystrokes (v1 has no per-keystroke event), it just re-asserts
     /// `""` after each submit so the widget clears.
     entry: String,
+    /// Flips on every submit and rides the entry as a class, purely so the
+    /// view differs from the last one. The host's `activate` handler sets a
+    /// one-shot latch, and the next reconcile that processes this `Entry`
+    /// node re-asserts `set_text` (clearing it) whatever else changed. But
+    /// the SDK drops a render identical to the last one, and a repeated
+    /// identical line on a full scrollback is exactly that, so no frame would
+    /// reach the reconcile that consumes the latch. One inert class difference
+    /// keeps the frame from being dropped. (The other ways to differ, a new
+    /// entry id or a counter in the text, would rebuild the widget or show on
+    /// screen.)
+    tick: bool,
 }
 
 impl Terminal {
@@ -100,8 +119,10 @@ impl Terminal {
     /// Fold a submitted entry into the model: echo it to the screen behind a
     /// `> ` prompt, then clear the entry. Pure local echo — nothing runs.
     fn submit(&mut self, text: &str) {
+        let text: String = text.chars().take(MAX_LINE_CHARS).collect();
         self.push_line(format!("> {text}"));
         self.entry.clear();
+        self.tick = !self.tick;
     }
 }
 
@@ -169,6 +190,7 @@ impl Plugin for Terminal {
         Self {
             history: Self::banner(),
             entry: String::new(),
+            tick: false,
         }
     }
 
@@ -221,7 +243,15 @@ impl Plugin for Terminal {
                     // `ts-terminal-input` dresses the entry in the VFD palette
                     // (shell CSS) so it reads as part of the preem screen above
                     // it, not a bare GTK text field (#369).
-                    classes: vec!["monospace".to_owned(), "ts-terminal-input".to_owned()],
+                    classes: {
+                        let mut classes =
+                            vec!["monospace".to_owned(), "ts-terminal-input".to_owned()];
+                        if self.tick {
+                            // Inert (no CSS); see `Terminal::tick`.
+                            classes.push("ts-terminal-ticked".to_owned());
+                        }
+                        classes
+                    },
                 },
             ],
             tooltip: None,
@@ -236,7 +266,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{COLS, ENTRY_ID, PLACEHOLDER, ROWS, Terminal, render_screen};
+    use super::{COLS, ENTRY_ID, MAX_LINE_CHARS, PLACEHOLDER, ROWS, Terminal, render_screen};
     use hytte_plugin::proto::{EventKind, Node, PluginMsg, decode, encode};
     use hytte_plugin::{Input, Plugin};
 
@@ -348,6 +378,39 @@ mod tests {
         let (text, _) = entry_of(&tree).expect("view has an entry");
         assert_eq!(text, "", "the rendered entry text is empty after a submit");
         assert_eq!(m.history.last().map(String::as_str), Some("> abc"));
+    }
+
+    /// A repeated identical line on a full scrollback leaves the history
+    /// unchanged, but the view must still differ so the SDK's render dedup
+    /// sends the frame that clears the entry.
+    #[test]
+    fn repeated_identical_submit_still_changes_the_view() {
+        let mut m = fresh();
+        for _ in 0..=ROWS {
+            let _ = m.update(submit("x"));
+        }
+        let before = m.history.clone();
+        let view = m.view();
+        let _ = m.update(submit("x"));
+        assert_eq!(m.history, before, "history is visibly unchanged");
+        assert_ne!(
+            m.view(),
+            view,
+            "the view still differs, so a render goes out"
+        );
+    }
+
+    /// An over-long paste is cut at the cap before it is stored or rendered.
+    #[test]
+    fn overlong_line_is_truncated() {
+        let mut m = fresh();
+        let _ = m.update(submit(&"ab".repeat(100_000)));
+        let last = m.history.last().expect("a line");
+        assert_eq!(
+            last.chars().count(),
+            2 + MAX_LINE_CHARS,
+            "prompt + capped text"
+        );
     }
 
     /// A submit on a node we don't own changes nothing.

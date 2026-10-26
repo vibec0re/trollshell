@@ -1147,6 +1147,29 @@ mod tests {
         assert_eq!(gate.admit(Some((1, vol(0.5, true)))), Some(vol(0.5, true)));
     }
 
+    /// The id the gate keys on is the *default* sink's own, read through
+    /// `default_volume` from a real sink list. Every other fixture sink is
+    /// id 0 and the gate tests hand-build their readings, so without this a
+    /// `default_volume` that returned a constant id passed every test while
+    /// the switch OSD came back (#1572 review).
+    #[test]
+    fn a_default_switch_through_default_volume_seeds_silently() {
+        let at = |id, name: &str, volume, is_default| Sink {
+            id,
+            ..sink(name, volume, false, is_default)
+        };
+        let speakers = [at(41, "hdmi", 0.4, false), at(42, "speakers", 0.7, true)];
+        let hdmi = [at(41, "hdmi", 0.4, true), at(42, "speakers", 0.7, false)];
+        assert_eq!(default_volume(&hdmi).map(|(id, _)| id), Some(41));
+        let mut gate = VolumeGate::default();
+        assert_eq!(gate.admit(default_volume(&speakers)), None, "seeds");
+        assert_eq!(
+            gate.admit(default_volume(&hdmi)),
+            None,
+            "a switch is not a volume change"
+        );
+    }
+
     /// What `guard` answers for each emission in `real`, in order.
     fn admitted(real: &[bool]) -> Vec<bool> {
         let mut guard = StartupGuard::default();

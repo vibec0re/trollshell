@@ -126,7 +126,7 @@ fn main() -> ExitCode {
         // `apply_from_cli`, which is where the "a keybind names no screen"
         // decision lives and is tested), so a keybind and a click cannot drift.
         Some(Command::Apply { layout }) => {
-            match apply_from_cli(&mut niri::SocketTransport, layout.into()) {
+            match apply_from_cli(&mut niri::SocketTransport::new(), layout.into()) {
                 // niri's own text, verbatim — the CLI has no toast to put it in.
                 Some(error) => {
                     eprintln!("{BIN}: {error}");

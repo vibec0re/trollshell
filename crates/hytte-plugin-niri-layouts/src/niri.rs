@@ -19,11 +19,15 @@
 
 use crate::layout::{self, Layout};
 use crate::plugin::PLUGIN_ID;
-use niri_ipc::socket::Socket;
+use niri_ipc::socket::SOCKET_PATH_ENV;
 use niri_ipc::{
     Action, Output, Reply, Request, Response, SizeChange, Window, Workspace, WorkspaceReferenceArg,
 };
 use std::collections::HashMap;
+use std::io::{self, BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+use std::path::Path;
+use std::time::Duration;
 
 /// One niri request, one niri reply.
 ///
@@ -44,21 +48,90 @@ pub(crate) trait Transport {
     fn log(&mut self, line: &str);
 }
 
+/// How long one request may wait on niri, per read and per write.
+///
+/// `niri_ipc::socket::Socket` arms no timeouts and hides its stream, so a niri
+/// that accepted the connection and then wedged (or never answers) parked the
+/// calling thread forever: the CLI hung under a `spawn` bind, and the chip's
+/// blocking-pool worker was lost for the session, with every later click queued
+/// behind it. #1526 deferred this until the #1516 reflow restore landed, since
+/// a timeout mid-chain is only safe to surface once the chain puts things
+/// back. A healthy niri answers in milliseconds; 5 s is generous.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The real transport: one short-lived `$NIRI_SOCKET` connection per request.
 ///
 /// A fresh connect per request rather than one long-lived socket, matching the
 /// shell's own command path (`hytte-services`' `niri::send_action`): a unix
 /// socket connect is cheap, and niri's IPC only guarantees one reply per
 /// connection for a non-`EventStream` request.
-pub(crate) struct SocketTransport;
+///
+/// It dials the stream itself (framing exactly as `Socket::send` does: one JSON
+/// request line, one JSON reply line) because only then can the read/write
+/// timeouts be armed. The long-lived `EventStream` reader in `watch.rs` shares
+/// none of this and deliberately keeps no request timeout: it idles legitimately.
+/// A timeout is not retried here: it is an `Err` like any transport failure,
+/// and `apply` stops at the first one.
+pub(crate) struct SocketTransport {
+    timeout: Duration,
+}
+
+impl SocketTransport {
+    pub(crate) fn new() -> Self {
+        Self::with_timeout(REQUEST_TIMEOUT)
+    }
+
+    /// A transport with its own timeout; the seam the timeout test uses so it
+    /// need not wait five seconds.
+    pub(crate) fn with_timeout(timeout: Duration) -> Self {
+        Self { timeout }
+    }
+
+    /// One request/reply over an already-connected stream.
+    fn exchange(&self, stream: &UnixStream, request: &Request) -> Result<Reply, String> {
+        stream
+            .set_read_timeout(Some(self.timeout))
+            .and_then(|()| stream.set_write_timeout(Some(self.timeout)))
+            .map_err(|e| format!("cannot arm the niri ipc timeouts: {e}"))?;
+        let mut line = serde_json::to_string(request)
+            .map_err(|e| format!("cannot encode the niri request: {e}"))?;
+        line.push('\n');
+        let mut writer = stream;
+        writer
+            .write_all(line.as_bytes())
+            .map_err(|e| self.describe(&e, "niri ipc write failed"))?;
+
+        let mut reply = String::new();
+        BufReader::new(stream)
+            .read_line(&mut reply)
+            .map_err(|e| self.describe(&e, "niri ipc failed"))?;
+        serde_json::from_str(&reply).map_err(|e| format!("niri ipc failed: bad reply: {e}"))
+    }
+
+    fn describe(&self, e: &io::Error, what: &str) -> String {
+        if matches!(
+            e.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ) {
+            format!("niri ipc timed out after {:?}", self.timeout)
+        } else {
+            format!("{what}: {e}")
+        }
+    }
+
+    fn send_to(&self, path: &Path, request: &Request) -> Result<Reply, String> {
+        let stream = UnixStream::connect(path)
+            .map_err(|e| format!("cannot reach niri over $NIRI_SOCKET: {e}"))?;
+        self.exchange(&stream, request)
+    }
+}
 
 impl Transport for SocketTransport {
     fn send(&mut self, request: Request) -> Result<Reply, String> {
-        let mut socket =
-            Socket::connect().map_err(|e| format!("cannot reach niri over $NIRI_SOCKET: {e}"))?;
-        socket
-            .send(request)
-            .map_err(|e| format!("niri ipc failed: {e}"))
+        let path = std::env::var_os(SOCKET_PATH_ENV).ok_or_else(|| {
+            format!("cannot reach niri over $NIRI_SOCKET: {SOCKET_PATH_ENV} is not set")
+        })?;
+        self.send_to(Path::new(&path), &request)
     }
 
     fn log(&mut self, line: &str) {
@@ -606,6 +679,30 @@ pub(crate) mod fake {
 
 #[cfg(test)]
 mod tests {
+    /// A niri that accepts and never replies must surface a timeout error in
+    /// bounded time instead of parking the caller forever.
+    #[test]
+    fn a_silent_niri_times_out_instead_of_hanging() {
+        use super::SocketTransport;
+        use std::os::unix::net::UnixListener;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("niri.sock");
+        let listener = UnixListener::bind(&path).expect("bind");
+        // Accept and hold the connection open, say nothing.
+        let holder = std::thread::spawn(move || listener.accept().map(|(s, _)| s));
+
+        let transport = SocketTransport::with_timeout(Duration::from_millis(100));
+        let started = Instant::now();
+        let err = transport
+            .send_to(&path, &Request::Version)
+            .expect_err("no reply must be an error");
+        assert!(err.contains("timed out"), "got {err:?}");
+        assert!(started.elapsed() < Duration::from_secs(3), "not bounded");
+        drop(holder.join());
+    }
+
     use super::fake::{self, Fake, tile};
     use super::{Transport, apply, missing_width_diagnostic};
     use crate::layout::Layout;

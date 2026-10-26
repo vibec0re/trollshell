@@ -45,3 +45,6 @@ niri-ipc.workspace = true
 # HIGH-1). `niri-ipc` already depends on it, so this adds no resolved package
 # and no `Cargo.lock` line.
 serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

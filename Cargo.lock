@@ -1388,6 +1388,7 @@ dependencies = [
  "hytte-plugin",
  "niri-ipc",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

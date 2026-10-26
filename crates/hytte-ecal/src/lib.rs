@@ -69,6 +69,7 @@ pub mod sys;
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::marker::PhantomData;
 use std::ptr;
 use std::sync::Arc;
 
@@ -1963,11 +1964,19 @@ unsafe fn component_ical_string(comp: *mut sys::ICalComponent) -> String {
 ///   `unix_to_local`) reinterprets the resulting midnight-UTC `time_t` as a
 ///   local calendar date, so this must stay midnight-UTC or the day would
 ///   drift. The zone argument is immaterial for a DATE.
-/// - **Resolved zone (a `…Z` UTC time, or a `TZID` whose `VTIMEZONE` libical
-///   could resolve — registered on the component or a builtin like
-///   `Europe/Berlin`):** pass the time's **own** zone as the source, so libical
-///   converts *from* that zone to the absolute instant. A UTC time carries the
-///   UTC singleton as its own zone, so this is correct for it too (#522).
+/// - **UTC (`…Z`):** already absolute; libical converts it with the UTC
+///   singleton, which is also the zone such a time carries.
+/// - **Resolved zone (a `TZID` whose `VTIMEZONE` libical could resolve —
+///   registered on the component, or a builtin like `Europe/Berlin` or
+///   `/freeassociation.sourceforge.net/Europe/Berlin`):** read the wall clock
+///   in the time's **own** zone (#522), not as UTC. Since #1590 it is read by
+///   [`wall_clock_to_unix`], RFC 5545 §3.3.5's rule, over that zone's UTC →
+///   offset map ([`IcalZone`]): the first occurrence in a fall-back fold, the
+///   offset before the gap in a spring-forward gap. libical's own conversion
+///   (`i_cal_time_as_timet_with_zone` with that zone) gets both edges wrong,
+///   taking the later instant in a fold and the post-gap offset in a gap, so
+///   it is used only if the rule finds no instant at all (a zone whose
+///   offsets chrono cannot hold).
 /// - **Genuinely floating DATE-TIME:** interpret the wall-clock fields in the
 ///   **local** system zone via chrono's `Local` (DST-correct), not UTC (#388).
 ///   A wall clock inside a DST fold or gap still names one instant, by RFC
@@ -2020,34 +2029,11 @@ unsafe fn ical_time_to_unix(tt: *mut sys::ICalTime) -> Option<i64> {
         return Some(unsafe { sys::i_cal_time_as_timet_with_zone(tt_const, utc.cast_const()) });
     }
 
-    if has_own_zone {
-        // Absolute DATE-TIME carrying a resolved zone — a `…Z` (UTC) time or
-        // one whose `TZID`'s `VTIMEZONE` libical could resolve (registered on
-        // the component, or a builtin like `Europe/Berlin`).
-        //
-        // `i_cal_time_as_timet_with_zone(tt, zone)` reads `zone` as the *source*
-        // zone the wall-clock is expressed in whenever `tt` is a non-DATE,
-        // non-UTC value — it does **not** substitute the time's own resolved
-        // zone (issue #522; the #388 fix wrongly assumed the argument was
-        // ignored for these). So the source zone MUST be the time's own zone:
-        // passing the UTC singleton instead reads the wall-clock as UTC, so a
-        // `TZID=Europe/Berlin` 12:30 becomes 12:30 UTC and displays as 14:30
-        // CEST — the +2h double-shift. A UTC (`…Z`) time carries the UTC
-        // singleton as its own zone, so this yields the correct instant for it
-        // unchanged.
-        //
-        // SAFETY: `tt_const` is the live borrow from above and `own_zone` is
-        // non-null (this branch) — a zone libical owns and keeps for the
-        // process lifetime, borrowed here and never unref'd. Read-only.
-        return Some(unsafe {
-            sys::i_cal_time_as_timet_with_zone(tt_const, own_zone.cast_const())
-        });
-    }
-
     if is_utc {
-        // A UTC-flagged time with no attached zone pointer (defensive: some
-        // libical values carry the `is_utc` bit without a zone object). It is
-        // already absolute — the UTC singleton is the correct source zone.
+        // A `…Z` time: already absolute, and its own zone (when it carries
+        // one) is this same UTC singleton, so libical's conversion has no
+        // choice to make. Checked before the resolved-zone branch below so a
+        // UTC time never pays for the zone sampling there.
         //
         // SAFETY: as the DATE branch above — a nullary getter for libical's
         // borrowed, never-unref'd process-wide singleton.
@@ -2055,6 +2041,38 @@ unsafe fn ical_time_to_unix(tt: *mut sys::ICalTime) -> Option<i64> {
         // SAFETY: as the DATE branch above — a read-only conversion of the
         // live borrow, with the singleton as the source zone.
         return Some(unsafe { sys::i_cal_time_as_timet_with_zone(tt_const, utc.cast_const()) });
+    }
+
+    if has_own_zone {
+        // A DATE-TIME whose `TZID`'s `VTIMEZONE` libical could resolve
+        // (registered on the component, or a builtin like `Europe/Berlin`).
+        // Its wall clock is read in that zone, never as UTC (#522: reading it
+        // as UTC put a `TZID=Europe/Berlin` 12:30 at 14:30 CEST), and by RFC
+        // 5545 §3.3.5's rule on a DST transition (#1590), which libical's own
+        // `i_cal_time_as_timet_with_zone(tt, own_zone)` does not follow: it
+        // reads a fold's wall clock as the later instant and a gap's with the
+        // post-gap offset. So only the zone's UTC → offset map is taken from
+        // libical (`IcalZone`), and `wall_clock_to_unix`, the rule a floating
+        // time is read by, does the rest.
+        //
+        // SAFETY: `own_zone` is non-null (this branch) and is a borrow `tt`
+        // holds, so it lives at least as long as `tt`, which is live for this
+        // whole call (this function's contract). The `IcalZone` is used only
+        // inside this branch, i.e. within that borrow.
+        let zone = unsafe { IcalZone::new(own_zone) };
+        // SAFETY: `WallClock::from_ical` requires a non-null live `ICalTime*`;
+        // `tt` is non-null (checked at the top) and live for this borrow.
+        let wall = unsafe { WallClock::from_ical(tt) };
+        return wall.to_unix_in(&zone).or_else(|| {
+            // No instant by the rule: the zone has an offset chrono cannot
+            // hold (a `VTIMEZONE` past ±24 h), or the fields are out of range.
+            // libical's own answer is what this branch returned before #1590,
+            // which beats dropping the event.
+            //
+            // SAFETY: `tt_const` is the live borrow from above and `own_zone`
+            // the non-null zone it holds, never unref'd. Read-only.
+            Some(unsafe { sys::i_cal_time_as_timet_with_zone(tt_const, own_zone.cast_const()) })
+        });
     }
 
     // Genuinely floating DATE-TIME (no zone, not UTC): resolve its wall-clock
@@ -2275,6 +2293,182 @@ fn offset_before_gap<Tz: chrono::TimeZone>(
             MappedLocalTime::None => None,
         }
     })
+}
+
+/// How far either side of a wall clock [`local_offsets`] samples a zone's
+/// offset: one day. Every instant a wall clock can name lies within a real
+/// UTC offset of it (−12 h to +14 h), so between the two samples.
+const LOCAL_OFFSET_SAMPLE_SECS: i64 = 86_400;
+
+/// The UTC offsets under which the wall clock `wall` names an instant in a
+/// zone known only by its UTC → offset map, `offset_at`. `wall` is the wall
+/// clock as seconds since the epoch, read as if it were UTC; offsets are in
+/// seconds east of UTC.
+///
+/// An offset `o` is valid for `wall` when the instant `wall − o` really has
+/// offset `o`. The candidates are the offsets a day before and a day after:
+/// with at most one transition in those two days, every instant `wall` can
+/// name has one of them. (#1585's sweep of every chrono-tz zone, 1970–2100,
+/// found no two transitions within 48 hours.) So:
+///
+/// - both valid is a **fold**: `Ambiguous`, earlier instant (larger offset)
+///   first, the order chrono documents;
+/// - one valid is `Single`;
+/// - neither is a **gap**: `None`.
+///
+/// Unlike chrono 0.4.44's Unix `Local` (#1579), a fold's upper bound is not in
+/// the fold here: only the offset that reads back there is valid.
+fn local_offsets(
+    wall: i64,
+    offset_at: impl Fn(i64) -> Option<i32>,
+) -> chrono::MappedLocalTime<i32> {
+    use chrono::MappedLocalTime;
+
+    let valid = |off: &i32| wall.checked_sub(i64::from(*off)).and_then(&offset_at) == Some(*off);
+    let before = wall
+        .checked_sub(LOCAL_OFFSET_SAMPLE_SECS)
+        .and_then(&offset_at);
+    let after = wall
+        .checked_add(LOCAL_OFFSET_SAMPLE_SECS)
+        .and_then(&offset_at)
+        .filter(|off| Some(*off) != before);
+    match (before.filter(valid), after.filter(valid)) {
+        (Some(a), Some(b)) => MappedLocalTime::Ambiguous(a.max(b), a.min(b)),
+        (Some(off), None) | (None, Some(off)) => MappedLocalTime::Single(off),
+        (None, None) => MappedLocalTime::None,
+    }
+}
+
+/// A libical zone (the one a resolved `TZID` time carries) seen through
+/// chrono's [`TimeZone`](chrono::TimeZone), so [`wall_clock_to_unix`] can read
+/// a zoned wall clock by RFC 5545 §3.3.5 (#1590).
+///
+/// Only libical's **UTC → offset** map is used
+/// ([`sys::i_cal_timezone_get_utc_offset_of_utc_time`]). It is a function:
+/// every instant has one offset. The local → UTC direction is derived from
+/// it by [`local_offsets`] instead of asked of libical, whose own answer
+/// (`icaltimezone_get_utc_offset`, behind
+/// [`sys::i_cal_time_as_timet_with_zone`]) takes the later instant in a fold
+/// and the post-gap offset in a gap.
+///
+/// Holds raw pointers, so it is constructed only by [`IcalZone::new`], whose
+/// contract is that `raw` stays live for `'a`. The lifetime keeps the value
+/// (and every [`IcalZoneOffset`] chrono derives from it) inside that borrow.
+#[derive(Clone, Copy, Debug)]
+struct IcalZone<'a> {
+    /// The zone. Borrowed from libical, never unref'd.
+    raw: *mut sys::ICalTimezone,
+    /// libical's UTC singleton, the zone an instant is built in before its
+    /// offset is asked for. Borrowed, never unref'd.
+    utc: *mut sys::ICalTimezone,
+    _zone: PhantomData<&'a sys::ICalTimezone>,
+}
+
+/// The offset an [`IcalZone`] hands chrono. It carries its zone because
+/// chrono rebuilds a `TimeZone` from an offset alone
+/// (`TimeZone::from_offset`).
+#[derive(Clone, Copy, Debug)]
+struct IcalZoneOffset<'a> {
+    zone: IcalZone<'a>,
+    fix: chrono::FixedOffset,
+}
+
+impl chrono::Offset for IcalZoneOffset<'_> {
+    fn fix(&self) -> chrono::FixedOffset {
+        self.fix
+    }
+}
+
+impl<'a> IcalZone<'a> {
+    /// Wrap the libical zone `raw`.
+    ///
+    /// # Safety
+    ///
+    /// `raw` must be a non-null, live `ICalTimezone*` for all of `'a`.
+    unsafe fn new(raw: *mut sys::ICalTimezone) -> Self {
+        // SAFETY: `i_cal_timezone_get_utc_timezone` is nullary and returns
+        // libical's process-wide singleton — borrowed, never unref'd.
+        let utc = unsafe { sys::i_cal_timezone_get_utc_timezone() };
+        Self {
+            raw,
+            utc,
+            _zone: PhantomData,
+        }
+    }
+
+    /// The offset this zone has at the instant `unix`, in seconds east of
+    /// UTC. `None` if libical cannot build that instant, or if the offset is
+    /// one chrono cannot hold (±24 h or more, which only a malformed
+    /// `VTIMEZONE` can spell).
+    fn offset_at(self, unix: i64) -> Option<i32> {
+        // SAFETY: `self.utc` is libical's UTC singleton (`new`); the
+        // constructor takes a plain `time_t`, a DATE flag (0: an instant) and
+        // that borrowed zone, and returns a **new** `ICalTime` ref (or null),
+        // released below.
+        let tt = unsafe { sys::i_cal_time_new_from_timet_with_zone(unix, 0, self.utc) };
+        if tt.is_null() {
+            return None;
+        }
+        // SAFETY: `tt` is the live time just built; a read-only predicate.
+        let is_null_time = unsafe { sys::i_cal_time_is_null_time(tt.cast_const()) } != 0;
+        let secs = (!is_null_time).then(|| {
+            // SAFETY: `self.raw` is live for `'a` (the contract of `new`, the
+            // only constructor), and `self` exists only within `'a`; `tt` is
+            // the live time built above. The call reads both, writes nothing
+            // through the null `is_daylight` (an optional out-param) and
+            // allocates nothing.
+            unsafe { sys::i_cal_timezone_get_utc_offset_of_utc_time(self.raw, tt, ptr::null_mut()) }
+        });
+        // SAFETY: the new ref taken above, released exactly once and never
+        // read after.
+        unsafe { sys::g_object_unref(tt) }
+        secs.filter(|secs| chrono::FixedOffset::east_opt(*secs).is_some())
+    }
+
+    /// The chrono offset for `secs` seconds east of UTC. An offset chrono
+    /// cannot hold reads as UTC. [`IcalZone::offset_at`] never hands one out,
+    /// so this can only see one through `offset_from_utc_datetime`'s fallback
+    /// for an instant libical cannot build, and an instant read with it then
+    /// fails to read back.
+    fn offset(self, secs: i32) -> IcalZoneOffset<'a> {
+        IcalZoneOffset {
+            zone: self,
+            fix: chrono::FixedOffset::east_opt(secs)
+                .unwrap_or_else(|| chrono::Offset::fix(&chrono::Utc)),
+        }
+    }
+}
+
+impl<'a> chrono::TimeZone for IcalZone<'a> {
+    type Offset = IcalZoneOffset<'a>;
+
+    fn from_offset(offset: &IcalZoneOffset<'a>) -> Self {
+        offset.zone
+    }
+
+    fn offset_from_local_date(
+        &self,
+        local: &chrono::NaiveDate,
+    ) -> chrono::MappedLocalTime<IcalZoneOffset<'a>> {
+        self.offset_from_local_datetime(&local.and_time(chrono::NaiveTime::MIN))
+    }
+
+    fn offset_from_local_datetime(
+        &self,
+        local: &chrono::NaiveDateTime,
+    ) -> chrono::MappedLocalTime<IcalZoneOffset<'a>> {
+        let zone = *self;
+        local_offsets(local.and_utc().timestamp(), |unix| zone.offset_at(unix))
+            .map(|secs| zone.offset(secs))
+    }
+
+    fn offset_from_utc_date(&self, utc: &chrono::NaiveDate) -> IcalZoneOffset<'a> {
+        self.offset_from_utc_datetime(&utc.and_time(chrono::NaiveTime::MIN))
+    }
+
+    fn offset_from_utc_datetime(&self, utc: &chrono::NaiveDateTime) -> IcalZoneOffset<'a> {
+        self.offset(self.offset_at(utc.and_utc().timestamp()).unwrap_or(0))
+    }
 }
 
 /// True iff the borrowed `ICalTime*` is a DATE (all-day, no time-of-day).
@@ -3205,6 +3399,20 @@ mod tests {
             }
         }
 
+        /// `America/New_York` in 2026: EST (−05:00), except EDT (−04:00) from
+        /// 2026-03-08T07:00Z to 2026-11-01T06:00Z. So local 2026-03-08
+        /// 02:00–02:59 never happens, and local 2026-11-01 01:00–01:59
+        /// happens twice.
+        fn new_york_2026() -> Self {
+            Self {
+                base: -18_000,
+                shifted: -14_400,
+                from: utc(2026, 3, 8, 7, 0),
+                until: utc(2026, 11, 1, 6, 0),
+                closed_folds: false,
+            }
+        }
+
         /// This zone with a fold's upper bound counted as part of the fold,
         /// the way chrono's Unix `Local` counts it.
         fn with_closed_folds(self) -> Self {
@@ -3646,6 +3854,513 @@ mod tests {
             (start.hour(), start.minute()),
             (11, 30),
             "floating 11:30 must land at 11:30 local (issue #388), not 11:30 UTC",
+        );
+    }
+
+    // ── `TZID` times on a DST transition (#1590 item 4) ───────────────────
+    //
+    // Until #1590 a resolved `TZID` time was converted by libical alone
+    // (`i_cal_time_as_timet_with_zone` with the time's own zone), and libical
+    // 3.0.20 answers both edges of a transition differently from RFC 5545
+    // §3.3.5. Its `icaltimezone_get_utc_offset` (`icaltimezone.c:818-973`)
+    // matches a wall time against each change at the change's *pre*-change
+    // local time (`:882`), so:
+    //
+    // - in a **gap** it takes the post-gap offset, which puts the time an
+    //   hour *before* the gap: 02:30 Berlin on 2026-03-29 becomes 00:30Z,
+    //   which reads 01:30 CET. The RFC takes the offset before the gap: 01:30Z,
+    //   which reads 03:30 CEST;
+    // - in a **fold** its overlap branch (`:930-960`) keeps the
+    //   post-transition change unless the time's `is_daylight` bit asks for
+    //   the other one, and a parsed time never sets that bit. So it takes the
+    //   *later* instant, where the RFC takes the first occurrence.
+    //
+    // The upper bound of a fold and of a gap it gets right. The rows below pin
+    // libical's own answers (the probe) and the instants the expansion gives
+    // now. Each row's RFC instant is also checked against #1585's
+    // `wall_clock_to_unix` on the hermetic `TwoOffsetZone` model of the same
+    // zone, so a `TZID` time and a floating one follow one rule.
+    //
+    // The inline-`VTIMEZONE` rows run everywhere. The builtin rows (a bare
+    // `TZID=Europe/Berlin`, and the `/freeassociation.sourceforge.net/` form
+    // Evolution writes) need libical to find the host's zoneinfo, which the
+    // nix build sandbox does not have. There they are skipped with a message;
+    // libical then reads the `TZID` as floating, which is a different path.
+
+    /// An inline `America/New_York` `VTIMEZONE` (the 2007 US rules): EDT from
+    /// the second Sunday of March at 02:00, EST from the first Sunday of
+    /// November at 02:00. Self-contained, like [`BERLIN_VTIMEZONE`].
+    const NEW_YORK_VTIMEZONE: &str = "BEGIN:VTIMEZONE\r\nTZID:America/New_York\r\n\
+         BEGIN:DAYLIGHT\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nTZNAME:EDT\r\n\
+         DTSTART:20070311T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU\r\nEND:DAYLIGHT\r\n\
+         BEGIN:STANDARD\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\nTZNAME:EST\r\n\
+         DTSTART:20071104T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU\r\nEND:STANDARD\r\n\
+         END:VTIMEZONE\r\n";
+
+    /// One wall clock on, or at the edge of, a DST transition.
+    #[derive(Clone, Copy, Debug)]
+    struct TzidEdge {
+        /// What the model zone says the wall clock is: `"fold"`, `"gap"`, or
+        /// `"single"` for a transition's upper bound, which happens once.
+        kind: &'static str,
+        wall: super::WallClock,
+        /// RFC 5545 §3.3.5's instant: the first occurrence in a fold, the
+        /// offset before the gap in a gap.
+        rfc: i64,
+        /// What libical 3.0.20 answers on its own, as measured.
+        libical: i64,
+        /// The hermetic model of the zone, the oracle for `rfc`.
+        model: TwoOffsetZone,
+    }
+
+    /// A zone the rows cover: its inline `VTIMEZONE`, the location its
+    /// builtin `TZID`s are spelled from, and its rows.
+    struct EdgeZone {
+        vtimezone: &'static str,
+        location: &'static str,
+        rows: Vec<TzidEdge>,
+    }
+
+    /// Berlin's two 2026 transitions, each at its lower bound, inside and at
+    /// its upper bound: the fall-back fold 02:00–03:00 on 10-25 and the
+    /// spring-forward gap 02:00–03:00 on 03-29. And New York's: the fold
+    /// 01:00–02:00 on 11-01 and the gap 02:00–03:00 on 03-08.
+    fn edge_zones() -> [EdgeZone; 2] {
+        let berlin = TwoOffsetZone::berlin_2026();
+        let new_york = TwoOffsetZone::new_york_2026();
+        let row = |model, kind, wall, rfc, libical| TzidEdge {
+            kind,
+            wall,
+            rfc,
+            libical,
+            model,
+        };
+        [
+            EdgeZone {
+                vtimezone: BERLIN_VTIMEZONE,
+                location: "Europe/Berlin",
+                rows: vec![
+                    row(
+                        berlin,
+                        "fold",
+                        wall(2026, 10, 25, 2, 0),
+                        utc(2026, 10, 25, 0, 0),
+                        utc(2026, 10, 25, 1, 0),
+                    ),
+                    row(
+                        berlin,
+                        "fold",
+                        wall(2026, 10, 25, 2, 30),
+                        utc(2026, 10, 25, 0, 30),
+                        utc(2026, 10, 25, 1, 30),
+                    ),
+                    row(
+                        berlin,
+                        "single",
+                        wall(2026, 10, 25, 3, 0),
+                        utc(2026, 10, 25, 2, 0),
+                        utc(2026, 10, 25, 2, 0),
+                    ),
+                    row(
+                        berlin,
+                        "gap",
+                        wall(2026, 3, 29, 2, 0),
+                        utc(2026, 3, 29, 1, 0),
+                        utc(2026, 3, 29, 0, 0),
+                    ),
+                    row(
+                        berlin,
+                        "gap",
+                        wall(2026, 3, 29, 2, 30),
+                        utc(2026, 3, 29, 1, 30),
+                        utc(2026, 3, 29, 0, 30),
+                    ),
+                    row(
+                        berlin,
+                        "single",
+                        wall(2026, 3, 29, 3, 0),
+                        utc(2026, 3, 29, 1, 0),
+                        utc(2026, 3, 29, 1, 0),
+                    ),
+                ],
+            },
+            EdgeZone {
+                vtimezone: NEW_YORK_VTIMEZONE,
+                location: "America/New_York",
+                rows: vec![
+                    row(
+                        new_york,
+                        "fold",
+                        wall(2026, 11, 1, 1, 0),
+                        utc(2026, 11, 1, 5, 0),
+                        utc(2026, 11, 1, 6, 0),
+                    ),
+                    row(
+                        new_york,
+                        "fold",
+                        wall(2026, 11, 1, 1, 30),
+                        utc(2026, 11, 1, 5, 30),
+                        utc(2026, 11, 1, 6, 30),
+                    ),
+                    row(
+                        new_york,
+                        "single",
+                        wall(2026, 11, 1, 2, 0),
+                        utc(2026, 11, 1, 7, 0),
+                        utc(2026, 11, 1, 7, 0),
+                    ),
+                    row(
+                        new_york,
+                        "gap",
+                        wall(2026, 3, 8, 2, 30),
+                        utc(2026, 3, 8, 7, 30),
+                        utc(2026, 3, 8, 6, 30),
+                    ),
+                ],
+            },
+        ]
+    }
+
+    /// The builtin `TZID` spellings of `location` libical resolves: the bare
+    /// location (Thunderbird, most CalDAV servers) and libical's own prefixed
+    /// form (Evolution).
+    fn builtin_tzids(location: &str) -> [String; 2] {
+        [
+            location.to_owned(),
+            format!("/freeassociation.sourceforge.net/{location}"),
+        ]
+    }
+
+    /// A wall clock as an iCalendar DATE-TIME value, `YYYYMMDDTHHMMSS`.
+    fn ical_wall(w: super::WallClock) -> String {
+        format!(
+            "{:04}{:02}{:02}T{:02}{:02}{:02}",
+            w.year, w.month, w.day, w.hour, w.minute, w.second
+        )
+    }
+
+    /// A VCALENDAR holding one event that starts at `w` in `tzid`, with
+    /// `vtimezone` inline (empty for a builtin lookup).
+    fn tzid_event(vtimezone: &str, tzid: &str, w: super::WallClock) -> String {
+        format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//hytte-ecal-test//\r\n{vtimezone}\
+             BEGIN:VEVENT\r\nUID:tzid-edge\r\nDTSTAMP:20260101T000000Z\r\n\
+             DTSTART;TZID={tzid}:{}\r\nSUMMARY:Edge\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+            ical_wall(w)
+        )
+    }
+
+    /// libical's **own** instant for the `DTSTART` of the event in `ical`:
+    /// `icaltime_as_timet_with_zone` with the zone the time resolved to, the
+    /// call `ical_time_to_unix` made for every resolved `TZID` time before
+    /// #1590. `None` when libical left the `TZID` unresolved, i.e. the time
+    /// reads as floating.
+    fn libical_own_instant(ical: &str) -> Option<i64> {
+        let comp = super::parse_vevent(ical).unwrap();
+        // SAFETY: `comp.raw` is the live VEVENT just parsed, owned by `comp`
+        // until this function returns; the accessor hands back a new
+        // `ICalTime` ref (or null), released below.
+        let tt = unsafe { sys::i_cal_component_get_dtstart(comp.raw) };
+        assert!(!tt.is_null(), "the fixture has a DTSTART");
+        // SAFETY: `tt` is the live time just taken; the zone is a borrow it
+        // holds, never unref'd here.
+        let zone = unsafe { sys::i_cal_time_get_timezone(tt.cast_const()) };
+        let unix = (!zone.is_null()).then(|| {
+            // SAFETY: `tt` and `zone` are the live borrows above; the
+            // conversion only reads them.
+            unsafe { sys::i_cal_time_as_timet_with_zone(tt.cast_const(), zone.cast_const()) }
+        });
+        // SAFETY: the new ref taken above, released exactly once and never
+        // read after.
+        unsafe { sys::g_object_unref(tt) }
+        unix
+    }
+
+    /// The start the expansion gives the one event in `ical`.
+    fn expanded_start(ical: &str) -> i64 {
+        let inst = super::expand_ical_for_test(ical, Y2026_START, Y2026_END).unwrap();
+        assert_eq!(inst.len(), 1, "one event, one instance:\n{ical}");
+        inst[0].start_unix
+    }
+
+    /// Fixture sanity for a row: the model zone reports the case the row is
+    /// about, and #1585's floating-time rule on that model gives the row's
+    /// RFC instant. That rule is the oracle the `TZID` path is held to.
+    fn check_edge_fixture(e: TzidEdge) {
+        assert_eq!(mapping(e.model, e.wall), e.kind, "fixture: {:?}", e.wall);
+        assert_eq!(
+            e.wall.to_unix_in(&e.model),
+            Some(e.rfc),
+            "fixture: {:?}",
+            e.wall
+        );
+        if e.kind == "single" {
+            assert_eq!(e.libical, e.rfc, "fixture: {:?}", e.wall);
+        } else {
+            assert_ne!(e.libical, e.rfc, "fixture: {:?}", e.wall);
+        }
+    }
+
+    /// The probe, kept as a test: what libical answers **on its own** for a
+    /// resolved `TZID` time on a transition. It takes the later instant in a
+    /// fold and the post-gap offset in a gap, on an inline `VTIMEZONE` and on
+    /// the builtin table alike, which is why `ical_time_to_unix` no longer
+    /// uses its answer. If a libical upgrade starts following RFC 5545 here,
+    /// this test fails and says so; `IcalZone` is then redundant, though still
+    /// correct.
+    #[test]
+    fn libical_alone_takes_the_later_instant_in_a_fold_and_the_post_gap_offset() {
+        let mut builtin_rows = 0;
+        for z in edge_zones() {
+            for e in &z.rows {
+                check_edge_fixture(*e);
+                let inline = tzid_event(z.vtimezone, z.location, e.wall);
+                assert_eq!(
+                    libical_own_instant(&inline),
+                    Some(e.libical),
+                    "inline {} {:?}",
+                    z.location,
+                    e.wall
+                );
+                for tzid in builtin_tzids(z.location) {
+                    let Some(got) = libical_own_instant(&tzid_event("", &tzid, e.wall)) else {
+                        eprintln!("skipped: libical cannot resolve the builtin {tzid} here");
+                        continue;
+                    };
+                    assert_eq!(got, e.libical, "builtin {tzid} {:?}", e.wall);
+                    builtin_rows += 1;
+                }
+            }
+        }
+        eprintln!("builtin-zone rows checked: {builtin_rows}");
+    }
+
+    /// The fix: a `TZID` time on a transition expands to RFC 5545 §3.3.5's
+    /// instant. In a fold, the first occurrence (Berlin 02:30 on 10-25 is
+    /// 00:30Z, not libical's 01:30Z); in a gap, the offset before it (Berlin
+    /// 02:30 on 03-29 is 01:30Z, not libical's 00:30Z); at an upper bound, the
+    /// one instant that reads it.
+    #[test]
+    fn a_tzid_time_on_a_transition_resolves_by_rfc_5545() {
+        for z in edge_zones() {
+            for e in &z.rows {
+                check_edge_fixture(*e);
+                let ical = tzid_event(z.vtimezone, z.location, e.wall);
+                assert_eq!(
+                    expanded_start(&ical),
+                    e.rfc,
+                    "{} {:?} ({}; libical alone says {})",
+                    z.location,
+                    e.wall,
+                    e.kind,
+                    e.libical
+                );
+            }
+        }
+    }
+
+    /// The same rows through libical's builtin zones, the shape EDS hands
+    /// back: its components carry no `VTIMEZONE`, so a `TZID` resolves
+    /// against the builtin table, by its bare location or by the prefixed
+    /// form Evolution writes. Skipped (with a message) where libical finds no
+    /// zoneinfo, as in the nix build sandbox.
+    #[test]
+    fn a_builtin_tzid_time_on_a_transition_resolves_by_rfc_5545() {
+        let mut checked = 0;
+        for z in edge_zones() {
+            for e in &z.rows {
+                for tzid in builtin_tzids(z.location) {
+                    let ical = tzid_event("", &tzid, e.wall);
+                    if libical_own_instant(&ical).is_none() {
+                        eprintln!("skipped: libical cannot resolve the builtin {tzid} here");
+                        continue;
+                    }
+                    assert_eq!(
+                        expanded_start(&ical),
+                        e.rfc,
+                        "{tzid} {:?} ({}; libical alone says {})",
+                        e.wall,
+                        e.kind,
+                        e.libical
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        eprintln!("builtin-zone rows checked: {checked}");
+    }
+
+    /// `local_offsets` against the hermetic models' own UTC → offset maps: a
+    /// fold answers both offsets (larger, i.e. earlier instant, first), a gap
+    /// none, everything else one. A fold's upper bound answers one: unlike
+    /// chrono's `Local` (`TwoOffsetZone::with_closed_folds`), only the offset
+    /// that reads back counts. Samoa's skipped day is a 24-hour gap, the
+    /// widest the one-day samples have to straddle.
+    #[test]
+    fn local_offsets_reads_a_zone_from_its_utc_offsets_alone() {
+        // `MappedLocalTime` is an alias of this enum, and an alias cannot
+        // import variants.
+        use chrono::LocalResult::{Ambiguous, None as Gap, Single};
+
+        let berlin = TwoOffsetZone::berlin_2026();
+        let new_york = TwoOffsetZone::new_york_2026();
+        let samoa = TwoOffsetZone::samoa_2011();
+        for (zone, w, want) in [
+            (berlin, wall(2026, 10, 25, 1, 59), Single(7_200)),
+            (berlin, wall(2026, 10, 25, 2, 0), Ambiguous(7_200, 3_600)),
+            (berlin, wall(2026, 10, 25, 2, 30), Ambiguous(7_200, 3_600)),
+            (berlin, wall(2026, 10, 25, 3, 0), Single(3_600)),
+            (berlin, wall(2026, 3, 29, 1, 59), Single(3_600)),
+            (berlin, wall(2026, 3, 29, 2, 0), Gap),
+            (berlin, wall(2026, 3, 29, 2, 30), Gap),
+            (berlin, wall(2026, 3, 29, 3, 0), Single(7_200)),
+            (berlin, wall(2026, 7, 1, 12, 0), Single(7_200)),
+            (
+                new_york,
+                wall(2026, 11, 1, 1, 30),
+                Ambiguous(-14_400, -18_000),
+            ),
+            (new_york, wall(2026, 11, 1, 2, 0), Single(-18_000)),
+            (new_york, wall(2026, 3, 8, 2, 30), Gap),
+            (samoa, wall(2011, 12, 29, 23, 30), Single(-36_000)),
+            (samoa, wall(2011, 12, 30, 0, 0), Gap),
+            (samoa, wall(2011, 12, 30, 23, 59), Gap),
+            (samoa, wall(2011, 12, 31, 0, 0), Single(50_400)),
+        ] {
+            let got = super::local_offsets(naive_of(w).and_utc().timestamp(), |unix| {
+                Some(zone.offset_at(unix))
+            });
+            assert_eq!(got, want, "{w:?}");
+        }
+        // A zone libical cannot sample at all has no instant for anything.
+        assert_eq!(super::local_offsets(0, |_| None), Gap);
+    }
+
+    /// A `VTIMEZONE` whose offset chrono cannot hold (+25:00, which only a
+    /// malformed one can spell) leaves the rule no instant. The event then
+    /// keeps libical's own answer, as before #1590, rather than being dropped
+    /// as undatable, and the out-of-range offset is never handed to chrono as
+    /// some other offset.
+    #[test]
+    fn a_zone_chrono_cannot_hold_falls_back_to_libicals_answer() {
+        const PLUS_25H: &str = "BEGIN:VTIMEZONE\r\nTZID:Test/Plus25\r\n\
+             BEGIN:STANDARD\r\nTZOFFSETFROM:+2500\r\nTZOFFSETTO:+2500\r\nTZNAME:P25\r\n\
+             DTSTART:19700101T000000\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\n";
+        let ical = tzid_event(PLUS_25H, "Test/Plus25", wall(2026, 7, 1, 12, 0));
+        let libical = libical_own_instant(&ical).expect("libical resolves the inline zone");
+        assert_eq!(
+            libical,
+            utc(2026, 7, 1, 12, 0) - 25 * 3_600,
+            "fixture: libical reads the zone as +25:00"
+        );
+        assert_eq!(expanded_start(&ical), libical);
+    }
+
+    /// An event from 02:30 to 03:30 on Berlin's fall-back day starts at the
+    /// first 02:30 (00:30Z) and ends at 03:30 CET (02:30Z): two hours. Pins
+    /// that `DTEND` takes the same conversion as `DTSTART`.
+    #[test]
+    fn an_event_across_a_fold_lasts_from_the_first_occurrence() {
+        let ical = berlin_calendar_of(&["UID:fold-span\r\nDTSTAMP:20260101T000000Z\r\n\
+             DTSTART;TZID=Europe/Berlin:20261025T023000\r\n\
+             DTEND;TZID=Europe/Berlin:20261025T033000\r\nSUMMARY:Night shift\r\n"]);
+        let inst = super::expand_calendar_for_test(&ical, Y2026_START, Y2026_END).unwrap();
+        assert_eq!(inst.len(), 1);
+        assert_eq!(inst[0].start_unix, utc(2026, 10, 25, 0, 30));
+        assert_eq!(inst[0].end_unix, utc(2026, 10, 25, 2, 30));
+    }
+
+    /// A daily 02:30 Berlin series across both 2026 transitions. The
+    /// occurrences the recurrence iterator lands in the gap and in the fold
+    /// take the same instants a single event does, since every occurrence
+    /// goes through `ical_time_to_unix`. Three shapes: one `COUNT` series per
+    /// transition (stepped from `DTSTART`, since libical will not fast-forward
+    /// a `COUNT` rule), and an unbounded series begun in 2020, which
+    /// `skip_iterator_to_window` (#1195) re-anchors on the window first.
+    ///
+    /// The spring rows stop at the gap day: the occurrence after it is the
+    /// iterator's own problem, not the conversion's (see
+    /// `the_occurrence_after_a_gap_day_keeps_the_series_time_of_day`).
+    #[test]
+    fn a_zoned_daily_series_takes_the_same_instants_on_transition_days() {
+        let spring = berlin_calendar_of(&["UID:spring\r\nDTSTAMP:20260101T000000Z\r\n\
+             DTSTART;TZID=Europe/Berlin:20260328T023000\r\n\
+             DTEND;TZID=Europe/Berlin:20260328T033000\r\n\
+             RRULE:FREQ=DAILY;COUNT=2\r\nSUMMARY:Spring\r\n"]);
+        let spring_want = vec![
+            utc(2026, 3, 28, 1, 30), // 02:30 CET
+            utc(2026, 3, 29, 1, 30), // in the gap: 03:30 CEST
+        ];
+        let inst = super::expand_calendar_for_test(&spring, Y2026_START, Y2026_END).unwrap();
+        assert_eq!(sorted_starts(&inst), spring_want);
+        assert!(inst.iter().all(|e| e.end_unix - e.start_unix == 3_600));
+
+        let autumn = berlin_calendar_of(&["UID:autumn\r\nDTSTAMP:20260101T000000Z\r\n\
+             DTSTART;TZID=Europe/Berlin:20261024T023000\r\n\
+             RRULE:FREQ=DAILY;COUNT=3\r\nSUMMARY:Autumn\r\n"]);
+        let autumn_want = vec![
+            utc(2026, 10, 24, 0, 30), // 02:30 CEST
+            utc(2026, 10, 25, 0, 30), // in the fold: the first 02:30, CEST
+            utc(2026, 10, 26, 1, 30), // 02:30 CET
+        ];
+        let inst = super::expand_calendar_for_test(&autumn, Y2026_START, Y2026_END).unwrap();
+        assert_eq!(sorted_starts(&inst), autumn_want);
+
+        let since_2020 = berlin_calendar_of(&["UID:old\r\nDTSTAMP:20200101T000000Z\r\n\
+             DTSTART;TZID=Europe/Berlin:20200101T023000\r\n\
+             RRULE:FREQ=DAILY\r\nSUMMARY:Old\r\n"]);
+        let spring_window = (utc(2026, 3, 28, 0, 0), utc(2026, 3, 30, 0, 0));
+        let inst =
+            super::expand_calendar_for_test(&since_2020, spring_window.0, spring_window.1).unwrap();
+        assert_eq!(sorted_starts(&inst), spring_want, "unbounded, spring");
+        let autumn_window = (utc(2026, 10, 24, 0, 0), utc(2026, 10, 27, 0, 0));
+        let inst =
+            super::expand_calendar_for_test(&since_2020, autumn_window.0, autumn_window.1).unwrap();
+        assert_eq!(sorted_starts(&inst), autumn_want, "unbounded, autumn");
+    }
+
+    /// An `EXDATE` naming the fold occurrence and a detached instance whose
+    /// `RECURRENCE-ID` names the gap one match the occurrences they name.
+    ///
+    /// The gap half failed before #1590: libical's iterator hands the gap
+    /// day's occurrence back as 03:30 (ICU moves the missing 02:30 forward),
+    /// which libical reads as 01:30Z, while the `RECURRENCE-ID`'s 02:30 went
+    /// through libical's gap answer, 00:30Z. The two never matched, so the
+    /// moved occurrence showed twice. The fold half held either way (both
+    /// sides read the same 02:30 the same way); it is here to catch a fix that
+    /// reaches the occurrences but not `EXDATE`.
+    #[test]
+    fn an_exdate_or_recurrence_id_on_a_transition_still_names_its_occurrence() {
+        let ical = berlin_calendar_of(&[
+            "UID:daily\r\nDTSTAMP:20260101T000000Z\r\n\
+             DTSTART;TZID=Europe/Berlin:20260101T023000\r\n\
+             RRULE:FREQ=DAILY\r\n\
+             EXDATE;TZID=Europe/Berlin:20261025T023000\r\nSUMMARY:Daily\r\n",
+            "UID:daily\r\nDTSTAMP:20260101T000000Z\r\n\
+             RECURRENCE-ID;TZID=Europe/Berlin:20260329T023000\r\n\
+             DTSTART;TZID=Europe/Berlin:20260329T120000\r\nSUMMARY:Daily (moved)\r\n",
+        ]);
+        let spring =
+            super::expand_calendar_for_test(&ical, utc(2026, 3, 28, 0, 0), utc(2026, 3, 30, 0, 0))
+                .unwrap();
+        assert_eq!(
+            sorted_starts(&spring),
+            vec![
+                utc(2026, 3, 28, 1, 30),
+                utc(2026, 3, 29, 10, 0), // the detached instance, 12:00 CEST
+            ],
+            "the gap occurrence is the one the detached instance replaces"
+        );
+        let autumn = super::expand_calendar_for_test(
+            &ical,
+            utc(2026, 10, 24, 0, 0),
+            utc(2026, 10, 27, 0, 0),
+        )
+        .unwrap();
+        assert_eq!(
+            sorted_starts(&autumn),
+            vec![utc(2026, 10, 24, 0, 30), utc(2026, 10, 26, 1, 30)],
+            "the fold occurrence is the one EXDATE cancels"
         );
     }
 

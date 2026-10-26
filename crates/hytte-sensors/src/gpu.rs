@@ -931,11 +931,40 @@ mod tests {
 
     // ── query_nvidia_smi (real child processes, hermetic scripts) ────────────
 
+    /// Install a `#!/bin/sh` stand-in at `dir/name`, written by a `sh` child
+    /// and **never by this process**.
+    ///
+    /// Not `std::fs::write` plus a chmod, because of `ETXTBSY`: a sibling
+    /// test that forks (a `sleeper()`, another stand-in, `kill`) hands its
+    /// child a copy of every fd this process has open at that instant -
+    /// `O_CLOEXEC` closes them only at the child's `exec` - and `execve`
+    /// refuses a file anyone holds open for writing. `query_nvidia_smi` maps
+    /// that spawn error to `Transient`, so a stand-in that never ran looked
+    /// like a timeout: measured on a 64-core box, 10 of 60 runs of this
+    /// binary failed that way (3 of 60 on `main`), and 0 of 60 with the write
+    /// in a child. Same fix as #1540's `stand_in::install` in
+    /// `hytte-claude-bridge`.
     fn script(dir: &std::path::Path, name: &str, body: &str) -> String {
-        use std::os::unix::fs::PermissionsExt;
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
         let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut writer = Command::new("/bin/sh")
+            .args(["-c", r#"cat > "$1" && chmod 755 "$1""#, "sh"])
+            .arg(&path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn the script writer");
+        writer
+            .stdin
+            .take()
+            .expect("piped")
+            .write_all(format!("#!/bin/sh\n{body}\n").as_bytes())
+            .expect("hand the script over");
+        assert!(
+            writer.wait().expect("reap the script writer").success(),
+            "could not install {}",
+            path.display()
+        );
         path.to_str().unwrap().to_string()
     }
 

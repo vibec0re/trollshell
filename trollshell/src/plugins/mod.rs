@@ -496,10 +496,10 @@ struct BrokeredEffect {
     ///
     /// Carried on the effect rather than looked up on the GTK side for the
     /// reason `SlotRender::grants` is: the mount lives on the tokio connection
-    /// task (it is `route_render`'s own placement decision), and the broker runs
-    /// on the GTK thread. Stamped from the same value that picked the render's
-    /// region mailbox, so a chip and its page cannot disagree about where the
-    /// plugin is.
+    /// task (it is the placement `session::mount_mailbox` makes for the
+    /// plugin's renders), and the broker runs on the GTK thread. Stamped from
+    /// the same value that picks the render's region mailbox, so a chip and its
+    /// page cannot disagree about where the plugin is.
     mount: Mount,
     outbound: mpsc::Sender<HostMsg>,
 }

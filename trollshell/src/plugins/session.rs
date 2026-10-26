@@ -5,23 +5,25 @@
 //! loop feeding renders into the mount mailboxes, and the shared teardown. It
 //! also carries the containment (#435) and registration-hygiene (#436) guards:
 //! the bounded outbound queue, the liveness ping, the effect rate cap, the
-//! per-id [`IdGuard`], and capability enforcement ([`enforce_capabilities`]).
+//! render bound ([`RenderGate`]), the per-id [`IdGuard`], and capability
+//! enforcement ([`enforce_capabilities`]).
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use hytte::futures_signals::signal::Mutable;
 use hytte::services::pipewire;
 use hytte_plugin_proto::{
     AudioSpectrum, Capability, ClockState, DatasourceError, DatasourceOutcome, Effect, HostMsg,
     LogLevel, MAX_BODY_TEXT_BYTES, MAX_DISPLAY_TEXT_BYTES, MAX_PLUGIN_ID_BYTES, Manifest, Mount,
     NowPlaying, PluginMsg, ProtoError, StateKey, StateSnapshot, UpcomingEvent, VOCAB, read_frame,
-    write_frame,
+    wire, write_frame,
 };
 use tokio::net::UnixStream;
 use tokio::net::unix::OwnedWriteHalf;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 
 use super::pump::PanelSelections;
 use super::region::{clear_region_if_owned, upsert_region};
@@ -118,22 +120,64 @@ impl Drop for SpectrumDemand {
 }
 
 /// Route one plugin `Render` frame (#274 / #277 / #349 PR2): strip its one-shot
-/// effects onto the global non-lossy broker channel, park (or clear) its optional
-/// drawer panel in the dedicated `panels` mailbox, and upsert its chip/card
-/// `tree` into the mount's region mailbox (latest-wins per plugin id). Factored
-/// out of [`serve_conn`] so that reader loop stays within the line budget.
-fn route_render(ctx: &ListenerCtx, mount: Mount, render: SlotRender, effects: Vec<Effect>) {
-    // The mount picks which region mailbox (and thus per-monitor container) the
-    // tree lands in: sidebar regions render as cards, bar regions as chips
-    // (#349); both share the reconciler path. The right sidebar's three (#1158)
-    // are ordinary rows here — one mailbox each, no side-awareness anywhere in
-    // this function, which is what "the host treats the two families
-    // identically" means in practice.
-    //
-    // This match is the host's whole placement decision, and
-    // `plugins::tests::sidebar_right_routing` pins every one of its nine arms
-    // against a real `handle_conn` (#1159): swapping two of them reds it.
-    let region = match mount {
+/// effects onto the global non-lossy broker channel, then hand its trees to this
+/// connection's [`RenderGate`], which parks them now ([`park_render`]), parks
+/// them later through [`flush_deferred_renders`], or drops them as a repeat of
+/// what is already parked. Factored out of [`serve_conn`] so that reader loop
+/// stays within the line budget.
+fn route_render(
+    ctx: &ListenerCtx,
+    mount: Mount,
+    pacer: &RenderPacer,
+    render: SlotRender,
+    effects: Vec<Effect>,
+) {
+    // One-shot effects first, over the (global) non-lossy channel, BEFORE
+    // parking the idempotent tree — a superseding render frame could otherwise
+    // coalesce this frame's click away (#277). Never paced and never deduped:
+    // the render bound below decides only when a *tree* reaches the mailbox, and
+    // effects have their own budget (`throttle_effects`, upstream of here).
+    for effect in effects {
+        let _ = ctx.effects_tx.send(BrokeredEffect {
+            plugin_id: render.plugin_id.clone(),
+            effect,
+            // The same `mount` that picks the region mailbox in
+            // [`mount_mailbox`] (#1010 §3): the broker routes
+            // `OpenPage(PluginSelf)` on it, so the surface a plugin's own page
+            // opens on is decided by the placement this connection's renders
+            // get rather than by a second lookup that could disagree with it.
+            mount,
+            // The connection's outbound, so a two-way effect (consent, #487) can
+            // send its reply frame back to this plugin.
+            outbound: render.outbound.clone(),
+        });
+    }
+    // Bound in its own statement, so the gate's lock is released before the
+    // mailboxes' are taken.
+    let admission = pacer.admit(render);
+    match admission {
+        RenderAdmission::Park(render) => park_render(ctx, mount, *render),
+        // The flusher sleeps until the bucket has a token, then parks whatever
+        // is newest by then.
+        RenderAdmission::Deferred => pacer.owed.notify_one(),
+        RenderAdmission::Unchanged => {}
+    }
+}
+
+/// The region mailbox a mount's trees land in.
+///
+/// The mount picks which region mailbox (and thus per-monitor container) the
+/// tree lands in: sidebar regions render as cards, bar regions as chips (#349);
+/// both share the reconciler path. The right sidebar's three (#1158) are
+/// ordinary rows here — one mailbox each, no side-awareness anywhere in this
+/// function, which is what "the host treats the two families identically" means
+/// in practice.
+///
+/// This match is the host's whole placement decision, and
+/// `plugins::tests::sidebar_right_routing` pins every one of its nine arms
+/// against a real `handle_conn` (#1159): swapping two of them reds it.
+fn mount_mailbox(ctx: &ListenerCtx, mount: Mount) -> &Mutable<Vec<SlotRender>> {
+    match mount {
         Mount::SidebarLead => &ctx.sidebar_lead,
         Mount::SidebarTop => &ctx.sidebar_top,
         Mount::SidebarBottom => &ctx.sidebar_bottom,
@@ -143,25 +187,17 @@ fn route_render(ctx: &ListenerCtx, mount: Mount, render: SlotRender, effects: Ve
         Mount::BarLeft => &ctx.bar_left,
         Mount::BarCenter => &ctx.bar_center,
         Mount::BarRight => &ctx.bar_right,
-    };
-    // One-shot effects first, over the (global) non-lossy channel, BEFORE
-    // parking the idempotent tree — a superseding render frame could otherwise
-    // coalesce this frame's click away (#277).
-    for effect in effects {
-        let _ = ctx.effects_tx.send(BrokeredEffect {
-            plugin_id: render.plugin_id.clone(),
-            effect,
-            // The same `mount` that picked the region mailbox above (#1010 §3):
-            // the broker routes `OpenPage(PluginSelf)` on it, so the surface a
-            // plugin's own page opens on is decided by the placement this very
-            // function just made rather than by a second lookup that could
-            // disagree with it.
-            mount,
-            // The connection's outbound, so a two-way effect (consent, #487) can
-            // send its reply frame back to this plugin.
-            outbound: render.outbound.clone(),
-        });
     }
+}
+
+/// Park (or clear) a frame's optional drawer panel in the dedicated `panels`
+/// mailbox and upsert its chip/card `tree` into the mount's region mailbox
+/// (latest-wins per plugin id) — the one place a connection writes a render to
+/// the mailboxes the GTK thread reconciles, whether [`route_render`] parks it
+/// at once or [`flush_deferred_renders`] parks it at the bound's deadline.
+fn park_render(ctx: &ListenerCtx, mount: Mount, render: SlotRender) {
+    #[cfg(test)]
+    PARKED_RENDERS.with(|parked| parked.set(parked.get() + 1));
     // The optional drawer panel (#349 PR2) rides the same frame but lands in the
     // dedicated `panels` mailbox (a single list across all mounts) so the
     // per-monitor drawer child can render whichever plugin is active. Upsert it
@@ -175,7 +211,265 @@ fn route_render(ctx: &ListenerCtx, mount: Mount, render: SlotRender, effects: Ve
     }
     // Latest-wins per plugin id: upsert overwrites *this* plugin's card in place,
     // leaving siblings alone (#274).
-    upsert_region(region, render);
+    upsert_region(mount_mailbox(ctx, mount), render);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Times [`park_render`] has run on this thread — i.e. how many times a
+    /// connection served on this thread wrote the mailboxes the GTK thread
+    /// reconciles.
+    ///
+    /// Counted at the write rather than read off a mailbox's signal, because a
+    /// `Mutable` signal is latest-value: two writes between two polls read as
+    /// one change, so a signal can show that *something* was parked but never
+    /// how often — which is the whole question the render bound answers. A
+    /// `#[tokio::test]` runs its connection on its own thread, so the count is
+    /// per test.
+    static PARKED_RENDERS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// How many renders [`park_render`] has written on this thread.
+/// `#[cfg(test)]` only — nothing shipped reads it.
+#[cfg(test)]
+pub(super) fn parked_renders() -> u32 {
+    PARKED_RENDERS.with(std::cell::Cell::get)
+}
+
+// ── The render bound ─────────────────────────────────────────────────────────
+//
+// Every `Render` used to be upserted unconditionally, and every upsert wakes the
+// region on the GTK main thread, which deep-clones the whole mailbox and
+// re-maps and re-reconciles **every** card in it. Effects, logs and
+// registrations were rate-limited; renders were not, so a plugin looping
+// renders of a large tree — a bug, or a cheap same-uid DoS — stuttered or froze
+// the bar and the sidebar. Two measures, per connection, both a no-op for an
+// honest SDK plugin: a frame identical to the one already parked is dropped, and
+// what is left is paced by a token bucket whose sustained rate is above the
+// SDK's own view-rate cap, latest-wins, with the last frame of a burst always
+// delivered.
+
+/// Render frames a connection may park back-to-back before
+/// [`RENDER_REFILL_PER_SEC`] applies.
+///
+/// Headroom for the bunching an honest plugin produces without exceeding its
+/// own cap: frames the SDK spaced 33 ms apart arriving together because the
+/// host's reader was descheduled, the extra frame the SDK sends with a click's
+/// effects regardless of its view-rate cap, and a non-SDK plugin's start-up
+/// flurry. Eight frames at the sustained rate is ~133 ms.
+pub(super) const RENDER_BURST: u32 = 8;
+
+/// Sustained render frames per second a connection may park.
+///
+/// **Twice the SDK's view-rate cap.** `hytte-plugin`'s session loop recomputes
+/// and sends a view at most once per `VIEW_MIN_INTERVAL` (33 ms ≈ 30 Hz, #560;
+/// `crates/hytte-plugin/src/runtime.rs`), so an SDK plugin at full rate spends
+/// half of this budget and never sees a frame deferred. A plugin that ignores
+/// the cap costs the GTK thread at most what two plugins at the SDK's cap
+/// would — and no more than one reconcile per frame of a 60 Hz display, which is
+/// as often as a repaint can be seen anyway. The trollshell side cannot link
+/// the SDK to read the constant (`trollshell` never links `hytte-plugin`), so
+/// `the_render_bound_sits_above_the_sdk_view_rate_cap` in `plugins::tests`
+/// reads it out of the SDK's source and fails if the two cross.
+pub(super) const RENDER_REFILL_PER_SEC: f64 = 60.0;
+
+/// The parts of a parked frame the GTK thread renders — what makes two frames
+/// the same frame to the mailboxes.
+///
+/// The rest of a [`SlotRender`] (`plugin_id`, `order`, `generation`, `grants`,
+/// `outbound`) is fixed for a connection's life, so two frames from one
+/// connection that agree on these three agree on everything the region and
+/// panel reconcilers read. `hidden_on` is included for the reason the SDK's own
+/// dedup compares the whole `View` (#1050): a frame whose only change is which
+/// screens hide it usually carries the very same tree.
+#[derive(PartialEq)]
+struct ParkedFrame {
+    tree: wire::Node,
+    panel: Option<wire::Node>,
+    hidden_on: Vec<String>,
+}
+
+impl ParkedFrame {
+    fn of(render: &SlotRender) -> Self {
+        Self {
+            tree: render.tree.clone(),
+            panel: render.panel.clone(),
+            hidden_on: render.hidden_on.clone(),
+        }
+    }
+
+    fn is(&self, render: &SlotRender) -> bool {
+        self.tree == render.tree && self.panel == render.panel && self.hidden_on == render.hidden_on
+    }
+}
+
+/// Whether two frames from one connection would park the same thing.
+fn same_frame(a: &SlotRender, b: &SlotRender) -> bool {
+    a.tree == b.tree && a.panel == b.panel && a.hidden_on == b.hidden_on
+}
+
+/// What [`RenderGate::admit`] decided for one frame.
+pub(super) enum RenderAdmission {
+    /// Park it now. Boxed because a [`SlotRender`] is some 360 bytes and the
+    /// other two answers carry nothing.
+    Park(Box<SlotRender>),
+    /// Over the bound: it is held as the connection's pending frame, replacing
+    /// any older one, and parked at [`RenderGate::deadline`] unless a newer
+    /// frame supersedes it first.
+    Deferred,
+    /// The same as what is parked (or already pending): nothing to do.
+    Unchanged,
+}
+
+/// One connection's render bound: the dedup against the last parked frame plus
+/// the [`RENDER_BURST`] / [`RENDER_REFILL_PER_SEC`] bucket, with the newest
+/// frame the bucket refused held for [`flush`](Self::flush). Pure — it takes
+/// `now` and never touches a mailbox — so its whole policy is unit-testable
+/// without a socket; [`RenderPacer`] is the wiring.
+///
+/// Latest-wins, never drop-on-the-floor: a refused frame is not lost, it is
+/// superseded. Whatever the plugin sent **last** is parked — immediately, at the
+/// bucket's next token, or not at all because it equals what is already parked —
+/// so a burst always ends on screen in its final state.
+///
+/// Invariant: `pending`, when held, differs from `parked`. A frame equal to
+/// `parked` clears it instead ([`admit`](Self::admit)'s second rule), which is
+/// what makes a burst that ends where it started cost no park at all.
+pub(super) struct RenderGate {
+    bucket: TokenBucket,
+    /// What this connection last wrote to the mailboxes — `None` until its first
+    /// frame, which is therefore always parked.
+    parked: Option<ParkedFrame>,
+    /// The newest frame the bucket refused, still owed to the mailboxes.
+    pending: Option<SlotRender>,
+}
+
+impl RenderGate {
+    pub(super) fn new_at(now: Instant) -> Self {
+        Self {
+            bucket: TokenBucket::new_at(now, RENDER_BURST, RENDER_REFILL_PER_SEC),
+            parked: None,
+            pending: None,
+        }
+    }
+
+    /// Decide one inbound frame's fate as of `now`.
+    pub(super) fn admit(&mut self, render: SlotRender, now: Instant) -> RenderAdmission {
+        // A repeat of the frame already waiting: it will be parked at the
+        // deadline either way.
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|p| same_frame(p, &render))
+        {
+            return RenderAdmission::Unchanged;
+        }
+        // A repeat of what the mailboxes hold. If a different frame was pending,
+        // this one supersedes it — and supersedes it with what is already on
+        // screen, so the pending frame is simply forgotten.
+        if self.parked.as_ref().is_some_and(|p| p.is(&render)) {
+            self.pending = None;
+            return RenderAdmission::Unchanged;
+        }
+        if self.bucket.allow(now) {
+            self.pending = None;
+            self.parked = Some(ParkedFrame::of(&render));
+            return RenderAdmission::Park(Box::new(render));
+        }
+        self.pending = Some(render);
+        RenderAdmission::Deferred
+    }
+
+    /// When the pending frame may be parked, or `None` if nothing is pending.
+    pub(super) fn deadline(&self) -> Option<Instant> {
+        self.pending.as_ref().map(|_| self.bucket.ready_at())
+    }
+
+    /// The pending frame, if one is held and the bucket has a token for it as
+    /// of `now`. A wake that comes early leaves it pending; the caller asks for
+    /// the [`deadline`](Self::deadline) again.
+    pub(super) fn flush(&mut self, now: Instant) -> Option<SlotRender> {
+        if self.pending.is_none() || !self.bucket.allow(now) {
+            return None;
+        }
+        let render = self.pending.take()?;
+        self.parked = Some(ParkedFrame::of(&render));
+        Some(render)
+    }
+}
+
+/// A connection's [`RenderGate`] shared between the two halves of `serve_conn`
+/// that touch it: the reader, which admits frames ([`route_render`]), and
+/// [`flush_deferred_renders`], which parks the deferred one at its deadline.
+///
+/// Both run as arms of the one `select!` that also races the liveness ping, so
+/// they are never polled at once and the lock never contends; it is a `Mutex`
+/// rather than a `RefCell` only because a future holding a `&RefCell` is not
+/// `Send`. And because they are arms of that `select!` rather than a spawned
+/// task, both are dropped before teardown clears this connection's cards — a
+/// deferred frame cannot be parked after its connection is gone.
+struct RenderPacer {
+    gate: Mutex<RenderGate>,
+    /// Woken when a frame is deferred, so an idle flusher learns there is a
+    /// deadline to sleep until. `notify_one` keeps a permit when nobody is
+    /// waiting, so a deferral made while the flusher is busy is not lost.
+    owed: Notify,
+}
+
+impl RenderPacer {
+    fn new_at(now: Instant) -> Self {
+        Self {
+            gate: Mutex::new(RenderGate::new_at(now)),
+            owed: Notify::new(),
+        }
+    }
+
+    fn admit(&self, render: SlotRender) -> RenderAdmission {
+        self.gate
+            .lock()
+            .expect("plugin render gate poisoned")
+            .admit(render, pacer_now())
+    }
+}
+
+/// The instant the render bound reads — `tokio`'s clock, not `std`'s, so the
+/// bucket and the flusher's `sleep_until` measure the same time. They agree in
+/// production; under a paused test clock only `tokio`'s moves, and a bucket on
+/// the other clock would see its deadline arrive with no token to spend.
+fn pacer_now() -> Instant {
+    tokio::time::Instant::now().into_std()
+}
+
+/// Park each frame [`route_render`] deferred, at the moment the connection's
+/// bucket has a token for it — the half of the render bound that guarantees a
+/// burst's **final** frame reaches the screen even when nothing follows it.
+///
+/// Never returns: it is an arm of `serve_conn`'s reader/liveness `select!`, and
+/// ends when that `select!` drops it.
+async fn flush_deferred_renders(ctx: &ListenerCtx, mount: Mount, pacer: &RenderPacer) {
+    loop {
+        // Bound first, so the guard is released before either await below.
+        let deadline = pacer
+            .gate
+            .lock()
+            .expect("plugin render gate poisoned")
+            .deadline();
+        let Some(deadline) = deadline else {
+            pacer.owed.notified().await;
+            continue;
+        };
+        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+        // Whatever is pending *now* — the reader may have replaced the frame
+        // that set this deadline with a newer one, or cleared it.
+        let flushed = pacer
+            .gate
+            .lock()
+            .expect("plugin render gate poisoned")
+            .flush(pacer_now());
+        if let Some(render) = flushed {
+            park_render(ctx, mount, render);
+        }
+    }
 }
 
 // ── Plugin containment (#435) ────────────────────────────────────────────────
@@ -204,9 +498,10 @@ pub(super) const MAX_MISSED_PONGS: u32 = 2;
 
 /// Bound on the per-connection outbound (host→plugin) queue. A well-behaved
 /// plugin drains it immediately so it sits near-empty; a plugin that stops
-/// reading its socket backs it up to this cap, at which point new frames are
-/// dropped (see [`push_state`]) rather than buffered without limit. Comfortably
-/// above any real burst, so the happy path never fills it.
+/// reading its socket backs it up to this cap, at which point nothing more is
+/// buffered: a stream frame is dropped ([`push_state`]) and a level-state push
+/// waits for room, owing at most its one newest value ([`push_latest`]).
+/// Comfortably above any real burst, so the happy path never fills it.
 ///
 /// **It bounds frames, not bytes**, which is why it is not the whole story
 /// (#1165 item 7). Every other `HostMsg` is a small, host-built value — a clock
@@ -600,23 +895,77 @@ pub(super) fn capped_effect_payload(
 /// above: exposed so `tests.rs` can pin the bounded-queue guarantee (#1166).
 pub(super) enum Push {
     /// The frame was sent, or dropped because the queue was momentarily full —
-    /// either way keep going (the next change re-sends the latest value).
+    /// either way keep going. A drop is only harmless for a stream, whose next
+    /// frame supersedes it within the stream's own period; see [`push_state`].
     Continue,
     /// The receiver (writer task) is gone: the connection is tearing down, stop.
     Stop,
 }
 
-/// Non-blocking push onto a connection's bounded outbound queue (#435). Every
-/// host→plugin state frame is latest-wins, so a `Full` queue (the plugin stopped
-/// reading) drops the frame rather than growing memory without bound — the stuck
-/// plugin is separately reaped by the liveness ping (it can't answer pings while
-/// not reading). `Closed` means the writer task exited; the producer stops.
+/// Non-blocking, **lossy** push onto a connection's bounded outbound queue
+/// (#435): a `Full` queue (the plugin is not reading) drops the frame rather
+/// than growing memory without bound, and `Closed` means the writer task exited,
+/// so the producer stops.
+///
+/// Only for a **stream** — today, just the audio spectrum ([`spectrum_task`]),
+/// whose next frame lands ~50 ms later and supersedes the dropped one. It is the
+/// wrong tool for level or edge state, and every other push task used to use it:
+/// a `SlotVisibility { visible: false }` dropped here was dropped for good,
+/// because the next frame of that push is the *next toggle*, and a plugin whose
+/// queue was full when its sidebar closed went on sampling and painting as
+/// visible until then. Level state goes through [`push_latest`] instead.
 ///
 /// `pub(super)` for the same reason as [`Push`] above (#1166).
 pub(super) fn push_state(out: &mpsc::Sender<HostMsg>, msg: HostMsg) -> Push {
     match out.try_send(msg) {
         Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Push::Continue,
         Err(mpsc::error::TrySendError::Closed(_)) => Push::Stop,
+    }
+}
+
+/// Drive one **level-state** push: queue `frame(value)` for `rx`'s current
+/// value at register (the seed) and again after every change, until the
+/// connection's queue closes or `rx`'s sender goes away.
+///
+/// Convergent where [`push_state`] is lossy: whatever the plugin is sent
+/// **last** is the value `rx` holds, even when a change meets a full queue. The
+/// rule that makes it so is *a permit first, the value second* — the task waits
+/// for room in the queue ([`mpsc::Sender::reserve`]) and only then reads the
+/// value it sends, so a change made while the queue was full is not lost and a
+/// burst of them collapses into the one frame that matters. That is
+/// [`page_task`]'s posture (#1433 review) without its edge bookkeeping, which a
+/// push whose every frame is the whole state does not need: a repeated value is
+/// a frame the plugin already acts on idempotently.
+///
+/// Why waiting is safe here:
+///
+/// - **Only this task waits.** The `watch`'s sender — the GTK thread or a
+///   service — never blocks on a plugin (`watch` sends do not wait for
+///   receivers), and the queue belongs to this one connection, so a stalled
+///   plugin parks its own push tasks and nobody else's.
+/// - **It holds at most one frame.** A waiting task owns no slot until the
+///   queue frees one, and sends into it at once, so the queue's bound stays
+///   [`OUTBOUND_CAPACITY`]; there is nothing to buffer and nothing to grow.
+/// - **It does not starve.** `tokio`'s bounded queue hands a freed slot to the
+///   tasks waiting in `reserve` before a `try_send` can take it, so a level
+///   push is not crowded out by the spectrum stream that filled the queue.
+/// - **A plugin that never drains is still reaped.** The liveness ping's own
+///   `try_send` fails on the full queue and drops the connection, whose
+///   teardown aborts this task.
+pub(super) async fn push_latest<T>(
+    mut rx: watch::Receiver<T>,
+    out: mpsc::Sender<HostMsg>,
+    frame: impl Fn(&T) -> HostMsg,
+) {
+    loop {
+        let Ok(permit) = out.reserve().await else {
+            return;
+        };
+        // The guard is a temporary of this statement, released before any await.
+        permit.send(frame(&rx.borrow_and_update()));
+        if rx.changed().await.is_err() {
+            return;
+        }
     }
 }
 
@@ -662,6 +1011,23 @@ impl TokenBucket {
         } else {
             false
         }
+    }
+
+    /// The earliest instant at which [`allow`](Self::allow) will next answer
+    /// `true`: the last call's instant if a token is already held, else the
+    /// moment the refill reaches one.
+    ///
+    /// Rounded up by a microsecond, so `allow(ready_at())` is `true` rather than
+    /// a float's width short of a token — 1 µs is ~10⁻⁴ of a token at any rate
+    /// this file uses, far above the rounding it covers and far below anything
+    /// a caller could notice. Every bucket here refills at a positive constant
+    /// rate, which is what keeps the division finite.
+    pub(super) fn ready_at(&self) -> Instant {
+        if self.tokens >= 1.0 {
+            return self.last;
+        }
+        let wait = (1.0 - self.tokens) / self.refill_per_sec;
+        self.last + Duration::from_secs_f64(wait) + Duration::from_micros(1)
     }
 
     /// Whether this bucket has refilled to its full burst as of `now`, i.e.
@@ -1294,8 +1660,10 @@ pub(super) async fn serve_conn(
 
     // Outbound writer: the single point that serializes host→plugin frames. The
     // queue is **bounded** (#435): a plugin that stops reading its socket can no
-    // longer make the host buffer frames without limit — producers drop onto a
-    // full queue (`push_state`) and the liveness ping reaps the stuck connection.
+    // longer make the host buffer frames without limit — the spectrum stream
+    // drops onto a full queue (`push_state`), the level-state pushes wait for
+    // room and send their newest value (`push_latest`), and the liveness ping
+    // reaps the stuck connection.
     let (out_tx, out_rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
     let writer = tokio::spawn(writer_task(wr, out_rx));
 
@@ -1506,6 +1874,10 @@ pub(super) async fn serve_conn(
     // #1165: the `PluginMsg::Log` length + rate gate, per connection like the
     // effect limiter beside it.
     let mut log_gate = LogGate::new_at(Instant::now());
+    // The render bound: the reader admits each frame's trees through it, and the
+    // flusher (raced below with the reader and the liveness ping) parks the one
+    // it deferred. Per connection, like the log gate.
+    let render_pacer = RenderPacer::new_at(pacer_now());
     let reader = async {
         loop {
             match read_frame::<PluginMsg, _>(&mut rd).await {
@@ -1573,6 +1945,7 @@ pub(super) async fn serve_conn(
                     route_render(
                         ctx,
                         mount,
+                        &render_pacer,
                         SlotRender {
                             plugin_id: plugin_id.clone(),
                             order,
@@ -1678,11 +2051,16 @@ pub(super) async fn serve_conn(
             }
         }
     };
+    // Never completes: it only parks what the reader deferred, and ends when this
+    // `select!` drops it — before the teardown below clears this connection's
+    // cards, so a deferred frame can never be parked after them.
+    let flusher = flush_deferred_renders(ctx, mount, &render_pacer);
     tokio::select! {
         () = reader => {}
         () = liveness => {
             tracing::warn!(plugin = %plugin_id, "plugin failed liveness ping; dropping as hung");
         }
+        () = flusher => {}
     }
 
     // Teardown: remove THIS plugin's card from its region only if THIS connection
@@ -1772,32 +2150,15 @@ async fn writer_task(mut wr: OwnedWriteHalf, mut rx: mpsc::Receiver<HostMsg>) {
 }
 
 /// Push the full subscribed state subset (v1: `clock`) on the initial subscribe
-/// and on every change, coalescing bursts latest-wins via `borrow_and_update`.
-async fn snapshot_task(
-    mut clock_rx: watch::Receiver<Option<ClockState>>,
-    out: mpsc::Sender<HostMsg>,
-) {
-    // Initial snapshot (the watch replays its current value).
-    let initial = clock_rx.borrow_and_update().clone();
-    if let Push::Stop = push_state(
-        &out,
-        HostMsg::StateSnapshot {
-            snapshot: StateSnapshot { clock: initial },
+/// and on every change, latest-wins and convergent across a full queue
+/// ([`push_latest`]).
+async fn snapshot_task(clock_rx: watch::Receiver<Option<ClockState>>, out: mpsc::Sender<HostMsg>) {
+    push_latest(clock_rx, out, |clock| HostMsg::StateSnapshot {
+        snapshot: StateSnapshot {
+            clock: clock.clone(),
         },
-    ) {
-        return;
-    }
-    while clock_rx.changed().await.is_ok() {
-        let clock = clock_rx.borrow_and_update().clone();
-        if let Push::Stop = push_state(
-            &out,
-            HostMsg::StateSnapshot {
-                snapshot: StateSnapshot { clock },
-            },
-        ) {
-            break;
-        }
-    }
+    })
+    .await;
 }
 
 /// Whether a mount's card lives on the **right** sidebar (#1158/#1160).
@@ -1849,6 +2210,12 @@ fn visibility_source(mount: Mount, ctx: &ListenerCtx) -> watch::Receiver<bool> {
 /// receives the frame, and a bar mount gets a constant `true` seed instead (its
 /// chip is always on-screen; see `serve_conn`, #438), never this change loop.
 ///
+/// Convergent across a full queue, by [`push_latest`]'s rule — a permit first,
+/// the value second — written out here rather than calling it because of the
+/// #542 re-seed below. This is the push that rule exists for: a close that met
+/// a full queue used to be dropped until the *next* toggle, and a plugin that
+/// parks its pollers on `SlotVisible` went on sampling a closed sidebar.
+///
 /// #542: when `now_playing_rx` is `Some` (a gated now-playing subscriber), the
 /// unpark rising edge (`false`→`true`) additionally re-seeds the current
 /// now-playing **after** the `SlotVisibility(true)` frame. A parked card drops
@@ -1856,31 +2223,37 @@ fn visibility_source(mount: Mount, ctx: &ListenerCtx) -> watch::Receiver<bool> {
 /// this re-seed it would resume showing a stale/stopped track until the next
 /// change. Carrying it here — rather than in a separate task — is what
 /// guarantees the ordering: the plugin flips `visible` before it adopts the
-/// re-seeded track (a separate task would race the visibility frame).
-async fn visibility_task(
+/// re-seeded track (a separate task would race the visibility frame). The edge
+/// is taken against what the plugin was last **told**, not what this task last
+/// saw: a close and reopen that both happened while the queue was full never
+/// reached the plugin, which therefore never parked and is owed no re-seed.
+pub(super) async fn visibility_task(
     mut visibility_rx: watch::Receiver<bool>,
     now_playing_rx: Option<watch::Receiver<NowPlaying>>,
     out: mpsc::Sender<HostMsg>,
 ) {
-    // Seed at register (the watch replays its current value).
-    let mut visible = *visibility_rx.borrow_and_update();
-    if let Push::Stop = push_state(&out, HostMsg::SlotVisibility { visible }) {
-        return;
-    }
-    while visibility_rx.changed().await.is_ok() {
-        let now_visible = *visibility_rx.borrow_and_update();
-        let rising = now_visible && !visible;
-        visible = now_visible;
-        if let Push::Stop = push_state(&out, HostMsg::SlotVisibility { visible }) {
-            break;
-        }
+    // What the plugin was last told; `None` until the register seed is queued.
+    let mut told: Option<bool> = None;
+    loop {
+        let Ok(permit) = out.reserve().await else {
+            return;
+        };
+        let visible = *visibility_rx.borrow_and_update();
+        permit.send(HostMsg::SlotVisibility { visible });
+        let rising = visible && told == Some(false);
+        told = Some(visible);
         // #542: re-seed the current now-playing on the unpark edge, ordered
-        // after the `SlotVisibility(true)` frame above.
+        // after the `SlotVisibility(true)` frame above (one task, one FIFO).
         if rising && let Some(np_rx) = now_playing_rx.as_ref() {
-            let now_playing = np_rx.borrow().clone();
-            if let Push::Stop = push_state(&out, HostMsg::NowPlaying { now_playing }) {
-                break;
-            }
+            let Ok(permit) = out.reserve().await else {
+                return;
+            };
+            permit.send(HostMsg::NowPlaying {
+                now_playing: np_rx.borrow().clone(),
+            });
+        }
+        if visibility_rx.changed().await.is_err() {
+            return;
         }
     }
 }
@@ -1988,18 +2361,11 @@ pub(super) async fn page_task(
 /// is live (#396): `install`'s `StyleManager` listener re-publishes on every
 /// accent/scheme change, which lands here as an additional `watch` update
 /// exactly like a late startup resolve.
-async fn accent_task(mut accent_rx: watch::Receiver<Option<[u8; 4]>>, out: mpsc::Sender<HostMsg>) {
-    // Seed at register (the watch replays its current value).
-    let initial = *accent_rx.borrow_and_update();
-    if let Push::Stop = push_state(&out, HostMsg::Accent { color: initial }) {
-        return;
-    }
-    while accent_rx.changed().await.is_ok() {
-        let color = *accent_rx.borrow_and_update();
-        if let Push::Stop = push_state(&out, HostMsg::Accent { color }) {
-            break;
-        }
-    }
+///
+/// Convergent across a full queue ([`push_latest`]): a skin change that met a
+/// full queue used to leave the plugin on the old tint until the next one.
+async fn accent_task(accent_rx: watch::Receiver<Option<[u8; 4]>>, out: mpsc::Sender<HostMsg>) {
+    push_latest(accent_rx, out, |color| HostMsg::Accent { color: *color }).await;
 }
 
 /// Push the latest audio spectrum on subscribe and on every change, coalescing
@@ -2008,6 +2374,11 @@ async fn accent_task(mut accent_rx: watch::Receiver<Option<[u8; 4]>>, out: mpsc:
 /// only ever receives real `{peak, bins}` frames. Spawned **only** for a
 /// connection that subscribes [`StateKey::AudioSpectrum`] (#305) — an
 /// unsubscribed plugin never receives the frame.
+///
+/// The one push left on the lossy [`push_state`], deliberately: it is a ~20 Hz
+/// **stream**, so a frame dropped on a full queue is superseded by the next one
+/// ~50 ms later, and the level pushes beside it ([`push_latest`]) are handed
+/// each freed slot ahead of it rather than fighting it for one.
 ///
 /// #559: this task also owns the connection's demand on the capture tap via a
 /// [`SpectrumDemand`] guard. The tap is only worth running while the card is
@@ -2068,63 +2439,43 @@ async fn spectrum_task(
 /// [`accent_task`]; an empty list is meaningful ("no upcoming events"), so — unlike
 /// [`spectrum_task`] — it is always sent. Spawned only for a connection that passes
 /// [`push_gate`] for [`StateKey::CalendarUpcoming`] (subscribed + `Capability::Calendar`).
+/// Convergent across a full queue ([`push_latest`]).
 async fn calendar_task(
-    mut calendar_rx: watch::Receiver<Vec<UpcomingEvent>>,
+    calendar_rx: watch::Receiver<Vec<UpcomingEvent>>,
     out: mpsc::Sender<HostMsg>,
 ) {
-    let initial = calendar_rx.borrow_and_update().clone();
-    if let Push::Stop = push_state(&out, HostMsg::CalendarUpcoming { events: initial }) {
-        return;
-    }
-    while calendar_rx.changed().await.is_ok() {
-        let events = calendar_rx.borrow_and_update().clone();
-        if let Push::Stop = push_state(&out, HostMsg::CalendarUpcoming { events }) {
-            break;
-        }
-    }
+    push_latest(calendar_rx, out, |events| HostMsg::CalendarUpcoming {
+        events: events.clone(),
+    })
+    .await;
 }
 
 /// Push the session-locked hint on subscribe (the register seed, so a plugin
 /// starts in the right state) and on every change, latest-wins (#484). Mirrors
 /// [`visibility_task`]; spawned only for a connection that passes [`push_gate`]
 /// for [`StateKey::SessionLocked`] (subscribed + `Capability::SessionState`).
-async fn locked_task(mut locked_rx: watch::Receiver<bool>, out: mpsc::Sender<HostMsg>) {
-    let initial = *locked_rx.borrow_and_update();
-    if let Push::Stop = push_state(&out, HostMsg::SessionLocked { locked: initial }) {
-        return;
-    }
-    while locked_rx.changed().await.is_ok() {
-        let locked = *locked_rx.borrow_and_update();
-        if let Push::Stop = push_state(&out, HostMsg::SessionLocked { locked }) {
-            break;
-        }
-    }
+///
+/// Convergent across a full queue ([`push_latest`]) — an edge, like
+/// visibility: an unlock that met a full queue used to leave the plugin
+/// believing the session locked until the next lock.
+async fn locked_task(locked_rx: watch::Receiver<bool>, out: mpsc::Sender<HostMsg>) {
+    push_latest(locked_rx, out, |locked| HostMsg::SessionLocked {
+        locked: *locked,
+    })
+    .await;
 }
 
 /// Push the now-playing digest on subscribe and on every change, coalescing bursts
 /// latest-wins via `borrow_and_update` (#528). Mirrors [`accent_task`]; the empty,
 /// not-playing default is meaningful, so it is always sent. Spawned only for a
 /// connection that passes [`push_gate`] for [`StateKey::NowPlaying`]
-/// (subscribed + `Capability::NowPlaying`).
-async fn now_playing_task(
-    mut now_playing_rx: watch::Receiver<NowPlaying>,
-    out: mpsc::Sender<HostMsg>,
-) {
-    let initial = now_playing_rx.borrow_and_update().clone();
-    if let Push::Stop = push_state(
-        &out,
-        HostMsg::NowPlaying {
-            now_playing: initial,
-        },
-    ) {
-        return;
-    }
-    while now_playing_rx.changed().await.is_ok() {
-        let now_playing = now_playing_rx.borrow_and_update().clone();
-        if let Push::Stop = push_state(&out, HostMsg::NowPlaying { now_playing }) {
-            break;
-        }
-    }
+/// (subscribed + `Capability::NowPlaying`). Convergent across a full queue
+/// ([`push_latest`]).
+async fn now_playing_task(now_playing_rx: watch::Receiver<NowPlaying>, out: mpsc::Sender<HostMsg>) {
+    push_latest(now_playing_rx, out, |now_playing| HostMsg::NowPlaying {
+        now_playing: now_playing.clone(),
+    })
+    .await;
 }
 
 /// Surface a plugin's `Log` frame at the matching host `tracing` level.

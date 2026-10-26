@@ -18,9 +18,8 @@ use hytte::services::pipewire;
 use hytte_plugin_proto::{
     AudioSpectrum, Capability, ClockState, DatasourceError, DatasourceOutcome, Effect, HostMsg,
     LogLevel, MAX_BODY_TEXT_BYTES, MAX_DISPLAY_TEXT_BYTES, MAX_FRAME_VALUES, MAX_PLUGIN_ID_BYTES,
-    Manifest, Mount,
-    NowPlaying, PluginMsg, ProtoError, StateKey, StateSnapshot, UpcomingEvent, VOCAB, read_frame,
-    wire, write_frame,
+    Manifest, Mount, NowPlaying, PluginMsg, ProtoError, StateKey, StateSnapshot, UpcomingEvent,
+    VOCAB, read_frame, wire, write_frame,
 };
 use tokio::net::UnixStream;
 use tokio::net::unix::OwnedWriteHalf;

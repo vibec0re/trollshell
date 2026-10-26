@@ -134,6 +134,10 @@ where
         R: DeserializeOwned + Type + 'static,
         A: Send + Sync + 'static,
     {
+        // The epoch the first attempt is issued under, read *before* it is
+        // issued. Read after the failure instead, it misses a reconnect that
+        // completed while the attempt was in flight; see `wait_for_reconnect`.
+        let issued_at = self.shared.epoch();
         let attempt_one = self.do_call::<R>().await;
         match (attempt_one, self.retry) {
             (Ok(r), _) => Ok(r),
@@ -143,7 +147,7 @@ where
                 // Wait for the supervisor to re-establish the connection (epoch
                 // advances) before retrying. This avoids an immediate second
                 // attempt that would also fail if the supervisor hasn't reconnected.
-                wait_for_reconnect(&self.shared, self.timeout).await;
+                wait_for_reconnect(&self.shared, issued_at, self.timeout).await;
                 self.do_call::<R>().await
             }
             (Err(e), RetryPolicy::Backoff { max_attempts }) => {
@@ -351,18 +355,39 @@ where
     Err(last)
 }
 
-/// Wait until the connection epoch advances (indicating the supervisor has
-/// successfully reconnected), or until `deadline` expires. Used by the
+/// Wait until the connection epoch has advanced past `issued_at` — the epoch
+/// the failed attempt was issued under — indicating the supervisor has
+/// reconnected since, or until `deadline` expires. Used by the
 /// `RetryPolicy::Once` path to avoid an immediate retry that would also fail.
-async fn wait_for_reconnect(shared: &SharedConnection, timeout: Duration) {
-    let current_epoch = shared.epoch();
+///
+/// **The baseline is the caller's, read before the attempt, not read here.**
+/// Until this took `issued_at` it read the epoch itself, after the attempt had
+/// already failed. A bus restart with several calls in flight is the case that
+/// breaks: whichever call notices first clears the cached connection, the
+/// supervisor reinstalls one in milliseconds, and every call whose failure
+/// surfaces after that read the *new* epoch as its baseline — so it waited for
+/// a second reconnect that nothing was going to perform, and slept the whole
+/// `timeout.min(5 s)` before a retry that then succeeded at once.
+/// `tests/call.rs` pins it both ways: deterministically, with the reconnect
+/// completed before any in-flight call fails, and end to end across a broker
+/// restart.
+///
+/// A reconnect that has already happened therefore returns at once, without
+/// subscribing. The epoch is bumped only after the new connection is installed
+/// (`supervisor_loop`), so an epoch past `issued_at` always has a connection
+/// behind it — unless it has failed again since, in which case the retry meets
+/// that and reports it, the same answer `Once` gives any second failure.
+async fn wait_for_reconnect(shared: &SharedConnection, issued_at: u64, timeout: Duration) {
+    if shared.epoch() > issued_at {
+        return;
+    }
     let mut epoch_stream = shared.epoch_signal().to_stream();
     // Give the supervisor a reasonable time to reconnect, bounded by the
     // caller's overall timeout (so fire_and_forget paths don't wait forever).
     let deadline = timeout.min(Duration::from_secs(5));
     let _ = tokio::time::timeout(deadline, async {
         while let Some(epoch) = epoch_stream.next().await {
-            if epoch > current_epoch {
+            if epoch > issued_at {
                 return;
             }
         }

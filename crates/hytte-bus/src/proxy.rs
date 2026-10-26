@@ -2,7 +2,7 @@
 //!
 //! See spec section 3.5.
 
-use crate::connection::SharedConnection;
+use crate::connection::{Generation, SharedConnection};
 use crate::error::BusError;
 use crate::handle::HandleTracker;
 use futures_signals::signal::{Mutable, Signal, SignalExt};
@@ -35,6 +35,21 @@ pub enum ProxyState {
 
 // ── Inner state ────────────────────────────────────────────────────────────────
 
+/// The cached `zbus::Proxy`, together with the [`Generation`] of the shared
+/// connection it was built on.
+///
+/// The generation travels with the proxy because it is the only thing that can
+/// say which connection a failure on *this* proxy belongs to.
+/// [`BusProxy::call`] hands it to
+/// [`SharedConnection::invalidate_if_generation`]; see there for the two
+/// windows in which the epoch it used to snapshot instead named the wrong
+/// connection.
+#[derive(Clone)]
+struct CachedProxy {
+    proxy: zbus::Proxy<'static>,
+    built_on: Generation,
+}
+
 struct ProxyInner {
     shared: SharedConnection,
     destination: String,
@@ -45,7 +60,7 @@ struct ProxyInner {
     /// (`PeerGone`). Cleared explicitly on those transitions so that `call()`
     /// fast-fails with `BusError::Transient` instead of attempting I/O on a
     /// dead connection.
-    cached: RwLock<Option<zbus::Proxy<'static>>>,
+    cached: RwLock<Option<CachedProxy>>,
     /// The `NameOwnerChanged` match rule for [`Self::destination`], built once
     /// by [`ProxyBuilder::build`].
     ///
@@ -119,14 +134,14 @@ impl BusProxy {
         A: Serialize + Type,
         R: DeserializeOwned + Type,
     {
-        // Snapshot the epoch before the call so a transient failure only
-        // invalidates the connection it was actually issued on.
-        let epoch = self.inner.shared.epoch();
-
         // Clone the cheap `zbus::Proxy` handle out of the cache and release the
         // read lock immediately, so a slow call cannot block the watcher from
-        // rebuilding the cache during a reconnect.
-        let proxy = {
+        // rebuilding the cache during a reconnect. It comes with the
+        // generation it was built on, so a transient failure only invalidates
+        // the connection the call was actually issued on — not one a reconnect
+        // installed since, which an epoch snapshot taken here could not tell
+        // apart from it (`SharedConnection::invalidate_if_generation`).
+        let CachedProxy { proxy, built_on } = {
             let guard = self.inner.cached.read().await;
             guard.as_ref().cloned().ok_or_else(|| {
                 let sentinel = zbus::Error::FDO(Box::new(zbus::fdo::Error::Disconnected(
@@ -146,7 +161,7 @@ impl BusProxy {
             Ok(v) => Ok(v),
             Err(e) => {
                 if e.is_transient() {
-                    self.inner.shared.invalidate_if_epoch(epoch).await;
+                    self.inner.shared.invalidate_if_generation(built_on).await;
                 }
                 Err(e)
             }
@@ -273,9 +288,9 @@ async fn do_rebuild_proxy_cache(inner: &Arc<ProxyInner>) -> Result<(), BusError>
     let path = inner.path.clone();
     let iface = inner.iface.clone();
 
-    let new_proxy = inner
+    let (proxy, built_on) = inner
         .shared
-        .with_conn(|conn| {
+        .with_conn_tagged(|conn| {
             let dest = dest.clone();
             let path = path.clone();
             let iface = iface.clone();
@@ -288,7 +303,7 @@ async fn do_rebuild_proxy_cache(inner: &Arc<ProxyInner>) -> Result<(), BusError>
         .await?;
 
     let mut cached = inner.cached.write().await;
-    *cached = Some(new_proxy);
+    *cached = Some(CachedProxy { proxy, built_on });
     Ok(())
 }
 

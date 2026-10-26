@@ -127,7 +127,8 @@
 //! Playback status is not an input to any of this: expand and collapse are
 //! purely about whether there is room on the bar (Annika's standing correction
 //! on #838). The container's visibility follows `mpris::active_player()` and
-//! nothing else.
+//! `is_empty_idle` (#1467: a stopped player with no title has nothing to
+//! show) and nothing else.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -135,7 +136,7 @@ use std::rc::Rc;
 use hytte::adw::{self, prelude::*};
 use hytte::gtk::{self, gdk, glib};
 use hytte::prelude::*;
-use hytte::services::mpris::{self, Player};
+use hytte::services::mpris::{self, PlaybackStatus, Player};
 
 use self::frozen_size::FrozenSize;
 use crate::components::mpris_controls::{bind_transport_button, play_pause_icon};
@@ -586,10 +587,19 @@ fn wire_visibility_and_state(
             Some(player) => {
                 *current_bus.borrow_mut() = Some(player.bus_name.clone());
                 apply_player_to_widgets(&player, &chips);
-                bin.set_visible(true);
+                bin.set_visible(!is_empty_idle(&player));
             }
         },
     );
+}
+
+/// A player that is `Stopped` and has no title has nothing to show (#1467), so
+/// the chip hides rather than render an empty row. A title that is empty or
+/// whitespace-only counts as absent: `Player::title` is a plain `String` that
+/// is `""` when the metadata carries no `xesam:title`. Paused and playing
+/// players always show.
+fn is_empty_idle(player: &Player) -> bool {
+    player.status == PlaybackStatus::Stopped && player.title.trim().is_empty()
 }
 
 fn apply_player_to_widgets(player: &Player, chips: &Chips) {
@@ -608,6 +618,41 @@ fn apply_player_to_widgets(player: &Player, chips: &Chips) {
     let icon_name = play_pause_icon(player.status);
     if let Some(img) = chips.play_pause_btn.child().and_downcast::<gtk::Image>() {
         img.set_icon_name(Some(icon_name));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PlaybackStatus, Player, is_empty_idle};
+
+    fn player(status: PlaybackStatus, title: &str) -> Player {
+        Player {
+            status,
+            title: title.to_owned(),
+            ..Player::default()
+        }
+    }
+
+    #[test]
+    fn stopped_without_a_title_hides() {
+        assert!(is_empty_idle(&player(PlaybackStatus::Stopped, "")));
+        assert!(is_empty_idle(&player(PlaybackStatus::Stopped, "  \t")));
+    }
+
+    #[test]
+    fn stopped_with_a_title_shows() {
+        assert!(!is_empty_idle(&player(PlaybackStatus::Stopped, "Song")));
+    }
+
+    #[test]
+    fn paused_without_a_title_shows() {
+        assert!(!is_empty_idle(&player(PlaybackStatus::Paused, "")));
+    }
+
+    #[test]
+    fn playing_shows() {
+        assert!(!is_empty_idle(&player(PlaybackStatus::Playing, "")));
+        assert!(!is_empty_idle(&player(PlaybackStatus::Playing, "Song")));
     }
 }
 

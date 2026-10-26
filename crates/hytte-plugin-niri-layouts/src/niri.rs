@@ -149,14 +149,18 @@ impl SocketTransport {
     /// Dial `path` within `deadline`. `UnixStream::connect` has no timeout and
     /// blocks while niri's listen backlog is full, so it runs on a helper
     /// thread the caller stops waiting for at the deadline (the thread ends
-    /// when the connect does).
+    /// when the connect does). A thread that cannot be created (the unit at
+    /// its tasks limit) is this request's error, not a panic.
     fn connect(&self, path: &Path, deadline: Instant) -> Result<UnixStream, String> {
         let (tx, rx) = std::sync::mpsc::channel();
         let path = path.to_owned();
-        std::thread::spawn(move || {
-            // The receiver may be gone after a timeout; the stream just drops.
-            drop(tx.send(UnixStream::connect(path)));
-        });
+        std::thread::Builder::new()
+            .name("niri-layouts-connect".to_owned())
+            .spawn(move || {
+                // The receiver may be gone after a timeout; the stream just drops.
+                drop(tx.send(UnixStream::connect(path)));
+            })
+            .map_err(|e| format!("cannot reach niri over $NIRI_SOCKET: no connect thread: {e}"))?;
         match rx.recv_timeout(self.remaining(deadline)?) {
             Ok(Ok(stream)) => Ok(stream),
             Ok(Err(e)) => Err(format!("cannot reach niri over $NIRI_SOCKET: {e}")),

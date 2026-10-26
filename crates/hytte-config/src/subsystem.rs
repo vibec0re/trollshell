@@ -3542,6 +3542,14 @@ fn remove_leaf(
 /// in the array, and every other marker (including `_locked`), are untouched.
 /// A malformed marker (not an array) is left alone — `malformed_unset` reports
 /// it and this writer does not guess.
+///
+/// Scope: only the leaf's **own** table's `_unset`. Its names are literal keys
+/// of that table, not paths (see `merge.rs`). A hand-written marker on a
+/// *parent* table (e.g. root `_unset = ["core"]`) still erases the base table,
+/// so resetting `core.brightness` then lands on the code default. That is
+/// deliberate: removing a parent marker would un-erase sibling keys the user
+/// may still want gone. [`remove_leaf`] applies this at the leaf's own table
+/// only, for the same reason.
 fn drop_unset_entry(table: &mut dyn toml_edit::TableLike, key: &str) {
     let Some(array) = table
         .get_mut(merge::UNSET_KEY)
@@ -8670,6 +8678,35 @@ label = "Borealis"
         let (_dir, path) = scratch("[core]\n_unset = [\"label\", \"brightness\"]\n");
         save_leaf(&path, "core.brightness", None, &BTreeSet::new()).expect("resets");
         assert_eq!(unset_names(&read(&path), "core"), ["label"]);
+    }
+
+    /// A multi-line `_unset` array: removing the first or the last element
+    /// leaves valid TOML and the other elements with their formatting.
+    ///
+    /// A comment attached to the removed element goes with it, matching
+    /// `remove_keeping_closing_space`: a comment describes the value that is
+    /// going away.
+    #[test]
+    fn a_reset_in_a_multi_line_unset_array_keeps_the_rest_intact() {
+        let text = "[core]\n_unset = [\n    \"brightness\",\n    \"label\",\n    \"palette\",\n]\n";
+        let (_dir, path) = scratch(text);
+        save_leaf(&path, "core.brightness", None, &BTreeSet::new()).expect("resets first");
+        let after = read(&path);
+        assert_eq!(unset_names(&after, "core"), ["label", "palette"], "{after}");
+        assert!(after.contains("\n    \"label\","), "{after}");
+        assert!(after.contains("\n    \"palette\","), "{after}");
+        assert!(after.contains("\n]"), "{after}");
+
+        let (_dir, path) = scratch(text);
+        save_leaf(&path, "core.palette", None, &BTreeSet::new()).expect("resets last");
+        let after = read(&path);
+        assert_eq!(
+            unset_names(&after, "core"),
+            ["brightness", "label"],
+            "{after}"
+        );
+        assert!(after.contains("\n    \"brightness\","), "{after}");
+        assert!(after.contains("\n    \"label\""), "{after}");
     }
 
     /// An emptied `_unset` array is removed, not left as `_unset = []`.

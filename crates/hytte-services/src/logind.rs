@@ -118,8 +118,12 @@ static SESSION_LOCKED: OnceLock<Mutable<bool>> = OnceLock::new();
 
 /// A signal of the session's logind `LockedHint` — `true` while the session is
 /// locked (#484). Sourced from `org.freedesktop.login1.Session.LockedHint` on the
-/// **system** bus, tracked live via [`hytte_bus::property`] so an unlock (a
-/// swaylock `SetLockedHint(false)`, `loginctl unlock-session`) flips it back.
+/// **system** bus, tracked live via [`hytte_bus::property`] so whatever sets
+/// the hint is reflected live. Nothing in the swaylock + swayidle stack does:
+/// `loginctl lock-session` only emits `Lock` without touching the hint, mainline
+/// swaylock never talks to logind, and swayidle calls only `SetIdleHint`. With
+/// that stack this signal stays `false` (and plugins' `SessionLocked` never goes
+/// true) unless the locker or the `Lock` bridge calls `SetLockedHint` itself.
 ///
 /// Starts `false` (unlocked) — the safe default for a shell in use (sensitive
 /// content shows, "first unlock" actions still fire) — and holds there until the

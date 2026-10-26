@@ -19,16 +19,18 @@
 //!
 //! This window has no address bar, no back button, and a header that asserts
 //! an identity. So the page it embeds gets **one origin** and no ability to
-//! open windows: [`crate::page::navigable_in_place`] decides, `decide-policy`
-//! enforces, and everything refused is handed to the desktop's default handler
-//! so a legitimate link in the agent's feed still works — in a browser, where
-//! the operator can see where they are. See `navigable_in_place`'s docs for
-//! the failure this prevents.
+//! open windows: [`crate::page::decide`] decides, `decide-policy` and `create`
+//! enforce, and a refused link the operator **clicked** is handed to the
+//! desktop's default handler so it still works — in a browser, where the
+//! operator can see where they are. A refused load nobody clicked goes
+//! nowhere: the page is agent output, and the desktop is not its to drive.
+//! See `navigable_in_place`'s and `decide`'s docs for the failures these
+//! prevent.
 
 use adw::prelude::*;
 use webkit::prelude::*;
 
-use crate::page::navigable_in_place;
+use crate::page::{Decision, Refusal, Target, decide, may_leave};
 use crate::tls::{CERT_ENV, Pinned, Resolved, TlsPolicy, failure_description};
 
 /// The `Stack` child names — the page, and the TLS failure state that replaces
@@ -137,7 +139,7 @@ pub fn page(url: &str, trust: &Resolved) -> gtk::Widget {
     let error = failed.clone();
     let tried = trust.tried.clone();
     view.connect_load_failed_with_tls_errors(move |_, failing_uri, _cert, errors| {
-        let host = crate::tls::host_of(failing_uri).unwrap_or(failing_uri);
+        let host = crate::tls::host_of(failing_uri).unwrap_or_else(|| failing_uri.to_owned());
         tracing::warn!(
             uri = failing_uri,
             ?errors,
@@ -155,7 +157,7 @@ pub fn page(url: &str, trust: &Resolved) -> gtk::Widget {
         // </dev/null` reads as an unopened closing tag) — escape at this
         // sink, the one place this text becomes a description. See
         // `tls::failure_message`'s docs (#1224).
-        error.set_description(Some(&failure_description(host, tried.as_deref())));
+        error.set_description(Some(&failure_description(&host, tried.as_deref())));
         sink.set_visible_child_name(TLS_FAILED);
         false
     });
@@ -364,16 +366,28 @@ pub fn is_probe_died(widget: &gtk::Widget) -> bool {
     widget.widget_name() == PROBE_DIED
 }
 
-/// Wire the navigation policy: in-place for the agent's own origin,
-/// `on_refuse` for everything else.
+/// Wire the navigation policy: [`decide`] answers, and this carries the
+/// answer out — in place, `hand_off` for a refused link the operator clicked,
+/// nothing at all for one nobody did.
 ///
-/// Both `NavigationAction` (a click or a `window.location =`) and
-/// `NewWindowAction` (`target="_blank"`) come through `decide-policy`;
-/// `create` is the one that would actually build a second `WebView`, and it
-/// refuses by returning `None`. Without the `create` handler a `_blank` link
-/// silently does nothing at all, which is its own small lie.
+/// Both `NavigationAction` (a click, a `window.location =`, a frame's own
+/// load) and `NewWindowAction` (`target="_blank"`) come through
+/// `decide-policy`; `create` is the one that would actually build a second
+/// `WebView`, and it refuses by returning `None` — after handing a clicked
+/// request off, because a new-window click that silently does nothing at all
+/// is its own small lie.
 ///
-/// # Why `on_refuse` is a parameter
+/// # Each request is handed off at most once
+///
+/// A `NewWindowAction` is **always ignored** in `decide-policy`, because
+/// [`decide`] never answers [`Decision::InPlace`] for one: `use` would only
+/// lead `WebKit` on to `create`, which builds nothing. So a `_blank` link is
+/// decided — and, if clicked, handed off — there, and never reaches `create`.
+/// `create` still asks [`decide`] itself, for a request that arrives there
+/// without passing through `decide-policy` first; either way one request is
+/// one decision and at most one `hand_off`.
+///
+/// # Why `hand_off` is a parameter
 ///
 /// [`page`] passes [`elsewhere`], and that is the **only** call site — nothing
 /// in the tree passes anything else today (#1130 N5, which caught this doc
@@ -387,25 +401,27 @@ pub fn is_probe_died(widget: &gtk::Widget) -> bool {
 /// watching what this hands out is the only way to observe the real handler
 /// through `WebKit`'s real dispatch; until then it costs one parameter and
 /// nothing else. See `gtk_tests`' module doc for why that day is not today.
-fn install_policy(view: &webkit::WebView, embedded: &str, on_refuse: std::rc::Rc<dyn Fn(&str)>) {
-    let origin = embedded.to_owned();
-    let refuse = std::rc::Rc::clone(&on_refuse);
+fn install_policy(view: &webkit::WebView, embedded: &str, hand_off: std::rc::Rc<dyn Fn(&str)>) {
+    let origin = std::rc::Rc::<str>::from(embedded);
+    let (policy_origin, policy_hand_off) =
+        (std::rc::Rc::clone(&origin), std::rc::Rc::clone(&hand_off));
     view.connect_decide_policy(move |_, decision, kind| {
         use webkit::PolicyDecisionType as Kind;
-        let action = match kind {
-            Kind::NavigationAction | Kind::NewWindowAction => decision
-                .downcast_ref::<webkit::NavigationPolicyDecision>()
-                .and_then(webkit::NavigationPolicyDecision::navigation_action),
+        let target = match kind {
+            Kind::NavigationAction => Target::ThisView,
+            Kind::NewWindowAction => Target::NewWindow,
             // A `Response` decision is about how to handle a body we already
             // asked for, on a URI this handler has already admitted. Let the
             // default run.
             _ => return false,
         };
-        let Some(uri) = action
-            .as_ref()
-            .and_then(webkit::NavigationAction::request)
-            .and_then(|r| r.uri())
-        else {
+        let action = decision
+            .downcast_ref::<webkit::NavigationPolicyDecision>()
+            .and_then(webkit::NavigationPolicyDecision::navigation_action);
+        let Some((uri, gesture)) = action.as_ref().and_then(|a| {
+            let uri = a.request().and_then(|r| r.uri())?;
+            Some((uri, a.is_user_gesture()))
+        }) else {
             // No URI to judge: refuse rather than guess. `decide-policy` is
             // the only gate, so "unknown" has to mean "not here".
             tracing::warn!("a navigation with no URI was refused");
@@ -413,22 +429,19 @@ fn install_policy(view: &webkit::WebView, embedded: &str, on_refuse: std::rc::Rc
             return true;
         };
 
-        if navigable_in_place(&origin, &uri) {
+        let answer = decide(&policy_origin, &uri, target, gesture);
+        if answer == Decision::InPlace {
             return false;
         }
-        tracing::info!(
-            %uri,
-            "not this agent's origin — handing it to the desktop's default handler"
-        );
         decision.ignore();
-        refuse(&uri);
+        carry_out(answer, &uri, &*policy_hand_off);
         true
     });
 
     view.connect_create(move |_, action| {
         if let Some(uri) = action.request().and_then(|r| r.uri()) {
-            tracing::info!(%uri, "a page asked for a new window — opening it elsewhere");
-            on_refuse(&uri);
+            let answer = decide(&origin, &uri, Target::NewWindow, action.is_user_gesture());
+            carry_out(answer, &uri, &*hand_off);
         }
         // Never a second `WebView`: this window is one agent's viewer, and a
         // popup inside it would carry this window's chrome and none of its
@@ -437,14 +450,43 @@ fn install_policy(view: &webkit::WebView, embedded: &str, on_refuse: std::rc::Rc
     });
 }
 
+/// Do what a refusing [`Decision`] says, with the one log line it gets.
+///
+/// [`Decision::InPlace`] is a no-op here: letting `WebKit` load is the
+/// *absence* of a refusal, which the `decide-policy` handler expresses by
+/// returning `false` before it ever gets here.
+fn carry_out(answer: Decision, uri: &str, hand_off: &dyn Fn(&str)) {
+    match answer {
+        Decision::InPlace => {}
+        Decision::Desktop => {
+            tracing::info!(
+                %uri,
+                "a clicked link that cannot open in this window — handing it to the desktop's \
+                 default handler"
+            );
+            hand_off(uri);
+        }
+        // Debug, not warn: a page that tries this does so on a loop, and the
+        // point of refusing it is that it achieves nothing — including a
+        // journal full of it.
+        Decision::Refuse(Refusal::NoGesture) => tracing::debug!(
+            %uri,
+            "refused: nobody clicked this, and it cannot load in this window (a script, a \
+             redirect, a frame's own load) — it goes nowhere"
+        ),
+        Decision::Refuse(Refusal::Scheme) => {
+            tracing::warn!(%uri, "refused: only http(s) links leave this window");
+        }
+    }
+}
+
 /// Hand a URI to the desktop, so a refused link still goes somewhere.
 ///
-/// `http`/`https` only — the same three-scheme judgement the shell's own
-/// `OpenUri` broker makes, minus `file:`, because nothing in an agent's turn
-/// stream has a reason to open a local path and this is the one place a
-/// hostile page's string reaches a launcher.
+/// [`may_leave`] asks again here even though [`decide`] already did: this is
+/// the one place a hostile page's string reaches a launcher, so it carries
+/// the scheme test itself rather than trusting every caller to have run it.
 fn elsewhere(uri: &str) {
-    if !(uri.starts_with("https://") || uri.starts_with("http://")) {
+    if !may_leave(uri) {
         tracing::warn!(%uri, "refused: only http(s) links leave this window");
         return;
     }
@@ -563,8 +605,9 @@ mod gtk_tests {
     /// | claim | where |
     /// | --- | --- |
     /// | which URIs may load in place | `page::navigable_in_place`'s tests — hermetic, and the mutation reds |
+    /// | which refusals reach the desktop (a click on http(s), nothing else) | `page::decide`'s tests — hermetic, and the mutations red |
     /// | the page cannot open windows or reach `data:`/`file:` | [`the_settings_are_the_ones_we_state`] below, on the real `Settings` object |
-    /// | the handler is installed and refuses through `WebKit`'s dispatch | **live-verify** (`docs/live-verify.md`, "The view stays on the hive") — it needs a machine with a working web process |
+    /// | the handler is installed, refuses through `WebKit`'s dispatch, and `is_user_gesture` reads true for a click and false for a frame or a script | **live-verify** (`docs/live-verify.md`, "The view stays on the hive" and "Nothing opens without a click") — it needs a machine with a working web process |
     ///
     /// [`the_settings_are_the_ones_we_state`]: gtk_tests::the_settings_are_the_ones_we_state
     /// **The page's permissions are the ones this file states**, read back off

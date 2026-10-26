@@ -89,12 +89,12 @@ fn build_display_row(o: &Output) -> adw::ActionRow {
         format!("Enabled, scale {:.1}\u{00d7}", o.scale)
     };
 
-    let row = adw::ActionRow::builder()
-        .title(&title)
-        .subtitle(&subtitle)
-        .build();
-    // Make/model come straight out of the monitor's EDID (#753).
+    let row = adw::ActionRow::new();
+    // Make/model come straight out of the monitor's EDID (#753). Off before
+    // the text is set (#1564).
     markup::plain_text(&row);
+    row.set_title(&title);
+    row.set_subtitle(&subtitle);
     // Long-form titles or driver-injected EDIDs can blow the modal width;
     // let title and subtitle wrap rather than push the surface.
     row.set_subtitle_lines(0);

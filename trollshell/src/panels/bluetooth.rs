@@ -73,29 +73,7 @@ pub fn panel_bluetooth() -> gtk::Widget {
 fn build_bluetooth_header() -> gtk::Widget {
     let group = adw::PreferencesGroup::new();
 
-    let row = adw::ActionRow::builder().title("Bluetooth").build();
-    // The adapter's own name is `bluetoothctl system-alias`-settable free
-    // text — capped (see `truncate_for_row`) rather than letting it push the
-    // drawer wider (#1302); `subtitle_lines(1)` is a second line of defense
-    // and the tooltip mirrors the full text.
-    //
-    // Free text as Pango markup too: `bluetoothd` defaults the alias to the
-    // *pretty* hostname, where `Annika's Laptop & Dock` is a fine name and a
-    // markup parse error that blanked the subtitle. The device rows below
-    // already render plain (#753).
-    markup::plain_text(&row);
-    row.set_subtitle_lines(1);
-    bind(
-        bluetooth::adapter().map(|a| match a {
-            Some(ad) => ad.name,
-            None => "No Bluetooth adapter".to_string(),
-        }),
-        &row,
-        |w, name| {
-            w.set_subtitle(&truncate_for_row(&name));
-            w.set_tooltip_text(Some(&name));
-        },
-    );
+    let row = build_header_row(bluetooth::adapter());
 
     let power_switch = gtk::Switch::new();
     power_switch.set_valign(gtk::Align::Center);
@@ -118,24 +96,52 @@ fn build_bluetooth_header() -> gtk::Widget {
     group.upcast()
 }
 
-/// Adapter sub-controls: Discoverable + Scan. Disabled when the adapter is
-/// off or absent, so toggling Power is the obvious entry point.
-fn build_bluetooth_controls() -> gtk::Widget {
-    let group = adw::PreferencesGroup::new();
+/// The header's "Bluetooth" row with the adapter name as its subtitle, over an
+/// injected adapter signal — the seam the markup test drives without the
+/// Bluetooth service registered (#1564).
+fn build_header_row(
+    adapter: impl Signal<Item = Option<bluetooth::Adapter>> + 'static,
+) -> adw::ActionRow {
+    let row = adw::ActionRow::new();
+    // The adapter's own name is `bluetoothctl system-alias`-settable free
+    // text — capped (see `truncate_for_row`) rather than letting it push the
+    // drawer wider (#1302); `subtitle_lines(1)` is a second line of defense
+    // and the tooltip mirrors the full text.
+    //
+    // Free text as Pango markup too: `bluetoothd` defaults the alias to the
+    // *pretty* hostname, where `Annika's Laptop & Dock` is a fine name and a
+    // markup parse error that blanked the subtitle. The device rows below
+    // already render plain (#753).
+    markup::plain_text(&row);
+    row.set_title("Bluetooth");
+    row.set_subtitle_lines(1);
     bind(
-        bluetooth::adapter().map(|a| a.is_some_and(|ad| ad.powered)),
-        &group,
-        gtk::prelude::WidgetExt::set_sensitive,
+        adapter.map(|a| match a {
+            Some(ad) => ad.name,
+            None => "No Bluetooth adapter".to_string(),
+        }),
+        &row,
+        |w, name| {
+            w.set_subtitle(&truncate_for_row(&name));
+            w.set_tooltip_text(Some(&name));
+        },
     );
+    row
+}
 
-    // Discoverable
-    let disc_row = adw::ActionRow::builder().title("Discoverable").build();
+/// The "Discoverable" row with its "Visible as …" subtitle, over an injected
+/// adapter signal — the seam the markup test drives (#1564).
+fn build_discoverable_row(
+    adapter: impl Signal<Item = Option<bluetooth::Adapter>> + 'static,
+) -> adw::ActionRow {
+    let disc_row = adw::ActionRow::new();
     // Same free-text adapter name as the header row above (#1302), and plain
-    // for the same reason (#753).
+    // for the same reason (#753). Off before the title is set (#1564).
     markup::plain_text(&disc_row);
+    disc_row.set_title("Discoverable");
     disc_row.set_subtitle_lines(1);
     bind(
-        bluetooth::adapter().map(|a| match a {
+        adapter.map(|a| match a {
             Some(ad) if ad.discoverable && !ad.name.is_empty() => {
                 format!("Visible as \u{201c}{}\u{201d}", ad.name)
             }
@@ -148,6 +154,21 @@ fn build_bluetooth_controls() -> gtk::Widget {
             row.set_tooltip_text(Some(&text));
         },
     );
+    disc_row
+}
+
+/// Adapter sub-controls: Discoverable + Scan. Disabled when the adapter is
+/// off or absent, so toggling Power is the obvious entry point.
+fn build_bluetooth_controls() -> gtk::Widget {
+    let group = adw::PreferencesGroup::new();
+    bind(
+        bluetooth::adapter().map(|a| a.is_some_and(|ad| ad.powered)),
+        &group,
+        gtk::prelude::WidgetExt::set_sensitive,
+    );
+
+    // Discoverable
+    let disc_row = build_discoverable_row(bluetooth::adapter());
     let disc_switch = gtk::Switch::new();
     disc_switch.set_valign(gtk::Align::Center);
     bind_two_way(
@@ -426,16 +447,15 @@ fn build_device_row(dev: &Device, is_busy: bool) -> adw::ActionRow {
     } else {
         "Tap to pair"
     };
-    let row = adw::ActionRow::builder()
-        .title(truncate_for_row(&dev.alias))
-        .subtitle(subtitle)
-        .activatable(true)
-        .build();
+    let row = adw::ActionRow::builder().activatable(true).build();
     // The alias is chosen by whoever is broadcasting, so anyone in radio
     // range controls this title — and the row is activatable (it is what you
     // tap to pair). Markup off rather than escaped: nothing in this row wants
-    // markup, and it covers the subtitle too (#753, cf. #30).
+    // markup, and it covers the subtitle too (#753, cf. #30). Off before the
+    // text is set (#1564).
     markup::plain_text(&row);
+    row.set_title(&truncate_for_row(&dev.alias));
+    row.set_subtitle(subtitle);
     // A broadcast alias is one unbreakable token with no bound — capped (see
     // `truncate_for_row`) rather than letting it push the whole drawer wider
     // (#1302); `title_lines(1)` is a second line of defense.
@@ -581,10 +601,12 @@ fn build_device_menu(dev: &Device, is_busy: bool) -> gtk::MenuButton {
 mod tests {
     use super::{
         Device, PairPrompt, bind_device_groups, bind_pair_prompt_banner, build_device_menu,
-        build_device_row, build_text_entry_row,
+        build_device_row, build_discoverable_row, build_header_row, build_text_entry_row,
     };
+    use crate::components::markup::test_support::{MARKUP_WARNING, assert_shows, child_output, in_child};
     use hytte::adw::{self, prelude::*};
-    use hytte::futures_signals::signal::Mutable;
+    use hytte::futures_signals::signal::{Mutable, always};
+    use hytte::services::bluetooth::Adapter;
     use hytte::gtk;
     use std::collections::HashSet;
 
@@ -835,4 +857,74 @@ mod tests {
              rebuilds this row on every `prompt()` emission (#1176)"
         );
     }
+
+    /// An adapter whose alias is hostile free text (`bluetoothctl
+    /// system-alias` takes anything; the default is the pretty hostname).
+    const HOSTILE_ALIAS: &str = "Annika's Laptop & <b>Dock</b>";
+
+    fn hostile_adapter() -> Adapter {
+        Adapter {
+            name: HOSTILE_ALIAS.to_owned(),
+            discoverable: true,
+            powered: true,
+            ..Adapter::default()
+        }
+    }
+
+    /// The header row shows the adapter alias **literally** (#753).
+    ///
+    /// **Falsification:** delete `markup::plain_text` in `build_header_row`
+    /// → this reds.
+    #[gtk::test]
+    fn the_header_row_shows_the_adapter_alias_literally() {
+        adw::init().expect("libadwaita init");
+        let row = build_header_row(always(Some(hostile_adapter())));
+        pump();
+        assert_shows(&row, HOSTILE_ALIAS);
+    }
+
+    /// Same for the Discoverable row, whose subtitle is `Visible as “alias”`.
+    ///
+    /// **Falsification:** delete `markup::plain_text` in
+    /// `build_discoverable_row` → this reds.
+    #[gtk::test]
+    fn the_discoverable_row_shows_the_adapter_alias_literally() {
+        adw::init().expect("libadwaita init");
+        let row = build_discoverable_row(always(Some(hostile_adapter())));
+        pump();
+        assert_shows(&row, &format!("Visible as \u{201c}{HOSTILE_ALIAS}\u{201d}"));
+    }
+
+    /// Building either row logs no markup warning (#1564).
+    ///
+    /// Both titles are literals, so the alias only ever arrives through the
+    /// bound subtitle, after `plain_text`; there is no order to flip here.
+    ///
+    /// **Falsification:** delete `markup::plain_text` in `build_header_row` →
+    /// this reds (the subtitle parse warns).
+    #[gtk::test]
+    fn building_the_adapter_rows_logs_no_markup_warning() {
+        if in_child() {
+            return;
+        }
+        let out = child_output("panels::bluetooth::tests::adapter_rows_child");
+        assert!(
+            !out.contains(MARKUP_WARNING),
+            "building the rows logged a markup warning: {out}"
+        );
+    }
+
+    /// Child body of [`building_the_adapter_rows_logs_no_markup_warning`].
+    #[gtk::test]
+    fn adapter_rows_child() {
+        if !in_child() {
+            return;
+        }
+        adw::init().expect("libadwaita init");
+        let header = build_header_row(always(Some(hostile_adapter())));
+        let disc = build_discoverable_row(always(Some(hostile_adapter())));
+        pump();
+        drop((header, disc));
+    }
 }
+

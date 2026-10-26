@@ -276,13 +276,15 @@ fn image_row<S>(
 where
     S: hytte::futures_signals::signal::Signal<Item = Option<String>> + 'static,
 {
-    let row = adw::ActionRow::builder().title(title).build();
+    let row = adw::ActionRow::new();
     // The subtitle is the picked image's **file name** — `Tom & Jerry.png`
     // from a downloads folder is an ordinary one — and a per-display row's
     // title is the output's make and model, which come out of the monitor's
     // own EDID. As Pango markup an `&` in either blanked the field; the
-    // Displays panel already renders that same title plain (#753).
+    // Displays panel already renders that same title plain (#753). Off
+    // before the title is set (#1564).
     markup::plain_text(&row);
+    row.set_title(title);
     // Long file paths shouldn't push the modal wide; let the subtitle wrap.
     row.set_subtitle_lines(0);
 

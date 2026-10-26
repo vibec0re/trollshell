@@ -441,12 +441,11 @@ fn bind_all_links<S>(
 /// `pan-down` (expanded) — so the disclosure state is ours, sidestepping
 /// libadwaita's stuck nested-expander arrow (#152).
 fn build_link_row(parent: &adw::ExpanderRow, link: &Link) -> LinkRow {
-    let action = adw::ActionRow::builder()
-        .title(&link.name)
-        .activatable(true)
-        .build();
-    // Interface names are reported by networkd/NM; markup off (#753).
+    let action = adw::ActionRow::builder().activatable(true).build();
+    // Interface names are reported by networkd/NM; markup off (#753), before
+    // the title is set (#1564).
     markup::plain_text(&action);
+    action.set_title(&link.name);
     action.set_title_lines(1);
 
     let pill = pill_label(

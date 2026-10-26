@@ -2342,14 +2342,12 @@ fn build_flapping_tasks_group() -> adw::PreferencesGroup {
         &group,
         flapping_tasks(),
         |task: &TaskHealth| {
-            let row = adw::ActionRow::builder()
-                .title(task.name)
-                .activatable(false)
-                .build();
+            let row = adw::ActionRow::builder().activatable(false).build();
             // Task labels are `&'static str` literals today and the subtitle is
             // generated here, but keeping both literal by construction costs one
             // call and survives a future `name` that interpolates (#753).
             markup::plain_text(&row);
+            row.set_title(task.name);
             row.set_subtitle(&flapping_subtitle(
                 task.state,
                 task.runs,

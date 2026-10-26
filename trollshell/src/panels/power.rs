@@ -68,21 +68,27 @@ fn build_keep_awake_row() -> gtk::ListBox {
 /// One builder so the two cannot drift: the copy is how the mirror missed the
 /// `plain_text` below while this one was being fixed.
 pub(crate) fn keep_awake_switch_row() -> adw::SwitchRow {
+    keep_awake_switch_row_from(screensaver::keep_awake(), screensaver::other_inhibitors())
+}
+
+/// [`keep_awake_switch_row`] over injected signals — the seam a test drives
+/// without registering the screensaver service.
+fn keep_awake_switch_row_from(
+    awake: impl hytte::futures_signals::signal::Signal<Item = bool> + 'static,
+    others: impl hytte::futures_signals::signal::Signal<Item = Vec<Inhibitor>> + 'static,
+) -> adw::SwitchRow {
     let row = keep_awake_row_shell();
 
     // Two-way: the authoritative signal drives `active` (block prevents the
     // programmatic set_active from re-entering the handler); a user flip calls
     // set_keep_awake, which is idempotent so mirrored state can't thrash the fd.
-    bind_two_way(
-        screensaver::keep_awake(),
-        &row,
-        adw::SwitchRow::set_active,
-        |r| r.connect_active_notify(|r| screensaver::set_keep_awake(r.is_active())),
-    );
+    bind_two_way(awake, &row, adw::SwitchRow::set_active, |r| {
+        r.connect_active_notify(|r| screensaver::set_keep_awake(r.is_active()))
+    });
 
     // Subtitle: what else is holding the system awake (Firefox, mpv, screen
     // share, …), so an off toggle doesn't imply the screen will sleep.
-    bind(screensaver::other_inhibitors(), &row, |r, others| {
+    bind(others, &row, |r, others| {
         r.set_subtitle(&keep_awake_subtitle(&others));
     });
 
@@ -98,8 +104,9 @@ pub(crate) fn keep_awake_switch_row() -> adw::SwitchRow {
 /// one carrying a `<span>` restyled the row. Markup is never wanted here
 /// (#753).
 fn keep_awake_row_shell() -> adw::SwitchRow {
-    let row = adw::SwitchRow::builder().title("Keep awake").build();
+    let row = adw::SwitchRow::new();
     markup::plain_text(&row);
+    row.set_title("Keep awake");
     row
 }
 
@@ -265,6 +272,30 @@ mod markup_tests {
         }];
         // What the binding does on every inhibitor change.
         row.set_subtitle(&keep_awake_subtitle(&others));
+        assert_shows(&row, "Also awake: Tom & <b>Jerry</b>");
+    }
+
+    /// The row **both** drawers mount, bindings and all — not just its shell.
+    ///
+    /// **Falsification:** build `keep_awake_switch_row_from`'s row with
+    /// `adw::SwitchRow::builder()` instead of `keep_awake_row_shell()` → this
+    /// reds, where `an_inhibitor_name_is_shown_literally` stays green.
+    #[gtk::test]
+    fn the_mounted_keep_awake_row_shows_an_inhibitor_name_literally() {
+        use super::keep_awake_switch_row_from;
+        use hytte::futures_signals::signal::always;
+
+        adw::init().expect("libadwaita init");
+        let row = keep_awake_switch_row_from(
+            always(false),
+            always(vec![Inhibitor {
+                cookie: 1,
+                application: "Tom & <b>Jerry</b>".to_owned(),
+                reason: "Playing video".to_owned(),
+            }]),
+        );
+        // Let the `bind` apply-loop deliver the first emission.
+        while gtk::glib::MainContext::default().iteration(false) {}
         assert_shows(&row, "Also awake: Tom & <b>Jerry</b>");
     }
 }

@@ -49,7 +49,7 @@ use std::sync::mpsc;
 use std::sync::{OnceLock, PoisonError, RwLock};
 use std::time::Duration as StdDuration;
 
-use chrono::{DateTime, Local, NaiveTime, TimeZone};
+use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
 use futures_signals::signal::{Mutable, Signal};
 use hytte_ecal::sys::ECalClientSourceType;
 use hytte_ecal::{CalClient, CalClientView, MainContext, Registry, Source, Waker};
@@ -866,22 +866,44 @@ fn sort_tasks(a: &Task, b: &Task) -> std::cmp::Ordering {
 }
 
 fn dpt_to_local(dpt: DatePerhapsTime) -> Option<(DateTime<Local>, bool)> {
+    dpt_to_zone(dpt, &Local)
+}
+
+/// [`dpt_to_local`] in an explicit zone, so the DST edges can be tested
+/// against real zones without touching the process-wide `TZ`. Each arm used
+/// to build its instant with `.single()?`, which is `None` when the wall
+/// clock happens twice or never, and `None` here is "no due date" (#1554):
+///
+/// - A date-only `DUE` is the first instant of that day,
+///   [`local_midnight`](crate::calendar::local_midnight): the earlier
+///   midnight on a fold (Havana's November Sunday), the transition on a gap.
+/// - A floating `DUE`, and a `TZID` one whose zone icalendar cannot resolve,
+///   is read by RFC 5545 §3.3.5's rule, through the same
+///   [`hytte_ecal::wall_clock_to_unix`] the calendar reads a floating
+///   `DTSTART` by (#1490): the first occurrence in a fold, the offset before
+///   the gap in a gap, and at a fold's upper bound the instant that reads it
+///   (#1579).
+///
+/// `None` only when the instant is outside chrono's range.
+fn dpt_to_zone<Tz: TimeZone>(dpt: DatePerhapsTime, tz: &Tz) -> Option<(DateTime<Tz>, bool)> {
     match dpt {
-        DatePerhapsTime::Date(d) => {
-            let naive = d.and_time(NaiveTime::from_hms_opt(0, 0, 0)?);
-            Some((Local.from_local_datetime(&naive).single()?, true))
-        }
+        DatePerhapsTime::Date(d) => Some((crate::calendar::local_midnight(d, tz), true)),
         DatePerhapsTime::DateTime(cdt) => match cdt {
-            CalendarDateTime::Utc(dt) => Some((dt.with_timezone(&Local), false)),
-            CalendarDateTime::Floating(naive) => {
-                Some((Local.from_local_datetime(&naive).single()?, false))
-            }
+            CalendarDateTime::Utc(dt) => Some((dt.with_timezone(tz), false)),
+            CalendarDateTime::Floating(naive) => Some((wall_clock_in(tz, naive)?, false)),
             ref other @ CalendarDateTime::WithTimezone { ref date_time, .. } => other
                 .try_into_utc()
-                .map(|utc| (utc.with_timezone(&Local), false))
-                .or_else(|| Some((Local.from_local_datetime(date_time).single()?, false))),
+                .map(|utc| (utc.with_timezone(tz), false))
+                .or_else(|| Some((wall_clock_in(tz, *date_time)?, false))),
         },
     }
+}
+
+/// The instant the wall clock `naive` names in `tz`, by
+/// [`hytte_ecal::wall_clock_to_unix`]'s rule.
+fn wall_clock_in<Tz: TimeZone>(tz: &Tz, naive: NaiveDateTime) -> Option<DateTime<Tz>> {
+    let unix = hytte_ecal::wall_clock_to_unix(tz, naive)?;
+    DateTime::from_timestamp(unix, 0).map(|utc| utc.with_timezone(tz))
 }
 
 fn date_perhaps_time_from_local(dt: DateTime<Local>) -> DatePerhapsTime {
@@ -1114,5 +1136,254 @@ mod tests {
             );
             assert_eq!(s, "Overdue \u{00b7} Yesterday", "today = {today}");
         }
+    }
+
+    // ── A due on a DST transition (#1554, #1579) ─────────────────────────
+    //
+    // `dpt_to_zone` is the zone-parameterised half of `dpt_to_local`, so the
+    // hermetic tests drive it with chrono-tz zones instead of `Local`. Those
+    // never report a fold at its upper bound, which only the real `Local`
+    // does; `a_due_on_a_transition_resolves_in_local` covers that case.
+
+    fn naive(y: i32, m: u32, d: u32, h: u32, mi: u32) -> NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(y, m, d)
+            .unwrap()
+            .and_hms_opt(h, mi, 0)
+            .unwrap()
+    }
+
+    fn utc(y: i32, m: u32, d: u32, h: u32, mi: u32) -> DateTime<chrono::Utc> {
+        chrono::Utc.with_ymd_and_hms(y, m, d, h, mi, 0).unwrap()
+    }
+
+    fn date(y: i32, m: u32, d: u32) -> DatePerhapsTime {
+        DatePerhapsTime::Date(chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap())
+    }
+
+    fn floating(at: NaiveDateTime) -> DatePerhapsTime {
+        DatePerhapsTime::DateTime(CalendarDateTime::Floating(at))
+    }
+
+    fn with_tzid(tzid: &str, at: NaiveDateTime) -> DatePerhapsTime {
+        DatePerhapsTime::DateTime(CalendarDateTime::WithTimezone {
+            date_time: at,
+            tzid: tzid.to_string(),
+        })
+    }
+
+    /// `dpt_to_zone`'s answer as (UTC instant, all-day).
+    fn due_in<Tz: TimeZone>(
+        dpt: DatePerhapsTime,
+        tz: &Tz,
+    ) -> Option<(DateTime<chrono::Utc>, bool)> {
+        dpt_to_zone(dpt, tz).map(|(t, all_day)| (t.with_timezone(&chrono::Utc), all_day))
+    }
+
+    /// A date-only due on a day whose midnight happens twice or never keeps
+    /// its date. Both used to be `None` (`.single()`), i.e. no due date.
+    #[test]
+    fn a_date_only_due_on_a_doubled_or_skipped_midnight_keeps_its_date() {
+        use chrono::MappedLocalTime;
+        use chrono_tz::America::{Havana, Santiago};
+        use chrono_tz::Europe::Berlin;
+
+        assert!(
+            matches!(
+                Havana.from_local_datetime(&naive(2026, 11, 1, 0, 0)),
+                MappedLocalTime::Ambiguous(..)
+            ),
+            "fixture: Havana's 2026-11-01 midnight happens twice"
+        );
+        assert!(
+            matches!(
+                Santiago.from_local_datetime(&naive(2026, 9, 6, 0, 0)),
+                MappedLocalTime::None
+            ),
+            "fixture: Santiago's 2026-09-06 midnight never happens"
+        );
+        // The earlier midnight, 00:00 CDT.
+        assert_eq!(
+            due_in(date(2026, 11, 1), &Havana),
+            Some((utc(2026, 11, 1, 4, 0), true))
+        );
+        // The day's first instant, 01:00 −03.
+        assert_eq!(
+            due_in(date(2026, 9, 6), &Santiago),
+            Some((utc(2026, 9, 6, 4, 0), true))
+        );
+        // An ordinary day is local midnight.
+        assert_eq!(
+            due_in(date(2026, 6, 10), &Berlin),
+            Some((utc(2026, 6, 9, 22, 0), true))
+        );
+    }
+
+    /// A floating due inside a fold is its first occurrence, and one in a gap
+    /// is read with the offset before it (RFC 5545 §3.3.5, #1490). Both used
+    /// to be `None`.
+    #[test]
+    fn a_floating_due_in_a_fold_or_a_gap_keeps_its_time() {
+        use chrono_tz::Europe::Berlin;
+
+        // 02:30 CEST, not the CET repeat at 01:30Z.
+        assert_eq!(
+            due_in(floating(naive(2026, 10, 25, 2, 30)), &Berlin),
+            Some((utc(2026, 10, 25, 0, 30), false))
+        );
+        // Read at +01:00: 03:30 CEST.
+        assert_eq!(
+            due_in(floating(naive(2026, 3, 29, 2, 30)), &Berlin),
+            Some((utc(2026, 3, 29, 1, 30), false))
+        );
+        // Off a transition, unchanged.
+        assert_eq!(
+            due_in(floating(naive(2026, 7, 22, 11, 30)), &Berlin),
+            Some((utc(2026, 7, 22, 9, 30), false))
+        );
+    }
+
+    /// A `TZID` icalendar cannot resolve (a Windows zone name, say) falls back
+    /// to the viewer's zone, by the same rule as a floating time. It used to
+    /// be `.single()` too. A `TZID` it does resolve is still read in that
+    /// zone.
+    #[test]
+    fn a_due_in_an_unresolvable_tzid_is_read_like_a_floating_one() {
+        use chrono_tz::Europe::Berlin;
+
+        const UNKNOWN: &str = "W. Europe Standard Time";
+        assert_eq!(
+            CalendarDateTime::WithTimezone {
+                date_time: naive(2026, 10, 25, 2, 30),
+                tzid: UNKNOWN.to_string(),
+            }
+            .try_into_utc(),
+            None,
+            "fixture: icalendar must not resolve this TZID"
+        );
+        assert_eq!(
+            due_in(with_tzid(UNKNOWN, naive(2026, 10, 25, 2, 30)), &Berlin),
+            Some((utc(2026, 10, 25, 0, 30), false))
+        );
+        assert_eq!(
+            due_in(with_tzid(UNKNOWN, naive(2026, 3, 29, 2, 30)), &Berlin),
+            Some((utc(2026, 3, 29, 1, 30), false))
+        );
+        // 09:00 EDT, whatever the viewer's zone.
+        assert_eq!(
+            due_in(
+                with_tzid("America/New_York", naive(2026, 7, 22, 9, 0)),
+                &Berlin
+            ),
+            Some((utc(2026, 7, 22, 13, 0), false))
+        );
+    }
+
+    const LOCAL_CHILD: &str = "HYTTE_1579_TASK_DUE_LOCAL_CHILD";
+    const LOCAL_CHILD_OK: &str = "hytte-1579-task-due-local-child-reached-the-end";
+
+    /// The same against the real `Local`, the zone production passes, which
+    /// also counts a fold's upper bound as part of the fold (#1579). This
+    /// re-execs the test binary with a POSIX `TZ` string, which chrono parses
+    /// itself, so no tzdata file is needed and the parallel suite's `TZ` is
+    /// never touched (the pattern of `calendar`'s
+    /// `local_midnight_local_tests`, #1577).
+    #[test]
+    fn a_due_on_a_transition_resolves_in_local() {
+        const BERLIN: &str = "CET-1CEST,M3.5.0,M10.5.0/3";
+        const HAVANA: &str = "CST5CDT,M3.2.0/0,M11.1.0/1";
+        const SANTIAGO: &str = "CLT4CLST,M9.1.6/24,M4.1.6/24";
+        const CAIRO: &str = "EET-2EEST,M4.5.5/0,M10.5.4/24";
+        for (tz, kind, at, want) in [
+            // A floating 03:00 at Berlin's fold's upper bound: 03:00 CET,
+            // not 01:00Z (which reads 02:00).
+            (
+                BERLIN,
+                "floating",
+                "2026-10-25T03:00:00",
+                "2026-10-25T02:00:00+00:00",
+            ),
+            // The same through a TZID icalendar cannot resolve.
+            (
+                BERLIN,
+                "unknown-tzid",
+                "2026-10-25T03:00:00",
+                "2026-10-25T02:00:00+00:00",
+            ),
+            // Santiago falls back at Saturday 24:00: Sunday 00:00 −04.
+            (
+                SANTIAGO,
+                "floating",
+                "2026-04-05T00:00:00",
+                "2026-04-05T04:00:00+00:00",
+            ),
+            // A date-only due on Havana's doubled midnight: the earlier one.
+            (
+                HAVANA,
+                "date",
+                "2026-11-01T00:00:00",
+                "2026-11-01T04:00:00+00:00",
+            ),
+            // A date-only due the day after Cairo's fall-back at 24:00:
+            // Friday 00:00 +02, not 23:00 on Thursday.
+            (
+                CAIRO,
+                "date",
+                "2026-10-30T00:00:00",
+                "2026-10-29T22:00:00+00:00",
+            ),
+        ] {
+            let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "--nocapture",
+                    "--test-threads=1",
+                    "tasks::tests::due_local_child",
+                ])
+                .env("TZ", tz)
+                .env(LOCAL_CHILD, format!("{kind} {at} {want}"))
+                .output()
+                .expect("re-exec the test binary");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.contains(LOCAL_CHILD_OK),
+                "TZ={tz} {kind} {at}:\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    /// The child half of the test above; a no-op outside its child.
+    #[test]
+    fn due_local_child() {
+        let Ok(arg) = std::env::var(LOCAL_CHILD) else {
+            return;
+        };
+        let mut args = arg.split(' ');
+        let (Some(kind), Some(at), Some(want)) = (args.next(), args.next(), args.next()) else {
+            panic!("`<kind> <wall clock> <want>`: {arg}");
+        };
+        let at: NaiveDateTime = at.parse().expect("a wall clock");
+        let (dpt, all_day) = match kind {
+            "date" => (DatePerhapsTime::Date(at.date()), true),
+            "floating" => (floating(at), false),
+            "unknown-tzid" => (with_tzid("W. Europe Standard Time", at), false),
+            other => panic!("unknown kind {other}"),
+        };
+        let (due, got_all_day) = dpt_to_local(dpt).expect("the due date is kept");
+        assert_eq!(
+            due.with_timezone(&chrono::Utc).to_rfc3339(),
+            want,
+            "{kind} {at}"
+        );
+        assert_eq!(got_all_day, all_day, "{kind} {at}");
+        // Read back through the zone's own UTC-to-local map: the wall clock
+        // itself, or for a date-only due, that date.
+        let reads = due.with_timezone(&Local).naive_local();
+        if all_day {
+            assert_eq!(reads.date(), at.date(), "{kind} {at}: reads another day");
+        } else {
+            assert_eq!(reads, at, "{kind} {at}: reads another wall clock");
+        }
+        println!("{LOCAL_CHILD_OK}");
     }
 }

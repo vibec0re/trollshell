@@ -2173,16 +2173,40 @@ impl WallClock {
 const GAP_SEARCH_STEP_MINUTES: i64 = 30;
 const GAP_SEARCH_STEPS: i64 = 48 * 60 / GAP_SEARCH_STEP_MINUTES;
 
-/// Map a wall-clock time in `tz` to POSIX UTC seconds, resolving a DST fold
-/// to its first occurrence and a DST gap with the offset in effect before it
-/// (RFC 5545 §3.3.5 — see [`WallClock::to_unix_in`]). `None` only when no
-/// offset before a gap can be found within [`GAP_SEARCH_STEPS`], or the result
-/// does not fit chrono's range.
-fn wall_clock_to_unix<Tz: chrono::TimeZone>(tz: &Tz, naive: chrono::NaiveDateTime) -> Option<i64> {
+/// Map a wall-clock time in `tz` to POSIX UTC seconds by the rule RFC 5545
+/// §3.3.5 gives for a `TZID` time. A floating iCalendar time is read in the
+/// viewer's zone (#388), so this is the rule for it too:
+///
+/// - **Fall-back fold** (the local time occurs twice, e.g. 02:30 on
+///   2026-10-25 in `Europe/Berlin`): the **first** occurrence, i.e. the
+///   earlier instant, still on the pre-transition offset.
+/// - **Spring-forward gap** (the local time never occurs, e.g. 02:30 on
+///   2026-03-29): read with **the UTC offset in effect before the gap**,
+///   which lands it as far past the gap as it was into it (03:30 CEST).
+///
+/// Of a fold's two candidates, only the ones that read back as `naive`
+/// count. chrono 0.4.44's Unix `Local` counts a fold's **upper bound** as part
+/// of the fold (`offset/local/tz_info/timezone.rs:249-250`, `rule.rs:265-266`
+/// and `277-278`). At exactly 03:00 on Berlin's fall-back day it answers
+/// `Ambiguous(03:00 +01:00, 03:00 +02:00)`. The second of those is the
+/// transition instant, 01:00Z, which reads **02:00**, so taking the earlier
+/// instant put a floating 03:00 an hour early (#1579). If neither candidate
+/// reads back, the time is treated as a gap.
+///
+/// Public so `hytte-services`' task list reads a floating `DUE` by the same
+/// rule the calendar reads a floating `DTSTART` by (#1554), not a copy of it.
+///
+/// `None` only when no offset before a gap can be found within 48 hours, or
+/// the result does not fit chrono's range.
+pub fn wall_clock_to_unix<Tz: chrono::TimeZone>(
+    tz: &Tz,
+    naive: chrono::NaiveDateTime,
+) -> Option<i64> {
     use chrono::{MappedLocalTime, Offset as _};
 
-    match tz.from_local_datetime(&naive) {
-        MappedLocalTime::Single(dt) => Some(dt.timestamp()),
+    let reads_back = |dt: &chrono::DateTime<Tz>| dt.with_timezone(tz).naive_local() == naive;
+    let resolved = match tz.from_local_datetime(&naive) {
+        MappedLocalTime::Single(dt) => return Some(dt.timestamp()),
         // The first occurrence is the earlier *instant*, picked by value and
         // not by position. chrono documents the pair as `(earliest, latest)`
         // (and `MappedLocalTime::earliest` just takes the first), but its
@@ -2190,14 +2214,20 @@ fn wall_clock_to_unix<Tz: chrono::TimeZone>(tz: &Tz, naive: chrono::NaiveDateTim
         // orders it by ascending UTC offset, which for a fall-back fold is
         // `(latest, earliest)`. Measured under `TZ=Europe/Berlin`:
         // `.earliest()` reads 02:30 on 2026-10-25 as 01:30Z, the CET repeat.
-        MappedLocalTime::Ambiguous(a, b) => Some(a.timestamp().min(b.timestamp())),
-        MappedLocalTime::None => {
-            let before = offset_before_gap(tz, naive)?;
-            naive
-                .checked_sub_offset(before.fix())
-                .map(|utc| utc.and_utc().timestamp())
-        }
-    }
+        MappedLocalTime::Ambiguous(a, b) => match (reads_back(&a), reads_back(&b)) {
+            (true, true) => Some(a.timestamp().min(b.timestamp())),
+            (true, false) => Some(a.timestamp()),
+            (false, true) => Some(b.timestamp()),
+            (false, false) => None,
+        },
+        MappedLocalTime::None => None,
+    };
+    resolved.or_else(|| {
+        let before = offset_before_gap(tz, naive)?;
+        naive
+            .checked_sub_offset(before.fix())
+            .map(|utc| utc.and_utc().timestamp())
+    })
 }
 
 /// The UTC offset in effect just before the spring-forward gap `naive` falls
@@ -2207,6 +2237,13 @@ fn wall_clock_to_unix<Tz: chrono::TimeZone>(tz: &Tz, naive: chrono::NaiveDateTim
 /// is the one the clock showed when the gap began — the smaller offset, since
 /// the instant is the wall clock minus the offset. Picked by value, for the
 /// reason [`wall_clock_to_unix`] gives.
+///
+/// Only an offset whose instant reads back as the probed time counts, as in
+/// [`wall_clock_to_unix`] (#1579). On chrono's own zones this filter changes
+/// no answer: at a fold's upper bound the candidate that does not read back
+/// is the larger, pre-transition offset, which the smaller-offset rule never
+/// picks. It is there so this search never trusts a candidate
+/// [`wall_clock_to_unix`] would reject.
 fn offset_before_gap<Tz: chrono::TimeZone>(
     tz: &Tz,
     naive: chrono::NaiveDateTime,
@@ -2216,15 +2253,19 @@ fn offset_before_gap<Tz: chrono::TimeZone>(
     (1..=GAP_SEARCH_STEPS).find_map(|step| {
         let probe =
             naive.checked_sub_signed(chrono::TimeDelta::minutes(step * GAP_SEARCH_STEP_MINUTES))?;
+        let reads_back = |offset: &Tz::Offset| {
+            probe.checked_sub_offset(offset.fix()).is_some_and(|utc| {
+                utc.checked_add_offset(tz.offset_from_utc_datetime(&utc).fix()) == Some(probe)
+            })
+        };
         match tz.offset_from_local_datetime(&probe) {
             MappedLocalTime::Single(offset) => Some(offset),
-            MappedLocalTime::Ambiguous(a, b) => {
-                if a.fix().local_minus_utc() <= b.fix().local_minus_utc() {
-                    Some(a)
-                } else {
-                    Some(b)
-                }
-            }
+            MappedLocalTime::Ambiguous(a, b) => match (reads_back(&a), reads_back(&b)) {
+                (true, true) if b.fix().local_minus_utc() < a.fix().local_minus_utc() => Some(b),
+                (true, _) => Some(a),
+                (false, true) => Some(b),
+                (false, false) => None,
+            },
             MappedLocalTime::None => None,
         }
     })
@@ -3084,12 +3125,20 @@ mod tests {
     /// everywhere except the UTC instants `[from, until)`, where it is
     /// `shifted`. Enough to model a year of `Europe/Berlin`, or Samoa's 2011
     /// date-line jump.
+    ///
+    /// `closed_folds` makes the local lookup count a fold's upper bound as
+    /// part of the fold, as chrono 0.4.44's Unix `Local` does
+    /// (`tz_info/timezone.rs:249-250`): the wall clock the old offset reads at
+    /// the transition instant answers `Ambiguous`, although only the
+    /// new-offset candidate reads back there. Without it the zone excludes
+    /// that bound, as chrono-tz does.
     #[derive(Clone, Copy, Debug)]
     struct TwoOffsetZone {
         base: i32,
         shifted: i32,
         from: i64,
         until: i64,
+        closed_folds: bool,
     }
 
     impl TwoOffsetZone {
@@ -3103,6 +3152,7 @@ mod tests {
                 shifted: 7_200,
                 from: utc(2026, 3, 29, 1, 0),
                 until: utc(2026, 10, 25, 1, 0),
+                closed_folds: false,
             }
         }
 
@@ -3115,6 +3165,46 @@ mod tests {
                 shifted: 50_400,
                 from: utc(2011, 12, 30, 10, 0),
                 until: i64::MAX,
+                closed_folds: false,
+            }
+        }
+
+        /// `Africa/Cairo` in 2026, which falls back at 24:00: EET (+02:00),
+        /// except EEST (+03:00) from 2026-04-23T22:00Z (Friday 04-24 00:00
+        /// local) to 2026-10-29T21:00Z (Thursday 10-29 24:00 EEST, which
+        /// becomes 23:00 EET). So local 23:00–24:00 on 10-29 happens twice,
+        /// and the fold's upper bound is 00:00 on 10-30.
+        fn cairo_2026() -> Self {
+            Self {
+                base: 7_200,
+                shifted: 10_800,
+                from: utc(2026, 4, 23, 22, 0),
+                until: utc(2026, 10, 29, 21, 0),
+                closed_folds: false,
+            }
+        }
+
+        /// `America/Santiago` in 2026, a southern zone that falls back at
+        /// 24:00: −03:00 in summer, −04:00 from 2026-04-05T03:00Z (Saturday
+        /// 04-04 24:00 −03, which becomes 23:00 −04) to 2026-09-06T04:00Z
+        /// (Sunday 09-06 00:00 −04, which becomes 01:00 −03). Here the fold is
+        /// at `from`, the gap at `until`.
+        fn santiago_2026() -> Self {
+            Self {
+                base: -10_800,
+                shifted: -14_400,
+                from: utc(2026, 4, 5, 3, 0),
+                until: utc(2026, 9, 6, 4, 0),
+                closed_folds: false,
+            }
+        }
+
+        /// This zone with a fold's upper bound counted as part of the fold,
+        /// the way chrono's Unix `Local` counts it.
+        fn with_closed_folds(self) -> Self {
+            Self {
+                closed_folds: true,
+                ..self
             }
         }
 
@@ -3157,6 +3247,9 @@ mod tests {
         /// the *later* instant first, not the `(earliest, latest)` chrono
         /// documents. So the fold test below pins that `to_unix_in` picks the
         /// earlier instant by value rather than trusting the pair's order.
+        ///
+        /// With `closed_folds`, a fold's upper bound answers `Ambiguous` as
+        /// well, although only its smaller-offset candidate reads back there.
         fn offset_from_local_datetime(
             &self,
             local: &chrono::NaiveDateTime,
@@ -3168,8 +3261,22 @@ mod tests {
             } else {
                 (self.base, self.shifted)
             };
+            // A fold's upper bound: what the old, larger offset reads at the
+            // transition instant into the smaller one.
+            let at_fold_top = self.closed_folds
+                && [
+                    (self.from, self.base, self.shifted),
+                    (self.until, self.shifted, self.base),
+                ]
+                .into_iter()
+                .any(|(at, before, after)| {
+                    before > after && at.checked_add(i64::from(before)) == Some(wall)
+                });
             match (valid(smaller), valid(larger)) {
                 (true, true) => {
+                    chrono::MappedLocalTime::Ambiguous(self.offset(smaller), self.offset(larger))
+                }
+                _ if at_fold_top => {
                     chrono::MappedLocalTime::Ambiguous(self.offset(smaller), self.offset(larger))
                 }
                 (true, false) => chrono::MappedLocalTime::Single(self.offset(smaller)),
@@ -3207,12 +3314,9 @@ mod tests {
         }
     }
 
-    /// Fixture sanity for the two edge tests: chrono reports exactly the case
-    /// each one is about, so a test zone that drifted into "always `Single`"
-    /// could not make them pass vacuously.
-    fn mapping(zone: TwoOffsetZone, w: super::WallClock) -> &'static str {
-        use chrono::{MappedLocalTime, TimeZone as _};
-        let naive = chrono::NaiveDate::from_ymd_opt(
+    /// The wall clock a [`super::WallClock`] fixture names.
+    fn naive_of(w: super::WallClock) -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(
             w.year,
             u32::try_from(w.month).unwrap(),
             u32::try_from(w.day).unwrap(),
@@ -3221,10 +3325,17 @@ mod tests {
         .and_hms_opt(
             u32::try_from(w.hour).unwrap(),
             u32::try_from(w.minute).unwrap(),
-            0,
+            u32::try_from(w.second).unwrap(),
         )
-        .unwrap();
-        match zone.offset_from_local_datetime(&naive) {
+        .unwrap()
+    }
+
+    /// Fixture sanity for the two edge tests: chrono reports exactly the case
+    /// each one is about, so a test zone that drifted into "always `Single`"
+    /// could not make them pass vacuously.
+    fn mapping(zone: TwoOffsetZone, w: super::WallClock) -> &'static str {
+        use chrono::{MappedLocalTime, TimeZone as _};
+        match zone.offset_from_local_datetime(&naive_of(w)) {
             MappedLocalTime::Single(_) => "single",
             MappedLocalTime::Ambiguous(..) => "fold",
             MappedLocalTime::None => "gap",
@@ -3302,6 +3413,211 @@ mod tests {
         assert_eq!(wall(2026, 13, 1, 0, 0).to_unix_in(&zone), None);
         assert_eq!(wall(2026, 2, 30, 0, 0).to_unix_in(&zone), None);
         assert_eq!(wall(2026, 1, 1, 24, 0).to_unix_in(&zone), None);
+    }
+
+    /// The wall clock `instant` reads in `zone`, through the zone's own
+    /// UTC-to-local map.
+    fn reads(zone: TwoOffsetZone, instant: i64) -> chrono::NaiveDateTime {
+        chrono::DateTime::from_timestamp(instant, 0)
+            .unwrap()
+            .with_timezone(&zone)
+            .naive_local()
+    }
+
+    /// #1579: a fold's upper bound, on a zone that counts it as part of the
+    /// fold the way chrono 0.4.44's Unix `Local` does. There the pair holds
+    /// the transition instant, which reads an hour earlier, and taking the
+    /// earlier instant put the time there. The wall clock happens once, and
+    /// the answer is the instant that reads it.
+    ///
+    /// - Berlin, 03:00 on 2026-10-25 (the issue's case): 02:00Z, not 01:00Z.
+    /// - Cairo, 00:00 on 2026-10-30, after a fall-back at 24:00: 22:00Z the
+    ///   day before, not 21:00Z, which reads 23:00 on 10-29.
+    /// - Santiago, 00:00 on 2026-04-05, the same at the zone's `from` end:
+    ///   04:00Z, not 03:00Z.
+    #[test]
+    fn a_floating_time_at_a_folds_upper_bound_is_the_instant_that_reads_it() {
+        for (zone, w, want, transition) in [
+            (
+                TwoOffsetZone::berlin_2026(),
+                wall(2026, 10, 25, 3, 0),
+                utc(2026, 10, 25, 2, 0),
+                utc(2026, 10, 25, 1, 0),
+            ),
+            (
+                TwoOffsetZone::cairo_2026(),
+                wall(2026, 10, 30, 0, 0),
+                utc(2026, 10, 29, 22, 0),
+                utc(2026, 10, 29, 21, 0),
+            ),
+            (
+                TwoOffsetZone::santiago_2026(),
+                wall(2026, 4, 5, 0, 0),
+                utc(2026, 4, 5, 4, 0),
+                utc(2026, 4, 5, 3, 0),
+            ),
+        ] {
+            let zone = zone.with_closed_folds();
+            assert_eq!(
+                mapping(zone, w),
+                "fold",
+                "fixture: {w:?} must answer the fold `Local` reports there"
+            );
+            assert_eq!(
+                reads(zone, transition) + chrono::TimeDelta::hours(1),
+                reads(zone, want),
+                "fixture: the transition instant for {w:?} reads an hour earlier"
+            );
+            assert_eq!(reads(zone, want), naive_of(w), "fixture: {w:?}");
+            assert_eq!(w.to_unix_in(&zone), Some(want), "{w:?}");
+        }
+    }
+
+    /// The fold's inside and lower bound, and the gap, on the same
+    /// closed-bound zones: still the first occurrence and the offset before
+    /// the gap, as in the open-bound tests above.
+    #[test]
+    fn closed_fold_bounds_leave_the_rest_of_a_transition_alone() {
+        let berlin = TwoOffsetZone::berlin_2026().with_closed_folds();
+        let cairo = TwoOffsetZone::cairo_2026().with_closed_folds();
+        let santiago = TwoOffsetZone::santiago_2026().with_closed_folds();
+        for (zone, w, want) in [
+            (berlin, wall(2026, 10, 25, 2, 0), utc(2026, 10, 25, 0, 0)),
+            (berlin, wall(2026, 10, 25, 2, 30), utc(2026, 10, 25, 0, 30)),
+            (berlin, wall(2026, 3, 29, 2, 30), utc(2026, 3, 29, 1, 30)),
+            (cairo, wall(2026, 10, 29, 23, 30), utc(2026, 10, 29, 20, 30)),
+            (santiago, wall(2026, 4, 4, 23, 30), utc(2026, 4, 5, 2, 30)),
+            (santiago, wall(2026, 9, 6, 0, 30), utc(2026, 9, 6, 4, 30)),
+        ] {
+            assert_eq!(w.to_unix_in(&zone), Some(want), "{w:?}");
+        }
+    }
+
+    const LOCAL_CHILD: &str = "HYTTE_1579_WALL_CLOCK_LOCAL_CHILD";
+    const LOCAL_CHILD_OK: &str = "hytte-1579-wall-clock-local-child-reached-the-end";
+
+    /// #1579 against the real `Local`, the zone production passes. This
+    /// re-execs the test binary with a POSIX `TZ` string, which chrono parses
+    /// itself, so no tzdata file is needed and the parallel suite's `TZ` is
+    /// never touched (the pattern of `hytte-services`' calendar
+    /// `local_midnight_local_tests`, #1577). Each row is a floating wall clock
+    /// and the UTC instant it must resolve to; a row marked `once` names a
+    /// time that exists, so the child also checks that the instant reads it
+    /// back.
+    #[test]
+    fn a_floating_time_at_a_folds_upper_bound_resolves_in_local() {
+        const BERLIN: &str = "CET-1CEST,M3.5.0,M10.5.0/3";
+        const NEW_YORK: &str = "EST5EDT,M3.2.0,M11.1.0";
+        const SANTIAGO: &str = "CLT4CLST,M9.1.6/24,M4.1.6/24";
+        const CAIRO: &str = "EET-2EEST,M4.5.5/0,M10.5.4/24";
+        for (tz, naive, want, kind) in [
+            // The issue's case: 03:00 CET, not 01:00Z (which reads 02:00).
+            (
+                BERLIN,
+                "2026-10-25T03:00:00",
+                "2026-10-25T02:00:00+00:00",
+                "once",
+            ),
+            // Inside the fold: the first occurrence, 02:30 CEST.
+            (
+                BERLIN,
+                "2026-10-25T02:30:00",
+                "2026-10-25T00:30:00+00:00",
+                "once",
+            ),
+            // In the spring gap: the offset before it, i.e. 03:30 CEST.
+            (
+                BERLIN,
+                "2026-03-29T02:30:00",
+                "2026-03-29T01:30:00+00:00",
+                "gap",
+            ),
+            // The US falls back at 02:00: 02:00 EST, not 06:00Z (01:00 EST).
+            (
+                NEW_YORK,
+                "2026-11-01T02:00:00",
+                "2026-11-01T07:00:00+00:00",
+                "once",
+            ),
+            // Santiago falls back at Saturday 24:00 −03: Sunday 00:00 −04,
+            // not 03:00Z (23:00 on Saturday).
+            (
+                SANTIAGO,
+                "2026-04-05T00:00:00",
+                "2026-04-05T04:00:00+00:00",
+                "once",
+            ),
+            // Its September gap at 00:00, which this `Local` answers `None`.
+            (
+                SANTIAGO,
+                "2026-09-06T00:30:00",
+                "2026-09-06T04:30:00+00:00",
+                "gap",
+            ),
+            // Cairo falls back at Thursday 24:00 +03: Friday 00:00 +02, not
+            // 21:00Z (23:00 on Thursday).
+            (
+                CAIRO,
+                "2026-10-30T00:00:00",
+                "2026-10-29T22:00:00+00:00",
+                "once",
+            ),
+        ] {
+            let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "--nocapture",
+                    "--test-threads=1",
+                    "tests::wall_clock_local_child",
+                ])
+                .env("TZ", tz)
+                .env(LOCAL_CHILD, format!("{naive} {want} {kind}"))
+                .output()
+                .expect("re-exec the test binary");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.contains(LOCAL_CHILD_OK),
+                "TZ={tz} {naive}:\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    /// The child half of the test above; a no-op outside its child.
+    #[test]
+    fn wall_clock_local_child() {
+        use chrono::{Datelike as _, Timelike as _};
+
+        let Ok(arg) = std::env::var(LOCAL_CHILD) else {
+            return;
+        };
+        let mut args = arg.split(' ');
+        let (Some(naive), Some(want), Some(kind)) = (args.next(), args.next(), args.next()) else {
+            panic!("`<naive> <want> <once|gap>`: {arg}");
+        };
+        let naive: chrono::NaiveDateTime = naive.parse().expect("a wall clock");
+        let w = super::WallClock {
+            year: naive.year(),
+            month: i32::try_from(naive.month()).unwrap(),
+            day: i32::try_from(naive.day()).unwrap(),
+            hour: i32::try_from(naive.hour()).unwrap(),
+            minute: i32::try_from(naive.minute()).unwrap(),
+            second: i32::try_from(naive.second()).unwrap(),
+        };
+        let got = w
+            .to_local_unix()
+            .and_then(|unix| chrono::DateTime::from_timestamp(unix, 0))
+            .expect("a floating time always resolves");
+        assert_eq!(got.to_rfc3339(), want, "{naive}");
+        if kind == "once" {
+            // Read back through the zone's own UTC-to-local map.
+            assert_eq!(
+                got.with_timezone(&chrono::Local).naive_local(),
+                naive,
+                "{naive}: the instant reads another wall clock"
+            );
+        }
+        println!("{LOCAL_CHILD_OK}");
     }
 
     /// End-to-end through the FFI: a floating `DTSTART` (no `TZID`, no `Z`)

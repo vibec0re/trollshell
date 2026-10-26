@@ -41,6 +41,106 @@ pub(crate) fn escape(text: &str) -> String {
     glib::markup_escape_text(text).into()
 }
 
+/// What a row **displays**, for the `system-tests` markup assertions every
+/// `plain_text` call site in the panels pins its fix with (#753's rule).
+///
+/// Asserted on the text the row's own `GtkLabel`s show — `Label::text()` is
+/// the text *after* Pango has parsed any markup — rather than on the
+/// `use-markup` flag, so a test pins the user-visible symptom: with markup on,
+/// `"Tom & Jerry"` fails to parse and the label shows nothing, and
+/// `"<b>hi</b>"` shows `hi`. Needs a display server to construct the rows.
+#[cfg(all(test, feature = "system-tests"))]
+pub(crate) mod test_support {
+    use hytte::gtk::{self, prelude::*};
+
+    /// Every `GtkLabel` text under `root` — a row's title/subtitle labels live
+    /// in libadwaita's template, so walk for them rather than name them.
+    pub(crate) fn label_texts(root: &gtk::Widget) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(w) = stack.pop() {
+            if let Some(label) = w.downcast_ref::<gtk::Label>() {
+                out.push(label.text().to_string());
+            }
+            let mut child = w.first_child();
+            while let Some(c) = child {
+                child = c.next_sibling();
+                stack.push(c);
+            }
+        }
+        out
+    }
+
+    /// Assert some label under `root` displays `literal` byte for byte.
+    #[track_caller]
+    pub(crate) fn assert_shows(root: &impl IsA<gtk::Widget>, literal: &str) {
+        let texts = label_texts(root.upcast_ref());
+        assert!(
+            texts.iter().any(|t| t == literal),
+            "no label displays {literal:?} literally — the row parsed it as Pango markup; \
+             labels show {texts:?}"
+        );
+    }
+}
+
+/// `plain_text` itself, on each row type the panels hand runtime text to.
+///
+/// The negative control is what makes the positive half mean something: the
+/// same row **without** the call must fail to show the string, or the
+/// assertion could pass on a libadwaita that stopped defaulting `use-markup`
+/// to `TRUE` and the call sites' tests would be pinning nothing.
+#[cfg(all(test, feature = "system-tests"))]
+mod gtk_tests {
+    use hytte::adw::{self, prelude::*};
+    use hytte::gtk;
+
+    use super::plain_text;
+    use super::test_support::{assert_shows, label_texts};
+
+    /// `&` is a parse error (the field blanks); `<b>` is obeyed (the tag
+    /// vanishes). One string carries both failure modes.
+    const HOSTILE: &str = "Tom & <b>Jerry</b>";
+
+    fn shows(root: &impl IsA<gtk::Widget>, literal: &str) -> bool {
+        label_texts(root.upcast_ref()).iter().any(|t| t == literal)
+    }
+
+    #[gtk::test]
+    fn an_action_row_shows_title_and_subtitle_literally() {
+        adw::init().expect("libadwaita init");
+        let row = adw::ActionRow::builder()
+            .title(HOSTILE)
+            .subtitle(HOSTILE)
+            .build();
+        assert!(
+            !shows(&row, HOSTILE),
+            "premise: libadwaita parses an ActionRow's title as markup by default"
+        );
+        plain_text(&row);
+        assert_shows(&row, HOSTILE);
+        assert!(!row.uses_markup());
+    }
+
+    /// The order-independence the doc above promises: a `set_subtitle` that
+    /// lands *after* the call (a `bind` re-firing) is covered too.
+    #[gtk::test]
+    fn a_switch_row_covers_a_subtitle_set_after_the_call() {
+        adw::init().expect("libadwaita init");
+        let row = adw::SwitchRow::builder().title("Keep awake").build();
+        plain_text(&row);
+        row.set_subtitle(HOSTILE);
+        assert_shows(&row, HOSTILE);
+    }
+
+    #[gtk::test]
+    fn an_expander_row_shows_its_title_literally() {
+        adw::init().expect("libadwaita init");
+        let row = adw::ExpanderRow::builder().title(HOSTILE).build();
+        plain_text(&row);
+        assert_shows(&row, HOSTILE);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::escape;

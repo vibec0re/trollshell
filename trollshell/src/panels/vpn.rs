@@ -258,6 +258,9 @@ fn build_tunnel_group(tunnel: &vpn::Tunnel) -> adw::PreferencesGroup {
 
     if let Some(summary) = tunnel.summary.as_ref() {
         let summary_row = adw::ActionRow::builder().title("Status").build();
+        // For Tailscale this names the exit node by its `HostName`, which the
+        // node's owner picks — on a shared tailnet, somebody else (#753).
+        markup::plain_text(&summary_row);
         summary_row.set_subtitle(summary);
         g.add(&summary_row);
     }
@@ -314,7 +317,7 @@ fn build_peer_row(peer: &vpn::Peer) -> adw::ActionRow {
 /// `reactive_list`'s own #761/#771 regression test.
 #[cfg(all(test, feature = "system-tests"))]
 mod tests {
-    use super::{bind_tunnel_groups, build_vpn_profile_row, vpn, wifi};
+    use super::{bind_tunnel_groups, build_tunnel_group, build_vpn_profile_row, vpn, wifi};
     use hytte::adw::{self, prelude::*};
     use hytte::futures_signals::signal::Mutable;
     use hytte::gtk;
@@ -386,5 +389,26 @@ mod tests {
              closure (rather than taking the closure's own `column` argument from `bind`) would \
              keep this alive for the life of the binding, defeating #224's WeakRef contract"
         );
+    }
+
+    /// A tunnel's status line shows the exit node's host name **literally**
+    /// (#753's rule) — another tailnet member's choice of name.
+    ///
+    /// **Falsification:** delete the `markup::plain_text` call on the Status
+    /// row in [`build_tunnel_group`] → this reds.
+    #[gtk::test]
+    fn a_tunnel_status_line_shows_a_peer_chosen_name_literally() {
+        adw::init().expect("libadwaita init");
+        let summary = "Running \u{b7} exit-node: Tom & <b>Jerry</b>";
+        let group = build_tunnel_group(&vpn::Tunnel {
+            name: "tailscale0".to_owned(),
+            kind: vpn::TunnelKind::Tailscale,
+            since: None,
+            rx_bytes: 0,
+            tx_bytes: 0,
+            peers: Vec::new(),
+            summary: Some(summary.to_owned()),
+        });
+        crate::components::markup::test_support::assert_shows(&group, summary);
     }
 }

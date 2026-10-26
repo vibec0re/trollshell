@@ -43,6 +43,7 @@ use hytte::services::nightlight;
 use hytte::services::wallpaper::{self, Mode, Slot};
 
 use crate::components::layout::{finish_page, page_box};
+use crate::components::markup;
 use crate::components::reactive_list::reactive_list;
 
 pub fn panel_appearance() -> gtk::Widget {
@@ -276,6 +277,12 @@ where
     S: hytte::futures_signals::signal::Signal<Item = Option<String>> + 'static,
 {
     let row = adw::ActionRow::builder().title(title).build();
+    // The subtitle is the picked image's **file name** — `Tom & Jerry.png`
+    // from a downloads folder is an ordinary one — and a per-display row's
+    // title is the output's make and model, which come out of the monitor's
+    // own EDID. As Pango markup an `&` in either blanked the field; the
+    // Displays panel already renders that same title plain (#753).
+    markup::plain_text(&row);
     // Long file paths shouldn't push the modal wide; let the subtitle wrap.
     row.set_subtitle_lines(0);
 
@@ -543,7 +550,7 @@ fn open_wallpaper_picker(on_pick: impl Fn(String) + 'static) {
 /// `wallpaper` service, and never touches the real `$XDG_STATE_HOME`.
 #[cfg(all(test, feature = "system-tests"))]
 mod tests {
-    use super::{Mode, anything_configured_to_scale, scaling_is_usable, scaling_row};
+    use super::{Mode, anything_configured_to_scale, image_row, scaling_is_usable, scaling_row};
     use hytte::adw::{self, prelude::*};
     use hytte::futures_signals::signal::Mutable;
     use hytte::gtk;
@@ -809,5 +816,29 @@ mod tests {
             u32::try_from(Mode::SCALING.len()).unwrap(),
             "the placeholder must be dropped once the signal reflects a real mode"
         );
+    }
+
+    /// A wallpaper row shows the picked file's name and the display's EDID
+    /// title **literally** (#753's rule): an `&` in either was a markup parse
+    /// error that blanked the field.
+    ///
+    /// **Falsification:** delete the `markup::plain_text` call in
+    /// [`image_row`] → this reds.
+    #[gtk::test]
+    fn an_image_row_shows_a_file_name_and_a_display_title_literally() {
+        use crate::components::markup::test_support::assert_shows;
+        use hytte::futures_signals::signal::always;
+
+        adw::init().expect("libadwaita init");
+        let row = image_row(
+            "Dell & <b>Co</b> U2720Q",
+            || always(Some("/home/a/Pictures/Tom & Jerry.png".to_owned())),
+            Option::unwrap_or_default,
+            Rc::new(|_| {}),
+            None,
+        );
+        pump();
+        assert_shows(&row, "Dell & <b>Co</b> U2720Q");
+        assert_shows(&row, "/home/a/Pictures/Tom & Jerry.png");
     }
 }

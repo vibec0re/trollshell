@@ -78,6 +78,12 @@ fn build_bluetooth_header() -> gtk::Widget {
     // text — capped (see `truncate_for_row`) rather than letting it push the
     // drawer wider (#1302); `subtitle_lines(1)` is a second line of defense
     // and the tooltip mirrors the full text.
+    //
+    // Free text as Pango markup too: `bluetoothd` defaults the alias to the
+    // *pretty* hostname, where `Annika's Laptop & Dock` is a fine name and a
+    // markup parse error that blanked the subtitle. The device rows below
+    // already render plain (#753).
+    markup::plain_text(&row);
     row.set_subtitle_lines(1);
     bind(
         bluetooth::adapter().map(|a| match a {
@@ -124,7 +130,9 @@ fn build_bluetooth_controls() -> gtk::Widget {
 
     // Discoverable
     let disc_row = adw::ActionRow::builder().title("Discoverable").build();
-    // Same free-text adapter name as the header row above (#1302).
+    // Same free-text adapter name as the header row above (#1302), and plain
+    // for the same reason (#753).
+    markup::plain_text(&disc_row);
     disc_row.set_subtitle_lines(1);
     bind(
         bluetooth::adapter().map(|a| match a {

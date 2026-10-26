@@ -11,6 +11,7 @@ use hytte::services::upower::{self, Battery, BatteryState};
 
 use crate::components::format::fmt_dur;
 use crate::components::layout::{boxed_list, finish_page, page_box, section};
+use crate::components::markup;
 use crate::components::power_profile::build_power_profile_expander;
 
 pub fn panel_power() -> gtk::Widget {
@@ -57,8 +58,17 @@ pub fn panel_power() -> gtk::Widget {
 /// and skips dim/lock while it's held.
 fn build_keep_awake_row() -> gtk::ListBox {
     let list = boxed_list();
+    list.append(&keep_awake_switch_row());
+    list.append(&build_fullscreen_inhibit_row());
+    list
+}
 
-    let row = adw::SwitchRow::builder().title("Keep awake").build();
+/// The "Keep awake" switch row itself — this drawer's, and the Settings
+/// drawer's mirror of it (#513), which used to be a second hand-copied body.
+/// One builder so the two cannot drift: the copy is how the mirror missed the
+/// `plain_text` below while this one was being fixed.
+pub(crate) fn keep_awake_switch_row() -> adw::SwitchRow {
+    let row = keep_awake_row_shell();
 
     // Two-way: the authoritative signal drives `active` (block prevents the
     // programmatic set_active from re-entering the handler); a user flip calls
@@ -76,9 +86,21 @@ fn build_keep_awake_row() -> gtk::ListBox {
         r.set_subtitle(&keep_awake_subtitle(&others));
     });
 
-    list.append(&row);
-    list.append(&build_fullscreen_inhibit_row());
-    list
+    row
+}
+
+/// [`keep_awake_switch_row`] before its bindings, which `.expect()` the
+/// screensaver service — the seam the markup test drives.
+///
+/// The subtitle joins `application_name`s exactly as each
+/// `org.freedesktop.ScreenSaver.Inhibit` caller sent them, and *any* client on
+/// the session bus may call it: a name carrying `&` blanked the subtitle, and
+/// one carrying a `<span>` restyled the row. Markup is never wanted here
+/// (#753).
+fn keep_awake_row_shell() -> adw::SwitchRow {
+    let row = adw::SwitchRow::builder().title("Keep awake").build();
+    markup::plain_text(&row);
+    row
 }
 
 /// "Keep awake when fullscreen" policy toggle (#404): an `adw::SwitchRow`
@@ -214,5 +236,35 @@ fn describe_battery(b: &Battery) -> String {
     match remaining {
         Some(r) => format!("{state} \u{2014} {r}"),
         None => state.to_string(),
+    }
+}
+
+/// The keep-awake subtitle renders inhibitor names **literally** (#753's
+/// rule). Needs a display server to construct the row, hence the
+/// `system-tests` gate.
+///
+/// **Falsification:** delete the `markup::plain_text` call in
+/// `keep_awake_row_shell` → this reds (the `&` blanks the subtitle).
+#[cfg(all(test, feature = "system-tests"))]
+mod markup_tests {
+    use hytte::adw::{self, prelude::*};
+    use hytte::gtk;
+    use hytte::services::screensaver::Inhibitor;
+
+    use super::{keep_awake_row_shell, keep_awake_subtitle};
+    use crate::components::markup::test_support::assert_shows;
+
+    #[gtk::test]
+    fn an_inhibitor_name_is_shown_literally() {
+        adw::init().expect("libadwaita init");
+        let row = keep_awake_row_shell();
+        let others = [Inhibitor {
+            cookie: 1,
+            application: "Tom & <b>Jerry</b>".to_owned(),
+            reason: "Playing video".to_owned(),
+        }];
+        // What the binding does on every inhibitor change.
+        row.set_subtitle(&keep_awake_subtitle(&others));
+        assert_shows(&row, "Also awake: Tom & <b>Jerry</b>");
     }
 }

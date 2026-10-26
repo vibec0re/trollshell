@@ -976,9 +976,9 @@ mod tests {
 #[cfg(all(test, feature = "system-tests"))]
 mod gtk_tests {
     use super::{PAGE, TLS_FAILED, page, settings, view_of};
+    use crate::tls::Resolved;
     use std::cell::Cell;
     use std::rc::Rc;
-    use crate::tls::Resolved;
     use webkit::prelude::*;
 
     /// # Why there is no end-to-end "the view refused it" test here
@@ -1090,7 +1090,11 @@ mod gtk_tests {
     #[gtk::test]
     fn the_view_carries_those_settings() {
         use gtk::glib::object::ObjectExt as _;
-        let w = page("https://hive.local/agent/stray/", &Resolved::default(), |_| {});
+        let w = page(
+            "https://hive.local/agent/stray/",
+            &Resolved::default(),
+            |_| {},
+        );
         let view = view_of(&w).expect("the page widget carries the view");
         let s =
             webkit::prelude::WebViewExt::settings(&view).expect("the view was built with settings");
@@ -1104,7 +1108,11 @@ mod gtk_tests {
     /// on a normal open.
     #[gtk::test]
     fn the_page_starts_on_the_view_not_on_the_error_state() {
-        let w = page("https://hive.local/agent/stray/", &Resolved::default(), |_| {});
+        let w = page(
+            "https://hive.local/agent/stray/",
+            &Resolved::default(),
+            |_| {},
+        );
         let stack = w
             .downcast_ref::<gtk::Stack>()
             .expect("the page widget is a stack");
@@ -1159,8 +1167,7 @@ mod gtk_tests {
     ) -> bool {
         use gtk::glib::object::ObjectExt as _;
         let before = declined.get();
-        let _: bool =
-            view.emit_by_name("load-failed", &[&webkit::LoadEvent::Started, &uri, error]);
+        let _: bool = view.emit_by_name("load-failed", &[&webkit::LoadEvent::Started, &uri, error]);
         declined.get() == before
     }
 
@@ -1203,7 +1210,10 @@ mod gtk_tests {
             use gtk::glib::object::ObjectExt as _;
             view.emit_by_name::<()>("load-changed", &[&webkit::LoadEvent::Committed]);
         }
-        assert!(!super::shows_unanswered(&w), "something answered: the page is back");
+        assert!(
+            !super::shows_unanswered(&w),
+            "something answered: the page is back"
+        );
         let stack = w.downcast_ref::<gtk::Stack>().expect("a stack");
         assert_eq!(stack.visible_child_name().as_deref(), Some(PAGE));
         assert_eq!(heard.borrow().last(), Some(&super::Gateway::Answered));
@@ -1283,7 +1293,11 @@ mod gtk_tests {
     /// `NetworkSession::default()` — the persistent one — and this reds.
     #[gtk::test]
     fn the_network_session_is_ephemeral() {
-        let w = page("https://hive.local/agent/stray/", &Resolved::default(), |_| {});
+        let w = page(
+            "https://hive.local/agent/stray/",
+            &Resolved::default(),
+            |_| {},
+        );
         let view = view_of(&w).expect("the page widget carries the view");
         assert!(
             view.network_session()

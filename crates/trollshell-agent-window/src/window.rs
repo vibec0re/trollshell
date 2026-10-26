@@ -230,9 +230,7 @@ fn on_resume(
     }
     match waiting {
         Waiting::Armed => OnResume::Leave,
-        Waiting::Parked => {
-            OnResume::Rearm(interval.saturating_sub(since_last.unwrap_or_default()))
-        }
+        Waiting::Parked => OnResume::Rearm(interval.saturating_sub(since_last.unwrap_or_default())),
     }
 }
 
@@ -1069,7 +1067,8 @@ impl Window {
                 );
                 if let Some(page) = self.page_slot.first_child() {
                     let me = std::rc::Weak::clone(&self.me);
-                    let tried = format!("asked {uri} for the agent's page, and nothing answered ({why})");
+                    let tried =
+                        format!("asked {uri} for the agent's page, and nothing answered ({why})");
                     webview::show_unanswered(
                         &page,
                         &webview::unreachable(Some(&tried), wait, move || {
@@ -1397,12 +1396,20 @@ mod tests {
             );
         }
         assert_eq!(
-            on_resume(Some(Waiting::Armed), Some(Duration::from_millis(500)), interval),
+            on_resume(
+                Some(Waiting::Armed),
+                Some(Duration::from_millis(500)),
+                interval
+            ),
             OnResume::Leave,
             "a flap leaves a running timer to fire on its own"
         );
         assert_eq!(
-            on_resume(Some(Waiting::Parked), Some(Duration::from_millis(500)), interval),
+            on_resume(
+                Some(Waiting::Parked),
+                Some(Duration::from_millis(500)),
+                interval
+            ),
             OnResume::Rearm(Duration::from_millis(1500)),
             "a flap gives a parked attempt a timer for the rest of the interval — not nothing"
         );

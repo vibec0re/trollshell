@@ -1068,7 +1068,10 @@ mod tests {
             host_of("https://hive.local./x").as_deref(),
             Some("hive.local.")
         );
-        assert_eq!(host_of("https://hive.local/x").as_deref(), Some("hive.local"));
+        assert_eq!(
+            host_of("https://hive.local/x").as_deref(),
+            Some("hive.local")
+        );
         assert_eq!(
             identity_host("xn--bcher-kva.example"),
             "xn--bcher-kva.example",

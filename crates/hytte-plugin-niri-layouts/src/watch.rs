@@ -269,6 +269,10 @@ pub(crate) struct Watch {
     seen_workspaces: bool,
     /// Whether the opening `WindowsChanged` of this connection has landed.
     seen_windows: bool,
+    /// A state-bearing event of this connection failed to decode (see
+    /// [`Incoming::Poisoned`]); the model has drifted, so nothing is judged
+    /// until the connection ends and [`Watch::forget_compositor_state`] resets.
+    poisoned: bool,
     /// The last verdict [`Watch::observe`] handed out. Empty because the chip
     /// starts hidden everywhere.
     emitted: Verdict,
@@ -307,7 +311,19 @@ impl Watch {
     /// Whether this connection has delivered both halves of its opening
     /// snapshot; see [`Watch::observe`].
     fn snapshot_complete(&self) -> bool {
-        self.seen_workspaces && self.seen_windows
+        self.seen_workspaces && self.seen_windows && !self.poisoned
+    }
+
+    /// Mark the model untrustworthy and return the hidden-everywhere verdict
+    /// if that is a change from what was last emitted. Sticky until the
+    /// connection ends.
+    pub(crate) fn poison(&mut self) -> Option<Verdict> {
+        self.poisoned = true;
+        let hidden = Verdict::default();
+        (self.emitted != hidden).then(|| {
+            self.emitted.clone_from(&hidden);
+            hidden
+        })
     }
 
     /// The verdict as it stands, whether or not it just changed.
@@ -399,6 +415,7 @@ impl Watch {
         self.workspaces.clear();
         self.seen_workspaces = false;
         self.seen_windows = false;
+        self.poisoned = false;
     }
 
     /// The fold itself. Five of niri 26.4's twenty-odd events move this state;
@@ -512,6 +529,10 @@ pub(crate) enum Incoming {
     Event(Box<Event>),
     Idle,
     Ended(String),
+    /// A **known** state-bearing event failed to decode, so the window model
+    /// can no longer be trusted for the rest of this connection: [`drive`]
+    /// logs the line and hides the chip via [`Watch::poison`].
+    Poisoned(String),
 }
 
 /// One connection's worth of events. The seam the reconnect tests script.
@@ -655,6 +676,14 @@ fn stream_once<B: Backend>(watch: &mut Watch, backend: &mut B) -> Stopped {
             // liveness check above.
             Incoming::Idle => {}
             Incoming::Ended(why) => return Stopped::StreamEnded(why),
+            Incoming::Poisoned(why) => {
+                backend.log(&why);
+                if let Some(verdict) = watch.poison()
+                    && !backend.emit(verdict)
+                {
+                    return Stopped::SessionOver;
+                }
+            }
         }
     }
 }
@@ -723,6 +752,74 @@ pub(crate) struct SocketEvents {
     /// sends a trailing newline ends the connection instead of growing this
     /// without bound (#1053 review LOW-2).
     line: Vec<u8>,
+    /// Variant names (or shapes) of undecodable lines already reported, so a
+    /// newer niri's chatty unknown event costs one journal line, not one per
+    /// event. Bounded by [`MAX_REPORTED_SHAPES`].
+    reported: std::collections::HashSet<String>,
+}
+
+/// Cap on [`SocketEvents::reported`]; past it a skip is silent.
+const MAX_REPORTED_SHAPES: usize = 32;
+
+/// Every `Event` variant the pinned `niri-ipc` (`=26.4.0`) knows. A bump of
+/// that pin must update this list; the test below checks each name decodes.
+const KNOWN_EVENTS: &[&str] = &[
+    "WorkspacesChanged",
+    "WorkspaceUrgencyChanged",
+    "WorkspaceActivated",
+    "WorkspaceActiveWindowChanged",
+    "WindowsChanged",
+    "WindowOpenedOrChanged",
+    "WindowClosed",
+    "WindowFocusChanged",
+    "WindowFocusTimestampChanged",
+    "WindowUrgencyChanged",
+    "WindowLayoutsChanged",
+    "KeyboardLayoutsChanged",
+    "KeyboardLayoutSwitched",
+    "OverviewOpenedOrClosed",
+    "ConfigLoaded",
+    "ScreenshotCaptured",
+    "CastsChanged",
+    "CastStartedOrChanged",
+    "CastStopped",
+];
+
+/// The subset [`Watch::apply`] folds into the window model. If one of these
+/// fails to decode the model drifts, so the chip is hidden, not guessed at.
+const STATE_EVENTS: &[&str] = &[
+    "WorkspacesChanged",
+    "WorkspaceActivated",
+    "WindowsChanged",
+    "WindowOpenedOrChanged",
+    "WindowClosed",
+];
+
+/// The journal line for a skipped event. Carries the shape and serde's error
+/// *class* and position only: serde's own message can echo the offending value
+/// (`invalid type: string "<window title>"`), and window titles and app ids do
+/// not belong in the journal.
+fn skip_message(what: &str, shape: &str, e: &serde_json::Error) -> String {
+    format!(
+        "[{}] {what} ({shape}): {:?} error at line {} column {}",
+        crate::plugin::PLUGIN_ID,
+        e.classify(),
+        e.line(),
+        e.column()
+    )
+}
+
+/// The externally-tagged variant name of an event line we could not decode,
+/// or a placeholder when the line is not even a JSON object.
+fn undecodable_shape(line: &[u8]) -> String {
+    match serde_json::from_slice::<serde_json::Value>(line) {
+        Ok(serde_json::Value::Object(map)) if map.len() == 1 => map
+            .keys()
+            .next()
+            .map_or_else(|| "<empty>".to_owned(), |k| k.chars().take(48).collect()),
+        Ok(_) => "<not a single-key object>".to_owned(),
+        Err(_) => "<not JSON>".to_owned(),
+    }
 }
 
 impl SocketEvents {
@@ -779,6 +876,7 @@ impl SocketEvents {
         Ok(Self {
             reader,
             line: Vec::new(),
+            reported: std::collections::HashSet::new(),
         })
     }
 }
@@ -864,20 +962,57 @@ impl EventSource for SocketEvents {
                 let consumed = pos + 1;
                 self.reader.consume(consumed);
                 let line = std::mem::take(&mut self.line);
-                return match serde_json::from_slice::<Event>(&line) {
-                    Ok(event) => Incoming::Event(Box::new(event)),
-                    Err(e) => Incoming::Ended(format!("cannot decode a niri event: {e}")),
-                };
-            }
-            let n = available.len();
-            self.line.extend_from_slice(available);
-            self.reader.consume(n);
-            if self.line.len() > MAX_LINE {
-                return Incoming::Ended(format!(
-                    "niri sent a {}-byte line with no newline — treating the stream \
-                     as dead rather than buffering forever",
-                    self.line.len()
-                ));
+                match serde_json::from_slice::<Event>(&line) {
+                    Ok(event) => return Incoming::Event(Box::new(event)),
+                    Err(e) => {
+                        // Each line is self-contained JSON, so one we cannot
+                        // decode (typically a variant a newer niri added to
+                        // the pinned `niri-ipc`) costs only itself. Ending the
+                        // stream would reconnect, get the same line, and loop
+                        // forever with the chip hidden. If the skipped line is
+                        // one of the two initial-state dumps, the model never
+                        // becomes ready and the chip stays hidden (the safe
+                        // failure) rather than showing a wrong count.
+                        //
+                        // A *known* variant is different: its payload changed
+                        // under us, so skipping it silently desyncs the model.
+                        // State-bearing ones poison the model (chip hidden).
+                        let shape = undecodable_shape(&line);
+                        let known = KNOWN_EVENTS.contains(&shape.as_str());
+                        let fresh = self.reported.len() < MAX_REPORTED_SHAPES
+                            && self.reported.insert(shape.clone());
+                        if STATE_EVENTS.contains(&shape.as_str()) {
+                            if fresh {
+                                return Incoming::Poisoned(skip_message(
+                                    "a known niri event no longer decodes; the window \
+                                     model cannot be trusted, hiding the chip until \
+                                     the next connection",
+                                    &shape,
+                                    &e,
+                                ));
+                            }
+                        } else if fresh {
+                            let what = if known {
+                                "a known niri event no longer decodes, skipping it \
+                                 (it does not feed the window model)"
+                            } else {
+                                "skipping an unknown niri event"
+                            };
+                            eprintln!("{}", skip_message(what, &shape, &e));
+                        }
+                    }
+                }
+            } else {
+                let n = available.len();
+                self.line.extend_from_slice(available);
+                self.reader.consume(n);
+                if self.line.len() > MAX_LINE {
+                    return Incoming::Ended(format!(
+                        "niri sent a {}-byte line with no newline — treating the stream \
+                         as dead rather than buffering forever",
+                        self.line.len()
+                    ));
+                }
             }
         }
     }
@@ -2177,6 +2312,146 @@ mod tests {
         }
 
         niri.join().expect("the fake niri thread");
+    }
+
+    /// An event line the pinned `niri-ipc` cannot decode (a newer niri's new
+    /// variant) is skipped: the known events around it still arrive and the
+    /// stream does not end.
+    #[test]
+    fn an_undecodable_event_line_is_skipped_not_fatal() {
+        let (ours, theirs) = UnixStream::pair().expect("socketpair");
+        let first = serde_json::to_string(&Event::WorkspaceActivated {
+            id: 1,
+            focused: true,
+        })
+        .expect("encode");
+        let second = serde_json::to_string(&Event::WorkspaceActivated {
+            id: 2,
+            focused: false,
+        })
+        .expect("encode");
+
+        let niri = std::thread::spawn(move || {
+            let mut reader = BufReader::new(theirs.try_clone().expect("clone"));
+            let mut request = String::new();
+            reader.read_line(&mut request).expect("a request line");
+            let mut writer = &theirs;
+            writer.write_all(b"{\"Ok\":\"Handled\"}\n").expect("reply");
+            writer.write_all(first.as_bytes()).expect("first");
+            writer.write_all(b"\n").expect("nl");
+            writer
+                .write_all(b"{\"FutureThing\":{\"x\":1}}\n{\"FutureThing\":{}}\n")
+                .expect("unknown");
+            writer.write_all(second.as_bytes()).expect("second");
+            writer.write_all(b"\n").expect("nl");
+            std::thread::sleep(POLL_INTERVAL);
+        });
+
+        let mut events = SocketEvents::over(ours).expect("handshake");
+        let mut ids = Vec::new();
+        for _ in 0..40 {
+            match events.next_event() {
+                Incoming::Event(e) => {
+                    if let Event::WorkspaceActivated { id, .. } = *e {
+                        ids.push(id);
+                    }
+                    if ids.len() == 2 {
+                        break;
+                    }
+                }
+                Incoming::Idle => {}
+                Incoming::Ended(why) => panic!("the stream must not end: {why}"),
+                Incoming::Poisoned(why) => panic!("unexpected poison: {why}"),
+            }
+        }
+        assert_eq!(ids, [1, 2]);
+        assert_eq!(events.reported.len(), 1, "reported once per shape");
+        niri.join().expect("fake niri");
+    }
+
+    /// Every name in `KNOWN_EVENTS` is a real variant of the pinned crate: an
+    /// event of that shape either decodes or fails with a payload error, but
+    /// a bare unit-ish probe of a bogus name is "unknown variant".
+    #[test]
+    fn known_events_list_matches_the_pinned_crate() {
+        for name in super::KNOWN_EVENTS {
+            let line = format!("{{\"{name}\":{{}}}}");
+            let err = serde_json::from_str::<Event>(&line);
+            if let Err(e) = err {
+                assert!(!e.to_string().contains("unknown variant"), "{name}: {e}");
+            }
+        }
+        let bogus = serde_json::from_str::<Event>("{\"NoSuchEvent\":{}}").expect_err("bogus");
+        assert!(bogus.to_string().contains("unknown variant"));
+        for name in super::STATE_EVENTS {
+            assert!(super::KNOWN_EVENTS.contains(name), "{name}");
+        }
+    }
+
+    /// A known state-bearing variant whose payload no longer decodes poisons
+    /// the model: the chip is hidden and stays hidden, while an unknown
+    /// variant still only gets skipped.
+    #[test]
+    fn a_known_event_that_no_longer_decodes_hides_the_chip() {
+        let (ours, theirs) = UnixStream::pair().expect("socketpair");
+        let niri = std::thread::spawn(move || {
+            let mut reader = BufReader::new(theirs.try_clone().expect("clone"));
+            let mut request = String::new();
+            reader.read_line(&mut request).expect("a request line");
+            let mut writer = &theirs;
+            writer.write_all(b"{\"Ok\":\"Handled\"}\n").expect("reply");
+            writer
+                .write_all(b"{\"WindowOpenedOrChanged\":{\"window\":\"SECRET-TITLE\"}}\n")
+                .expect("bad payload");
+            std::thread::sleep(POLL_INTERVAL);
+        });
+        let mut events = SocketEvents::over(ours).expect("handshake");
+        let msg = loop {
+            match events.next_event() {
+                Incoming::Poisoned(msg) => break msg,
+                Incoming::Idle => {}
+                other => panic!("expected Poisoned: {other:?}"),
+            }
+        };
+        assert!(msg.contains("WindowOpenedOrChanged"), "{msg}");
+        assert!(
+            !msg.contains("SECRET-TITLE"),
+            "value leaked into log: {msg}"
+        );
+
+        // The watch hides a previously shown chip, and stays hidden.
+        let mut watch = Watch::default();
+        let shown = watch
+            .observe(Event::WorkspacesChanged {
+                workspaces: vec![workspace(1, true)],
+            })
+            .or_else(|| {
+                watch.observe(Event::WindowsChanged {
+                    windows: vec![window(1, Some(1)), window(2, Some(1))],
+                })
+            })
+            .expect("the chip shows");
+        assert!(shown.hidden_on.is_empty());
+        let hidden = watch.poison().expect("poisoning hides it");
+        assert_eq!(hidden, Verdict::default());
+        assert!(
+            watch.observe(Event::WindowClosed { id: 2 }).is_none(),
+            "poisoned model emits nothing"
+        );
+        niri.join().expect("fake niri");
+    }
+
+    /// The skip line never carries the offending value.
+    #[test]
+    fn the_skip_message_carries_no_payload_value() {
+        let e = serde_json::from_str::<Event>("{\"WindowClosed\":{\"id\":\"SECRET-TITLE\"}}")
+            .expect_err("bad id");
+        assert!(
+            e.to_string().contains("SECRET-TITLE"),
+            "premise: serde echoes"
+        );
+        let msg = super::skip_message("x", "WindowClosed", &e);
+        assert!(!msg.contains("SECRET-TITLE"), "{msg}");
     }
 
     // ── the hand-rolled framing (#1038) ──────────────────────────────────────

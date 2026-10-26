@@ -113,6 +113,24 @@ pub(super) async fn set_adapter_path(path: &str, store: &Arc<tokio::sync::RwLock
     *store.write().await = path.to_string();
 }
 
+/// Subscribe (`subscribe`, which takes its receiver too), then take the
+/// snapshot (`snapshot`), in that order, for [`listen`] (#1551).
+///
+/// A helper rather than two lines in `listen` so the order is pinned (#1573
+/// review): the pre-#1551 regression was the two lines swapped, which no test
+/// could see.
+async fn subscribe_then_snapshot<S, T, F>(
+    subscribe: impl FnOnce() -> S,
+    snapshot: impl FnOnce() -> F,
+) -> (S, T)
+where
+    F: std::future::Future<Output = T>,
+{
+    let subscribed = subscribe();
+    let taken = snapshot().await;
+    (subscribed, taken)
+}
+
 pub(super) async fn listen(
     adapter_mutable: &Mutable<Option<Adapter>>,
     devices_mutable: &Mutable<Vec<Device>>,
@@ -136,12 +154,16 @@ pub(super) async fn listen(
     // with nothing to wait on for it, so this orders the `AddMatch` ahead of
     // `GetManagedObjects` in practice, not by proof. The window left is that
     // one round trip, not the snapshot plus a publish.
-    let owner_sub = name_owner_changed();
-    let owner_items = owner_sub.items();
-
-    let managed = get_managed_objects()
-        .await
-        .map_err(|e| anyhow::anyhow!("GetManagedObjects: {e}"))?;
+    let ((owner_sub, owner_items), managed) = subscribe_then_snapshot(
+        || {
+            let sub = name_owner_changed();
+            let items = sub.items();
+            (sub, items)
+        },
+        get_managed_objects,
+    )
+    .await;
+    let managed = managed.map_err(|e| anyhow::anyhow!("GetManagedObjects: {e}"))?;
 
     // ── Find the first adapter ────────────────────────────────────────────────
 
@@ -884,6 +906,27 @@ async fn handle_device_props_changed(state: &State, path: &str, body: &zbus::Mes
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `listen` subscribes to bluetoothd's owner before it takes the
+    /// snapshot (#1551), so a restart while the snapshot is taken is queued
+    /// for `event_loop` rather than missed (#1573 review).
+    ///
+    /// **Falsification:** take the snapshot first in
+    /// `subscribe_then_snapshot` (the pre-#1551 order) and the recorded order
+    /// flips.
+    #[tokio::test]
+    async fn the_owner_subscription_comes_before_the_snapshot() {
+        let log = std::cell::RefCell::new(Vec::new());
+        let ((), ()) = subscribe_then_snapshot(
+            || log.borrow_mut().push("subscribe"),
+            || {
+                log.borrow_mut().push("snapshot");
+                async {}
+            },
+        )
+        .await;
+        assert_eq!(log.into_inner(), ["subscribe", "snapshot"]);
+    }
 
     // ── #1201: bluetooth_marker_or_event routes markers to a resync ─────────
 

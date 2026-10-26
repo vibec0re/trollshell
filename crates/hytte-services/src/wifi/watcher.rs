@@ -321,6 +321,57 @@ fn log_registration(
 
 // ── Main watcher task ─────────────────────────────────────────────────────────
 
+/// What [`open_discovery`] hands the rest of a discovery pass.
+struct Opened<O, E, T> {
+    /// The pass's owner receiver, after the wait (if any) read it.
+    owner: O,
+    /// The pass's `InterfacesAdded` receiver.
+    added: E,
+    /// The pass's `InterfacesRemoved` receiver.
+    removed: E,
+    /// The snapshot, or `None` when iwd did not answer or had no station.
+    snapshot: Option<T>,
+}
+
+/// Open one discovery pass, in the order #1551 needs, with every step
+/// injected so a test can record the order (#1573 review: until then the
+/// order lived only in [`run_wifi_watcher`]'s body, and moving the wait or a
+/// receiver left the suite green).
+///
+/// 1. A fresh owner receiver (`take_owner`), taken before the wait reads it.
+/// 2. Except on the watcher's first pass, the wait for iwd to have an owner
+///    (`wait`), so a later discovery never D-Bus-activates a stopped iwd. The
+///    first pass is the one call the backend probe may rely on to start iwd.
+/// 3. Fresh iwd receivers (`take_iwd`), after the wait and before the
+///    snapshot, so every change made while the snapshot is taken is queued.
+/// 4. The snapshot (`discover`).
+async fn open_discovery<O, E, T, W, WF, D, DF>(
+    first: &mut bool,
+    take_owner: impl FnOnce() -> O,
+    wait: W,
+    take_iwd: impl FnOnce() -> (E, E),
+    discover: D,
+) -> Opened<O, E, T>
+where
+    W: FnOnce(O) -> WF,
+    WF: Future<Output = O>,
+    D: FnOnce() -> DF,
+    DF: Future<Output = Option<T>>,
+{
+    let mut owner = take_owner();
+    if !std::mem::take(first) {
+        owner = wait(owner).await;
+    }
+    let (added, removed) = take_iwd();
+    let snapshot = discover().await;
+    Opened {
+        owner,
+        added,
+        removed,
+        snapshot,
+    }
+}
+
 /// `paths` is the committed iwd backend's own path cache — passed in rather than
 /// reached for through a process-global, so that a backend switch retires this
 /// watcher's paths along with the watcher (#633; see [`IwdPaths`]).
@@ -364,19 +415,23 @@ pub(super) async fn run_wifi_watcher(
     let mut first_discovery = true;
 
     'discovery: loop {
-        // Fresh receivers for this pass, each taken before what it must not
-        // miss: the owner's before the wait reads it, iwd's before the
-        // snapshot.
-        let mut owner_items = owner_sub.items();
-        if first_discovery {
-            first_discovery = false;
-        } else {
-            wait_for_iwd(&mut owner_items).await;
-        }
-        let mut added_events = added_sub.events();
-        let mut removed_events = removed_sub.events();
-
-        let Some((managed, station_path)) = discover_station().await else {
+        let Opened {
+            owner: mut owner_items,
+            added: mut added_events,
+            removed: mut removed_events,
+            snapshot,
+        } = open_discovery(
+            &mut first_discovery,
+            || owner_sub.items(),
+            |mut owner| async move {
+                wait_for_iwd(&mut owner).await;
+                owner
+            },
+            || (added_sub.events(), removed_sub.events()),
+            discover_station,
+        )
+        .await;
+        let Some((managed, station_path)) = snapshot else {
             tokio::time::sleep(DISCOVERY_RETRY).await;
             continue 'discovery;
         };
@@ -543,7 +598,7 @@ async fn handle_station_props_event(
 #[cfg(test)]
 mod tests {
     use super::{
-        IWD_RECHECK, IwdOwner, OwnerReaction, iwd_owner_change, next_iwd_owner,
+        IWD_RECHECK, IwdOwner, OwnerReaction, iwd_owner_change, next_iwd_owner, open_discovery,
         owner_reaction, register_agent_until_accepted, wait_for_owner,
     };
     use crate::retry;
@@ -717,6 +772,51 @@ mod tests {
                 .await
                 .is_err(),
             "a closed stream must leave the pacing to the re-check"
+        );
+    }
+
+    /// A discovery pass opens in #1551's order: the owner receiver, then the
+    /// wait for iwd (every pass but the watcher's first), then iwd's
+    /// receivers, then the snapshot (#1573 review).
+    ///
+    /// **Falsification:** wait on the first pass too, skip the wait on a
+    /// later one, take iwd's receivers before the wait, or take the snapshot
+    /// before them, and the recorded order changes.
+    #[tokio::test]
+    async fn a_discovery_pass_opens_in_order_and_waits_except_the_first() {
+        let log = RefCell::new(Vec::new());
+        let mut first = true;
+        for _ in 0..2 {
+            let opened = open_discovery(
+                &mut first,
+                || log.borrow_mut().push("owner receiver"),
+                |owner| {
+                    log.borrow_mut().push("wait for iwd");
+                    async move { owner }
+                },
+                || {
+                    log.borrow_mut().push("iwd receivers");
+                    ((), ())
+                },
+                || {
+                    log.borrow_mut().push("snapshot");
+                    async { Some(()) }
+                },
+            )
+            .await;
+            assert_eq!(opened.snapshot, Some(()));
+        }
+        assert_eq!(
+            log.into_inner(),
+            [
+                "owner receiver",
+                "iwd receivers",
+                "snapshot",
+                "owner receiver",
+                "wait for iwd",
+                "iwd receivers",
+                "snapshot",
+            ]
         );
     }
 

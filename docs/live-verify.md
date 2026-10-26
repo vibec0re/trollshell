@@ -2033,6 +2033,24 @@ title` in the stderr tail — worth a deliberate look on first run, since
       `RUST_LOG=trollshell=debug` "source colour is not one GTK can parse"
       line is reachable only if the two ends ever disagree, so seeing one at
       all is the finding.
+- [ ] **(#1490)** Moved single occurrence: in Nextcloud (or Thunderbird),
+      move **one** occurrence of a weekly event to another day and time ("this
+      occurrence only"). Within one poll (60 s) the sidebar Upcoming list and
+      the month grid show it **once**, at the new time (with the new title, if
+      you changed it). The original slot is empty and every other week is
+      unchanged. Before #1490 it showed at both times.
+- [ ] **(#1490)** Moved across the window: move an occurrence from this
+      month into next month, and one the other way, then page the drawer
+      calendar between the two months. Each appears in exactly one of them,
+      at its new time.
+- [ ] **(#1490)** Cancelled single occurrence on a Google-synced calendar
+      (Google writes a `STATUS:CANCELLED` detached instance rather than an
+      `EXDATE`). It disappears from the shell instead of staying at its
+      original time.
+- [ ] **(#1490)** Floating time on a DST transition: a floating (zone-less)
+      event at 02:30 on a fall-back day shows at 02:30 **CEST**, not missing,
+      and a floating daily 02:30 series keeps going past that night. On the
+      spring-forward day the 02:30 occurrence shows at 03:30 CEST.
 
 ## Displays / compositor geometry & overlays
 

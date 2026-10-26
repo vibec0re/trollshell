@@ -3538,6 +3538,7 @@ fn remove_leaf(
     documented: &BTreeSet<String>,
 ) {
     let Some((head, rest)) = key_path.split_once('.') else {
+        drop_unset_entry(table, key_path);
         remove_keeping_closing_space(table, key_path);
         return;
     };
@@ -3556,6 +3557,41 @@ fn remove_leaf(
         .is_some_and(toml_edit::TableLike::is_empty);
     if emptied && !documented.contains(&path) {
         remove_keeping_closing_space(table, head);
+    }
+}
+
+/// Drop `key` from the same table's [`merge::UNSET_KEY`] array, and the
+/// `_unset` key itself if that empties it.
+///
+/// A reset means "fall back to the inherited value". A hand-written
+/// `_unset = ["k"]` beside `k` would keep erasing the base layer's `k` after
+/// the overlay's own line is gone, so the row would land on the built-in
+/// default and skip the nix/base value. Only `key`'s entry goes: other names
+/// in the array, and every other marker (including `_locked`), are untouched.
+/// A malformed marker (not an array) is left alone — `malformed_unset` reports
+/// it and this writer does not guess.
+///
+/// Scope: only the leaf's **own** table's `_unset`. Its names are literal keys
+/// of that table, not paths (see `merge.rs`). A hand-written marker on a
+/// *parent* table (e.g. root `_unset = ["core"]`) still erases the base table,
+/// so resetting `core.brightness` then lands on the code default. That is
+/// deliberate: removing a parent marker would un-erase sibling keys the user
+/// may still want gone. [`remove_leaf`] applies this at the leaf's own table
+/// only, for the same reason.
+fn drop_unset_entry(table: &mut dyn toml_edit::TableLike, key: &str) {
+    let Some(array) = table
+        .get_mut(merge::UNSET_KEY)
+        .and_then(toml_edit::Item::as_array_mut)
+    else {
+        return;
+    };
+    let before = array.len();
+    array.retain(|v| v.as_str() != Some(key));
+    if array.len() == before {
+        return;
+    }
+    if array.is_empty() {
+        table.remove(merge::UNSET_KEY);
     }
 }
 
@@ -8774,5 +8810,104 @@ label = "Borealis"
                 }
             }
         }
+    }
+
+    /// What the merge keeps of `overlay_text` over a base that sets
+    /// `core.brightness = 9` — the end-to-end half of the reset tests below.
+    fn merged_over_base(overlay_text: &str) -> toml::Table {
+        let base: toml::Table = "[core]\nbrightness = 9\n".parse().expect("base");
+        let overlay: toml::Table = overlay_text.parse().expect("overlay");
+        crate::merge::merge_all([base, overlay])
+    }
+
+    /// The `_unset` names left in `[table]` of `text`.
+    fn unset_names(text: &str, table: &str) -> Vec<String> {
+        let back: toml::Table = text.parse().expect("TOML");
+        back[table]["_unset"]
+            .as_array()
+            .expect("array stays")
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// A reset must fall back to the *base* layer, not past it: a hand-written
+    /// `_unset` naming the key would keep erasing the inherited value.
+    ///
+    /// Red without `drop_unset_entry`: the marker stays, and the merge below
+    /// has no `brightness` at all.
+    #[test]
+    fn a_reset_drops_the_unset_entry_that_would_erase_the_base_value() {
+        let (_dir, path) =
+            scratch("[core]\nbrightness = 3\n_unset = [\"brightness\"]\nlabel = \"x\"\n");
+        save_leaf(&path, "core.brightness", None, &BTreeSet::new()).expect("resets");
+        let after = read(&path);
+        assert_eq!(after, "[core]\nlabel = \"x\"\n");
+        let merged = merged_over_base(&after);
+        assert_eq!(
+            merged["core"]["brightness"].as_integer(),
+            Some(9),
+            "the base value shows through: {merged:?}"
+        );
+    }
+
+    /// Only this key's entry goes; the other names in the array stay.
+    #[test]
+    fn a_reset_keeps_the_unset_entries_for_other_keys() {
+        let (_dir, path) = scratch("[core]\n_unset = [\"label\", \"brightness\"]\n");
+        save_leaf(&path, "core.brightness", None, &BTreeSet::new()).expect("resets");
+        assert_eq!(unset_names(&read(&path), "core"), ["label"]);
+    }
+
+    /// A multi-line `_unset` array: removing the first or the last element
+    /// leaves valid TOML and the other elements with their formatting.
+    ///
+    /// A comment attached to the removed element goes with it, matching
+    /// `remove_keeping_closing_space`: a comment describes the value that is
+    /// going away.
+    #[test]
+    fn a_reset_in_a_multi_line_unset_array_keeps_the_rest_intact() {
+        let text = "[core]\n_unset = [\n    \"brightness\",\n    \"label\",\n    \"palette\",\n]\n";
+        let (_dir, path) = scratch(text);
+        save_leaf(&path, "core.brightness", None, &BTreeSet::new()).expect("resets first");
+        let after = read(&path);
+        assert_eq!(unset_names(&after, "core"), ["label", "palette"], "{after}");
+        assert!(after.contains("\n    \"label\","), "{after}");
+        assert!(after.contains("\n    \"palette\","), "{after}");
+        assert!(after.contains("\n]"), "{after}");
+
+        let (_dir, path) = scratch(text);
+        save_leaf(&path, "core.palette", None, &BTreeSet::new()).expect("resets last");
+        let after = read(&path);
+        assert_eq!(
+            unset_names(&after, "core"),
+            ["brightness", "label"],
+            "{after}"
+        );
+        assert!(after.contains("\n    \"brightness\","), "{after}");
+        assert!(after.contains("\n    \"label\""), "{after}");
+    }
+
+    /// An emptied `_unset` array is removed, not left as `_unset = []`.
+    #[test]
+    fn a_reset_removes_an_unset_array_it_empties() {
+        let (_dir, path) = scratch("[core]\n_unset = [\"brightness\"]\nlabel = \"x\"\n");
+        save_leaf(&path, "core.brightness", None, &BTreeSet::new()).expect("resets");
+        let after = read(&path);
+        assert!(!after.contains("_unset"), "{after}");
+        assert_eq!(after, "[core]\nlabel = \"x\"\n");
+    }
+
+    /// The same hazard for a whole-entry removal: `[display] _unset =
+    /// ["argus"]` would keep erasing an inherited `display.argus` after the
+    /// overlay's own entry is gone. `remove_entry_to_locked` shares
+    /// `remove_leaf`, so the same fix covers it.
+    #[test]
+    fn removing_an_entry_drops_the_unset_entry_naming_it() {
+        let (_dir, path) = scratch(
+            "[display]\n_unset = [\"argus\", \"borealis\"]\n\n[display.argus]\nlabel = \"A\"\n",
+        );
+        remove_entry_to_locked::<Leds>(&path, "display.argus", &BTreeSet::new()).expect("removes");
+        assert_eq!(unset_names(&read(&path), "display"), ["borealis"]);
     }
 }

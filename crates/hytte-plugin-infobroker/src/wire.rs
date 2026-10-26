@@ -146,7 +146,9 @@ pub struct Response {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// An actionable next step for the human (e.g. how to grant). Present on the
-    /// consent denials the human should act on.
+    /// consent denials the human should act on — and, on an otherwise `ok`
+    /// `grants` reply, when `grants.toml` could not be read, so the list is
+    /// the broker's in-memory set rather than the file's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
     /// The minted session token (`auth` ok).
@@ -197,6 +199,90 @@ impl Response {
             ..Self::default()
         }
     }
+}
+
+/// The longest agent name an `auth` may assert, in `char`s — the same 64 the
+/// shell allows a plugin's self-declared version (`trollshell`'s
+/// `plugins::version::MAX_VERSION_CHARS`), and for the same reason: the name is
+/// display text the broker did not choose. See [`check_agent_name`].
+pub const MAX_AGENT_NAME_CHARS: usize = 64;
+
+/// Check the agent name an `auth` asserts, before the broker does anything
+/// else with it (the #1489 follow-up audit, M2).
+///
+/// The name is self-asserted — the socket is same-uid, so it labels a request
+/// rather than authenticating one — but it is still the one string a client
+/// chooses that a **human** then reads: in the consent card (its title and
+/// its "⟨agent⟩ wants to read …" line), in the panel's rows, in the denial
+/// toast, in the broker's journal lines and in `grants.toml`. Only blank
+/// names were refused before, so a name could carry a newline that wrote a
+/// second line into the card or a fake `[infobroker]` line into the journal,
+/// a bidi override that displayed differently from its bytes, or 64 KiB of
+/// text (the request cap) copied into every audit row of the 30-entry ring.
+///
+/// It is refused rather than cleaned: an identity that the broker rewrote
+/// would no longer match the name the agent sends next time, and two names
+/// that differ only in what was stripped would collapse into one grant row.
+/// A name is accepted when it:
+/// - is not blank;
+/// - is at most [`MAX_AGENT_NAME_CHARS`] `char`s;
+/// - contains none of the characters `trollshell`'s
+///   `plugins::version::is_dropped` names for plugin-declared display text
+///   (#1397 review M1) — controls, the line and paragraph separators, bidi
+///   embeddings/overrides/isolates and the zero-width formats. Transcribed
+///   below rather than shared, because this library links no shell crate;
+///   keep the two lists in step;
+/// - has no leading or trailing whitespace, so `claude` and `claude ` cannot
+///   be two grant rows that read the same in the panel.
+///
+/// Interior spaces and non-ASCII letters stay legal (`Claude Code`, `Kätzchen`):
+/// a name that worked before is refused only if it carried one of the above.
+/// Rows already in `grants.toml` are not re-checked on load — a hand-written or
+/// pre-check row with such a name still loads, still shows, and can still be
+/// revoked; it just can no longer be asked for.
+///
+/// # Errors
+/// A one-line reason, phrased for the client (it never echoes the name back).
+pub fn check_agent_name(agent: &str) -> Result<(), String> {
+    if agent.trim().is_empty() {
+        return Err("the agent name is empty".to_owned());
+    }
+    if agent.chars().nth(MAX_AGENT_NAME_CHARS).is_some() {
+        return Err(format!(
+            "the agent name is longer than {MAX_AGENT_NAME_CHARS} characters"
+        ));
+    }
+    if let Some(c) = agent.chars().find(|&c| is_unprintable(c)) {
+        return Err(format!(
+            "the agent name contains U+{:04X}, a character that is invisible, breaks a line, \
+             or reorders the text around it",
+            u32::from(c)
+        ));
+    }
+    if agent.trim() != agent {
+        return Err("the agent name starts or ends with whitespace".to_owned());
+    }
+    Ok(())
+}
+
+/// Whether [`check_agent_name`] refuses a name containing `c`: anything that
+/// is invisible, moves text between lines, or reorders how the rest displays.
+/// A transcription of `trollshell`'s `plugins::version::is_dropped` (#1397
+/// review M1), whose doc lists what each range is.
+fn is_unprintable(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{00AD}'
+                | '\u{061C}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{206F}'
+                | '\u{FEFF}'
+                | '\u{FFF9}'..='\u{FFFB}'
+        )
 }
 
 /// Parse one request line. Returns a human-readable error (used verbatim in the
@@ -342,6 +428,71 @@ mod tests {
         );
         let back: Response = serde_json::from_str(&line).expect("decodes");
         assert_eq!(back, resp);
+    }
+
+    /// M2: the names an agent plausibly picks still pass — including the ones
+    /// with interior spaces or non-ASCII letters, which a stricter ASCII-only
+    /// rule would have locked out of grants they already hold.
+    #[test]
+    fn ordinary_agent_names_pass_the_check() {
+        for name in [
+            "claude",
+            "claude-code",
+            "Claude Code",
+            "agent.1",
+            "claude@laptop",
+            "Kätzchen",
+            "名前",
+            &"x".repeat(MAX_AGENT_NAME_CHARS),
+            // 64 `char`s of a multi-byte letter: the cap counts chars, not bytes.
+            &"ä".repeat(MAX_AGENT_NAME_CHARS),
+        ] {
+            assert_eq!(check_agent_name(name), Ok(()), "{name:?} must pass");
+        }
+    }
+
+    /// M2: blank, over-long, and padded names are refused, each with its own
+    /// reason.
+    #[test]
+    fn blank_long_and_padded_agent_names_are_refused() {
+        for (name, reason) in [
+            ("", "empty"),
+            ("   ", "empty"),
+            (" claude", "whitespace"),
+            ("claude ", "whitespace"),
+            ("claude\u{3000}", "whitespace"),
+        ] {
+            let err = check_agent_name(name).expect_err(name);
+            assert!(err.contains(reason), "{name:?}: {err}");
+        }
+        let long = "x".repeat(MAX_AGENT_NAME_CHARS + 1);
+        let err = check_agent_name(&long).expect_err("one char past the cap");
+        assert!(err.contains("longer than 64"), "{err}");
+    }
+
+    /// M2: every class the shell's own display-text rule drops is refused in
+    /// a name — a newline (a second line in the consent card, a forged
+    /// journal line), an escape, a bidi override (a name that displays
+    /// differently from its bytes), the line/paragraph separators, and the
+    /// zero-width formats.
+    #[test]
+    fn invisible_line_breaking_and_reordering_characters_are_refused() {
+        for c in [
+            '\n', '\r', '\t', '\u{1b}', '\u{7f}', '\u{85}', '\u{00AD}', '\u{061C}', '\u{180E}',
+            '\u{200B}', '\u{200D}', '\u{200E}', '\u{2028}', '\u{2029}', '\u{202E}', '\u{2060}',
+            '\u{2066}', '\u{2069}', '\u{FEFF}', '\u{FFFB}',
+        ] {
+            let name = format!("cla{c}ude");
+            let err = check_agent_name(&name).expect_err(&name);
+            assert!(
+                err.contains(&format!("U+{:04X}", u32::from(c))),
+                "the refusal names the character: {err}"
+            );
+            assert!(
+                !err.contains("cla"),
+                "the refusal never echoes the name: {err}"
+            );
+        }
     }
 
     #[test]

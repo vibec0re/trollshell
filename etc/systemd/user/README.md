@@ -276,7 +276,11 @@ audit trail. Unlike the other plugins it **also binds its own socket**,
 `$XDG_RUNTIME_DIR/hytte-infobroker.sock` (0600, same-user-only), which the
 separate `hytte-infobroker` CLI dials so an agent can `auth` (mint a session
 token) and `get` scoped data. Durable grants persist to
-`$XDG_STATE_HOME/hytte-infobroker/grants.toml` (or `~/.local/state/…`); session
+`$XDG_STATE_HOME/hytte-infobroker/grants.toml` (or `~/.local/state/…`) — and
+if that file is there but does not parse, the broker leaves it untouched,
+enforces none of it, keeps the session's grant changes in memory only, and says
+so in a toast, on its panel and in `hytte-infobroker grants list`, until it is
+fixed and the unit restarted; session
 tokens are in-memory only (12 h TTL, killed by a panel revoke or a restart of
 this unit / trollshell). The first request from an agent with no standing
 grant fires an interactive Allow/Deny consent prompt at the human

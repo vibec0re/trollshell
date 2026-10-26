@@ -28,11 +28,14 @@
 
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{CommandFactory as _, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 
+use hytte_plugin_infobroker::broker::CONSENT_PARK_TIMEOUT;
 use hytte_plugin_infobroker::paths;
 use hytte_plugin_infobroker::wire::{
     DATASOURCE_CALENDAR, DATASOURCE_DEPARTURES, DATASOURCE_WEATHER, Request, Response,
@@ -41,6 +44,19 @@ use hytte_plugin_infobroker::wire::{
 /// The environment variable carrying the session token, injected by `auth` and
 /// read by `get`.
 const ENV_TOKEN: &str = "HYTTE_INFOBROKER_TOKEN";
+
+/// How long [`call`] waits for the broker's one reply line before giving up.
+///
+/// The longest a working broker legitimately takes is an `auth` parked on the
+/// human: the shell's card answers within 60 s, and the broker's own backstop
+/// ([`CONSENT_PARK_TIMEOUT`], 65 s) answers a card that never does. This is
+/// that backstop plus 15 s of slack, so a slow-but-alive broker always answers
+/// first. Without any bound (#1489 follow-up audit, L2) a wedged broker — one
+/// that accepted the connection and then never wrote — hung the CLI, and with
+/// it the agent that shelled out to it, forever.
+const REPLY_TIMEOUT: Duration = CONSENT_PARK_TIMEOUT.saturating_add(Duration::from_secs(15));
+
+const _: () = assert!(REPLY_TIMEOUT.as_secs() > CONSENT_PARK_TIMEOUT.as_secs());
 
 /// The agent-flow example shown in `--help`.
 const LONG_ABOUT: &str = "hytte-infobroker — the trollshell data broker CLI (issue #487)\n\
@@ -240,10 +256,16 @@ fn cmd_get(datasource: Datasource, limit: Option<usize>) -> Result<(), String> {
 }
 
 /// `grants list` → one grant per line (agent, datasource, scope, decision).
+/// A `hint` on the reply — `grants.toml` could not be read, so this is the
+/// broker's in-memory set rather than the file's (#1489 follow-up audit, M3) —
+/// goes to stderr first, so an empty list cannot read as "no grants".
 fn cmd_grants() -> Result<(), String> {
     let resp = call(&Request::Grants)?;
     if !resp.ok {
         return Err(deny_message(&resp));
+    }
+    if let Some(hint) = &resp.hint {
+        eprintln!("hytte-infobroker: warning: {hint}");
     }
     let grants = resp.grants.unwrap_or_default();
     if grants.is_empty() {
@@ -260,12 +282,21 @@ fn cmd_grants() -> Result<(), String> {
 fn call(req: &Request) -> Result<Response, String> {
     let path =
         paths::socket_path().ok_or("XDG_RUNTIME_DIR not set — is this a desktop session?")?;
-    let stream = UnixStream::connect(&path).map_err(|e| {
+    call_at(&path, req, REPLY_TIMEOUT)
+}
+
+/// [`call`] against an explicit socket and reply bound — the seam a test
+/// drives with a scratch socket and a short `reply_timeout`.
+fn call_at(path: &Path, req: &Request, reply_timeout: Duration) -> Result<Response, String> {
+    let stream = UnixStream::connect(path).map_err(|e| {
         format!(
             "cannot reach the broker at {} ({e}) — is the infobroker plugin running?",
             path.display()
         )
     })?;
+    stream
+        .set_read_timeout(Some(reply_timeout))
+        .map_err(|e| format!("setting the reply timeout: {e}"))?;
 
     let mut line = serde_json::to_string(req).map_err(|e| format!("encoding request: {e}"))?;
     line.push('\n');
@@ -275,9 +306,21 @@ fn call(req: &Request) -> Result<Response, String> {
 
     let mut reader = BufReader::new(&stream);
     let mut resp_line = String::new();
-    reader
-        .read_line(&mut resp_line)
-        .map_err(|e| format!("reading response: {e}"))?;
+    reader.read_line(&mut resp_line).map_err(|e| {
+        if matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ) {
+            format!(
+                "the broker at {} did not answer within {} s — it may be wedged; restarting the \
+                 infobroker plugin should clear it",
+                path.display(),
+                reply_timeout.as_secs()
+            )
+        } else {
+            format!("reading response: {e}")
+        }
+    })?;
     let resp_line = resp_line.trim();
     if resp_line.is_empty() {
         return Err("the broker closed the connection without a response".to_owned());
@@ -315,6 +358,59 @@ mod tests {
     use clap_complete::Shell;
 
     use super::{Cli, Command, GrantsAction, render_completions};
+    use super::{Duration, Request, call_at};
+
+    /// L2: a broker that accepts the connection and never writes fails the
+    /// call at the reply bound, with an error saying so, instead of hanging
+    /// the CLI (and the agent that shelled out to it) forever.
+    ///
+    /// Mutation: drop the `set_read_timeout`, and this test hangs — which
+    /// is the bug.
+    #[test]
+    fn a_broker_that_never_answers_times_out_instead_of_hanging() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("broker.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        // Accept and hold the connection without writing a byte.
+        let holder = std::thread::spawn(move || listener.accept().map(|(stream, _)| stream));
+
+        let started = std::time::Instant::now();
+        let err = call_at(&path, &Request::Grants, Duration::from_millis(200))
+            .expect_err("a silent broker is an error");
+        assert!(err.contains("did not answer within"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "gave up at the bound, not later: {:?}",
+            started.elapsed()
+        );
+        drop(holder.join());
+    }
+
+    /// L2, the other side: the bound changes nothing for a broker that
+    /// answers.
+    #[test]
+    fn a_broker_that_answers_is_read_as_before() {
+        use std::io::{BufRead as _, Write as _};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("broker.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut request = String::new();
+            std::io::BufReader::new(&stream)
+                .read_line(&mut request)
+                .expect("read the request");
+            (&stream)
+                .write_all(b"{\"ok\":true,\"grants\":[]}\n")
+                .expect("reply");
+            request
+        });
+        let resp = call_at(&path, &Request::Grants, Duration::from_secs(5)).expect("answered");
+        assert!(resp.ok);
+        assert_eq!(resp.grants, Some(Vec::new()));
+        assert_eq!(server.join().expect("server").trim(), r#"{"op":"grants"}"#);
+    }
 
     fn parse(argv: &[&str]) -> Result<Cli, clap::Error> {
         let mut full = vec!["hytte-infobroker"];

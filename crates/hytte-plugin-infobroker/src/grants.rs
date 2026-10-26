@@ -112,11 +112,16 @@ struct WriterLane {
 }
 
 /// The in-memory grant set plus the file it persists to. Construct via
-/// [`GrantStore::load`] (disk) or [`GrantStore::from_grants`] (tests).
+/// [`GrantStore::load`] (disk), [`GrantStore::unreadable`] (a file that is
+/// there but did not load) or [`GrantStore::from_grants`] (tests).
 #[derive(Debug)]
 pub struct GrantStore {
     path: Option<PathBuf>,
     grants: Vec<Grant>,
+    /// Why `path` could not be loaded, when it could not (the #1489 follow-up
+    /// audit, M3) — and so why this store never writes it. See
+    /// [`GrantStore::unreadable`].
+    load_error: Option<String>,
     /// The store's **single writer** lane (#1074 review M1), created on the
     /// first [`save`](GrantStore::save) that has a tokio runtime to spawn it
     /// on. Every snapshot goes through this one channel so writes land in
@@ -148,8 +153,45 @@ impl GrantStore {
         Ok(Self {
             path: Some(path),
             grants,
+            load_error: None,
             writer: OnceLock::new(),
         })
+    }
+
+    /// The store for a `path` that [`GrantStore::load`] refused with `error`:
+    /// a file that is there but does not parse, or cannot be read. It starts
+    /// empty, keeps `path` so the broker can name it, and **never writes it**
+    /// (the #1489 follow-up audit, M3).
+    ///
+    /// The broker used to answer that `Err` with [`GrantStore::from_grants`]'s
+    /// path-less store, which kept the file safe by accident — `save` is a
+    /// no-op without a path — but said so only once, in the journal, at
+    /// session start. Every Allow, Revoke and consent answer for the rest of
+    /// the session then went nowhere, while the panel and the card behaved as
+    /// if they had been saved; and nothing the human could see said that the
+    /// standing denies in the file were no longer in force. Keeping the path
+    /// is what lets the panel say all of that ([`GrantStore::load_error`]),
+    /// and the refusal to write moved from a side effect of a missing path to
+    /// a check of its own in `save`.
+    ///
+    /// Refusing writes rather than moving the bad file aside and starting a
+    /// fresh one is this workspace's rule for a config it cannot read:
+    /// `hytte-config`'s places writer never seeds over an unreadable
+    /// `places.toml` (#1486), and a live reload of an unparsable `agents.toml`
+    /// keeps what was in force (#1531). `grants.toml` is a file the human is
+    /// told to edit by hand (every denial's hint says so), so a typo is the
+    /// expected way it breaks — and a fresh file beside a set-aside one would
+    /// quietly fork the policy, leaving every standing deny in a file nothing
+    /// reads again. Here the human's file stays the one source of truth: fix
+    /// it, restart the broker, and every grant in it is back.
+    #[must_use]
+    pub fn unreadable(path: impl Into<PathBuf>, error: impl Into<String>) -> Self {
+        Self {
+            path: Some(path.into()),
+            grants: Vec::new(),
+            load_error: Some(error.into()),
+            writer: OnceLock::new(),
+        }
     }
 
     /// An in-memory store with no backing file — for tests and for the rare
@@ -159,8 +201,24 @@ impl GrantStore {
         Self {
             path: None,
             grants,
+            load_error: None,
             writer: OnceLock::new(),
         }
+    }
+
+    /// The file this store persists to, if it has one — including the one an
+    /// [`unreadable`](GrantStore::unreadable) store will not write.
+    #[must_use]
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// Why this store's file could not be loaded — `Some` exactly for a store
+    /// built by [`GrantStore::unreadable`], which keeps its changes in memory
+    /// and never writes them.
+    #[must_use]
+    pub fn load_error(&self) -> Option<&str> {
+        self.load_error.as_deref()
     }
 
     /// All grants, in file order.
@@ -352,7 +410,10 @@ impl GrantStore {
     /// the write would be worse than blocking briefly for it. Both of those
     /// writes bypass the lane, per the scope note above.
     ///
-    /// A store with no backing file is a no-op (test / no-`HOME`). A failure —
+    /// A store with no backing file is a no-op (test / no-`HOME`), and so is an
+    /// [`unreadable`](GrantStore::unreadable) one, with a journal line saying
+    /// the change was kept in memory only: the bytes there are the human's, and
+    /// this store cannot account for them. A failure —
     /// encoding, creating the state dir, the write, or the rename — is logged
     /// from wherever it happens: encoding is synchronous here, so it logs and
     /// returns without queueing; the rest is logged by the writer task, since
@@ -378,6 +439,14 @@ impl GrantStore {
         let Some(path) = self.path.clone() else {
             return;
         };
+        if let Some(error) = &self.load_error {
+            log(&format!(
+                "not saving {}: it could not be loaded when this session started ({error}), and \
+                 saving would replace it; this grant change lasts until the broker restarts",
+                path.display()
+            ));
+            return;
+        }
         let text = match to_toml(&self.grants) {
             Ok(text) => text,
             Err(e) => {
@@ -689,8 +758,34 @@ fn tighten_dir(_dir: &Path) {}
 /// # Errors
 /// If `text` isn't valid TOML for the grant schema.
 pub fn parse_grants(text: &str) -> Result<Vec<Grant>, String> {
-    let file: GrantsFile = toml::from_str(text).map_err(|e| format!("grants.toml: {e}"))?;
+    let file: GrantsFile = toml::from_str(text).map_err(|e| describe_toml_error(text, &e))?;
     Ok(file.grant)
+}
+
+/// One line for a `grants.toml` that does not parse:
+/// `grants.toml: line L, column C: <what is wrong>`.
+///
+/// The `toml` crate's own `Display` is a multi-line source excerpt with a caret
+/// under the column — right for a terminal, wrong for where this string lands
+/// since the #1489 follow-up audit (M3): the panel's notice, a wrapping label
+/// in a proportional font where the caret no longer lines up, and a journal
+/// line that systemd would otherwise split into one record per excerpt line.
+fn describe_toml_error(text: &str, error: &toml::de::Error) -> String {
+    let message = error
+        .message()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let position = error
+        .span()
+        .and_then(|span| text.get(..span.start))
+        .map(|before| {
+            let line = before.matches('\n').count() + 1;
+            let line_start = before.rfind('\n').map_or(before, |i| &before[i + 1..]);
+            format!("line {line}, column {}: ", line_start.chars().count() + 1)
+        })
+        .unwrap_or_default();
+    format!("grants.toml: {position}{message}")
 }
 
 /// Serialize grant rows back to a `grants.toml` body. Pure.
@@ -853,6 +948,105 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let store = GrantStore::load(&path).expect("missing file → empty");
         assert!(store.grants().is_empty());
+    }
+
+    /// M3: a `grants.toml` that does not parse is described on one line that
+    /// says where — the string the panel's notice and the journal both carry,
+    /// neither of which can show the `toml` crate's multi-line excerpt.
+    #[test]
+    fn a_parse_error_is_one_line_naming_where() {
+        let err = parse_grants("[[grant]]\nagent = \"a\"\ndecision = \n").unwrap_err();
+        assert!(err.starts_with("grants.toml: line 3, column "), "{err}");
+        assert!(!err.contains('\n'), "one line: {err:?}");
+    }
+
+    /// M2's other half: the agent-name rule is enforced where a name enters
+    /// (`auth`), never on load — so a file with the names agents actually use
+    /// still loads, and so does a row the rule would now refuse (a hand edit,
+    /// or one an older broker wrote), rather than costing the whole file.
+    #[test]
+    fn grant_files_load_whatever_names_their_rows_carry() {
+        let grants = parse_grants(
+            "[[grant]]\nagent = \"claude\"\ndatasource = \"departures\"\ndecision = \"always\"\n\
+             [[grant]]\nagent = \"Claude Code\"\ndatasource = \"calendar\"\ndecision = \"deny\"\n\
+             [[grant]]\nagent = \"Kätzchen\"\ndatasource = \"weather\"\ndecision = \"always\"\n\
+             [[grant]]\nagent = \"old\\nrow\"\ndatasource = \"departures\"\ndecision = \"deny\"\n",
+        )
+        .expect("every row loads");
+        let agents: Vec<&str> = grants.iter().map(|g| g.agent.as_str()).collect();
+        assert_eq!(agents, ["claude", "Claude Code", "Kätzchen", "old\nrow"]);
+    }
+
+    /// The bytes a corrupt `grants.toml` holds in the M3 tests below.
+    const CORRUPT: &str =
+        "[[grant]]\nagent = \"claude\"\ndatasource = \"departures\"\ndecision = \n";
+
+    /// Seed [`CORRUPT`] at `dir/grants.toml` and build the store the broker
+    /// builds for it.
+    fn unreadable_store(dir: &Path) -> (PathBuf, GrantStore, String) {
+        let path = dir.join("grants.toml");
+        std::fs::write(&path, CORRUPT).expect("seed the corrupt file");
+        let err = GrantStore::load(&path).expect_err("the seed does not parse");
+        let store = GrantStore::unreadable(&path, err.clone());
+        (path, store, err)
+    }
+
+    /// Assert `path` still holds [`CORRUPT`] and nothing else was left in its
+    /// directory (no temp file from a write that started and was abandoned).
+    fn assert_untouched(path: &Path) {
+        assert_eq!(
+            std::fs::read_to_string(path).expect("the file is still there"),
+            CORRUPT,
+            "the human's bytes must be left exactly as they were"
+        );
+        let entries: Vec<_> = std::fs::read_dir(path.parent().expect("has a parent"))
+            .expect("reads dir")
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("grants.toml")]);
+    }
+
+    /// M3: the store for an unreadable `grants.toml` keeps its path and the
+    /// reason, starts empty, takes every change in memory — and never writes
+    /// the file. A plain `#[test]`, so `save` takes its no-runtime arm (the
+    /// inline write the CLI and plain tests get).
+    ///
+    /// Mutation: drop `save`'s `load_error` check, and the first
+    /// `grant_always` replaces the file inline.
+    #[test]
+    fn an_unreadable_store_keeps_changes_in_memory_and_never_writes_inline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (path, mut store, err) = unreadable_store(dir.path());
+        assert_eq!(store.path(), Some(path.as_path()), "the path is kept");
+        assert_eq!(store.load_error(), Some(err.as_str()));
+        assert!(store.grants().is_empty(), "nothing in the file is in force");
+
+        store.grant_always("claude", "departures");
+        store.grant_deny("stranger", "calendar");
+        assert!(store.revoke("stranger", "calendar"));
+        assert_eq!(
+            store.decision_for("claude", "departures"),
+            Some(Decision::Always),
+            "the change holds for the session"
+        );
+        assert_untouched(&path);
+    }
+
+    /// M3, the broker's arm: with a runtime, `save` would queue on the writer
+    /// lane — and `drain` (the shutdown hook, #1079) would wait that write
+    /// out. The file is still untouched after both.
+    ///
+    /// Mutation: drop `save`'s `load_error` check, and `drain` returns only
+    /// once the lane has replaced the file.
+    #[tokio::test]
+    async fn an_unreadable_store_never_writes_through_the_writer_lane() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (path, mut store, _) = unreadable_store(dir.path());
+        store.grant_always("claude", "departures");
+        store.grant_deny("claude", "calendar");
+        store.drain().await;
+        assert_untouched(&path);
     }
 
     // ── `write_atomic` (#1065) ───────────────────────────────────────────────

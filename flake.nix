@@ -1868,6 +1868,11 @@
                 assert !(bad "1; touch /tmp/pwned").success;
                 assert !(bad "$(id)").success;
                 assert (bad "12.5").success;
+                assert (bad "+52.5").success;
+                assert (bad ".5").success;
+                assert (bad "52.").success;
+                assert !(bad "1e5").success;
+                assert !(bad "1,5").success;
                 "ok";
             in
             pkgs.runCommand "trollshell-hm-module-unit-escaping-check" { inherit probe; } ''

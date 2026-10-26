@@ -39,7 +39,7 @@ let
   # coordinates are spliced into the wlsunset unit's `sh -c '...'` ExecStart, so
   # a free-form string would be shell and systemd injection; a float is already
   # safe, and this keeps the string spelling working.
-  decimalDegreesStr = lib.types.strMatching "-?[0-9]+(\\.[0-9]+)?";
+  decimalDegreesStr = lib.types.strMatching "[-+]?([0-9]+\\.?[0-9]*|\\.[0-9]+)";
 
   bundledPluginIds = map (lib.removePrefix "hytte-plugin-") (import ./bundled-plugins.nix);
 

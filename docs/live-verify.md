@@ -4547,6 +4547,36 @@ switch` repoints atomically to a new store path every rebuild; the running
       Worth checking at two font sizes, and on a second output of a different
       height if you have one — the cap is derived per live monitor now, so it
       should differ between them.
+- [ ] **(RUSTSEC-2026-0386)** **The Disks card still follows a mount live.**
+      The mount-table watcher behind it left tokio's `AsyncFd` (whose safe
+      constructors tokio 1.54 deprecates as unsound) for a supervised thread
+      parked in `poll(2)` on `/proc/self/mountinfo`
+      (`hytte-services::sensors::spawn_mount_watch`). The tests pin the poll
+      mask against the real file and the loop through its seams, but the one
+      thing none can do is change the mount table under a real `poll` — and
+      the list the card reads is refreshed by **nothing else**, so a watcher
+      that never wakes shows up as a card frozen at startup's mounts until a
+      shell restart.
+  - **A mount appears.** `tmpfs` is filtered out of the card
+    (`PSEUDO_FSTYPES`), so use a real filesystem: a USB stick, or a loop
+    image — `truncate -s 64M /tmp/lv.img && mkfs.ext4 -q /tmp/lv.img &&
+sudo mount -o loop /tmp/lv.img /mnt`. With the Stats drawer open on the
+    Disks card, a `/mnt` row must appear within about 5 s — the
+    watcher updates the list at once; the card redraws on the next disk tick,
+    which is every fifth 1 Hz tick.
+  - **An unmount disappears.** `sudo umount /mnt` (then
+    `rm /tmp/lv.img`): the row goes on the same cadence. Mount and unmount
+    two or three times in a row to see the watcher re-arm after each change
+    rather than firing once.
+  - **No hot loop at idle.** `top -H -p "$(pidof trollshell)"` with the
+    drawer closed: no thread sits near 100 % CPU. A poll mask that also
+    asked for `POLLIN` (which this file reports on every call) would return
+    at once forever and re-read the mount table in a loop — the regression
+    `the_watch_mask_parks_on_an_unchanged_mount_table` exists to catch, cheap
+    to confirm on glass.
+  - **Quiet journal.** `journalctl --user -u trollshell -b | grep -i mountinfo`
+    is empty: neither `failed to open mountinfo for watch` nor
+    `mountinfo poll error, exiting watcher` should appear.
 
 ## Weather & location
 

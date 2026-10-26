@@ -19,10 +19,13 @@ system-tests = []
 
 [dependencies]
 anyhow.workspace = true
-# "signal" is this crate's own addition (`recorder.rs`'s SIGINT) on top of
-# the workspace baseline's "fs" (#453 — shared version here, no
-# hand-repinning); `hytte-sensors` takes the baseline alone.
-nix = { workspace = true, features = ["signal"] }
+# "signal" and "poll" are this crate's own additions on top of the workspace
+# baseline's "fs" (#453 — shared version here, no hand-repinning):
+# `recorder.rs`'s SIGINT, and the `poll(2)` the sensors mount-table watcher
+# parks in since tokio 1.54 deprecated the `AsyncFd` constructor it used to
+# register with (RUSTSEC-2026-0386; see `spawn_mount_watch`). Neither feature
+# resolves a package. `hytte-sensors` takes the baseline alone.
+nix = { workspace = true, features = ["signal", "poll"] }
 chrono.workspace = true
 futures-channel.workspace = true
 futures-signals.workspace = true
@@ -51,8 +54,11 @@ niri-ipc.workspace = true
 # hits; all SPA access goes through the `pipewire` re-export, see
 # audio_native/pod.rs's doc comment).
 pipewire = "0.10.0"
+# NOTE: no "net" here any more — it was enabled for one item, the sensors
+# mount-table watcher's `AsyncFd` (74cdf928), which left for a `poll(2)` thread
+# with RUSTSEC-2026-0386. Nothing else in this crate names a `net`-gated tokio
+# item; re-add it with the first thing that does.
 tokio = { workspace = true, features = [
-  "net",
   "rt",
   "io-util",
   "process",

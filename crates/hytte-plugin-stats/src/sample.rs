@@ -453,8 +453,9 @@ impl Sampler {
 
         // The mount table is re-read every tick rather than cached behind a
         // `POLLPRI` watcher the way `hytte-services`' own sensors service does
-        // it (#1249 left that half in the shell, since it needs an `AsyncFd`
-        // and a tokio reactor). One small `/proc` read per poll buys a plugin
+        // it (#1249 left that half in the shell, since it needed an `AsyncFd`
+        // and a tokio reactor — a supervised `poll(2)` thread since
+        // RUSTSEC-2026-0386). One small `/proc` read per poll buys a plugin
         // that notices a `mount` immediately and owns no watcher — and the
         // `statvfs` calls beside it dominate the cost either way.
         let disks = if self.needs.disk {

@@ -270,16 +270,90 @@ fn parse_nvidia_csv(s: &str) -> Option<GpuState> {
     })
 }
 
-/// True while a detached thread is reaping a timed-out `nvidia-smi`.
-static REAPER_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Most killed children the reaper tracks at once.
+///
+/// A child stuck in uninterruptible driver sleep stays on the reaper's list
+/// until the kernel lets it go. How fast new ones can arrive depends on the
+/// caller:
+///
+/// - On the retry backoff alone, at most one per backoff
+///   ([`NVIDIA_BACKOFF_INITIAL`] doubling to [`NVIDIA_BACKOFF_MAX`]), so 64
+///   means about 4.8 h of continuous failures (5 + 10 + ... + 160 s, then
+///   57 x 300 s).
+/// - [`GpuCache::forget_readings`] clears that backoff, and
+///   `hytte-plugin-stats` calls it (`Sampler::reset`) when its sidebar
+///   reopens after a while. So with a wedged driver, each such reopen can add
+///   one more child (one [`NVIDIA_SMI_DEADLINE`] fork each), and the cap is
+///   what bounds that path.
+///
+/// Past the cap a further child is dropped un-waited (a zombie until the
+/// process exits, the pre-reaper behaviour) so the list, and the memory
+/// behind it, stays bounded.
+const REAPER_MAX_PENDING: usize = 64;
+
+/// How often the reaper re-polls its list while any child is still alive.
+const REAPER_POLL: Duration = Duration::from_millis(100);
+
+/// The one long-lived reaper thread's inbox, spawned on first use.
+static REAPER: std::sync::OnceLock<std::sync::mpsc::Sender<std::process::Child>> =
+    std::sync::OnceLock::new();
+
+/// Body of the reaper thread: collect killed children and `try_wait` them all
+/// until each is gone. Polling the whole list (instead of blocking in `wait`
+/// on one) means a child stuck in D-state cannot delay reaping the others.
+fn reaper_loop(rx: &std::sync::mpsc::Receiver<std::process::Child>) {
+    let mut pending: Vec<std::process::Child> = Vec::new();
+    loop {
+        // Idle: block for work. Busy: wait one poll interval for more.
+        let next = if pending.is_empty() {
+            rx.recv().map_err(|_| ())
+        } else {
+            match rx.recv_timeout(REAPER_POLL) {
+                Ok(c) => Ok(c),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(()),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        };
+        match next {
+            Ok(child) => {
+                if pending.len() < REAPER_MAX_PENDING {
+                    pending.push(child);
+                }
+                // else: over the cap, dropped un-waited (see REAPER_MAX_PENDING).
+            }
+            Err(()) if pending.is_empty() => return,
+            Err(()) => {}
+        }
+        // Reap whatever has exited; keep the rest. An error from `try_wait`
+        // (ECHILD: already reaped elsewhere) also retires the entry.
+        pending.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
+    }
+}
+
+/// Hand a killed `nvidia-smi` to the reaper so it is always `wait`ed.
+fn reap_later(child: std::process::Child) {
+    let tx = REAPER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        // If the spawn fails (a transient EAGAIN, say), `tx` is cached with a
+        // dead receiver and is never replaced: every later `send` errors and
+        // its child is dropped un-waited, so reaping stays off for the rest
+        // of the process (each later timeout leaves one zombie). Before this
+        // reaper, `thread::spawn` panicked on the same failure instead.
+        let _ = std::thread::Builder::new()
+            .name("nvidia-smi-reaper".into())
+            .spawn(move || reaper_loop(&rx));
+        tx
+    });
+    let _ = tx.send(child);
+}
 
 /// Run `program` (normally `nvidia-smi`) with a hard `deadline`.
 ///
 /// The child is polled with `try_wait` rather than waited on, so a hung
 /// driver costs at most `deadline`. On timeout it is `SIGKILL`ed and reaped
-/// on a detached thread: a process stuck in uninterruptible driver sleep may
-/// not die promptly, and `wait` on it must not hold the sampler hostage
-/// either (the thread ends whenever the kernel lets the process go).
+/// by the single reaper thread ([`reap_later`]): a process stuck in
+/// uninterruptible driver sleep may not die promptly, and waiting on it must
+/// not hold the sampler hostage either.
 fn query_nvidia_smi(program: &str, deadline: Duration) -> Result<GpuState, NvidiaFailure> {
     use std::io::Read;
     use std::process::{Command, Stdio};
@@ -310,18 +384,7 @@ fn query_nvidia_smi(program: &str, deadline: Duration) -> Result<GpuState, Nvidi
             }
             Ok(None) | Err(_) => {
                 let _ = child.kill();
-                // At most one reaper thread at a time: a child stuck in
-                // D-state keeps its reaper blocked, and every further timeout
-                // would otherwise add another blocked thread. While one is
-                // outstanding, later killed children are simply dropped
-                // (left as zombies until the process exits) - bounded by the
-                // retry backoff, which allows one new child per few minutes.
-                if !REAPER_BUSY.swap(true, std::sync::atomic::Ordering::AcqRel) {
-                    std::thread::spawn(move || {
-                        let _ = child.wait();
-                        REAPER_BUSY.store(false, std::sync::atomic::Ordering::Release);
-                    });
-                }
+                reap_later(child);
                 return Err(NvidiaFailure::Transient);
             }
         }
@@ -882,11 +945,40 @@ mod tests {
 
     // ── query_nvidia_smi (real child processes, hermetic scripts) ────────────
 
+    /// Install a `#!/bin/sh` stand-in at `dir/name`, written by a `sh` child
+    /// and **never by this process**.
+    ///
+    /// Not `std::fs::write` plus a chmod, because of `ETXTBSY`: a sibling
+    /// test that forks (a `sleeper()`, another stand-in, `kill`) hands its
+    /// child a copy of every fd this process has open at that instant -
+    /// `O_CLOEXEC` closes them only at the child's `exec` - and `execve`
+    /// refuses a file anyone holds open for writing. `query_nvidia_smi` maps
+    /// that spawn error to `Transient`, so a stand-in that never ran looked
+    /// like a timeout: measured on a 64-core box, 10 of 60 runs of this
+    /// binary failed that way (3 of 60 on `main`), and 0 of 60 with the write
+    /// in a child. Same fix as #1540's `stand_in::install` in
+    /// `hytte-claude-bridge`.
     fn script(dir: &std::path::Path, name: &str, body: &str) -> String {
-        use std::os::unix::fs::PermissionsExt;
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
         let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut writer = Command::new("/bin/sh")
+            .args(["-c", r#"cat > "$1" && chmod 755 "$1""#, "sh"])
+            .arg(&path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn the script writer");
+        writer
+            .stdin
+            .take()
+            .expect("piped")
+            .write_all(format!("#!/bin/sh\n{body}\n").as_bytes())
+            .expect("hand the script over");
+        assert!(
+            writer.wait().expect("reap the script writer").success(),
+            "could not install {}",
+            path.display()
+        );
         path.to_str().unwrap().to_string()
     }
 
@@ -1134,5 +1226,145 @@ mod tests {
                 "the wrapper forked instead of serving the cached reading"
             );
         }
+    }
+
+    // ── the reaper (no killed child is ever left un-waited) ──────────────────
+
+    /// True once `/proc/<pid>` no longer exists, i.e. the child was waited on.
+    /// A killed-but-unreaped child lingers there in state `Z`.
+    fn is_reaped(pid: u32) -> bool {
+        !std::path::Path::new(&format!("/proc/{pid}/stat")).exists()
+    }
+
+    fn wait_reaped(pid: u32, within: Duration) -> bool {
+        let end = Instant::now() + within;
+        while Instant::now() < end {
+            if is_reaped(pid) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        is_reaped(pid)
+    }
+
+    fn sleeper() -> std::process::Child {
+        std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_killed_child_handed_to_the_reaper_is_waited_on() {
+        let mut child = sleeper();
+        let pid = child.id();
+        child.kill().unwrap();
+        reap_later(child);
+        assert!(
+            wait_reaped(pid, Duration::from_secs(5)),
+            "zombie left behind"
+        );
+    }
+
+    /// The regression: with one reaper per outstanding child, a second killed
+    /// child arriving while the first is stuck was dropped as a zombie. One
+    /// stuck (still-running) child must not hold up reaping the next.
+    #[test]
+    fn a_stuck_child_does_not_hold_up_reaping_the_next() {
+        let stuck = sleeper();
+        let stuck_pid = stuck.id();
+        reap_later(stuck);
+
+        let mut killed = sleeper();
+        let killed_pid = killed.id();
+        killed.kill().unwrap();
+        reap_later(killed);
+        assert!(
+            wait_reaped(killed_pid, Duration::from_secs(5)),
+            "a later killed child stayed a zombie behind a stuck one"
+        );
+        assert!(!is_reaped(stuck_pid), "the live child was disturbed");
+
+        // Let it go: the reaper must collect it too.
+        let _ = std::process::Command::new("kill")
+            .arg(stuck_pid.to_string())
+            .status();
+        assert!(
+            wait_reaped(stuck_pid, Duration::from_secs(5)),
+            "the released child was never reaped"
+        );
+    }
+
+    /// End to end through the deadline path: the child that missed its
+    /// deadline is killed and gone from `/proc`, not left in state `Z`.
+    #[test]
+    fn query_nvidia_smi_leaves_no_zombie_after_a_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let p = script(
+            dir.path(),
+            "smi",
+            &format!("echo $$ > {}\nexec sleep 30", pidfile.display()),
+        );
+        let got = query_nvidia_smi(&p, Duration::from_millis(500));
+        assert_eq!(got.err(), Some(NvidiaFailure::Transient));
+        let pid: u32 = std::fs::read_to_string(&pidfile)
+            .expect("the script ran")
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            wait_reaped(pid, Duration::from_secs(5)),
+            "zombie left behind"
+        );
+    }
+
+    /// Voluntary context switches of one thread, from `<task>/status`.
+    fn voluntary_switches(task: &std::path::Path) -> u64 {
+        std::fs::read_to_string(task.join("status"))
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("voluntary_ctxt_switches:"))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap()
+    }
+
+    /// An idle reaper sleeps in `recv()`: it must not wake every
+    /// `REAPER_POLL` for the life of the process, on every machine.
+    ///
+    /// Counts the thread's `voluntary_ctxt_switches` (each block-and-wake is
+    /// one) over a 2 s idle window. Measured: 0-1 for the shipped loop, and
+    /// about 9 per second (~19 here) with the idle arm mutated into the
+    /// 100 ms poll. The threshold of 5 leaves room for a stray wakeup on a
+    /// loaded runner and is still far below the mutant. Runs `reaper_loop` on
+    /// a private channel so sibling tests' children cannot keep it busy.
+    #[test]
+    fn an_idle_reaper_does_not_wake() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (task_tx, task_rx) = std::sync::mpsc::channel();
+        let reaper = std::thread::spawn(move || {
+            task_tx
+                .send(std::fs::read_link("/proc/thread-self").unwrap())
+                .unwrap();
+            reaper_loop(&rx);
+        });
+        let task = std::path::Path::new("/proc").join(task_rx.recv().unwrap());
+        // One busy spell first, so the loop has been through its polling arm
+        // and must find its way back to the blocking one.
+        let mut child = sleeper();
+        let pid = child.id();
+        child.kill().unwrap();
+        tx.send(child).unwrap();
+        assert!(
+            wait_reaped(pid, Duration::from_secs(5)),
+            "zombie left behind"
+        );
+        std::thread::sleep(REAPER_POLL * 3);
+        let before = voluntary_switches(&task);
+        std::thread::sleep(REAPER_POLL * 20);
+        let woke = voluntary_switches(&task) - before;
+        assert!(woke < 5, "an idle reaper woke {woke} times in 2 s");
+        drop(tx);
+        reaper.join().unwrap();
     }
 }

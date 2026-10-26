@@ -92,6 +92,12 @@ pub type ICalTimezone = c_void;
 /// borrowed-or-owned per accessor; we `g_object_unref` the ones we own.
 pub type ICalProperty = c_void;
 
+/// `ICalParameter *` — one parameter of a property (e.g. the `RANGE=` on a
+/// `RECURRENCE-ID`). [`i_cal_property_get_first_parameter`] returns a new
+/// wrapper ref (owned — unref) whose native parameter stays owned by the
+/// property, so releasing the wrapper never frees the property's data.
+pub type ICalParameter = c_void;
+
 /// `ICalRecurrence *` — a parsed RRULE value. Released with [`g_object_unref`].
 pub type ICalRecurrence = c_void;
 
@@ -106,7 +112,21 @@ pub type ICalDatetimeperiod = c_void;
 pub type ICalPeriod = c_void;
 
 /// `ICalRecurIterator *` — libical's core recurrence iterator. Created via
-/// [`i_cal_recur_iterator_new`]; freed with [`i_cal_recur_iterator_free`].
+/// [`i_cal_recur_iterator_new`]; released with [`g_object_unref`], like every
+/// other libical-glib wrapper here.
+///
+/// **Not** with `i_cal_recur_iterator_free`, which this module deliberately
+/// does not bind. In libical-glib 3.0 an `ICalRecurIterator` is an
+/// `ICalObject` (a GObject) wrapping the native `icalrecur_iterator`, built by
+/// `i_cal_object_construct(…, native, icalrecur_iterator_free, FALSE, NULL)`
+/// — so the wrapper's own finalizer frees the native iterator.
+/// `i_cal_recur_iterator_free` is a generated `kind="destructor"` stub
+/// (`api/i-cal-recur-iterator.xml`, `annotation="skip"`) whose whole body is
+/// `icalrecur_iterator_free(i_cal_object_get_native(iter))`: it frees the
+/// native iterator, never drops the GObject's ref and never clears the
+/// native pointer. Calling it leaks the wrapper; calling it *and then*
+/// unref'ing would double-free the native iterator. EDS itself releases these
+/// with `g_clear_object` (`e-cal-recur.c`, `e-cal-util.c`).
 pub type ICalRecurIterator = c_void;
 
 /// `ECalClientView *` — a live, push-based query result. Created via
@@ -140,6 +160,24 @@ pub const I_CAL_EXDATE_PROPERTY: c_int = 35;
 /// property (value 62 in `icalderivedproperty.h`). As with EXDATE, libical
 /// surfaces one property per RDATE value, iterated the same way.
 pub const I_CAL_RDATE_PROPERTY: c_int = 62;
+
+/// `ICAL_RECURRENCEID_PROPERTY` — the `ICalPropertyKind` discriminant for a
+/// `RECURRENCE-ID` property (value 66 in `icalderivedproperty.h`). Its presence
+/// is what makes a component a *detached* instance of a recurring series
+/// rather than the series' master (RFC 5545 §3.8.4.4).
+pub const I_CAL_RECURRENCEID_PROPERTY: c_int = 66;
+
+/// `ICAL_RANGE_PARAMETER` — the `ICalParameterKind` discriminant for the
+/// `RANGE=` parameter (value 21 in `icalderivedparameter.h`), which only a
+/// `RECURRENCE-ID` may carry. Passed to [`i_cal_property_get_first_parameter`].
+pub const I_CAL_RANGE_PARAMETER: c_int = 21;
+
+/// `ICAL_RANGE_THISANDFUTURE` — the `ICalParameterRange` value of a
+/// `RANGE=THISANDFUTURE` parameter (20702 in `icalderivedparameter.h`; its
+/// siblings are `ICAL_RANGE_X` 20700, the deprecated `THISANDPRIOR` 20701 and
+/// `ICAL_RANGE_NONE` 20799). Compared against [`i_cal_parameter_get_range`]'s
+/// return.
+pub const I_CAL_RANGE_THISANDFUTURE: c_int = 20_702;
 
 /// `ICalRecurrenceFrequency` discriminants for the three sub-day frequencies
 /// (`icalrecurrencetype_frequency` in `icalrecur.h`, mirrored 1:1 as
@@ -419,6 +457,14 @@ unsafe extern "C" {
         parent: *mut ICalComponent,
         kind: ICalComponentKind,
     ) -> *mut ICalComponent;
+    /// Next child of `kind`, continuing the walk
+    /// [`i_cal_component_get_first_component`] began on `parent`. A new
+    /// wrapper ref (owned — unref) whose native component stays owned by
+    /// `parent` (the wrapper holds a ref on it), or null once exhausted.
+    pub fn i_cal_component_get_next_component(
+        parent: *mut ICalComponent,
+        kind: ICalComponentKind,
+    ) -> *mut ICalComponent;
     /// Returns the component's kind as a raw `ICalComponentKind` C enum
     /// value. Declared as `c_int` (not the [`ICalComponentKind`] Rust
     /// enum) because libical may return any of ~28 kinds — only a subset
@@ -507,6 +553,34 @@ unsafe extern "C" {
     /// [`ICalRecurrence`] (owned — unref).
     pub fn i_cal_property_get_rrule(prop: *mut ICalProperty) -> *mut ICalRecurrence;
 
+    /// A DATE or DATE-TIME property's value as a new [`ICalTime`] (owned —
+    /// unref), with its `TZID` resolved the way [`i_cal_component_get_dtstart`]
+    /// resolves DTSTART's: against the `VTIMEZONE`s of `comp` and its parents,
+    /// then libical's builtin zones (`icalproperty_get_datetime_with_component`
+    /// — `icalcomponent_get_dtstart` is exactly this call on the DTSTART
+    /// property). That is why a `RECURRENCE-ID` is read through it rather than
+    /// through `i_cal_component_get_recurrenceid`, which hands a `TZID`'d value
+    /// back with no zone attached (so it would read as floating) and could not
+    /// be compared with the occurrences of a zoned master. Borrows both.
+    pub fn i_cal_property_get_datetime_with_component(
+        prop: *mut ICalProperty,
+        comp: *mut ICalComponent,
+    ) -> *mut ICalTime;
+
+    /// First parameter of `kind` (an `ICalParameterKind` discriminant such as
+    /// [`I_CAL_RANGE_PARAMETER`]) on `prop`, as a new [`ICalParameter`] wrapper
+    /// (owned — unref; the native parameter stays the property's), or null
+    /// if `prop` has none. Borrows `prop`.
+    pub fn i_cal_property_get_first_parameter(
+        prop: *mut ICalProperty,
+        kind: c_int,
+    ) -> *mut ICalParameter;
+
+    /// The value of a `RANGE=` [`ICalParameter`] as a raw `ICalParameterRange`
+    /// (`c_int`, compared against [`I_CAL_RANGE_THISANDFUTURE`] — never
+    /// transmuted into an enum). Borrows `param`; allocates nothing.
+    pub fn i_cal_parameter_get_range(param: *const ICalParameter) -> c_int;
+
     /// The RRULE's `FREQ` as an `ICalRecurrenceFrequency` (`gint`-sized C
     /// enum — see the [`I_CAL_HOURLY_RECURRENCE`] family). Borrows `recur`;
     /// allocates nothing (#1206 HIGH-1).
@@ -543,7 +617,8 @@ unsafe extern "C" {
     pub fn i_cal_period_get_start(period: *mut ICalPeriod) -> *mut ICalTime;
 
     /// Create a libical recurrence iterator for `rule` anchored at
-    /// `dtstart`. Owned — release with [`i_cal_recur_iterator_free`].
+    /// `dtstart`. Owned — release with [`g_object_unref`] (see
+    /// [`ICalRecurIterator`] for why not `i_cal_recur_iterator_free`).
     /// Borrows `rule`/`dtstart`.
     pub fn i_cal_recur_iterator_new(
         rule: *mut ICalRecurrence,
@@ -594,9 +669,6 @@ unsafe extern "C" {
         iter: *mut ICalRecurIterator,
         start: *mut ICalTime,
     ) -> c_int;
-
-    /// Free a recurrence iterator created by [`i_cal_recur_iterator_new`].
-    pub fn i_cal_recur_iterator_free(iter: *mut ICalRecurIterator);
 }
 
 #[link(name = "ical-glib")]
@@ -611,6 +683,21 @@ unsafe extern "C" {
 #[link(name = "gobject-2.0")]
 unsafe extern "C" {
     pub fn g_object_unref(obj: *mut c_void);
+
+    /// `g_object_add_weak_pointer` — make GLib write `NULL` to
+    /// `*weak_pointer_location` when `object` is finalized. Only the tests use
+    /// it: it is how they prove a release really finalized a libical-glib
+    /// wrapper rather than leaking it (see [`ICalRecurIterator`]). The location
+    /// must outlive the object or be unregistered with
+    /// [`g_object_remove_weak_pointer`] first.
+    pub fn g_object_add_weak_pointer(object: *mut c_void, weak_pointer_location: *mut *mut c_void);
+
+    /// `g_object_remove_weak_pointer` — undo [`g_object_add_weak_pointer`]
+    /// for an object that is still alive.
+    pub fn g_object_remove_weak_pointer(
+        object: *mut c_void,
+        weak_pointer_location: *mut *mut c_void,
+    );
 
     /// `g_signal_connect_data` — connect `c_handler` to the named signal on
     /// `instance`, threading `data` (our boxed Rust callback) through to every

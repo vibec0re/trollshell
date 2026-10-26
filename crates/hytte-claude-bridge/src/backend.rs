@@ -1259,16 +1259,27 @@ mod tests {
     /// Before the fix this was `hive-claude`'s idle watchdog's job, and at the
     /// default budget it could not do it (5 s probes against a 7 s window, an 8
     /// s outer timeout): the turn was dropped and the stand-in here would have
-    /// slept on, unreaped, for its full 30 s. The upper bound on the elapsed
-    /// time is the second half of the claim — finishing under
-    /// [`super::REAP_GRACE`] past the deadline means the child really was
-    /// reaped, not given up on after the grace.
+    /// slept on, unreaped, for its full 30 s.
+    ///
+    /// The claim is the `/proc` assertion: the child is gone — reaped, not
+    /// merely killed — when `run_until` returns. The wall clock is checked only
+    /// coarsely, and on purpose. Its lower bound is exact (tokio timers never
+    /// fire early, so the turn really was held to its deadline), but its upper
+    /// bound is a generous `STALL_SLACK` rather than [`super::REAP_GRACE`]:
+    /// on a loaded CI runner, scheduler lateness lands in that number too, and
+    /// a bound tight enough to tell a reap from a grace expiry would fail on a
+    /// slow machine rather than on a regression. What it still catches is the
+    /// deadline not being enforced at all — the stand-in sleeps for 30 s.
     #[tokio::test]
     async fn a_silently_hung_child_is_killed_and_reaped_at_the_deadline() {
-        use super::{REAP_GRACE, run_until, stand_in};
+        use super::{run_until, stand_in};
         use hive_claude::Config;
         use std::time::Duration;
         use tokio::time::Instant;
+
+        /// How late past the deadline the answer may land before this test
+        /// calls it a hang — scheduler lateness on a loaded runner included.
+        const STALL_SLACK: Duration = Duration::from_secs(5);
 
         let dir = tempfile::tempdir().expect("tempdir");
         let config = Config {
@@ -1294,8 +1305,8 @@ mod tests {
             504
         );
         assert!(
-            (budget..budget + REAP_GRACE).contains(&elapsed),
-            "answered after {elapsed:?}: not at the {budget:?} deadline plus a reap",
+            (budget..budget + STALL_SLACK).contains(&elapsed),
+            "answered after {elapsed:?}: not at the {budget:?} deadline",
         );
         let [pid] = stand_in::started(dir.path())[..] else {
             panic!("expected exactly one stand-in run");

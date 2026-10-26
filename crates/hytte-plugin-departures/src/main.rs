@@ -670,7 +670,23 @@ impl Board {
 
     /// Answer (from what is on hand) every parked query older than
     /// [`QUERY_DEADLINE_SECS`], so none outlives the host's own timeout.
+    ///
+    /// Also forgets a woken fetch that has gone unanswered for that long, so a
+    /// `Cmd::Refresh` that never produced a `Fetched` cannot leave
+    /// `refresh_inflight` stuck (every later query would park, time out, and
+    /// bypass the floor).
+    ///
+    /// A periodic fetch landing while a woken `Refresh` is still queued costs
+    /// one redundant fetch: the lane gives the poll task no way to peek or
+    /// retract a queued command, and the floor bounds it to one per 15 s.
     fn expire_pending(&mut self, now_unix: i64) -> Vec<Effect> {
+        if self.refresh_inflight
+            && self
+                .last_kick_unix
+                .is_some_and(|t| now_unix - t > QUERY_DEADLINE_SECS)
+        {
+            self.refresh_inflight = false;
+        }
         let (expired, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending)
             .into_iter()
             .partition(|q| now_unix - q.queued_at >= QUERY_DEADLINE_SECS);
@@ -681,14 +697,14 @@ impl Board {
             .collect()
     }
 
-    /// Answer a `departures` datasource query (#509) from the board's current rows.
-    /// The rows are live off the poller, so this serves the model — Loading/Err
-    /// surface as a provider-sourced failure the requester can relay.
-    /// Answer a query at an explicit instant. Like the
-    /// board view it drops rows that have already departed, and it refuses to
-    /// answer at all from a list older than [`DATASOURCE_MAX_AGE_SECS`] — the
-    /// poller parks while the sidebar is hidden, so the held rows can be hours
-    /// old, and a requester must never read them as "now".
+    /// Answer a `departures` datasource query (#509) from the board's current
+    /// rows, as of `now_unix`. Loading/Err surface as a provider-sourced failure
+    /// the requester can relay.
+    ///
+    /// Like the board view, it drops rows that have already departed. It also
+    /// refuses to answer from a list older than [`DATASOURCE_MAX_AGE_SECS`]:
+    /// the poller parks while the sidebar is hidden, so the held rows can be
+    /// hours old, and a requester must never read them as "now".
     fn answer_query_at(&self, request_id: u64, params: &str, now_unix: i64) -> Effect {
         let limit = serde_json::from_str::<QueryParams>(params)
             .unwrap_or_default()
@@ -1733,6 +1749,22 @@ mod tests {
             DatasourceOutcome::Failed { message, .. } if message == "stale"
         ));
         assert!(board.pending.is_empty());
+    }
+
+    #[test]
+    fn an_unanswered_wake_does_not_stick_the_inflight_flag() {
+        let (mut board, mut rx) = hour_old_board();
+        query(&mut board, 1);
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Refresh)));
+        // The refresh is never answered. Past the deadline the query is
+        // answered `stale` and the flag clears.
+        board.update(snapshot_at("2030-01-01T16:00:09+01:00"));
+        assert!(!board.refresh_inflight);
+        // Past the floor too, the next query wakes a fresh fetch rather than
+        // parking behind a ghost.
+        board.update(snapshot_at("2030-01-01T16:00:16+01:00"));
+        assert!(query(&mut board, 2).is_empty());
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Refresh)));
     }
 
     #[test]

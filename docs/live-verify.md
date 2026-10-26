@@ -1711,6 +1711,32 @@ four window properties below are pinned nowhere but here.
      snaps back within a poll, and its subtitle reads "Not changed: the
      choice could not be kept (…)" naming the write error. Restore the mode
      afterwards.
+- [ ] **(#1417 follow-up)** A launch waits out a unit that is still stopping.
+      The hermetic `Manager` tests and the gated `ts1417-*` tests on a real
+      user manager carry the logic; this is the Plugins tab end to end.
+      Declare a throwaway plugin that ignores SIGTERM, so its stop takes the
+      launcher's full `TimeoutStopSec=10s`, and rebuild:
+      `programs.trollshell.plugins.stuck = { enable = lib.mkDefault true; package = pkgs.writeShellScriptBin "stuck" "trap '' TERM; while :; do sleep 1; done"; };`
+      (`lib.mkDefault`, so the switch is not pinned; it has no manifest, so
+      it lists as "Not connected").
+  1. **The switch flipped off and straight back on.** In the Plugins tab,
+     switch `stuck` off and, while its row still reads "Stopping…", on
+     again. The switch should stay on while the row reads "Stopping…" for
+     the rest of the 10 s, and the plugin then comes back up by itself:
+     `systemctl --user is-active trollshell-plugin-stuck` prints `active`,
+     and
+     `journalctl --user -u trollshell -g 'still stopping; starting it once it is down' --since -5min`
+     shows the wait. On `main` the switch falls back to off within a second
+     and the unit ends `inactive`, although the choice kept is on (a
+     `systemctl --user restart trollshell` brings it up).
+  2. **A reconcile onto a unit still stopping.** Stop it behind the switch's
+     back and reconcile straight after:
+     `busctl --user call mov.vibec0re.trollshell.Control /mov/vibec0re/trollshell/Control mov.vibec0re.trollshell.Control StopPlugin s stuck && busctl --user call mov.vibec0re.trollshell.Control /mov/vibec0re/trollshell/Control mov.vibec0re.trollshell.Control ReloadPlugins`.
+     The journal shows "declared enabled, but its unit is still stopping;
+     launching it once it is down", and the unit is `active` again about
+     10 s later. On `main` it logs "plugin launch failed … already loaded or
+     has a fragment file" and the unit stays down.
+  3. Clean up: remove `stuck` and rebuild.
 
 ## Infobroker
 

@@ -1085,7 +1085,11 @@ fn a_save_and_a_start_of_one_name_at_once_take_turns() {
 
     saving.expect("the Save");
     assert_eq!(niri.saved(), vec![name.to_owned()]);
-    assert_eq!(niri.name_of(1).as_deref(), Some(name), "the Save named its card");
+    assert_eq!(
+        niri.name_of(1).as_deref(),
+        Some(name),
+        "the Save named its card"
+    );
     assert_eq!(
         starting.expect_err("the Start"),
         StartError::NameTaken.to_string(),

@@ -668,9 +668,8 @@ mod tests {
     /// A decoded entry reaches `wl-copy` byte for byte, asked for by its id.
     #[test]
     fn a_decoded_entry_reaches_wl_copy_byte_for_byte() {
-        let stand = Stand::copying(
-            r#"printf '%s' "$*" > "$(dirname "$0")/args"; printf 'hello\tclip\n'"#,
-        );
+        let stand =
+            Stand::copying(r#"printf '%s' "$*" > "$(dirname "$0")/args"; printf 'hello\tclip\n'"#);
         stand.paste(42, 1024, GENEROUS).expect("the paste");
         assert_eq!(stand.copied().as_deref(), Some(&b"hello\tclip\n"[..]));
         assert_eq!(

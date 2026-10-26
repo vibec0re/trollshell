@@ -120,8 +120,7 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     });
 
     wire_scroll(&btn, move |direction| {
-        let next =
-            LAST_REQUEST.with(|last| notch(last, polled.get(), Instant::now(), direction));
+        let next = LAST_REQUEST.with(|last| notch(last, polled.get(), Instant::now(), direction));
         brightness::set(next);
     });
 

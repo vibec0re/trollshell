@@ -541,8 +541,7 @@ mod slider_tests {
         )]
         fn at(&self, fraction: f64, then: &[&str], presses: u32, releases: u32) {
             let (w, h) = (self.slider.width(), self.slider.height());
-            let point =
-                gtk::graphene::Point::new((f64::from(w) * fraction) as f32, h as f32 / 2.0);
+            let point = gtk::graphene::Point::new((f64::from(w) * fraction) as f32, h as f32 / 2.0);
             let at = self
                 .slider
                 .compute_point(&self.window, &point)

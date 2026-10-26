@@ -43,9 +43,10 @@
 //! handed in by `main` through [`read_declared_with`]), taken each time
 //! registrations are applied and each time the control-center asks.
 //! "Connected" is the host's runtime mirror (`PLUGIN_RUNTIME`). When
-//! `plugins.json` cannot be read, the last reading that could be read stands —
-//! at startup, the ids the cache file already holds — so a broken file forgets
-//! nothing that was declared.
+//! `plugins.json` cannot be read, or is missing, the last good reading stands
+//! — at startup, the ids the cache file already holds. So a broken file, or
+//! one a switch leaves briefly absent, forgets nothing that was declared, and
+//! a first start with neither file declares nothing.
 //!
 //! # Applied in order
 //!
@@ -318,8 +319,9 @@ impl Store {
     /// neither declared nor `live`, and persist the declared ones if that
     /// changed them.
     ///
-    /// `declared` is the ids `plugins.json` declares now, or `None` when it
-    /// cannot be read — then the last reading stands. `live` is the ids
+    /// `declared` is the ids `plugins.json` declares now, or `None` when that
+    /// cannot be told (the file unreadable or missing) — then the last reading
+    /// stands. `live` is the ids
     /// connected now. A registration from an id that is neither is dropped
     /// with the rest: it has already disconnected, and nothing would read its
     /// form.
@@ -407,8 +409,9 @@ fn with_store<R>(f: impl FnOnce(&mut Store) -> R) -> R {
     f(store)
 }
 
-/// A reading of the ids `plugins.json` declares: `None` when the file exists
-/// but cannot be read or parsed, `Some` (empty, if need be) otherwise.
+/// A reading of the ids `plugins.json` declares: `None` when that cannot be
+/// told — the file cannot be read or parsed, or is missing — and `Some`
+/// (empty, if need be) otherwise.
 pub type DeclaredReader = fn() -> Pin<Box<dyn Future<Output = Option<BTreeSet<String>>> + Send>>;
 
 /// How [`drain`] reads `plugins.json`. The reading is the launcher's
@@ -567,7 +570,7 @@ pub(super) fn register(runtime: &PluginRuntimeStore, id: &str, declared: &[Setti
 
 /// Every plugin's declared settings — what `Control.ListPluginSettings`
 /// serves — after forgetting the ids that `declared` (the ids `plugins.json`
-/// declares, `None` when it cannot be read) does not cover and that are not
+/// declares, `None` when it is unreadable or missing) does not cover and that are not
 /// connected. Blocking (the first call reads the cache file, and a prune
 /// writes it), so the D-Bus handler runs it off its own task.
 #[must_use]
@@ -943,6 +946,50 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["pet"]
         );
+    }
+
+    /// A missing `plugins.json` reads as `None` (`plugin_launcher::
+    /// declared_ids`), which covers both of its cases. With a known declared
+    /// set and a cache on disk — a switch that left the file briefly absent —
+    /// the last reading stands: no form is forgotten and the file is not
+    /// deleted. On a first start with neither file, the last reading is empty,
+    /// so nothing is declared and nothing is persisted.
+    ///
+    /// That a missing file *is* `None` is the launcher's half, pinned by
+    /// `declared_ids_are_none_when_plugins_json_cannot_be_read`; this pins
+    /// what `None` then does in each case.
+    #[test]
+    fn a_missing_plugins_json_keeps_a_known_set_and_declares_nothing_on_first_start() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plugin-settings-schema.toml");
+
+        // First start: no cache, no plugins.json. A connected plugin is served
+        // while connected, and nothing is declared or written.
+        let mut first = Store::open(Some(path.clone()));
+        first.apply(
+            Schemas::from([("pet".to_owned(), vec![Setting::text("PET_NAME", "Name")])]),
+            None,
+            &set(&["pet"]),
+        );
+        assert!(first.declared.is_empty(), "nothing is declared");
+        assert!(!path.exists(), "and nothing is persisted");
+        assert!(first.snapshot(None, &set(&[])).is_empty());
+
+        // A known set on disk, then the file goes missing mid-switch.
+        record(
+            &mut first,
+            "pet",
+            vec![Setting::text("PET_NAME", "Name")],
+            &["pet"],
+        );
+        assert!(path.exists());
+        let mut next = Store::open(Some(path.clone()));
+        assert_eq!(
+            next.snapshot(None, &set(&[])).keys().collect::<Vec<_>>(),
+            ["pet"],
+            "the unconnected plugin keeps its form"
+        );
+        assert!(path.exists(), "and the cache file is not deleted");
     }
 
     /// When `plugins.json` cannot be read, the last reading that could stands:

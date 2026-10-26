@@ -28,6 +28,7 @@
 //! the host maps it back to the parked requester +
 //! original `request_id`. Provider and requester id-spaces never touch.
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -59,6 +60,37 @@ struct ProviderEntry {
     outbound: mpsc::Sender<HostMsg>,
     scopes: Vec<String>,
     generation: u64,
+}
+
+/// Who serves one datasource id: the `holder` every query goes to, and the
+/// plugins that declared the id while the holder was live, oldest first. Each
+/// standby keeps its own channel and generation, so it can serve the moment
+/// the holder leaves and its own teardown can take it out of the line.
+struct ProviderSlot {
+    holder: ProviderEntry,
+    standby: Vec<ProviderEntry>,
+}
+
+/// What [`DatasourceRouter::register_provider`] did, for its log line.
+enum Registered {
+    /// The id had no provider; this one serves it.
+    Serving,
+    /// The same plugin declared the id again; its entry was replaced.
+    Replaced,
+    /// Another plugin serves the id; this one waits behind it.
+    Standby { holder: String },
+}
+
+/// What [`DatasourceRouter::unregister_provider`] did, for its log line.
+enum Unregistered {
+    /// The generation owns nothing for this id: a no-op.
+    Nothing,
+    /// A standby left before it ever served.
+    Standby,
+    /// The holder left and nobody was waiting; the id is free.
+    Free,
+    /// The holder left and its oldest live standby serves now.
+    Promoted { left: String, holder: String },
 }
 
 /// A datasource query parked awaiting its provider's answer (#509): the requester's
@@ -93,8 +125,8 @@ struct PendingQuery {
 /// ever touched briefly (never across an await), so a plain `Mutex` is right.
 #[derive(Clone, Default)]
 pub(super) struct DatasourceRouter {
-    /// Datasource id → its live provider.
-    providers: Arc<Mutex<BTreeMap<String, ProviderEntry>>>,
+    /// Datasource id → its live provider, and the live standbys behind it.
+    providers: Arc<Mutex<BTreeMap<String, ProviderSlot>>>,
     /// Host correlation → the parked requester.
     pending: Arc<Mutex<HashMap<u64, PendingQuery>>>,
     /// Monotonic host correlation counter.
@@ -108,21 +140,21 @@ impl DatasourceRouter {
     /// routed here.
     ///
     /// **Another plugin's datasource cannot be taken over.** While a plugin
-    /// holds `id`, a registration from a *different* plugin id is refused, with
-    /// one warning naming both, and the holder keeps serving. A requester names
-    /// a datasource, not a plugin, so replacing the holder would hand its
+    /// holds `id`, a registration from a *different* plugin id does not replace
+    /// it: the holder keeps serving, and the newcomer joins the id's
+    /// **standby** line, with one warning naming both. A requester names a
+    /// datasource, not a plugin, so replacing the holder would hand its
     /// queries — and the answers the requester trusts — to whichever plugin
-    /// registered last. The holder's entry goes at its teardown
-    /// ([`unregister_provider`](Self::unregister_provider)), and from then on
-    /// any plugin may claim the id. Every entry here belongs to a live
-    /// connection, because teardown is what removes it.
+    /// registered last. When the holder's connection tears down
+    /// ([`unregister_provider`](Self::unregister_provider)), the oldest live
+    /// standby serves from then on; with none waiting, the id is free and the
+    /// next plugin to declare it serves it. Every entry here belongs to a live
+    /// connection, because teardown is what removes it, standbys included.
     ///
-    /// The **same** plugin id still replaces its own entry, which is what #509's
-    /// latest-wins was for: a reconnecting provider's newer generation
-    /// supersedes its stale one, and the stale connection's teardown is then a
-    /// no-op under the generation guard. (`IdGuard`'s one live connection per id
-    /// makes that sequential today, so the case that reaches this arm in
-    /// practice is a manifest listing the same datasource twice.)
+    /// The **same** plugin id replaces its own entry. `IdGuard` allows one live
+    /// connection per id and teardown unregisters inside that window, so a
+    /// reconnect never finds its old entry still here: the one way to reach
+    /// this arm is a manifest that lists the same datasource twice.
     pub(super) fn register_provider(
         &self,
         id: &str,
@@ -131,62 +163,119 @@ impl DatasourceRouter {
         outbound: mpsc::Sender<HostMsg>,
         generation: u64,
     ) {
-        // `Err(holder)` when another plugin holds `id`, else `Ok(whether this
-        // replaced the same plugin's earlier entry)`. Decided under the lock,
-        // logged after it.
+        let entry = ProviderEntry {
+            plugin_id: plugin_id.to_owned(),
+            outbound,
+            scopes,
+            generation,
+        };
+        // Decided under the lock, logged after it.
         let outcome = {
             let mut providers = self
                 .providers
                 .lock()
                 .expect("datasource providers poisoned");
-            match providers.get(id) {
-                Some(holder) if holder.plugin_id != plugin_id => Err(holder.plugin_id.clone()),
-                _ => Ok(providers
-                    .insert(
-                        id.to_owned(),
-                        ProviderEntry {
-                            plugin_id: plugin_id.to_owned(),
-                            outbound,
-                            scopes,
-                            generation,
-                        },
-                    )
-                    .is_some()),
+            match providers.entry(id.to_owned()) {
+                Entry::Vacant(vacant) => {
+                    vacant.insert(ProviderSlot {
+                        holder: entry,
+                        standby: Vec::new(),
+                    });
+                    Registered::Serving
+                }
+                Entry::Occupied(mut occupied) => {
+                    let slot = occupied.get_mut();
+                    if slot.holder.plugin_id == plugin_id {
+                        slot.holder = entry;
+                        Registered::Replaced
+                    } else {
+                        // A manifest listing the id twice keeps one place.
+                        match slot.standby.iter_mut().find(|e| e.plugin_id == plugin_id) {
+                            Some(waiting) => *waiting = entry,
+                            None => slot.standby.push(entry),
+                        }
+                        Registered::Standby {
+                            holder: slot.holder.plugin_id.clone(),
+                        }
+                    }
+                }
             }
         };
         match outcome {
-            Err(holder) => tracing::warn!(
+            Registered::Standby { holder } => tracing::warn!(
                 datasource = %id,
                 holder = %holder,
-                refused = %plugin_id,
-                "datasource id is already served by another live plugin; registration refused, \
-                 the holder keeps serving",
+                standby = %plugin_id,
+                "datasource id is already served by another live plugin; the holder keeps \
+                 serving, and this one stands by to take over when it leaves",
             ),
-            Ok(true) => tracing::info!(
+            Registered::Replaced => tracing::info!(
                 datasource = %id,
                 plugin = %plugin_id,
                 "datasource provider re-registered by the same plugin; replacing its earlier entry",
             ),
-            Ok(false) => {
+            Registered::Serving => {
                 tracing::info!(datasource = %id, plugin = %plugin_id, "datasource provider registered");
             }
         }
     }
 
-    /// Remove `id`'s provider iff it is still the one this `generation` registered
-    /// (teardown). A fast-reconnect successor with a newer generation is never
-    /// evicted — the same guard `clear_region_if_owned` applies to region cards.
+    /// Remove whatever this connection `generation` registered for `id`
+    /// (teardown): the holder only if this generation is still the holder's —
+    /// the same guard `clear_region_if_owned` applies to region cards — and
+    /// otherwise its place in the standby line, if it has one.
+    ///
+    /// When the holder leaves, the **oldest live standby** serves from then
+    /// on, with one log line naming both; a standby whose connection is
+    /// already closed (its writer gone, its teardown still to come) is skipped
+    /// and dropped. With no standby left the id is free.
     pub(super) fn unregister_provider(&self, id: &str, generation: u64) {
-        let mut providers = self
-            .providers
-            .lock()
-            .expect("datasource providers poisoned");
-        if providers
-            .get(id)
-            .is_some_and(|e| e.generation == generation)
-        {
-            providers.remove(id);
-            tracing::info!(datasource = %id, "datasource provider unregistered");
+        let outcome = {
+            let mut providers = self
+                .providers
+                .lock()
+                .expect("datasource providers poisoned");
+            match providers.get_mut(id) {
+                None => Unregistered::Nothing,
+                Some(slot) if slot.holder.generation != generation => {
+                    let before = slot.standby.len();
+                    slot.standby.retain(|e| e.generation != generation);
+                    if slot.standby.len() == before {
+                        Unregistered::Nothing
+                    } else {
+                        Unregistered::Standby
+                    }
+                }
+                Some(slot) => {
+                    slot.standby.retain(|e| !e.outbound.is_closed());
+                    if slot.standby.is_empty() {
+                        providers.remove(id);
+                        Unregistered::Free
+                    } else {
+                        let next = slot.standby.remove(0);
+                        let left = std::mem::replace(&mut slot.holder, next);
+                        Unregistered::Promoted {
+                            left: left.plugin_id,
+                            holder: slot.holder.plugin_id.clone(),
+                        }
+                    }
+                }
+            }
+        };
+        match outcome {
+            Unregistered::Nothing => {}
+            Unregistered::Standby => {
+                tracing::debug!(datasource = %id, "datasource standby left before it served");
+            }
+            Unregistered::Free => {
+                tracing::info!(datasource = %id, "datasource provider unregistered");
+            }
+            Unregistered::Promoted { left, holder } => tracing::info!(
+                datasource = %id,
+                left = %left,
+                holder = %holder,
+                "datasource provider left; its oldest standby serves now",
+            ),
         }
     }
 
@@ -214,9 +303,10 @@ impl DatasourceRouter {
             // the lock so nothing is held across an await.
             let found = {
                 let guard = providers.lock().expect("datasource providers poisoned");
-                guard
-                    .get(&provider)
-                    .map(|e| (e.plugin_id.clone(), e.outbound.clone(), e.scopes.clone()))
+                guard.get(&provider).map(|slot| {
+                    let e = &slot.holder;
+                    (e.plugin_id.clone(), e.outbound.clone(), e.scopes.clone())
+                })
             };
             let Some((provider_id, provider_out, scopes)) = found else {
                 tracing::info!(
@@ -443,8 +533,34 @@ async fn fail(
 mod tests {
     use super::*;
 
+    /// A channel whose receiver is already gone: what a provider's outbound
+    /// looks like once its writer has stopped.
     fn chan() -> mpsc::Sender<HostMsg> {
         mpsc::channel(8).0
+    }
+
+    /// A channel whose receiver the test keeps: a provider still connected.
+    fn live() -> (mpsc::Sender<HostMsg>, mpsc::Receiver<HostMsg>) {
+        mpsc::channel(8)
+    }
+
+    /// The holder of datasource `id`, as `(plugin id, generation)`.
+    fn holder(r: &DatasourceRouter, id: &str) -> Option<(String, u64)> {
+        r.providers
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|slot| (slot.holder.plugin_id.clone(), slot.holder.generation))
+    }
+
+    /// The standby line of datasource `id`, oldest first, as plugin ids.
+    fn standbys(r: &DatasourceRouter, id: &str) -> Vec<String> {
+        r.providers
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|slot| slot.standby.iter().map(|e| e.plugin_id.clone()).collect())
+            .unwrap_or_default()
     }
 
     #[test]
@@ -452,7 +568,7 @@ mod tests {
         let r = DatasourceRouter::default();
         r.register_provider("departures", "dep-plugin", vec!["next".into()], chan(), 1);
         let guard = r.providers.lock().unwrap();
-        let entry = guard.get("departures").expect("registered");
+        let entry = &guard.get("departures").expect("registered").holder;
         assert_eq!(entry.plugin_id, "dep-plugin");
         assert!(entry.scopes.iter().any(|s| s == "next"));
         assert!(!entry.scopes.iter().any(|s| s == "history"));
@@ -470,28 +586,33 @@ mod tests {
         assert!(!r.providers.lock().unwrap().contains_key("weather"));
     }
 
-    /// #509's latest-wins, kept for the case it was written for: the same plugin
-    /// registering again under a newer generation replaces its own entry, and
+    /// The same plugin id replaces its own entry. A manifest listing the
+    /// datasource twice is what reaches this in practice (one generation);
+    /// a newer generation of the same plugin, #509's case, does the same, and
     /// the older generation's teardown is then a no-op.
     #[test]
     fn a_reregistering_provider_replaces_its_own_entry() {
         let r = DatasourceRouter::default();
         r.register_provider("x", "weather", vec!["a".into()], chan(), 1);
-        r.register_provider("x", "weather", vec!["b".into()], chan(), 2);
+        r.register_provider("x", "weather", vec!["b".into()], chan(), 1);
+        {
+            let guard = r.providers.lock().unwrap();
+            let slot = guard.get("x").expect("present");
+            assert_eq!(slot.holder.scopes, ["b"], "the later entry wins");
+            assert!(slot.standby.is_empty(), "and nothing waits behind itself");
+        }
+        r.register_provider("x", "weather", vec!["c".into()], chan(), 2);
         r.unregister_provider("x", 1);
-        let guard = r.providers.lock().unwrap();
-        let entry = guard.get("x").expect("newer provider still present");
-        assert_eq!(entry.generation, 2);
-        assert!(entry.scopes.iter().any(|s| s == "b"));
+        assert_eq!(holder(&r, "x"), Some(("weather".to_owned(), 2)));
     }
 
-    /// A different plugin declaring a datasource another live plugin serves is
-    /// refused, with one warning naming both, and the holder keeps serving —
-    /// including through the refused connection's teardown. Once the holder
-    /// goes, the id is free for anyone.
+    /// A different plugin declaring a datasource another live plugin serves
+    /// does not replace it: the holder keeps serving, one warning names both,
+    /// and the newcomer stands by. A standby that leaves first is gone from
+    /// the line, so the holder's own teardown then frees the id.
     ///
     /// Red against #509's unconditional latest-wins: the holder's entry is
-    /// replaced and the `generation == 1` assertion fails.
+    /// replaced and the first `holder` assertion fails.
     #[test]
     fn another_plugin_cannot_take_over_a_live_datasource() {
         let r = DatasourceRouter::default();
@@ -499,13 +620,8 @@ mod tests {
         let (captured, guard) = hytte_config::test_support::capture();
         r.register_provider("weather", "squatter", vec!["forged".into()], chan(), 2);
         drop(guard);
-        {
-            let providers = r.providers.lock().unwrap();
-            let entry = providers.get("weather").expect("the holder still serves");
-            assert_eq!(entry.plugin_id, "wx-plugin");
-            assert_eq!(entry.generation, 1);
-            assert_eq!(entry.scopes, ["current"]);
-        }
+        assert_eq!(holder(&r, "weather"), Some(("wx-plugin".to_owned(), 1)));
+        assert_eq!(standbys(&r, "weather"), ["squatter"]);
         let warnings: Vec<_> = captured
             .events()
             .into_iter()
@@ -513,18 +629,85 @@ mod tests {
             .collect();
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert_eq!(warnings[0].fields["holder"], "wx-plugin", "{warnings:?}");
-        assert_eq!(warnings[0].fields["refused"], "squatter", "{warnings:?}");
+        assert_eq!(warnings[0].fields["standby"], "squatter", "{warnings:?}");
 
-        // The refused connection's teardown leaves the holder alone.
+        // The standby's teardown leaves the holder alone and takes it out of
+        // the line, so it is never promoted.
         r.unregister_provider("weather", 2);
-        assert_eq!(
-            r.providers.lock().unwrap()["weather"].plugin_id,
-            "wx-plugin"
-        );
-        // The holder's own teardown frees the id for the next plugin.
+        assert_eq!(holder(&r, "weather"), Some(("wx-plugin".to_owned(), 1)));
+        assert!(standbys(&r, "weather").is_empty());
+        // The holder's own teardown, with nobody waiting, frees the id.
         r.unregister_provider("weather", 1);
+        assert_eq!(holder(&r, "weather"), None);
         r.register_provider("weather", "squatter", vec!["current".into()], chan(), 3);
-        assert_eq!(r.providers.lock().unwrap()["weather"].plugin_id, "squatter");
+        assert_eq!(holder(&r, "weather"), Some(("squatter".to_owned(), 3)));
+    }
+
+    /// Failover: A holds, B stands by, A leaves — B serves, on its own
+    /// channel and scopes, with one line naming both. B's teardown then frees
+    /// the id.
+    ///
+    /// Red against a refusal that keeps nothing: the id is free once A goes,
+    /// and every query gets `NotFound` until B reconnects.
+    #[test]
+    fn a_standby_serves_once_the_holder_leaves() {
+        let r = DatasourceRouter::default();
+        let (a, _a_rx) = live();
+        let (b, _b_rx) = live();
+        r.register_provider("weather", "wx-a", vec!["current".into()], a, 1);
+        r.register_provider("weather", "wx-b", vec!["hourly".into()], b, 2);
+        let (captured, guard) = hytte_config::test_support::capture();
+        r.unregister_provider("weather", 1);
+        drop(guard);
+        {
+            let guard = r.providers.lock().unwrap();
+            let slot = guard.get("weather").expect("still served");
+            assert_eq!(slot.holder.plugin_id, "wx-b");
+            assert_eq!(slot.holder.generation, 2);
+            assert_eq!(slot.holder.scopes, ["hourly"], "B serves what B declared");
+            assert!(slot.standby.is_empty());
+        }
+        let promoted: Vec<_> = captured
+            .events()
+            .into_iter()
+            .filter(|e| e.fields.contains_key("left"))
+            .collect();
+        assert_eq!(promoted.len(), 1, "{promoted:?}");
+        assert_eq!(promoted[0].fields["left"], "wx-a", "{promoted:?}");
+        assert_eq!(promoted[0].fields["holder"], "wx-b", "{promoted:?}");
+
+        r.unregister_provider("weather", 2);
+        assert_eq!(holder(&r, "weather"), None);
+    }
+
+    /// The line is oldest first, and only live connections are in it: a
+    /// standby that left is never promoted, and one whose channel is already
+    /// closed is skipped and dropped.
+    #[test]
+    fn a_standby_that_left_is_never_promoted() {
+        let r = DatasourceRouter::default();
+        let (a, _a_rx) = live();
+        let (b, _b_rx) = live();
+        let (c, _c_rx) = live();
+        r.register_provider("weather", "wx-a", vec!["current".into()], a, 1);
+        r.register_provider("weather", "wx-b", vec!["current".into()], b, 2);
+        r.register_provider("weather", "wx-closed", vec!["current".into()], chan(), 3);
+        r.register_provider("weather", "wx-c", vec!["current".into()], c, 4);
+        assert_eq!(standbys(&r, "weather"), ["wx-b", "wx-closed", "wx-c"]);
+
+        r.unregister_provider("weather", 2);
+        assert_eq!(standbys(&r, "weather"), ["wx-closed", "wx-c"]);
+        assert_eq!(holder(&r, "weather"), Some(("wx-a".to_owned(), 1)));
+
+        r.unregister_provider("weather", 1);
+        assert_eq!(holder(&r, "weather"), Some(("wx-c".to_owned(), 4)));
+        assert!(
+            standbys(&r, "weather").is_empty(),
+            "the closed one was dropped"
+        );
+
+        r.unregister_provider("weather", 4);
+        assert_eq!(holder(&r, "weather"), None);
     }
 
     /// Park a query at `corr` for `provider_id`, as `route_query` does, with a

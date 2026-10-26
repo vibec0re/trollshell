@@ -223,18 +223,20 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
       (not the broker's old internal fetch), under the same grant/token flow
       as `calendar`. Confirm both still resolve correctly through
       `hytte-infobroker get <name>` with a grant in place.
-  - [ ] **A second plugin cannot take a datasource over.** With
-        `hytte-plugin-weather` running, start a second instance of it under
-        another id (a second `programs.trollshell.plugins.<id>` entry, or
-        `HYTTE_PLUGIN_ID=weather-2 hytte-plugin-weather` from a terminal).
+  - [ ] **A second plugin cannot take a datasource over, but stands by.**
+        With `hytte-plugin-weather` running, start a second instance of it
+        under another id (a second `programs.trollshell.plugins.<id>` entry,
+        or `HYTTE_PLUGIN_ID=weather-2 hytte-plugin-weather` from a terminal).
         The shell's journal has one line, _"datasource id is already served
-        by another live plugin; registration refused, the holder keeps
-        serving"_, naming `holder=weather` and `refused=weather-2`, and
-        `hytte-infobroker get weather` keeps answering from the first
-        instance. Before this, the second instance silently took the
-        datasource. Restarting the first instance itself
-        (`systemctl --user restart trollshell-plugin-weather`) still gets it
-        back.
+        by another live plugin; the holder keeps serving, and this one stands
+        by to take over when it leaves"_, naming `holder=weather` and
+        `standby=weather-2`, and `hytte-infobroker get weather` keeps
+        answering from the first instance. Before this, the second instance
+        silently took the datasource. Now stop the first instance
+        (`systemctl --user stop trollshell-plugin-weather`): one line,
+        _"datasource provider left; its oldest standby serves now"_, naming
+        `left=weather holder=weather-2`, and `get weather` keeps answering,
+        now from `weather-2`, without restarting it.
 - [ ] **(#539)** Domain `StateKey`s (calendar / session-lock / now-playing) —
       see the Caw and Infobroker sections below for the per-consumer checks;
       the underlying push only fires when a plugin **both** subscribes the key

@@ -3717,8 +3717,8 @@ fn provider_render(effects: Vec<Effect>) -> PluginMsg {
 }
 
 /// End to end through `handle_conn`: a second plugin listing a datasource that
-/// a connected plugin already serves is refused, and queries keep reaching the
-/// first plugin's connection.
+/// a connected plugin already serves does not take it over — it only stands
+/// by — and queries keep reaching the first plugin's connection.
 ///
 /// Red against #509's unconditional latest-wins: the query is forwarded to the
 /// squatter's connection instead, and the first plugin's read times out.
@@ -3757,6 +3757,67 @@ async fn a_second_plugin_cannot_take_over_a_connected_providers_datasource() {
     );
     let HostMsg::DatasourceQuery { datasource, .. } = recv(&mut holder_rd).await else {
         panic!("the first provider must still receive the query");
+    };
+    assert_eq!(datasource, "departures");
+}
+
+/// End to end through `handle_conn`: once the provider serving a datasource
+/// disconnects, the plugin standing by for it — still connected, never
+/// re-registered — receives the next query.
+///
+/// Red against a refusal that keeps nothing: the datasource is unserved once
+/// the first plugin goes, the query is answered `NotFound`, and the standby's
+/// read times out.
+#[tokio::test]
+async fn a_standby_provider_serves_once_the_connected_one_leaves() {
+    let (_clock_tx, clock_rx) = watch::channel(None);
+    let (_vis_tx, vis_rx) = watch::channel(false);
+    let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+    let router = ctx.datasource.clone();
+
+    let (holder_rd, holder_wr) = connect_provider(
+        &ctx,
+        "departures",
+        Mount::SidebarBottom,
+        &ctx.sidebar_bottom,
+        "departures",
+    )
+    .await;
+    let (mut standby_rd, _standby_wr) = connect_provider(
+        &ctx,
+        "departures-2",
+        Mount::SidebarTop,
+        &ctx.sidebar_top,
+        "departures",
+    )
+    .await;
+
+    // The first plugin goes away. Its teardown unregisters its datasource
+    // before it leaves the runtime mirror, so once the mirror has lost it the
+    // standby has been promoted.
+    drop((holder_rd, holder_wr));
+    for _ in 0..200 {
+        if !ctx.runtime.lock().unwrap().contains_key("departures") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        !ctx.runtime.lock().unwrap().contains_key("departures"),
+        "the first provider's connection tore down"
+    );
+
+    let (req_tx, _req_rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
+    router.route_query(
+        "infobroker".into(),
+        6,
+        "departures".into(),
+        "next".into(),
+        "{}".into(),
+        req_tx,
+    );
+    let HostMsg::DatasourceQuery { datasource, .. } = recv(&mut standby_rd).await else {
+        panic!("the standby must receive the query once the holder left");
     };
     assert_eq!(datasource, "departures");
 }

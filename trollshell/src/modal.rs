@@ -1751,8 +1751,20 @@ fn toggle_inner(
 /// - Something else showing → swap the stack child in place; the card keeps
 ///   the position it opened at.
 /// - Closed → anchor on `trigger`, present, reveal.
+///
+/// "Showing" means revealed, the rule [`reshow_plugin_if_open`] already uses: a
+/// drawer **mid-retract** (`reveals_child` already `false`, `current` not yet
+/// cleared by `wire_retract_finish`) is closing, so it takes the closed arm —
+/// re-anchored on `trigger`, and `set_reveal_child(true)` turns the slide
+/// around where it is. Read as open, the same chip clicked within the 180 ms
+/// retract was a second, no-op retract, and another chip's page was swapped
+/// into a drawer that then finished closing.
 fn toggle_panel(panel: &ModalPanel, active: Active, trigger: &gtk::Widget, retract_on_same: bool) {
-    let current = panel.current.borrow().clone();
+    let current = if panel.revealer.reveals_child() {
+        panel.current.borrow().clone()
+    } else {
+        None
+    };
     match current {
         Some(shown) if shown == active => {
             if retract_on_same {
@@ -3785,6 +3797,106 @@ mod gtk_tests {
         assert!(
             revealed,
             "a page asked for while its drawer closes opens again"
+        );
+    }
+
+    /// A chip clicked while its drawer **retracts** reopens it, under that
+    /// chip. `toggle_panel` used to read the closing drawer as open on that
+    /// chip's page — `current` still names it until `wire_retract_finish`
+    /// runs — and retract it a second time, a no-op, so the click was lost.
+    /// The harness wires no `wire_retract_finish`, which is exactly that
+    /// mid-animation state.
+    ///
+    /// **Falsification:** drop the `reveals_child()` term from `toggle_panel`'s
+    /// read of `current` → the third click retracts again and this reds.
+    #[gtk::test]
+    fn a_chip_clicked_while_its_drawer_retracts_reopens_it() {
+        use super::toggle_builtin_under;
+
+        const KEY: &str = "test-retract-same-chip";
+        if !crate::plugins::host_is_live() {
+            crate::plugins::install_test_handles();
+        }
+        let (panel, chip) = builtin_drawer(&test_monitor(), KEY);
+        let _mounted = Mounted {
+            keys: &[KEY],
+            panels: vec![panel.clone()],
+        };
+
+        assert!(toggle_builtin_under(chip.upcast_ref(), Page::Audio));
+        assert!(toggle_builtin_under(chip.upcast_ref(), Page::Audio));
+        assert!(
+            !panel.revealer.reveals_child(),
+            "premise: the drawer is closing"
+        );
+        assert_eq!(
+            *panel.current.borrow(),
+            Some(Active::Builtin(Page::Audio)),
+            "premise: …with its page still recorded",
+        );
+
+        assert!(toggle_builtin_under(chip.upcast_ref(), Page::Audio));
+        assert!(
+            panel.revealer.reveals_child(),
+            "the click reopens the closing drawer"
+        );
+        assert_eq!(*panel.current.borrow(), Some(Active::Builtin(Page::Audio)));
+        assert_eq!(anchored_on(&panel), Some(chip.upcast::<gtk::Widget>()));
+    }
+
+    /// **Another** chip clicked while the drawer retracts opens its own page,
+    /// revealed and under that chip. `toggle_panel` used to take the in-place
+    /// swap arm for it: the stack switched to the new page inside a drawer
+    /// that went on closing, so the page never showed.
+    ///
+    /// Two chips on one bar, so the anchor tells the arms apart too: the swap
+    /// keeps the card under the chip it opened from, the closed arm centres it
+    /// under the one just clicked.
+    ///
+    /// **Falsification:** drop the `reveals_child()` term from `toggle_panel`'s
+    /// read of `current` → the swap arm runs, the drawer stays shut and this
+    /// reds.
+    #[gtk::test]
+    fn another_chip_clicked_while_the_drawer_retracts_opens_its_page() {
+        use super::toggle_builtin_under;
+
+        const KEY: &str = "test-retract-other-chip";
+        if !crate::plugins::host_is_live() {
+            crate::plugins::install_test_handles();
+        }
+        let (panel, chip_a) = builtin_drawer(&test_monitor(), KEY);
+        let _mounted = Mounted {
+            keys: &[KEY],
+            panels: vec![panel.clone()],
+        };
+        // `builtin_drawer` makes its one chip the bar's whole child; put a
+        // second one beside it.
+        let chip_b = gtk::Button::new();
+        let chips = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        panel.geometry.bar_window.set_child(Some(&chips));
+        chips.append(&chip_a);
+        chips.append(&chip_b);
+
+        assert!(toggle_builtin_under(chip_a.upcast_ref(), Page::Audio));
+        assert!(toggle_builtin_under(chip_a.upcast_ref(), Page::Audio));
+        assert!(
+            !panel.revealer.reveals_child(),
+            "premise: the drawer is closing"
+        );
+
+        assert!(toggle_plugin_under(chip_b.upcast_ref(), "retract-b"));
+        assert!(
+            panel.revealer.reveals_child(),
+            "the other chip's page opens rather than riding the closing drawer shut",
+        );
+        assert_eq!(
+            *panel.current.borrow(),
+            Some(Active::Plugin("retract-b".to_owned()))
+        );
+        assert_eq!(
+            anchored_on(&panel),
+            Some(chip_b.upcast::<gtk::Widget>()),
+            "…centred under the chip that was clicked",
         );
     }
 

@@ -439,8 +439,8 @@ in
           # Let trollshell's geoclue client (DesktopId "trollshell")
           # request location.
           appConfig.trollshell = {
-            isAllowed = true;
-            isSystem = false;
+            isAllowed = lib.mkDefault true;
+            isSystem = lib.mkDefault false;
           };
         };
 

@@ -860,8 +860,9 @@ mod tests {
         );
     }
 
-    /// An adapter whose alias is hostile free text (`bluetoothctl
-    /// system-alias` takes anything; the default is the pretty hostname).
+    /// An alias that is hostile free text: the adapter's (`bluetoothctl
+    /// system-alias` takes anything; the default is the pretty hostname) or a
+    /// device's (whatever a device in radio range broadcasts).
     const HOSTILE_ALIAS: &str = "Annika's Laptop & <b>Dock</b>";
 
     fn hostile_adapter() -> Adapter {
@@ -871,6 +872,29 @@ mod tests {
             powered: true,
             ..Adapter::default()
         }
+    }
+
+    /// A nearby device broadcasting [`HOSTILE_ALIAS`] as its name.
+    fn hostile_device() -> Device {
+        Device {
+            path: "/org/bluez/hci0/dev_AA".to_owned(),
+            address: "AA:BB:CC:DD:EE:FF".to_owned(),
+            alias: HOSTILE_ALIAS.to_owned(),
+            ..Device::default()
+        }
+    }
+
+    /// A device row shows the alias a nearby device broadcasts **literally**
+    /// (#753). Anyone in radio range picks that string, and the row is the
+    /// one you tap to pair.
+    ///
+    /// **Falsification:** delete `markup::plain_text` in `build_device_row`
+    /// → this reds.
+    #[gtk::test]
+    fn a_device_row_shows_a_broadcast_alias_literally() {
+        adw::init().expect("libadwaita init");
+        let row = build_device_row(&hostile_device(), false);
+        assert_shows(&row, HOSTILE_ALIAS);
     }
 
     /// The header row shows the adapter alias **literally** (#753).
@@ -897,35 +921,41 @@ mod tests {
         assert_shows(&row, &format!("Visible as \u{201c}{HOSTILE_ALIAS}\u{201d}"));
     }
 
-    /// Building either row logs no markup warning (#1564).
+    /// Building the header, Discoverable or a device row logs no markup
+    /// warning (#1564).
     ///
-    /// Both titles are literals, so the alias only ever arrives through the
-    /// bound subtitle, after `plain_text`; there is no order to flip here.
+    /// The device row is the one whose order matters: its **title** is the
+    /// broadcast alias, and the device list rebuilds it on every emission, so
+    /// setting it before `plain_text` logged a `Gtk-WARNING` per rebuild. The
+    /// two adapter rows have literal titles, and the alias reaches them only
+    /// through the bound subtitle, after `plain_text`.
     ///
-    /// **Falsification:** delete `markup::plain_text` in `build_header_row` →
-    /// this reds (the subtitle parse warns).
+    /// **Falsification:** set the device row's title in its builder (before
+    /// `plain_text`), or delete `markup::plain_text` in `build_device_row` or
+    /// `build_header_row` → this reds.
     #[gtk::test]
-    fn building_the_adapter_rows_logs_no_markup_warning() {
+    fn building_the_bluetooth_rows_logs_no_markup_warning() {
         if in_child() {
             return;
         }
-        let out = child_output("panels::bluetooth::tests::adapter_rows_child");
+        let out = child_output("panels::bluetooth::tests::bluetooth_rows_child");
         assert!(
             !out.contains(MARKUP_WARNING),
             "building the rows logged a markup warning: {out}"
         );
     }
 
-    /// Child body of [`building_the_adapter_rows_logs_no_markup_warning`].
+    /// Child body of [`building_the_bluetooth_rows_logs_no_markup_warning`].
     #[gtk::test]
-    fn adapter_rows_child() {
+    fn bluetooth_rows_child() {
         if !in_child() {
             return;
         }
         adw::init().expect("libadwaita init");
         let header = build_header_row(always(Some(hostile_adapter())));
         let disc = build_discoverable_row(always(Some(hostile_adapter())));
+        let device = build_device_row(&hostile_device(), false);
         pump();
-        drop((header, disc));
+        drop((header, disc, device));
     }
 }

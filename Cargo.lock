@@ -1409,6 +1409,7 @@ dependencies = [
 name = "hytte-plugin-proto"
 version = "0.1.0"
 dependencies = [
+ "rmp",
  "rmp-serde",
  "serde",
  "serde_bytes",

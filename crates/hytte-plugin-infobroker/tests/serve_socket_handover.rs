@@ -9,6 +9,12 @@
 //! property: that a synchronous step inside `serve` does not stop the
 //! current-thread runtime `serve` is spawned onto in production.
 //!
+//! The #1489 follow-up audit (M3) added scenario F for one more: that a
+//! `grants.toml` the real `load_grants` cannot parse comes out of a session
+//! byte for byte, and the session says why it is not saving — the only
+//! place `load_grants` itself runs against a file, since it reads the
+//! process's own `XDG_STATE_HOME`.
+//!
 //! Every scenario needs a real second OS process, for two independent reasons:
 //!
 //! - [`broker::SOCKET`] and [`broker::STOOD_DOWN`] are process-wide statics
@@ -1348,5 +1354,153 @@ async fn shutdown_drains_a_queued_grant_save_inner() {
 
     // #1024 review M1 / New-5 — see the first scenario for why this line
     // matters and why the name is derived rather than typed.
+    println!("{SCENARIO_OK_PREFIX}{}", this_fn_name!());
+}
+
+// ── Scenario F: an unreadable grants.toml is left alone (#1489 follow-up, M3) ──
+
+/// What scenario F seeds as `grants.toml`: a standing deny the human wrote,
+/// then a hand-added row whose `decision` has no value — the typo that makes
+/// the whole file fail to parse.
+const CORRUPT_GRANTS: &str = "[[grant]]\nagent = \"scratch\"\ndatasource = \"departures\"\n\
+                              decision = \"deny\"\n\n[[grant]]\nagent = \"claude\"\n\
+                              datasource = \"calendar\"\ndecision = \n";
+
+/// The #1489 follow-up audit's M3, through the real `serve` and the real
+/// `load_grants` — which reads `XDG_STATE_HOME`, so only this harness can
+/// point it at a scratch file. A `grants.toml` that does not parse used to
+/// become a path-less empty store: nothing overwrote the file, but every
+/// grant change for the session silently went nowhere and the only word of
+/// it was one journal line. Now the store keeps the path and refuses to
+/// write it, and the session says so.
+///
+/// Drives a whole session the production way (`serve_with_shutdown`, as
+/// `src/plugin.rs`'s `sources()` does): the seed must carry the panel notice
+/// and a toast naming the file; an `Allow` must still apply for the session;
+/// and after the shutdown drain — the point at which any queued write has
+/// provably landed (scenario E) — the human's bytes must be exactly what they
+/// were, with no temp file left beside them.
+///
+/// Two mutations, one assertion each: the old path-less fallback has no
+/// notice (RED on the seed); keeping the path but writing anyway replaces the
+/// file with the session's one `claude` row (RED on the bytes, both here and
+/// in the parent).
+#[tokio::test]
+async fn an_unreadable_grants_file_survives_a_session_that_changes_grants() {
+    // #1024 review New-6: see the sibling scenarios' identical guard.
+    if in_scenario_child() {
+        return;
+    }
+    let runtime_dir = tempfile::tempdir().expect("XDG_RUNTIME_DIR scratch dir");
+    let state_dir = tempfile::tempdir().expect("XDG_STATE_HOME scratch dir");
+    let grants_dir = state_dir.path().join(STATE_DIR);
+    std::fs::create_dir_all(&grants_dir).expect("create the scratch state dir");
+    let grants_path = grants_dir.join(GRANTS_FILE);
+    std::fs::write(&grants_path, CORRUPT_GRANTS).expect("seed the corrupt grants.toml");
+
+    let inner_name = format!("{}_inner", this_fn_name!());
+    run_inner(&inner_name, runtime_dir.path(), state_dir.path());
+
+    // Checked again here, after the child process — and with it every
+    // runtime and writer task it had — is gone.
+    assert_eq!(
+        std::fs::read_to_string(&grants_path).expect("grants.toml is still there"),
+        CORRUPT_GRANTS,
+        "the human's grants.toml must come out of the session byte for byte as it went in",
+    );
+    let entries: Vec<_> = std::fs::read_dir(&grants_dir)
+        .expect("read the state dir")
+        .filter_map(Result::ok)
+        .map(|e| e.file_name())
+        .collect();
+    assert_eq!(
+        entries,
+        vec![std::ffi::OsString::from(GRANTS_FILE)],
+        "no write was started beside it either",
+    );
+}
+
+#[tokio::test]
+async fn an_unreadable_grants_file_survives_a_session_that_changes_grants_inner() {
+    if !in_scenario_child() {
+        return;
+    }
+    let state_dir = std::env::var_os("XDG_STATE_HOME").expect("the harness sets XDG_STATE_HOME");
+    let grants_path = Path::new(&state_dir).join(STATE_DIR).join(GRANTS_FILE);
+    let shown = grants_path.display().to_string();
+
+    let (cmds_tx, cmds_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<BrokerMsg>();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let session = tokio::spawn(serve_with_shutdown(cmds_rx, out_tx, shutdown_rx));
+
+    // The seed: no socket trouble, but the store's — on the panel and in a
+    // toast.
+    let (seed, toast) = tokio::time::timeout(GIVE_UP, async {
+        loop {
+            match out_rx.recv().await {
+                Some(BrokerMsg::Update { snapshot, toast }) => break (snapshot, toast),
+                Some(BrokerMsg::RequestConsent(_) | BrokerMsg::Query(_)) => {}
+                None => panic!("the lane closed before the seed"),
+            }
+        }
+    })
+    .await
+    .expect("the session must seed promptly");
+    assert_eq!(seed.notice, None, "the socket binds: {:?}", seed.notice);
+    let store_notice = seed
+        .store_notice
+        .expect("an unreadable grants.toml must be named on the panel — RED on the old fallback");
+    assert!(
+        store_notice.contains(&shown) && store_notice.contains("line "),
+        "the notice names the file and where it fails to parse: {store_notice}",
+    );
+    assert!(
+        seed.grants.is_empty(),
+        "nothing in an unparsable file is in force"
+    );
+    let toast = toast.expect("the seed toasts the same news");
+    assert!(toast.body.contains(&shown), "{toast:?}");
+
+    // A grant change still applies for the session...
+    cmds_tx
+        .send(Cmd::Allow {
+            agent: "claude".to_owned(),
+            datasource: "departures".to_owned(),
+        })
+        .expect("the broker task is still alive");
+    let after_allow = tokio::time::timeout(GIVE_UP, recv_update(&mut out_rx))
+        .await
+        .expect("the Allow must produce a fresh snapshot")
+        .expect("the lane produced a snapshot");
+    assert_eq!(
+        after_allow.grants,
+        vec![GrantView {
+            agent: "claude".to_owned(),
+            datasource: "departures".to_owned(),
+            decision: "always",
+        }],
+    );
+    assert!(after_allow.store_notice.is_some(), "and the notice stays");
+
+    // ...and after the drain, which waits out any write the lane had queued,
+    // the file is exactly what the human left.
+    let (ack_tx, ack_rx) = oneshot::channel();
+    shutdown_tx
+        .send(ack_tx)
+        .expect("the broker task is still alive to receive the shutdown request");
+    tokio::time::timeout(GIVE_UP, ack_rx)
+        .await
+        .expect("the shutdown ack must arrive within the bound")
+        .expect("the broker task must not drop the ack sender without answering");
+    assert_eq!(
+        std::fs::read_to_string(&grants_path).expect("grants.toml is still there"),
+        CORRUPT_GRANTS,
+        "an Allow must not be written over a grants.toml the broker could not read",
+    );
+
+    let _ = tokio::time::timeout(Duration::from_secs(2), session).await;
+
+    // #1024 review M1 / New-5 — see the first scenario.
     println!("{SCENARIO_OK_PREFIX}{}", this_fn_name!());
 }

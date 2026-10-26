@@ -188,6 +188,27 @@ range above is a floor, not a ceiling.
       goes at once (before, it waited for the silent client's 5 s timeout),
       and `hytte-infobroker grants list` from another terminal answers
       straight away too.
+- [ ] **(#1489 follow-up, M1)** Panel buttons act on the row they label. Deny
+      two probes once each (`auth --agent probe-a`, `auth --agent probe-b`,
+      **Deny** both cards) so the panel shows two pending rows, then click
+      **Allow** on the _second_ one: the grant that appears is `probe-b`'s.
+      Revoke it, then click the stale **Revoke** again before the panel
+      repaints (or double-click): no other grant goes. The rows still render
+      and the buttons still respond after a repaint (their ids now name the
+      pair, e.g. `allow:probe-b:departures`). Clean up the probe rows.
+- [ ] **(#1489 follow-up, M2)** `hytte-infobroker auth --agent $'claude\nhi'`
+      exits non-zero with _"invalid agent name"_ and the name rule as its
+      hint, and **no card** appears; `--agent "Claude Code"` still prompts.
+- [ ] **(#1489 follow-up, M3)** A broken `grants.toml` is left alone. Note
+      `sha256sum ~/.local/state/hytte-infobroker/grants.toml`, add a row ending
+      in `decision = ` (no value), and
+      `systemctl --user restart trollshell-plugin-infobroker`. Expect a toast
+      _"infobroker: grant changes are not being saved"_, a warning under the
+      panel title naming the file and the line, and a `warning:` line on
+      stderr from `hytte-infobroker grants list`. Allow a pending row (or
+      answer a card **Always**): it applies — the next `auth` is silent — but
+      the journal says _"not saving …"_ and the checksum is unchanged (after
+      your edit). Fix the typo and restart: the file's grants are back.
 - [ ] **(#544)** A plugin granted `Capability::RunCommand` emits
       `Effect::RunCommand` → the host spawns the argv and the plugin gets back
       an `EffectResult` with the exit status + captured stdout. A missing

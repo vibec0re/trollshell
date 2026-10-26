@@ -42,7 +42,11 @@ finds it on PATH automatically — no per-skill setup needed.
 - **Identity is a token.** You authenticate as an _agent name_ (pick a stable
   one, e.g. `claude`). `hytte-infobroker auth` mints a short-lived **session
   token** and prints an `export HYTTE_INFOBROKER_TOKEN=…` line. `eval` it;
-  subsequent `get`s read that env var.
+  subsequent `get`s read that env var. The name is what the human reads on
+  the consent prompt, so it must be printable: 1–64 characters, no control,
+  line-break, bidi or zero-width characters, and no leading or trailing
+  whitespace (spaces inside and non-ASCII letters are fine). Anything else is
+  refused before the human is asked.
 - **Tokens are ephemeral, grants are durable.** A token lives ≤ 12 h and dies on
   a desktop restart or an explicit revoke — re-auth is cheap. The _grant_ (your
   agent × a datasource) is what persists; a human sets it once.
@@ -86,6 +90,10 @@ export HYTTE_INFOBROKER_TOKEN=3be6622c0256634e6839949e9631063e
 
 On denial it exits non-zero and prints the reason + a how-to-grant hint to
 stderr. **Do not** keep re-running it — a denial is a standing "not yet".
+(An `invalid agent name` refusal is the exception: pick a name that follows
+the rule above and ask once with that.) `auth` can wait up to about a minute
+for the human to answer; the CLI gives up after 80 s if the broker never
+answers at all.
 
 ### `get <datasource> [--limit N]`
 
@@ -145,7 +153,10 @@ directly.
 
 Prints your durable grants, one per line
 (`agent  datasource  scope  decision`). Read-only introspection — handy to check
-what you may read before you `get`.
+what you may read before you `get`. If the desktop's `grants.toml` could not be
+read, a `warning:` line on stderr says so: the list is then only what the
+human has granted since the broker started, and none of it is being saved —
+tell the human, since only they can fix the file.
 
 ## Consent etiquette (please follow)
 
@@ -171,8 +182,8 @@ same-user-only). One request object per line in, one response per line out:
 ```text
 → {"op":"auth","agent":"claude","datasource":"departures"}
 ← {"ok":true,"token":"…","expires_unix":1750000000,"agent":"claude"}
-  ("datasource" is optional and defaults to "departures"; a request line is
-   at most 64 KiB)
+  ("datasource" is optional and defaults to "departures"; "agent" follows the
+   name rule above; a request line is at most 64 KiB)
 
 → {"op":"get","token":"…","datasource":"departures","limit":5}
 ← {"ok":true,"datasource":"departures","departures":[ … ]}
@@ -185,6 +196,7 @@ same-user-only). One request object per line in, one response per line out:
 
 → {"op":"grants"}
 ← {"ok":true,"grants":[{"agent":"claude","datasource":"departures","scope":"*","decision":"always"}]}
+  (plus a "hint" when grants.toml could not be read — see `grants list`)
 
 ← {"ok":false,"error":"…","hint":"…"}        (any denied request)
 ```

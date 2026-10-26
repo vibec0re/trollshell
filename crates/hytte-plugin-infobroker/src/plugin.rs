@@ -61,10 +61,14 @@ std::thread_local! {
 }
 
 // Node ids. The chip button opens the panel; the per-row allow/revoke buttons
-// carry the row index (resolved against the model snapshot in `update`).
+// carry the `(agent, datasource)` pair their row names — see `row_action_id`.
 const ROOT_ID: &str = "infobroker-root";
 const CHIP_ID: &str = "infobroker-chip";
 const PANEL_ID: &str = "infobroker-panel";
+/// The prefix of a pending row's **Allow** button id (see [`row_action_id`]).
+const ALLOW_PREFIX: &str = "allow:";
+/// The prefix of a grant row's **Revoke** button id (see [`row_action_id`]).
+const REVOKE_PREFIX: &str = "revoke:";
 
 // ── The model ─────────────────────────────────────────────────────────────────
 
@@ -317,9 +321,25 @@ impl Plugin for Infobroker {
 }
 
 impl Infobroker {
-    /// Resolve a click: the chip opens the panel; an `allow:<n>` / `revoke:<n>`
-    /// button resolves its row index against the current snapshot and dispatches
-    /// the matching command down the lane.
+    /// Resolve a click: the chip opens the panel; an Allow / Revoke button
+    /// dispatches the matching command for the `(agent, datasource)` pair its
+    /// own id carries ([`parse_row_action_id`]).
+    ///
+    /// The pair comes from the id and **not** from the model's snapshot (the
+    /// #1489 follow-up audit, M1). The ids used to carry a row index, read
+    /// against `self.snapshot` here — which is the *newest* snapshot, not the
+    /// one the host had painted when the human clicked. The pending rows are
+    /// derived from the 30-entry audit ring, so a same-uid process re-asking
+    /// under a name with a standing deny (each refusal is an audit entry) can
+    /// churn the ring fast enough to evict an older row: a click on the row
+    /// that said `claude` then resolved `allow:0` against a list whose row 0
+    /// was the other name — and wrote a durable `always` grant for it. Revoke
+    /// had the same shape (a double-click on a row that a first revoke had
+    /// just shifted). Now the id is the label: whatever the snapshot has
+    /// become, a click acts on exactly the pair its row showed, and on nothing
+    /// if the id is not one this plugin renders. No membership check against
+    /// the snapshot either — a row that has since fallen off the ring was still
+    /// what the human read and chose, and Allow/Revoke are idempotent.
     fn on_event(&mut self, node: &str, kind: &EventKind) -> Vec<Effect> {
         if *kind != EventKind::Click {
             return Vec::new();
@@ -327,20 +347,10 @@ impl Infobroker {
         if node == CHIP_ID {
             return vec![Effect::OpenPage(Page::PluginSelf)];
         }
-        if let Some(pending) =
-            parse_index(node, "allow:").and_then(|n| self.snapshot.pending.get(n))
-        {
-            let _ = self.cmd_tx.send(Cmd::Allow {
-                agent: pending.agent.clone(),
-                datasource: pending.datasource.clone(),
-            });
-        } else if let Some(grant) =
-            parse_index(node, "revoke:").and_then(|n| self.snapshot.grants.get(n))
-        {
-            let _ = self.cmd_tx.send(Cmd::Revoke {
-                agent: grant.agent.clone(),
-                datasource: grant.datasource.clone(),
-            });
+        if let Some((agent, datasource)) = parse_row_action_id(node, ALLOW_PREFIX) {
+            let _ = self.cmd_tx.send(Cmd::Allow { agent, datasource });
+        } else if let Some((agent, datasource)) = parse_row_action_id(node, REVOKE_PREFIX) {
+            let _ = self.cmd_tx.send(Cmd::Revoke { agent, datasource });
         }
         Vec::new()
     }
@@ -434,14 +444,7 @@ impl Infobroker {
         if !self.snapshot.pending.is_empty() {
             sections.push(section(
                 "Pending requests",
-                list(
-                    self.snapshot
-                        .pending
-                        .iter()
-                        .enumerate()
-                        .map(|(i, p)| pending_row(i, p))
-                        .collect(),
-                ),
+                list(self.snapshot.pending.iter().map(pending_row).collect()),
             ));
         }
         sections.push(section(
@@ -449,14 +452,7 @@ impl Infobroker {
             if self.snapshot.grants.is_empty() {
                 muted_text("No grants yet — an agent must be allowed before it can read.")
             } else {
-                list(
-                    self.snapshot
-                        .grants
-                        .iter()
-                        .enumerate()
-                        .map(|(i, g)| grant_row(i, g))
-                        .collect(),
-                )
+                list(self.snapshot.grants.iter().map(grant_row).collect())
             },
         ));
         sections.push(section(
@@ -502,9 +498,16 @@ impl Infobroker {
         // the sections read as distinct groups (and the title is set off from the
         // first one). A `notice` — this process is not serving the socket, e.g.
         // a duplicate that stood down (#995) — rides directly under the title,
-        // ahead of everything, because it explains why the rest is empty.
+        // ahead of everything, because it explains why the rest is empty. A
+        // `store_notice` — `grants.toml` could not be read, so nothing here is
+        // being saved (the #1489 follow-up audit, M3) — follows it, for the
+        // same reason: it explains why the Grants section is empty, and why a
+        // click on Allow or Revoke will not outlive the broker.
         let mut children = vec![label("Info broker", &["title-4"])];
-        if let Some(notice) = &self.snapshot.notice {
+        for notice in [&self.snapshot.notice, &self.snapshot.store_notice]
+            .into_iter()
+            .flatten()
+        {
             children.push(notice_line(notice));
         }
         for s in sections {
@@ -629,7 +632,7 @@ fn action_row(title: &str, subtitle: &str, trailing: Option<Node>) -> Node {
     }
 }
 
-/// A small labelled button (`id` carries the action, e.g. `revoke:0`).
+/// A small labelled button (`id` carries the action — see [`row_action_id`]).
 fn action_button(id: String, text: &str, classes: &[&str]) -> Node {
     Node::Button {
         id,
@@ -638,13 +641,14 @@ fn action_button(id: String, text: &str, classes: &[&str]) -> Node {
     }
 }
 
-/// A pending knock: `<agent>` over `wants <datasource>`, Allow right-pinned.
-fn pending_row(index: usize, p: &PendingView) -> Node {
+/// A pending knock: `<agent>` over `wants <datasource>`, Allow right-pinned,
+/// its id naming the same pair the row shows.
+fn pending_row(p: &PendingView) -> Node {
     action_row(
         &p.agent,
         &format!("wants {}", p.datasource),
         Some(action_button(
-            format!("allow:{index}"),
+            row_action_id(ALLOW_PREFIX, &p.agent, &p.datasource),
             "Allow",
             &["suggested-action"],
         )),
@@ -654,13 +658,13 @@ fn pending_row(index: usize, p: &PendingView) -> Node {
 /// A durable grant: `<agent>` over `<datasource> · <decision>`, Revoke
 /// right-pinned. The `datasource · decision` subtitle is one formatted string so
 /// its two fields stay legibly separated (they used to render as adjacent bare
-/// labels — "departuresalways").
-fn grant_row(index: usize, g: &GrantView) -> Node {
+/// labels — "departuresalways"). The Revoke id names the row's pair.
+fn grant_row(g: &GrantView) -> Node {
     action_row(
         &g.agent,
         &format!("{} · {}", g.datasource, g.decision),
         Some(action_button(
-            format!("revoke:{index}"),
+            row_action_id(REVOKE_PREFIX, &g.agent, &g.datasource),
             "Revoke",
             &["destructive-action"],
         )),
@@ -717,10 +721,78 @@ fn audit_row(a: &AuditView, now_unix: i64) -> Node {
 
 // ── Pure helpers (unit-tested) ────────────────────────────────────────────────
 
-/// Parse `"<prefix><n>"` into the row index `n`, or `None` if the node id isn't
-/// a numbered action button of that kind.
-fn parse_index(node: &str, prefix: &str) -> Option<usize> {
-    node.strip_prefix(prefix).and_then(|s| s.parse().ok())
+/// The id of a row's action button: `<prefix><agent>:<datasource>`, each part
+/// [`encode_id_part`]-escaped — the pair the row's own labels show, so a click
+/// resolves by value rather than by a row index (the #1489 follow-up audit,
+/// M1; see [`Infobroker::on_event`]).
+///
+/// A [`NodeId`](hytte_plugin::proto::NodeId) is any string and the host
+/// imposes no charset on it, so the escaping is not for the wire: it is so
+/// that the `:` between the parts is unambiguous whatever a name contains.
+/// `grants.toml` is hand-editable and is not re-checked against the agent-name
+/// rule on load, so a Revoke button must still round-trip a name with a `:`, a
+/// `%` or a newline in it. Two rows for the same pair (a hand-written
+/// duplicate) share an id, which the host's keyed diff tolerates — each sits
+/// in its own unkeyed row — and their buttons do the same thing anyway.
+fn row_action_id(prefix: &str, agent: &str, datasource: &str) -> String {
+    format!(
+        "{prefix}{}:{}",
+        encode_id_part(agent),
+        encode_id_part(datasource)
+    )
+}
+
+/// Parse a [`row_action_id`] with `prefix` back into its `(agent, datasource)`,
+/// or `None` if `node` is not exactly such an id: a different prefix, a
+/// missing or extra `:`, a malformed escape, or bytes that are not UTF-8.
+fn parse_row_action_id(node: &str, prefix: &str) -> Option<(String, String)> {
+    let (agent, datasource) = node.strip_prefix(prefix)?.split_once(':')?;
+    Some((decode_id_part(agent)?, decode_id_part(datasource)?))
+}
+
+/// Percent-escape `part` for a [`row_action_id`]: the RFC 3986 unreserved
+/// bytes (`A–Z a–z 0–9 - . _ ~`) stay as they are, so the ids of ordinary
+/// names stay readable in a debug dump (`allow:claude:departures`); every
+/// other UTF-8 byte — `:` and `%` among them — becomes `%XX`.
+fn encode_id_part(part: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(part.len());
+    for byte in part.bytes() {
+        if is_unreserved(byte) {
+            out.push(char::from(byte));
+        } else {
+            out.push('%');
+            out.push(char::from(HEX[usize::from(byte >> 4)]));
+            out.push(char::from(HEX[usize::from(byte & 0x0F)]));
+        }
+    }
+    out
+}
+
+/// RFC 3986's unreserved set — the bytes [`encode_id_part`] leaves literal.
+fn is_unreserved(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
+}
+
+/// The inverse of [`encode_id_part`], strict: a byte outside the unreserved
+/// set that is not part of a `%XX` escape (so `:` too) is refused rather than
+/// passed through, as is an escape without two hex digits, and the decoded
+/// bytes must be UTF-8.
+fn decode_id_part(part: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(part.len());
+    let mut rest = part.bytes();
+    while let Some(byte) = rest.next() {
+        if byte == b'%' {
+            let hi = char::from(rest.next()?).to_digit(16)?;
+            let lo = char::from(rest.next()?).to_digit(16)?;
+            bytes.push(u8::try_from(hi * 16 + lo).ok()?);
+        } else if is_unreserved(byte) {
+            bytes.push(byte);
+        } else {
+            return None;
+        }
+    }
+    String::from_utf8(bytes).ok()
 }
 
 /// Map a proto [`UpcomingEvent`] onto the broker library's SDK-free
@@ -1067,14 +1139,42 @@ mod tests {
         assert_eq!(m.snapshot.pending, snap.pending, "the snapshot is adopted");
     }
 
+    fn pending(agent: &str, datasource: &str) -> PendingView {
+        PendingView {
+            agent: agent.to_owned(),
+            datasource: datasource.to_owned(),
+        }
+    }
+
+    fn grant(agent: &str, datasource: &str) -> GrantView {
+        GrantView {
+            agent: agent.to_owned(),
+            datasource: datasource.to_owned(),
+            decision: "always",
+        }
+    }
+
+    /// The id of the one action button in a `pending_row`/`grant_row` — what
+    /// the host sends back when that row's button is clicked.
+    fn button_id(row: &Node) -> String {
+        let Node::Row { children, .. } = row else {
+            panic!("an action row is a Row");
+        };
+        children
+            .iter()
+            .find_map(|c| match c {
+                Node::Button { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .expect("the row has its action button")
+    }
+
     #[test]
-    fn allow_button_dispatches_allow_for_the_indexed_pending_row() {
+    fn allow_button_dispatches_allow_for_its_own_row() {
         let (mut m, mut rx) = model();
-        m.snapshot.pending = vec![PendingView {
-            agent: "claude".to_owned(),
-            datasource: "departures".to_owned(),
-        }];
-        let fx = m.on_event("allow:0", &EventKind::Click);
+        let row = pending("claude", "departures");
+        m.snapshot.pending = vec![row.clone()];
+        let fx = m.on_event(&button_id(&pending_row(&row)), &EventKind::Click);
         assert!(fx.is_empty(), "the command rides the lane, not an effect");
         assert_eq!(
             rx.try_recv(),
@@ -1086,14 +1186,11 @@ mod tests {
     }
 
     #[test]
-    fn revoke_button_dispatches_revoke_for_the_indexed_grant_row() {
+    fn revoke_button_dispatches_revoke_for_its_own_row() {
         let (mut m, mut rx) = model();
-        m.snapshot.grants = vec![GrantView {
-            agent: "claude".to_owned(),
-            datasource: "departures".to_owned(),
-            decision: "always",
-        }];
-        m.on_event("revoke:0", &EventKind::Click);
+        let row = grant("claude", "departures");
+        m.snapshot.grants = vec![row.clone()];
+        m.on_event(&button_id(&grant_row(&row)), &EventKind::Click);
         assert_eq!(
             rx.try_recv(),
             Ok(Cmd::Revoke {
@@ -1103,25 +1200,147 @@ mod tests {
         );
     }
 
+    /// M1, the audit's scenario: the human reads a pending row for `claude`
+    /// and clicks its Allow — but by the time the click reaches the plugin,
+    /// ring churn has evicted `claude`'s denials and the other name now sits
+    /// where `claude` was. The click must allow `claude`, never the row that
+    /// now holds its old position.
+    ///
+    /// Mutation: resolve the click against `self.snapshot.pending` by position
+    /// again (the pre-fix `allow:<n>`), and this dispatches
+    /// `Allow { agent: "evil" }` — a durable grant the human never chose.
     #[test]
-    fn a_stale_index_dispatches_nothing() {
+    fn an_allow_click_acts_on_the_row_it_labelled_after_the_rows_shift() {
         let (mut m, mut rx) = model();
-        // No pending rows → allow:0 resolves to nothing (a click that raced a
-        // re-render can't panic or mis-fire).
-        m.on_event("allow:0", &EventKind::Click);
-        assert!(
-            rx.try_recv().is_err(),
-            "no command for an out-of-range index"
+        let claude = pending("claude", "departures");
+        m.snapshot.pending = vec![claude.clone(), pending("evil", "departures")];
+        // What the host painted, and so what the human clicked.
+        let clicked = button_id(&pending_row(&claude));
+
+        // The rows shift before the click lands.
+        m.snapshot.pending = vec![pending("evil", "departures")];
+        m.on_event(&clicked, &EventKind::Click);
+
+        assert_eq!(
+            rx.try_recv(),
+            Ok(Cmd::Allow {
+                agent: "claude".to_owned(),
+                datasource: "departures".to_owned(),
+            }),
+            "the click allows exactly the pair its row showed"
+        );
+        assert!(rx.try_recv().is_err(), "and nothing else");
+    }
+
+    /// M1, Revoke's shape: a second click on a row a first revoke already
+    /// removed (a double click, or a click on a stale paint) must revoke
+    /// that row's pair again — a no-op broker-side — not the grant that
+    /// moved up into its slot.
+    #[test]
+    fn a_revoke_click_acts_on_the_row_it_labelled_after_the_rows_shift() {
+        let (mut m, mut rx) = model();
+        let first = grant("claude", "departures");
+        m.snapshot.grants = vec![first.clone(), grant("claude", "calendar")];
+        let clicked = button_id(&grant_row(&first));
+
+        m.snapshot.grants = vec![grant("claude", "calendar")];
+        m.on_event(&clicked, &EventKind::Click);
+
+        assert_eq!(
+            rx.try_recv(),
+            Ok(Cmd::Revoke {
+                agent: "claude".to_owned(),
+                datasource: "departures".to_owned(),
+            })
         );
     }
 
+    /// The ids round-trip any pair — including names with the separator, the
+    /// escape character, a newline (a hand-edited or pre-M2 `grants.toml`
+    /// row, which still needs a working Revoke), non-ASCII text, and the
+    /// empty string — and an ordinary name's id stays readable.
     #[test]
-    fn parse_index_only_matches_its_prefix() {
-        assert_eq!(parse_index("allow:3", "allow:"), Some(3));
-        assert_eq!(parse_index("revoke:0", "revoke:"), Some(0));
-        assert_eq!(parse_index("allow:3", "revoke:"), None);
-        assert_eq!(parse_index("allow:x", "allow:"), None);
-        assert_eq!(parse_index("chip", "allow:"), None);
+    fn row_action_ids_round_trip_any_pair() {
+        assert_eq!(
+            row_action_id(ALLOW_PREFIX, "claude", "departures"),
+            "allow:claude:departures"
+        );
+        for (agent, datasource) in [
+            ("claude", "departures"),
+            ("a:b", "c:d"),
+            ("100%", "%41"),
+            ("old\nrow", "calendar"),
+            ("Claude Code", "weather"),
+            ("Kätzchen 名前", "weather"),
+            ("", ""),
+        ] {
+            for prefix in [ALLOW_PREFIX, REVOKE_PREFIX] {
+                let id = row_action_id(prefix, agent, datasource);
+                assert_eq!(
+                    parse_row_action_id(&id, prefix),
+                    Some((agent.to_owned(), datasource.to_owned())),
+                    "{id:?}"
+                );
+            }
+            assert_eq!(
+                parse_row_action_id(
+                    &row_action_id(ALLOW_PREFIX, agent, datasource),
+                    REVOKE_PREFIX
+                ),
+                None,
+                "an Allow id is never read as a Revoke"
+            );
+        }
+    }
+
+    /// Anything that is not exactly an id this plugin renders dispatches
+    /// nothing: the old index form, a missing or extra separator, a malformed
+    /// escape, an escape that decodes to invalid UTF-8, the chip, junk.
+    #[test]
+    fn a_malformed_action_id_dispatches_nothing() {
+        let (mut m, mut rx) = model();
+        m.snapshot.pending = vec![pending("claude", "departures")];
+        m.snapshot.grants = vec![grant("claude", "departures")];
+        for node in [
+            "allow:0",
+            "revoke:0",
+            "allow:",
+            "allow:claude",
+            "allow:claude:departures:x",
+            "allow:cla ude:departures",
+            "allow:%4:departures",
+            "allow:%zz:departures",
+            "allow:%C3:departures",
+            "infobroker-panel",
+        ] {
+            m.on_event(node, &EventKind::Click);
+            assert!(rx.try_recv().is_err(), "{node:?} must dispatch nothing");
+        }
+    }
+
+    /// M3: a broker whose `grants.toml` could not be read says so on the
+    /// panel, under the title and styled as a warning — beside the socket
+    /// notice when both apply, not instead of it.
+    #[test]
+    fn a_broker_that_is_not_saving_grants_says_so_on_the_panel() {
+        let (mut m, _rx) = model();
+        let store = "Not saving grant changes: /x/grants.toml could not be read (…).";
+        let socket = "Not serving: another info broker already owns /x.sock.";
+        m.snapshot = BrokerSnapshot {
+            notice: Some(socket.to_owned()),
+            store_notice: Some(store.to_owned()),
+            ..BrokerSnapshot::default()
+        };
+        let Node::Box { children, .. } = m.panel() else {
+            panic!("panel root is a Box");
+        };
+        for (i, text) in [(1, socket), (2, store)] {
+            assert!(
+                matches!(&children[i], Node::Text { text: t, classes, .. }
+                    if t == text && classes.iter().any(|c| c == "warning")),
+                "child {i} must be the warning {text:?}"
+            );
+        }
     }
 
     #[test]
@@ -1233,7 +1452,7 @@ mod tests {
             datasource: "departures".to_owned(),
             decision: "always",
         };
-        let Node::Row { children, .. } = grant_row(0, &g) else {
+        let Node::Row { children, .. } = grant_row(&g) else {
             panic!("grant_row is a Row");
         };
         let Node::Box {
@@ -1247,9 +1466,9 @@ mod tests {
             matches!(&stack[1], Node::Label { text, .. } if text == "departures · always"),
             "datasource and decision are one spaced subtitle, not adjacent bare labels"
         );
-        // Revoke stays right-pinned after a spacer.
+        // Revoke stays right-pinned after a spacer, its id naming the row's pair.
         assert!(matches!(&children[1], Node::Spacer));
-        assert!(matches!(&children[2], Node::Button { id, .. } if id == "revoke:0"));
+        assert!(matches!(&children[2], Node::Button { id, .. } if id == "revoke:fnord:departures"));
     }
 
     #[test]

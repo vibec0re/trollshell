@@ -41,7 +41,7 @@
 //!   knocks alert the human.
 
 use std::collections::{HashMap, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::Utc;
@@ -55,7 +55,8 @@ use crate::paths;
 use crate::tokens::{Token, TokenScope, TokenStore};
 use crate::wire::{
     CalendarEntry, DATASOURCE_CALENDAR, DATASOURCE_DEPARTURES, DATASOURCE_WEATHER, DepartureOut,
-    GrantOut, Request, Response, WeatherOut, encode_response, parse_request,
+    GrantOut, MAX_AGENT_NAME_CHARS, Request, Response, WeatherOut, check_agent_name,
+    encode_response, parse_request,
 };
 
 /// Cap on the in-memory audit ring shown in the panel. Oldest entries fall off.
@@ -99,7 +100,19 @@ const MAX_PENDING_CONSENTS: usize = 8;
 /// sends a decision within it (an explicit click, or `Deny` on its own timeout),
 /// so a live shell's answer reliably arrives first — this is the pure fallback
 /// for a wedged or pre-1b host that never surfaces the prompt at all.
-const CONSENT_PARK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(65);
+///
+/// Public because it is also the longest a well-behaved broker leaves a client
+/// waiting for its one reply line (an `auth` parked on the human), which is
+/// what the CLI sizes its own read timeout from.
+pub const CONSENT_PARK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(65);
+
+/// How long the session loop pauses after a failed `accept()` before it tries
+/// again. An accept error is usually a resource one — `EMFILE`/`ENFILE` with the
+/// connection still queued in the backlog — and retrying at once just fails
+/// again, so without a pause the loop spun on it, one journal line per lap.
+/// Short enough that a consent click or a revoke queued behind it waits no
+/// longer than this.
+const ACCEPT_ERROR_PAUSE: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// How long the broker holds a **parked** datasource query before giving up
 /// (#509). A backstop for a wedged/pre-#509 host: the shell's own query router has
@@ -248,6 +261,27 @@ fn known_datasources_hint() -> String {
     )
 }
 
+/// The hint on an `auth` whose agent name [`check_agent_name`] refused.
+fn agent_name_hint() -> String {
+    format!(
+        "pick a short, stable name such as 'claude': 1 to {MAX_AGENT_NAME_CHARS} characters, \
+         no control, line-break, bidi or zero-width characters, and no leading or trailing \
+         whitespace"
+    )
+}
+
+/// `"<path> could not be read (<why>)"` for a grant store standing in for an
+/// unreadable `grants.toml` (the #1489 follow-up audit, M3), or `None` for one
+/// that loaded. The shared core of what the panel, the seed toast and the
+/// `grants` reply each say about it.
+fn unreadable_grants(grants: &GrantStore) -> Option<String> {
+    let error = grants.load_error()?;
+    let path = grants
+        .path()
+        .map_or_else(|| "grants.toml".to_owned(), |p| p.display().to_string());
+    Some(format!("{path} could not be read ({error})"))
+}
+
 /// The consent card's detail line for `agent` asking to read `datasource` —
 /// the plain-words version of the card's "⟨agent⟩ wants: read access from
 /// ⟨datasource⟩". The departures wording is byte-for-byte what every prompt
@@ -377,6 +411,13 @@ pub struct BrokerSnapshot {
     /// duplicate (#995) painted a panel indistinguishable from an idle broker
     /// and the only explanation was one stderr line in that unit's journal.
     pub notice: Option<String>,
+    /// A one-line warning that this broker is **not saving grant changes**,
+    /// because `grants.toml` is there but could not be read (the #1489
+    /// follow-up audit, M3) — rendered under [`notice`](Self::notice). `None`
+    /// in the normal case. A separate field because both can be true at once
+    /// and say different things: `notice` is about the socket, this is about
+    /// the grant store.
+    pub store_notice: Option<String>,
 }
 
 // ── The panel command lane + the outbound message ─────────────────────────────
@@ -651,7 +692,26 @@ impl BrokerState {
             audit,
             datasources,
             notice: self.notice.clone(),
+            store_notice: unreadable_grants(&self.grants).map(|what| {
+                format!(
+                    "Not saving grant changes: {what}. The file is left as it is and none of \
+                     its grants are in force; Allow, Deny and Revoke still apply until the \
+                     broker restarts. Fix the file (or move it away), then restart the broker."
+                )
+            }),
         }
+    }
+
+    /// The toast a session raises with its seed snapshot when `grants.toml`
+    /// could not be read (M3) — the panel's notice reaches only someone who
+    /// opens the panel, and a human answering a consent card with "Always"
+    /// never does. Raised once per session start, so it repeats on a restart
+    /// for as long as the file stays broken, and not otherwise.
+    fn unreadable_store_toast(&self) -> Option<Toast> {
+        unreadable_grants(&self.grants).map(|what| Toast {
+            summary: "infobroker: grant changes are not being saved".to_owned(),
+            body: format!("{what}. Fix it and restart the broker — see the infobroker panel."),
+        })
     }
 
     /// Apply a panel command (revoke / allow). Returns nothing — the caller
@@ -713,10 +773,23 @@ impl BrokerState {
     /// An unknown datasource is refused before any of that, without an audit
     /// entry or a prompt: there is nothing it could be granted, and the prompt
     /// must never show the human a datasource name the agent made up.
+    ///
+    /// So is an agent name [`check_agent_name`] refuses (the #1489 follow-up
+    /// audit, M2) — over [`MAX_AGENT_NAME_CHARS`], or carrying a control, a
+    /// line break, a bidi override or a zero-width character. This is the one
+    /// place a name enters the broker: every token is minted here or from a
+    /// consent this parked, and every audit row and pending row names the
+    /// agent of a request that got past this check.
     fn handle_auth(&mut self, agent: &str, datasource: Option<&str>) -> Dispatch {
         let now = now_unix();
-        if agent.trim().is_empty() {
-            return Dispatch::Answer(Response::error("auth: empty agent name"), None);
+        if let Err(reason) = check_agent_name(agent) {
+            return Dispatch::Answer(
+                Response::denied(
+                    format!("auth: invalid agent name: {reason}"),
+                    agent_name_hint(),
+                ),
+                None,
+            );
         }
         let datasource = datasource.unwrap_or(DATASOURCE_DEPARTURES);
         if !is_known_datasource(datasource) {
@@ -831,6 +904,14 @@ impl BrokerState {
     /// **routed through their provider plugins** over the host's datasource query
     /// protocol ([`GetDisposition::Query`]) rather than fetched here — the #509 dedup
     /// of the broker's former internal departures fetch.
+    ///
+    /// A `get` for a datasource the broker does not serve is refused without an
+    /// audit entry, the rule `handle_auth` already keeps (the #1489 follow-up
+    /// audit, M2). It used to be recorded with the requested name as the
+    /// activity row's resource — the one string in a `get` the client picks,
+    /// unchecked and up to the 64 KiB request cap, rendered into the panel for
+    /// the life of the ring. The agent hears the refusal; the panel shows only
+    /// datasources that exist.
     fn handle_get(
         &mut self,
         token: &str,
@@ -847,7 +928,6 @@ impl BrokerState {
         };
         let agent = auth.agent;
         if !is_known_datasource(datasource) {
-            self.record(&agent, datasource, datasource, Outcome::Denied, now);
             return GetDisposition::Answer(
                 Response::denied(
                     format!("unknown datasource '{datasource}'"),
@@ -908,6 +988,11 @@ impl BrokerState {
     }
 
     /// `grants`: read-only introspection of the durable store.
+    ///
+    /// When `grants.toml` could not be read (M3) the list is the session's
+    /// in-memory set rather than the file's, and the reply's `hint` says so —
+    /// `ok` stays `true` because the list is still the truth about what this
+    /// broker enforces, but an empty one must not read as "no grants".
     fn handle_grants(&self) -> Response {
         let grants: Vec<GrantOut> = self
             .grants
@@ -923,6 +1008,12 @@ impl BrokerState {
         Response {
             ok: true,
             grants: Some(grants),
+            hint: unreadable_grants(&self.grants).map(|what| {
+                format!(
+                    "{what}: these are this session's grants, not the file's, and changes to \
+                     them are not saved — fix the file, then restart the broker"
+                )
+            }),
             ..Response::default()
         }
     }
@@ -1525,25 +1616,43 @@ pub async fn serve(cmds: mpsc::UnboundedReceiver<Cmd>, out: mpsc::UnboundedSende
 
 /// Read and parse the durable grant store for one session: `grants.toml` when
 /// there is a state dir to hold it, an empty in-memory store when there is not
-/// (no `HOME`/`XDG_STATE_HOME`) or when the file on disk is unreadable.
+/// (no `HOME`/`XDG_STATE_HOME`). See [`load_grants_at`] for a file that is
+/// there but does not load.
 ///
 /// **Wholly synchronous** — a `std::fs::read_to_string` plus a TOML parse, with
 /// no `.await` anywhere inside it — which is the entire reason
 /// [`serve_with_grant_loader`] hands it to `tokio::task::spawn_blocking`
 /// instead of calling it inline (#1059).
 fn load_grants() -> GrantStore {
-    paths::grants_path().map_or_else(
-        || {
-            tracing_eprintln("no HOME/XDG_STATE_HOME; grants are in-memory only this session");
-            GrantStore::from_grants(Vec::new())
-        },
-        |path| {
-            GrantStore::load(&path).unwrap_or_else(|e| {
-                tracing_eprintln(&format!("grant store unreadable ({e}); starting empty"));
-                GrantStore::from_grants(Vec::new())
-            })
-        },
-    )
+    load_grants_at(paths::grants_path())
+}
+
+/// [`load_grants`] for an explicit path, so the unreadable-file arm is testable
+/// without the process environment (`std::env::set_var` is `unsafe` here).
+///
+/// A `grants.toml` that is there but does not parse, or cannot be read, gets
+/// [`GrantStore::unreadable`] (the #1489 follow-up audit, M3): empty, but bound
+/// to the path, and refusing to write it. It used to get a path-less store,
+/// which never overwrote the file but also never told anyone past this one
+/// journal line that every grant change this session would be dropped — see
+/// that constructor for the whole story and for why the file is left in place
+/// rather than moved aside. The session surfaces the store's state on the
+/// panel ([`BrokerSnapshot::store_notice`]), in a toast with its seed, and in
+/// the `grants` reply's hint.
+fn load_grants_at(path: Option<PathBuf>) -> GrantStore {
+    let Some(path) = path else {
+        tracing_eprintln("no HOME/XDG_STATE_HOME; grants are in-memory only this session");
+        return GrantStore::from_grants(Vec::new());
+    };
+    GrantStore::load(&path).unwrap_or_else(|e| {
+        tracing_eprintln(&format!(
+            "{} could not be read ({e}); leaving it untouched and starting with no grants in \
+             force — grant changes this session are not saved until it is fixed and the broker \
+             restarts",
+            path.display()
+        ));
+        GrantStore::unreadable(path, e)
+    })
 }
 
 /// [`serve`], with the synchronous grant-load step supplied by the caller —
@@ -1665,8 +1774,9 @@ async fn serve_inner<L>(
 
     // #1059: off the session's own thread — see this function's doc comment.
     // A panicking loader is a bug in the loader, not a reason to take the
-    // broker down with it: log it and serve with an empty store, the same
-    // fallback an unreadable `grants.toml` already gets.
+    // broker down with it: log it and serve with an empty in-memory store.
+    // (An unreadable `grants.toml` does not come through here: `load_grants`
+    // answers it with `GrantStore::unreadable`, which keeps the path.)
     let grants = match tokio::task::spawn_blocking(load_grants).await {
         Ok(grants) => grants,
         Err(e) => {
@@ -1974,8 +2084,10 @@ async fn run_session(
 ) {
     let mut session = Session::new(state, out);
     // Seed the panel with the current grants/status before any request — and,
-    // when there is no socket, with the reason.
-    session.push_update(None);
+    // when there is no socket, with the reason. When `grants.toml` could not
+    // be read, the seed also carries a toast saying so (M3).
+    let toast = session.state.unreadable_store_toast();
+    session.push_update(toast);
 
     let mut readers: JoinSet<Option<(UnixStream, Request)>> = JoinSet::new();
     loop {
@@ -2021,7 +2133,16 @@ async fn run_session(
                     Ok((stream, _addr)) => {
                         readers.spawn(read_request(stream));
                     }
-                    Err(e) => tracing_eprintln(&format!("accept error: {e}")),
+                    // Pause before the next lap rather than spin on an error
+                    // that is usually still true (`EMFILE`) — see
+                    // `ACCEPT_ERROR_PAUSE`.
+                    Err(e) => {
+                        tracing_eprintln(&format!(
+                            "accept error: {e}; retrying in {} ms",
+                            ACCEPT_ERROR_PAUSE.as_millis()
+                        ));
+                        tokio::time::sleep(ACCEPT_ERROR_PAUSE).await;
+                    }
                 }
             }
         }
@@ -2759,6 +2880,142 @@ mod tests {
         assert!(!resp.ok);
         assert!(toast.is_none());
         assert!(state.audit.is_empty(), "a blank auth isn't audited");
+    }
+
+    /// M2: a name the wire rule refuses is answered with that reason and the
+    /// rule as a hint, before anything else — no prompt (so it never reaches
+    /// the consent card), no audit row (so never the panel), no toast, no
+    /// token. Covers both a name with no grant (which would otherwise prompt)
+    /// and one that matches a legacy `grants.toml` row byte for byte (which
+    /// would otherwise mint silently).
+    ///
+    /// Mutation: restore the old blank-only check, and the first name here
+    /// comes back as `Dispatch::Consent` — a prompt carrying a newline.
+    #[test]
+    fn an_auth_with_an_unprintable_or_overlong_name_is_refused_before_anything() {
+        let mut state = BrokerState::new(store(vec![Grant::always("old\nrow", "departures")]));
+        let long = "x".repeat(MAX_AGENT_NAME_CHARS + 1);
+        for name in [
+            "claude\n\nThe system updater",
+            "evil\u{202E}edualc",
+            "old\nrow",
+            "\u{1b}[31mred",
+            long.as_str(),
+        ] {
+            let (resp, toast) = answer(state.handle_auth(name, Some("calendar")));
+            assert!(!resp.ok, "{name:?} must be refused");
+            let error = resp.error.expect("a reason");
+            assert!(error.starts_with("auth: invalid agent name:"), "{error}");
+            assert!(
+                resp.hint.is_some_and(|h| h.contains("1 to 64 characters")),
+                "the hint states the rule"
+            );
+            assert!(toast.is_none(), "{name:?}: no toast");
+            assert!(resp.token.is_none(), "{name:?}: no token");
+        }
+        assert!(state.audit.is_empty(), "no audit row, so no panel row");
+        assert!(state.tokens.active(now_unix()).is_empty());
+    }
+
+    /// M2: a `grants.toml` whose names are the ones agents actually use still
+    /// works after the check — including a name with interior spaces and one
+    /// with non-ASCII letters — and a row the check would now refuse loads
+    /// without costing the file (inert: nothing can auth as it any more, and
+    /// the panel can still revoke it).
+    #[test]
+    fn existing_grants_with_valid_names_still_mint_silently() {
+        let mut state = BrokerState::new(store(vec![
+            Grant::always("claude", "departures"),
+            Grant::always("Claude Code", "calendar"),
+            Grant::always("Kätzchen", "weather"),
+            Grant::always("old\nrow", "departures"),
+        ]));
+        for (agent, datasource) in [
+            ("claude", "departures"),
+            ("Claude Code", "calendar"),
+            ("Kätzchen", "weather"),
+        ] {
+            let (resp, toast) = answer(state.handle_auth(agent, Some(datasource)));
+            assert!(resp.ok, "{agent:?} must still mint: {:?}", resp.error);
+            assert!(toast.is_none());
+        }
+        state.apply_cmd(Cmd::Revoke {
+            agent: "old\nrow".to_owned(),
+            datasource: "departures".to_owned(),
+        });
+        assert_eq!(state.grants.grants().len(), 3, "the legacy row revokes");
+    }
+
+    /// M2, `handle_get`'s half: a `get` for a datasource the broker does not
+    /// serve is refused without an audit row, so the panel's activity list
+    /// never renders the one free-text string a `get` carries.
+    ///
+    /// Mutation: restore the `record` call, and the ring holds the newline.
+    #[test]
+    fn a_get_for_an_unknown_datasource_leaves_no_audit_row() {
+        let mut state = BrokerState::new(store(Vec::new()));
+        let token = state.tokens.mint("claude", now_unix());
+        let (resp, _) = get_answer(state.handle_get(&token.value, "stocks\n[infobroker] x", None));
+        assert!(!resp.ok);
+        assert!(
+            state.audit.is_empty(),
+            "{:?}",
+            state.snapshot(now_unix()).audit
+        );
+    }
+
+    /// M3: a `grants.toml` that does not parse becomes a store bound to its
+    /// path that will not write it — and every surface says so: the panel's
+    /// `store_notice`, the seed toast, and the `grants` reply's hint, each
+    /// naming the file and the parse error. A file that loads says nothing.
+    ///
+    /// Mutation: restore the old `GrantStore::from_grants(Vec::new())`
+    /// fallback, and all three are `None`.
+    #[test]
+    fn an_unparsable_grants_file_is_named_on_every_surface_and_left_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("grants.toml");
+        let corrupt = "[[grant]]\nagent = \"claude\"\ndecision = \n";
+        std::fs::write(&path, corrupt).expect("seed");
+
+        let mut state = BrokerState::new(load_grants_at(Some(path.clone())));
+        assert_eq!(
+            state.grants.path(),
+            Some(path.as_path()),
+            "the path is kept"
+        );
+        let shown = path.display().to_string();
+
+        let notice = state
+            .snapshot(now_unix())
+            .store_notice
+            .expect("a panel notice");
+        assert!(notice.starts_with("Not saving grant changes:"), "{notice}");
+        assert!(
+            notice.contains(&shown) && notice.contains("line 3"),
+            "{notice}"
+        );
+        let toast = state.unreadable_store_toast().expect("a seed toast");
+        assert!(toast.body.contains(&shown), "{toast:?}");
+        let hint = state.handle_grants().hint.expect("a grants hint");
+        assert!(hint.contains(&shown), "{hint}");
+
+        // Changes still apply for the session, and the file is untouched.
+        state.apply_cmd(Cmd::Allow {
+            agent: "claude".to_owned(),
+            datasource: "departures".to_owned(),
+        });
+        assert!(matches!(
+            state.handle_auth("claude", None),
+            Dispatch::Answer(Response { ok: true, .. }, None)
+        ));
+        assert_eq!(std::fs::read_to_string(&path).expect("reads"), corrupt);
+
+        // A file that loads is quiet on all three.
+        std::fs::write(&path, "").expect("an empty file is an empty store");
+        let state = BrokerState::new(load_grants_at(Some(path)));
+        assert_eq!(state.unreadable_store_toast(), None);
+        assert_eq!(state.handle_grants().hint, None);
     }
 
     #[test]
@@ -3539,6 +3796,76 @@ mod tests {
             assert_eq!(other.datasource, "weather", "another pair still prompts");
             assert_ne!(other.request_id, first.request_id);
 
+            drop(cmds_tx);
+        };
+        tokio::join!(session, drive);
+    }
+
+    /// M2 over the socket: an `auth` whose name carries a newline is answered
+    /// with the refusal on the wire, and nothing goes up the lane — no
+    /// consent prompt for the shell to put on screen, no panel update.
+    #[tokio::test]
+    async fn a_bad_agent_name_is_refused_on_the_wire_without_a_prompt() {
+        let (_dir, path, listener) = scratch_listener();
+        let (cmds_tx, cmds_rx) = mpsc::unbounded_channel();
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let session = run_session(
+            BrokerState::new(store(Vec::new())),
+            Some(&listener),
+            cmds_rx,
+            out_tx,
+            None,
+        );
+        let drive = async move {
+            // The seed snapshot.
+            assert!(matches!(
+                out_rx.recv().await,
+                Some(BrokerMsg::Update { toast: None, .. })
+            ));
+            let mut asker = knock(
+                &path,
+                r#"{"op":"auth","agent":"claude\nwants your passwords"}"#,
+            )
+            .await;
+            let reply = tokio::time::timeout(PROMPT, read_reply(&mut asker))
+                .await
+                .expect("refused at once");
+            let reply: Response = serde_json::from_str(&reply).expect("one response line");
+            assert!(!reply.ok);
+            assert!(
+                reply
+                    .error
+                    .is_some_and(|e| e.starts_with("auth: invalid agent name:")),
+                "the refusal says why"
+            );
+            // Whatever the session sends after answering it (a panel update) must
+            // not be a prompt.
+            tokio::time::sleep(ACCEPT_SETTLE).await;
+            assert!(queued_prompts(&mut out_rx).is_empty(), "no consent prompt");
+            drop(cmds_tx);
+        };
+        tokio::join!(session, drive);
+    }
+
+    /// M3: a session whose grant store could not be loaded raises a toast
+    /// with its seed snapshot — the one surface a human who only ever
+    /// answers consent cards will see — and the snapshot carries the notice.
+    #[tokio::test]
+    async fn a_session_over_an_unreadable_grants_file_toasts_with_its_seed() {
+        let (cmds_tx, cmds_rx) = mpsc::unbounded_channel();
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let state = BrokerState::new(GrantStore::unreadable(
+            "/nonexistent/grants.toml",
+            "grants.toml: line 1, column 1: bad",
+        ));
+        let session = run_session(state, None, cmds_rx, out_tx, None);
+        let drive = async move {
+            let Some(BrokerMsg::Update { snapshot, toast }) = out_rx.recv().await else {
+                panic!("the seed is an update");
+            };
+            assert!(snapshot.store_notice.is_some(), "the panel says so");
+            let toast = toast.expect("the seed toasts");
+            assert!(toast.body.contains("/nonexistent/grants.toml"), "{toast:?}");
             drop(cmds_tx);
         };
         tokio::join!(session, drive);

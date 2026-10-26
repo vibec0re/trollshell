@@ -925,9 +925,10 @@ fn bind_save_outcome<S>(
     let refusal_weak = refusal_label.downgrade();
     bind(outcomes, save, move |save, outcome| {
         let Some(outcome) = outcome else { return };
-        // Not ours, or a replay of one that predates this form: ignore it. A
-        // `Mutable`'s signal replays on subscribe, so without the ticket every
-        // freshly-built form would immediately act on the previous Save.
+        // Not the Save this form is waiting for: ignore it. Production hands
+        // each Save its own channel (`workspace_stacks::save_reply`), so only a
+        // source shared between Saves could deliver one, but it must never
+        // close or mark the wrong form.
         if pending.get() != Some(outcome.ticket) {
             return;
         }
@@ -991,39 +992,43 @@ fn build_actions(draft: &Rc<RefCell<Draft>>, name: &gtk::Entry) -> (gtk::Box, gt
     refusal_label.set_wrap(true);
     refusal_label.set_visible(false);
 
-    // Which Save this form is waiting for. `None` = not saving; the binding
-    // below ignores every outcome that is not this one, which is what stops a
-    // replayed or someone else's result from closing the page.
+    // Which Save this form is waiting for. `None` = not saving; the outcome
+    // binding ignores every outcome that is not this one.
     let pending: Rc<std::cell::Cell<Option<u64>>> = Rc::new(std::cell::Cell::new(None));
 
     {
         let draft = Rc::clone(draft);
         let name = name.downgrade();
-        let save_weak = save.downgrade();
         let refusal_weak = refusal_label.downgrade();
         let pending = Rc::clone(&pending);
-        save.connect_clicked(move |_| {
+        save.connect_clicked(move |save| {
             if pending.get().is_some() {
                 // Already in flight — a second click is not a second Save.
                 return;
             }
             match plan_save(&draft.borrow()) {
                 Ok(plan) => {
+                    // The label lives in this form; without it the form is gone.
+                    let Some(refusal) = refusal_weak.upgrade() else {
+                        return;
+                    };
                     // **The form stays up.** It comes down in the outcome
-                    // binding below, and only on success — a write that fails
-                    // (a taken name the merged view knows about, no overlay
-                    // path, a `SetWorkspaceName` that did not land) must not
-                    // have already taken the user's whole draft with it.
-                    let ticket = workspace_stacks::next_save_ticket();
-                    pending.set(Some(ticket));
-                    if let Some(save) = save_weak.upgrade() {
-                        save.set_sensitive(false);
-                        save.set_label("Saving\u{2026}");
-                    }
-                    if let Some(refusal) = refusal_weak.upgrade() {
-                        refusal.set_visible(false);
-                    }
-                    commit(ticket, &plan);
+                    // binding, and only on success — a write that fails (a
+                    // taken name the merged view knows about, no overlay path,
+                    // a `SetWorkspaceName` that did not land) must not have
+                    // already taken the user's whole draft with it.
+                    //
+                    // One binding per Save, on that Save's own channel: a
+                    // shared slot dropped an outcome whenever two Saves ended
+                    // in one main-loop turn (#1576 review, LOW 2). The binding
+                    // ends with its one outcome.
+                    let (reply, outcome) = workspace_stacks::save_reply();
+                    pending.set(Some(reply.ticket()));
+                    save.set_sensitive(false);
+                    save.set_label("Saving\u{2026}");
+                    refusal.set_visible(false);
+                    bind_save_outcome(save, outcome, &pending, &refusal);
+                    commit(reply, &plan);
                 }
                 Err(why) => {
                     // The correction surface is the field, beside the cursor —
@@ -1044,13 +1049,6 @@ fn build_actions(draft: &Rc<RefCell<Draft>>, name: &gtk::Entry) -> (gtk::Box, gt
         });
     }
     actions.append(&save);
-
-    bind_save_outcome(
-        &save,
-        workspace_stacks::save_outcome(),
-        &pending,
-        &refusal_label,
-    );
     (actions, refusal_label)
 }
 
@@ -1209,13 +1207,13 @@ fn refusal(why: &SaveError) -> String {
 /// * **a saved card** is a file write and nothing else. Its workspace either
 ///   already carries the name or does not exist, and a rename — the only case
 ///   where niri would have something to do — is refused while Active.
-fn commit(ticket: u64, plan: &SavePlan) {
+fn commit(reply: workspace_stacks::SaveReply, plan: &SavePlan) {
     match plan.name_workspace {
         Some(workspace) => {
-            workspace_stacks::spawn_save(ticket, workspace, plan.name.clone(), plan.stack.clone());
+            workspace_stacks::spawn_save(reply, workspace, plan.name.clone(), plan.stack.clone());
         }
         None => workspace_stacks::spawn_save_edit(
-            ticket,
+            reply,
             plan.previous.clone(),
             plan.name.clone(),
             plan.stack.clone(),
@@ -2596,9 +2594,10 @@ mod tests {
 
     /// …and the outcome binding is what closes it, on **its own** Save only.
     ///
-    /// A `Mutable`'s signal replays on subscribe, so without the ticket every
-    /// freshly-built form would immediately act on whatever the previous Save
-    /// did. Driven through the injected signal rather than the global one.
+    /// Each Save has its own channel now (`workspace_stacks::save_reply`), so
+    /// production never hands a form another Save's outcome; the ticket check is
+    /// what keeps any source shared between Saves from closing the wrong form.
+    /// Driven through an injected shared signal for exactly that case.
     ///
     /// **The mutation**: dropping the ticket comparison reds the first half.
     #[gtk::test]
@@ -2685,6 +2684,80 @@ mod tests {
         // so leave it as `close()` would, or the next test that opens the
         // form finds a stale draft still sitting in it.
         super::close();
+    }
+
+    /// Two Saves that end in **one** main-loop turn each reach their own form
+    /// (#1576 review, LOW 2) — two drawers saving one name at the same moment.
+    ///
+    /// Driven through the production plumbing: `save_reply` for each form's
+    /// channel and `finish_save` for each Save's end, both before the main loop
+    /// runs either binding. Through the old single `Mutable` slot the second
+    /// outcome overwrote the first before the first form's binding ran, so that
+    /// form never saw its ticket and sat on "Saving…" with Save disabled.
+    ///
+    /// **The mutation**: route every reply through one shared
+    /// `Mutable<Option<SaveOutcome>>` (the old design) and this reds — the first
+    /// form's `pending` is still `Some`.
+    #[gtk::test]
+    fn two_saves_ending_in_one_turn_each_reach_their_own_form() {
+        use crate::workspace_stacks::{finish_save, save_reply};
+
+        adw::init().expect("libadwaita init");
+        let form = || {
+            let save = gtk::Button::with_label("Saving\u{2026}");
+            save.set_sensitive(false);
+            let refusal = gtk::Label::new(None);
+            refusal.set_visible(false);
+            (save, refusal)
+        };
+        let (save_a, refusal_a) = form();
+        let (save_b, refusal_b) = form();
+
+        let (reply_a, outcome_a) = save_reply();
+        let (reply_b, outcome_b) = save_reply();
+        let pending_a = Rc::new(std::cell::Cell::new(Some(reply_a.ticket())));
+        let pending_b = Rc::new(std::cell::Cell::new(Some(reply_b.ticket())));
+        super::bind_save_outcome(&save_a, outcome_a, &pending_a, &refusal_a);
+        super::bind_save_outcome(&save_b, outcome_b, &pending_b, &refusal_b);
+        pump();
+
+        // Both end before the main loop turns again.
+        finish_save(reply_a, "talk", Err("a workspace called talk already exists".to_owned()));
+        finish_save(reply_b, "talk", Err("no overlay path".to_owned()));
+        pump();
+
+        assert_eq!(pending_a.get(), None, "the first form never saw its outcome");
+        assert_eq!(pending_b.get(), None, "the second form never saw its outcome");
+        assert_eq!(
+            refusal_a.text(),
+            "talk was not saved: a workspace called talk already exists"
+        );
+        assert_eq!(refusal_b.text(), "talk was not saved: no overlay path");
+        assert!(save_a.is_sensitive() && save_b.is_sensitive());
+    }
+
+    /// A Save task that stops without answering still reaches its form, as a
+    /// failure — never a form left on "Saving…" for good.
+    #[gtk::test]
+    fn a_save_that_never_answers_still_releases_its_form() {
+        use crate::workspace_stacks::save_reply;
+
+        adw::init().expect("libadwaita init");
+        let save = gtk::Button::with_label("Saving\u{2026}");
+        save.set_sensitive(false);
+        let refusal = gtk::Label::new(None);
+        refusal.set_visible(false);
+        let (reply, outcome) = save_reply();
+        let pending = Rc::new(std::cell::Cell::new(Some(reply.ticket())));
+        super::bind_save_outcome(&save, outcome, &pending, &refusal);
+        pump();
+
+        drop(reply);
+        pump();
+
+        assert_eq!(pending.get(), None);
+        assert!(refusal.is_visible());
+        assert!(save.is_sensitive(), "Save must be usable again");
     }
 
     /// **Cancel writes nothing** (#1071 §5) — observable after all.

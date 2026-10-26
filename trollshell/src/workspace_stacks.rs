@@ -2138,14 +2138,14 @@ pub(crate) async fn save(
     }
 }
 
-/// Run a Save on the runtime.
-pub(crate) fn spawn_save(ticket: u64, workspace: u64, name: String, stack: Stack) {
+/// Run a Save on the runtime, answering `reply` when it ends.
+pub(crate) fn spawn_save(reply: SaveReply, workspace: u64, name: String, stack: Stack) {
     hytte::reactive::runtime::handle().spawn(async move {
         let result = save(&Live, workspace, &name, &stack).await;
         if result.is_ok() {
             tracing::info!(workspace = name, apps = stack.apps.len(), "workspace saved");
         }
-        finish_save(ticket, &name, result);
+        finish_save(reply, &name, result);
     });
 }
 
@@ -2154,8 +2154,7 @@ pub(crate) fn spawn_save(ticket: u64, workspace: u64, name: String, stack: Stack
 /// A Save is the one action on this page whose failure the user must not have to
 /// discover from a toast *after* the drawer has gone back to the cards and taken
 /// their whole draft with it. The write happens on the runtime, so the result
-/// comes back the way every other cross-thread fact in this shell does: a
-/// process-global `Mutable` the GTK side binds to.
+/// crosses back to the GTK side over the Save's own [`SaveReply`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SaveOutcome {
     /// Which Save this is the answer to — see [`next_save_ticket`].
@@ -2164,34 +2163,65 @@ pub(crate) struct SaveOutcome {
     pub error: Option<String>,
 }
 
-/// The ticket source.
-///
-/// A form must not act on an outcome that is not its own, and it must not act on
-/// a *stale* one either — a `Mutable`'s signal replays on subscribe, so a form
-/// built after some earlier Save would otherwise immediately see that Save's
-/// result and act on it. A monotonic ticket settles both: the form records the
-/// one it is waiting for and ignores every other.
+/// The ticket source: one number per Save, so a form can tell its own outcome
+/// from any other.
 static SAVE_TICKETS: AtomicU64 = AtomicU64::new(1);
 
-/// The outcome of the most recently finished Save.
-static SAVE_OUTCOME: LazyLock<Mutable<Option<SaveOutcome>>> = LazyLock::new(|| Mutable::new(None));
-
-/// Claim a ticket for a Save that is about to be spawned.
+/// Claim a ticket for a Save that is about to be spawned. [`save_reply`] is
+/// the one production caller.
 pub(crate) fn next_save_ticket() -> u64 {
     SAVE_TICKETS.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Subscribe to Save outcomes (review MEDIUM 8).
-pub(crate) fn save_outcome() -> impl Signal<Item = Option<SaveOutcome>> {
-    SAVE_OUTCOME.signal_cloned()
+/// Where **one** Save's outcome goes: to the form that started it, and nowhere
+/// else (#1576 review, LOW 2).
+///
+/// This used to be one process-wide `Mutable<Option<SaveOutcome>>` every form
+/// bound to and filtered by ticket. A `Mutable`'s signal delivers only its
+/// newest value, so two Saves finishing before the GTK loop next ran a form's
+/// binding — two drawers saving one name at once — left the first form seeing
+/// only the second ticket. It ignored that, and sat on "Saving…" with its Save
+/// button disabled until it was closed. A channel per Save cannot lose its one
+/// value to another Save's.
+pub(crate) struct SaveReply {
+    ticket: u64,
+    tx: tokio::sync::oneshot::Sender<SaveOutcome>,
 }
 
-/// Publish one, and report a failure to the journal and the user as before.
+impl SaveReply {
+    /// This Save's ticket.
+    pub(crate) fn ticket(&self) -> u64 {
+        self.ticket
+    }
+}
+
+/// Claim a ticket for a Save that is about to be spawned, and the signal its
+/// outcome will arrive on.
+///
+/// The signal reads `None` until the Save ends, then `Some` once, then ends. A
+/// Save task that stops without answering — a panic drops its [`SaveReply`] —
+/// still arrives, as a failed outcome, so the form is never left waiting on a
+/// write nobody is doing.
+pub(crate) fn save_reply() -> (SaveReply, impl Signal<Item = Option<SaveOutcome>>) {
+    let ticket = next_save_ticket();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let outcome = hytte::futures_signals::signal::from_future(rx).map(move |arrived| {
+        arrived.map(|sent| {
+            sent.unwrap_or_else(|_| SaveOutcome {
+                ticket,
+                error: Some("the Save stopped before it finished; see the journal".to_owned()),
+            })
+        })
+    });
+    (SaveReply { ticket, tx }, outcome)
+}
+
+/// Answer `reply`, and report a failure to the journal and the user as before.
 ///
 /// The toast stays: a form may have been closed, or the drawer retracted, by the
 /// time a niri round trip finishes, and the journal is the durable record either
 /// way. What is new is that the form can *also* see it.
-fn finish_save(ticket: u64, name: &str, result: Result<(), String>) {
+pub(crate) fn finish_save(reply: SaveReply, name: &str, result: Result<(), String>) {
     let error = match result {
         Ok(()) => None,
         Err(e) => {
@@ -2200,7 +2230,9 @@ fn finish_save(ticket: u64, name: &str, result: Result<(), String>) {
             Some(message)
         }
     };
-    SAVE_OUTCOME.set(Some(SaveOutcome { ticket, error }));
+    let SaveReply { ticket, tx } = reply;
+    // The form may be gone by now; then there is nobody left to tell.
+    drop(tx.send(SaveOutcome { ticket, error }));
 }
 
 /// Rewrite the card order, on the runtime — the file half of #1071 §3.6's
@@ -2231,7 +2263,12 @@ pub(crate) fn spawn_set_order(order: Vec<String>) {
 /// (`config::workspaces::save_edit_to`) is tested against a `tempdir`, and
 /// nothing in the suite reaches this function — which is what keeps it from ever
 /// touching the developer's real `~/.config/trollshell`.
-pub(crate) fn spawn_save_edit(ticket: u64, previous: Option<String>, name: String, stack: Stack) {
+pub(crate) fn spawn_save_edit(
+    reply: SaveReply,
+    previous: Option<String>,
+    name: String,
+    stack: Stack,
+) {
     hytte::reactive::runtime::handle().spawn(async move {
         let result = crate::config::workspaces::save_edit(previous.as_deref(), &name, &stack)
             .map_err(|e| e.to_string());
@@ -2242,7 +2279,7 @@ pub(crate) fn spawn_save_edit(ticket: u64, previous: Option<String>, name: Strin
                 "workspace stack saved"
             );
         }
-        finish_save(ticket, &name, result);
+        finish_save(reply, &name, result);
     });
 }
 

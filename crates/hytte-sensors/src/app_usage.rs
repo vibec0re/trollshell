@@ -470,17 +470,21 @@ fn parse_rss_pages(text: &str) -> Option<u64> {
     text.split_ascii_whitespace().nth(1)?.parse().ok()
 }
 
-/// Sum the aggregate `cpu` line (first line) of `/proc/stat` into total jiffies.
+/// Total jiffies of the aggregate `cpu` line (first line) of `/proc/stat`,
+/// without `guest`/`guest_nice`, which the kernel already counts in
+/// `user`/`nice` (a process's `utime` includes its guest time too).
 fn read_total_cpu_jiffies() -> u64 {
     std::fs::read_to_string("/proc/stat").map_or(0, |t| parse_total_cpu(&t))
 }
 
 fn parse_total_cpu(text: &str) -> u64 {
     text.lines().next().map_or(0, |line| {
-        line.split_ascii_whitespace()
+        let nums: Vec<u64> = line
+            .split_ascii_whitespace()
             .skip(1)
             .filter_map(|f| f.parse::<u64>().ok())
-            .sum()
+            .collect();
+        crate::proc_stat::active_and_total(&nums).1
     })
 }
 
@@ -833,6 +837,8 @@ mod tests {
         let stat = "cpu  10 20 30 40 50\ncpu0 1 2 3 4 5\ncpu1 6 7 8 9 10\n";
         assert_eq!(parse_total_cpu(stat), 150);
         assert_eq!(parse_total_cpu(""), 0);
+        // guest (9th) and guest_nice (10th) are already inside user/nice.
+        assert_eq!(parse_total_cpu("cpu  50 0 0 50 0 0 0 0 50 0\n"), 100);
     }
 
     #[test]

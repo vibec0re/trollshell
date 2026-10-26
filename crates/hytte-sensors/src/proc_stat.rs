@@ -4,6 +4,20 @@ use crate::cast::u64_to_f64_count;
 
 use super::CpuLoad;
 
+/// `(active, total)` jiffies from the numeric fields of a `cpu` line:
+/// `user nice system idle iowait irq softirq steal guest guest_nice`.
+///
+/// The kernel already accounts `guest` inside `user` and `guest_nice` inside
+/// `nice` (`account_guest_time`), so those two trailing fields are **not**
+/// summed — doing so counts a VM's CPU time twice. Idle is `idle + iowait`.
+/// Lines from older kernels carry fewer fields; missing ones read as 0.
+pub(crate) fn active_and_total(nums: &[u64]) -> (u64, u64) {
+    let field = |i: usize| nums.get(i).copied().unwrap_or(0);
+    let idle = field(3).saturating_add(field(4));
+    let total = nums.iter().take(8).fold(0u64, |a, &n| a.saturating_add(n));
+    (total.saturating_sub(idle), total)
+}
+
 /// Returns one entry per `cpu*` line: `(active_jiffies, total_jiffies)`.
 /// Index 0 = aggregate `cpu` line, 1+ = `cpu0`, `cpu1`, …
 pub fn read_proc_stat() -> Result<Vec<(u64, u64)>, std::io::Error> {
@@ -21,12 +35,7 @@ pub fn read_proc_stat() -> Result<Vec<(u64, u64)>, std::io::Error> {
         if nums.is_empty() {
             continue;
         }
-        // field layout after the label: user nice system idle iowait …
-        // nums[0]=user, nums[1]=nice, nums[2]=system, nums[3]=idle, nums[4]=iowait
-        let total: u64 = nums.iter().sum();
-        let idle_jiffies = nums.get(3).copied().unwrap_or(0) + nums.get(4).copied().unwrap_or(0);
-        let active = total.saturating_sub(idle_jiffies);
-        entries.push((active, total));
+        entries.push(active_and_total(&nums));
     }
 
     Ok(entries)
@@ -90,6 +99,31 @@ mod tests {
             load.per_core.is_empty(),
             "empty first sample must yield no cores"
         );
+    }
+
+    #[test]
+    fn guest_time_is_not_counted_twice() {
+        // One core: user 50 (all of it guest), idle 50 -> 50 %, not 66 %.
+        assert_eq!(
+            active_and_total(&[50, 0, 0, 50, 0, 0, 0, 0, 50, 0]),
+            (50, 100)
+        );
+        // guest_nice is likewise already inside nice.
+        assert_eq!(
+            active_and_total(&[0, 30, 0, 70, 0, 0, 0, 0, 0, 30]),
+            (30, 100)
+        );
+    }
+
+    #[test]
+    fn zero_guest_and_short_lines_are_unchanged() {
+        assert_eq!(
+            active_and_total(&[10, 20, 30, 40, 50, 1, 2, 3, 0, 0]),
+            (66, 156)
+        );
+        // Old kernels: five fields only.
+        assert_eq!(active_and_total(&[10, 20, 30, 40, 50]), (60, 150));
+        assert_eq!(active_and_total(&[]), (0, 0));
     }
 
     /// A malformed `/proc/stat` cpu line (missing all numeric fields) must

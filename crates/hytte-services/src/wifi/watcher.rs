@@ -109,7 +109,7 @@ enum IwdOwner {
     Hole,
 }
 
-/// Classify one item from [`IwdSubs::owner`]. `None` for any name other
+/// Classify one item from [`IwdStreams::owner`]. `None` for any name other
 /// than iwd's.
 fn iwd_owner_change(item: &SignalItem) -> Option<IwdOwner> {
     match item {

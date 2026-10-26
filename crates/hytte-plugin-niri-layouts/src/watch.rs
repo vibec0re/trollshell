@@ -723,6 +723,26 @@ pub(crate) struct SocketEvents {
     /// sends a trailing newline ends the connection instead of growing this
     /// without bound (#1053 review LOW-2).
     line: Vec<u8>,
+    /// Variant names (or shapes) of undecodable lines already reported, so a
+    /// newer niri's chatty unknown event costs one journal line, not one per
+    /// event. Bounded by [`MAX_REPORTED_SHAPES`].
+    reported: std::collections::HashSet<String>,
+}
+
+/// Cap on [`SocketEvents::reported`]; past it a skip is silent.
+const MAX_REPORTED_SHAPES: usize = 32;
+
+/// The externally-tagged variant name of an event line we could not decode,
+/// or a placeholder when the line is not even a JSON object.
+fn undecodable_shape(line: &[u8]) -> String {
+    match serde_json::from_slice::<serde_json::Value>(line) {
+        Ok(serde_json::Value::Object(map)) if map.len() == 1 => map
+            .keys()
+            .next()
+            .map_or_else(|| "<empty>".to_owned(), Clone::clone),
+        Ok(_) => "<not a single-key object>".to_owned(),
+        Err(_) => "<not JSON>".to_owned(),
+    }
 }
 
 impl SocketEvents {
@@ -779,6 +799,7 @@ impl SocketEvents {
         Ok(Self {
             reader,
             line: Vec::new(),
+            reported: std::collections::HashSet::new(),
         })
     }
 }
@@ -864,20 +885,40 @@ impl EventSource for SocketEvents {
                 let consumed = pos + 1;
                 self.reader.consume(consumed);
                 let line = std::mem::take(&mut self.line);
-                return match serde_json::from_slice::<Event>(&line) {
-                    Ok(event) => Incoming::Event(Box::new(event)),
-                    Err(e) => Incoming::Ended(format!("cannot decode a niri event: {e}")),
-                };
-            }
-            let n = available.len();
-            self.line.extend_from_slice(available);
-            self.reader.consume(n);
-            if self.line.len() > MAX_LINE {
-                return Incoming::Ended(format!(
-                    "niri sent a {}-byte line with no newline — treating the stream \
-                     as dead rather than buffering forever",
-                    self.line.len()
-                ));
+                match serde_json::from_slice::<Event>(&line) {
+                    Ok(event) => return Incoming::Event(Box::new(event)),
+                    Err(e) => {
+                        // Each line is self-contained JSON, so one we cannot
+                        // decode (typically a variant a newer niri added to
+                        // the pinned `niri-ipc`) costs only itself. Ending the
+                        // stream would reconnect, get the same line, and loop
+                        // forever with the chip hidden. If the skipped line is
+                        // one of the two initial-state dumps, the model never
+                        // becomes ready and the chip stays hidden (the safe
+                        // failure) rather than showing a wrong count.
+                        let shape = undecodable_shape(&line);
+                        if self.reported.len() < MAX_REPORTED_SHAPES
+                            && self.reported.insert(shape.clone())
+                        {
+                            eprintln!(
+                                "[{}] skipping an undecodable niri event ({shape}): {e}; \
+                                 further lines of this shape are skipped silently",
+                                crate::plugin::PLUGIN_ID
+                            );
+                        }
+                    }
+                }
+            } else {
+                let n = available.len();
+                self.line.extend_from_slice(available);
+                self.reader.consume(n);
+                if self.line.len() > MAX_LINE {
+                    return Incoming::Ended(format!(
+                        "niri sent a {}-byte line with no newline — treating the stream \
+                         as dead rather than buffering forever",
+                        self.line.len()
+                    ));
+                }
             }
         }
     }
@@ -2177,6 +2218,60 @@ mod tests {
         }
 
         niri.join().expect("the fake niri thread");
+    }
+
+    /// An event line the pinned `niri-ipc` cannot decode (a newer niri's new
+    /// variant) is skipped: the known events around it still arrive and the
+    /// stream does not end.
+    #[test]
+    fn an_undecodable_event_line_is_skipped_not_fatal() {
+        let (ours, theirs) = UnixStream::pair().expect("socketpair");
+        let first = serde_json::to_string(&Event::WorkspaceActivated {
+            id: 1,
+            focused: true,
+        })
+        .expect("encode");
+        let second = serde_json::to_string(&Event::WorkspaceActivated {
+            id: 2,
+            focused: false,
+        })
+        .expect("encode");
+
+        let niri = std::thread::spawn(move || {
+            let mut reader = BufReader::new(theirs.try_clone().expect("clone"));
+            let mut request = String::new();
+            reader.read_line(&mut request).expect("a request line");
+            let mut writer = &theirs;
+            writer.write_all(b"{\"Ok\":\"Handled\"}\n").expect("reply");
+            writer.write_all(first.as_bytes()).expect("first");
+            writer.write_all(b"\n").expect("nl");
+            writer
+                .write_all(b"{\"FutureThing\":{\"x\":1}}\n{\"FutureThing\":{}}\n")
+                .expect("unknown");
+            writer.write_all(second.as_bytes()).expect("second");
+            writer.write_all(b"\n").expect("nl");
+            std::thread::sleep(POLL_INTERVAL);
+        });
+
+        let mut events = SocketEvents::over(ours).expect("handshake");
+        let mut ids = Vec::new();
+        for _ in 0..40 {
+            match events.next_event() {
+                Incoming::Event(e) => {
+                    if let Event::WorkspaceActivated { id, .. } = *e {
+                        ids.push(id);
+                    }
+                    if ids.len() == 2 {
+                        break;
+                    }
+                }
+                Incoming::Idle => {}
+                Incoming::Ended(why) => panic!("the stream must not end: {why}"),
+            }
+        }
+        assert_eq!(ids, [1, 2]);
+        assert_eq!(events.reported.len(), 1, "reported once per shape");
+        niri.join().expect("fake niri");
     }
 
     // ── the hand-rolled framing (#1038) ──────────────────────────────────────

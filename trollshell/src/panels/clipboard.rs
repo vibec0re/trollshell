@@ -58,14 +58,13 @@ pub fn panel_clipboard() -> gtk::Widget {
 }
 
 fn build_clipboard_row(entry: &ClipEntry) -> adw::ActionRow {
-    let row = adw::ActionRow::builder()
-        .title(&entry.preview)
-        .activatable(true)
-        .build();
+    let row = adw::ActionRow::builder().activatable(true).build();
     // The preview is whatever text some app last copied — any app on the
     // session can put `&`, `<` or a whole `<span>` on the clipboard, and as
-    // Pango markup that blanked the row or restyled it (#753).
+    // Pango markup that blanked the row or restyled it (#753). Off before the
+    // text is set, so nothing is parsed and nothing warns (#1564).
     markup::plain_text(&row);
+    row.set_title(&entry.preview);
     row.set_title_lines(1);
 
     let icon_name = match entry.kind {

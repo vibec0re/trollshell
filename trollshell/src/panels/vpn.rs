@@ -150,14 +150,12 @@ fn build_vpn_profile_row(profile: &wifi::VpnProfile) -> adw::ActionRow {
         "Available"
     };
 
-    let row = adw::ActionRow::builder()
-        .title(truncate_for_row(&profile.name))
-        .subtitle(subtitle)
-        .activatable(false)
-        .build();
+    let row = adw::ActionRow::builder().activatable(false).build();
     // Profile names come from NetworkManager's connection store; markup is
-    // never wanted here (#753).
+    // never wanted here (#753). Off before the text is set (#1564).
     markup::plain_text(&row);
+    row.set_title(&truncate_for_row(&profile.name));
+    row.set_subtitle(subtitle);
     // A saved VPN profile's name is free text with no bound — capped (see
     // `truncate_for_row`) rather than letting it push the whole drawer wider
     // (#1302); `title_lines(1)` is a second line of defense.
@@ -286,10 +284,11 @@ fn build_tunnel_group(tunnel: &vpn::Tunnel) -> adw::PreferencesGroup {
 
 fn build_peer_row(peer: &vpn::Peer) -> adw::ActionRow {
     let key_short: String = peer.public_key.chars().take(8).collect();
-    let row = adw::ActionRow::builder().title(&key_short).build();
+    let row = adw::ActionRow::new();
     // Key, endpoint and allowed-IPs all come off the wire; the subtitle is
     // assembled from them below, and `plain_text` covers it too (#753).
     markup::plain_text(&row);
+    row.set_title(&key_short);
     row.add_css_class("ts-mono");
     let mut subtitle_parts: Vec<String> = Vec::new();
     if let Some(ep) = peer.endpoint.as_deref() {

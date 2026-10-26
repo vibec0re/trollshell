@@ -47,13 +47,12 @@ fn build_wired_row(profile: &wifi::WiredProfile) -> adw::ActionRow {
         (None, _) => "No interface".to_string(),
     };
 
-    let row = adw::ActionRow::builder()
-        .title(&profile.name)
-        .subtitle(subtitle)
-        .activatable(false)
-        .build();
-    // Profile names come from NetworkManager's connection store (#753).
+    let row = adw::ActionRow::builder().activatable(false).build();
+    // Profile names come from NetworkManager's connection store (#753). Off
+    // before the text is set (#1564).
     markup::plain_text(&row);
+    row.set_title(&profile.name);
+    row.set_subtitle(&subtitle);
 
     let icon = gtk::Image::from_icon_name("network-wired-symbolic");
     row.add_prefix(&icon);

@@ -26,9 +26,18 @@ use hytte::gtk::glib;
 
 /// Render this row's title and subtitle literally instead of as Pango markup.
 ///
-/// Order-independent: `GtkLabel` keeps the string it was handed and re-lays it
-/// out when `use-markup` flips, so calling this *after* a builder already set
-/// the title is fine.
+/// What the row **displays** does not depend on call order: `GtkLabel` keeps
+/// the string it was handed and re-lays it out when `use-markup` flips, so a
+/// `set_title` that lands after this call, or a builder that set the title
+/// before it, both render literally.
+///
+/// The **warning** does depend on it. A label parses markup the moment it is
+/// handed text, so a hostile string set while `use-markup` is still on logs
+/// `Gtk-WARNING: Failed to set text … from markup` once per build, and
+/// `.use_markup(false)` in the builder does not help (measured, #1564). Call
+/// this before the first non-literal title or subtitle is set: construct the
+/// row with `new()` (or a builder carrying no text), call `plain_text`, then
+/// `set_title`/`set_subtitle` (`panels/notifications.rs` is the reference).
 pub(crate) fn plain_text(row: &impl IsA<adw::PreferencesRow>) {
     row.set_use_markup(false);
 }
@@ -71,6 +80,56 @@ pub(crate) mod test_support {
         out
     }
 
+    /// The env var that tells a re-executed test binary it is the child of a
+    /// [`child_output`] call.
+    const CHILD_ENV: &str = "TROLLSHELL_MARKUP_WARNING_CHILD";
+
+    /// True inside the child process [`child_output`] spawns. A `*_child` test
+    /// returns early unless this holds, so in a normal run it is a no-op.
+    pub(crate) fn in_child() -> bool {
+        std::env::var_os(CHILD_ENV).is_some()
+    }
+
+    /// Re-run this test binary on the single test `path` (the path `cargo
+    /// test` lists, `module::sub::name`) and return everything it printed.
+    ///
+    /// Why a child and not an in-process handler: GTK logs through `GLib`'s
+    /// *structured* writer, which skips handlers installed with
+    /// `g_log_set_handler` (measured: a handler on the `Gtk` domain saw
+    /// nothing while the warning was printed), and the only hook that does see
+    /// it, `g_log_set_writer_func`, is a once-per-process global that would
+    /// leak into every other test in the binary. A child's stderr is the
+    /// observable the warning has, and the global state stays the child's.
+    ///
+    /// A missing warning proves nothing unless the child really put its
+    /// hostile text on a row, so every `*_child` body ends with
+    /// [`assert_shows`] on that text. A child whose text never reached a label
+    /// then fails, and this function's pass check fails the parent with it.
+    #[track_caller]
+    pub(crate) fn child_output(path: &str) -> String {
+        let exe = std::env::current_exe().expect("the test binary's own path");
+        let out = std::process::Command::new(exe)
+            .args([path, "--exact", "--nocapture", "--test-threads=1"])
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("re-running the test binary");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.status.success() && text.contains("1 passed"),
+            "the child run of {path} did not pass exactly one test (a wrong path runs none): \
+             {text}"
+        );
+        text
+    }
+
+    /// The `Gtk-WARNING` a label logs when it is handed hostile text while
+    /// `use-markup` is still on.
+    pub(crate) const MARKUP_WARNING: &str = "from markup due to error parsing markup";
+
     /// Assert some label under `root` displays `literal` byte for byte.
     #[track_caller]
     pub(crate) fn assert_shows(root: &impl IsA<gtk::Widget>, literal: &str) {
@@ -95,7 +154,7 @@ mod gtk_tests {
     use hytte::gtk;
 
     use super::plain_text;
-    use super::test_support::{assert_shows, label_texts};
+    use super::test_support::{self, assert_shows, label_texts};
 
     /// `&` is a parse error (the field blanks); `<b>` is obeyed (the tag
     /// vanishes). One string carries both failure modes.
@@ -103,6 +162,57 @@ mod gtk_tests {
 
     fn shows(root: &impl IsA<gtk::Widget>, literal: &str) -> bool {
         label_texts(root.upcast_ref()).iter().any(|t| t == literal)
+    }
+
+    const PROBE: &str = "ORDER-PROBE Tom & <span size=\"xx-large\">Jerry</span>";
+
+    /// Child body: the **old** order (title in the builder, `plain_text`
+    /// afterwards).
+    #[gtk::test]
+    fn order_probe_old_child() {
+        if !test_support::in_child() {
+            return;
+        }
+        adw::init().expect("libadwaita init");
+        let row = adw::ActionRow::builder().title(PROBE).build();
+        plain_text(&row);
+        assert_shows(&row, PROBE);
+    }
+
+    /// Child body: the **new** order (`plain_text` before any text).
+    #[gtk::test]
+    fn order_probe_new_child() {
+        if !test_support::in_child() {
+            return;
+        }
+        adw::init().expect("libadwaita init");
+        let row = adw::ActionRow::new();
+        plain_text(&row);
+        row.set_title(PROBE);
+        row.set_subtitle(PROBE);
+        assert_shows(&row, PROBE);
+    }
+
+    /// **The premise of every no-warning pin in the panels**, so they cannot
+    /// go green on a capture that sees nothing: the old order *does* log the
+    /// markup warning, and `plain_text` before the text does not (#1564).
+    #[gtk::test]
+    fn the_capture_sees_the_warning_only_for_the_old_order() {
+        if test_support::in_child() {
+            return;
+        }
+        let old =
+            test_support::child_output("components::markup::gtk_tests::order_probe_old_child");
+        assert!(
+            old.contains(test_support::MARKUP_WARNING),
+            "premise: the old order must log the warning, or the probe sees nothing: {old}"
+        );
+        let new =
+            test_support::child_output("components::markup::gtk_tests::order_probe_new_child");
+        assert!(
+            !new.contains(test_support::MARKUP_WARNING),
+            "plain_text first must not warn: {new}"
+        );
     }
 
     #[gtk::test]

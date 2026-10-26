@@ -20,12 +20,12 @@ pub(crate) fn build_connection_row(c: &Connection) -> adw::ActionRow {
         },
         None => "(unknown)".to_string(),
     };
-    let row = adw::ActionRow::builder()
-        .title(truncate_for_row(&title))
-        .build();
+    let row = adw::ActionRow::new();
     // The program name is read out of `/proc`, so any process on the box
-    // picks it — and the subtitle carries peer addresses (#753).
+    // picks it — and the subtitle carries peer addresses (#753). Markup goes
+    // off before the first text is set, so no parse is ever attempted (#1564).
     markup::plain_text(&row);
+    row.set_title(&truncate_for_row(&title));
     // A process name (or the "name · pid N" title above) has no bound in
     // principle — capped (see `truncate_for_row`) rather than letting it push
     // the whole drawer wider (#1302); `title_lines(1)` is a second line of

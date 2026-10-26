@@ -255,20 +255,21 @@ fn build_network_row(net: &wifi::WifiNetwork) -> adw::ActionRow {
     // rows are per-SSID already). Delete this one binding and the `{ap_count}`
     // it fills to go back to plain rows.
     let ap_count = ap_count_suffix(net.ap_count);
-    let row = adw::ActionRow::builder()
-        .title(&net.ssid)
-        .subtitle(format!(
-            "{} dBm \u{00b7} {}{ap_count}",
-            net.signal_dbm,
-            security_label(&net.security)
-        ))
-        .activatable(true)
-        .build();
+    let row = adw::ActionRow::builder().activatable(true).build();
     // The SSID is whatever any transmitter in radio range advertises: up to 32
     // arbitrary bytes, so `&`, `<` and `>` are all fair game. As Pango markup
     // a `Tom & Jerry` blanked the row and a `<span size="xx-large">` restyled
     // it — markup is never wanted here (#753).
+    // It is switched off *before* the text is set: a label parses the markup
+    // the moment it is handed, so the other order logs a `Gtk-WARNING` per
+    // scan for a hostile SSID (#1564).
     markup::plain_text(&row);
+    row.set_title(&net.ssid);
+    row.set_subtitle(&format!(
+        "{} dBm \u{00b7} {}{ap_count}",
+        net.signal_dbm,
+        security_label(&net.security)
+    ));
 
     let icon = gtk::Image::from_icon_name(signal_icon(net.signal_dbm));
     row.add_prefix(&icon);
@@ -537,7 +538,11 @@ mod markup_tests {
     use hytte::services::wifi;
 
     use super::build_network_row;
-    use crate::components::markup::test_support::assert_shows;
+    use crate::components::markup::test_support::{
+        MARKUP_WARNING, assert_shows, child_output, in_child,
+    };
+
+    const SSID: &str = "Tom & <span size=\"xx-large\">Jerry</span>";
 
     #[gtk::test]
     fn a_network_row_shows_a_hostile_ssid_literally() {
@@ -555,5 +560,48 @@ mod markup_tests {
         };
         let row = build_network_row(&net);
         assert_shows(&row, "Tom & <span size=\"xx-large\">Jerry</span>");
+    }
+
+    /// The list rebuilds this row on every scan, so a hostile SSID used to
+    /// log one `Gtk-WARNING … from markup` per scan (#1564): the row was
+    /// built with the title in the builder and `plain_text` afterwards.
+    ///
+    /// **Falsification:** put `.title(&net.ssid)` back on the builder in
+    /// `build_network_row` (and drop the `set_title`) → this reds.
+    #[gtk::test]
+    fn building_a_network_row_logs_no_markup_warning() {
+        if in_child() {
+            return;
+        }
+        let out = child_output("panels::network::wifi::markup_tests::build_network_row_child");
+        assert!(
+            !out.contains(MARKUP_WARNING),
+            "building the row logged a markup warning: {out}"
+        );
+    }
+
+    /// Child body of [`building_a_network_row_logs_no_markup_warning`]: only
+    /// runs when that test re-executes the binary on it.
+    #[gtk::test]
+    fn build_network_row_child() {
+        if !in_child() {
+            return;
+        }
+        adw::init().expect("libadwaita init");
+        let net = wifi::WifiNetwork {
+            path: "/ap/0".to_string(),
+            ssid: SSID.to_string(),
+            security: "psk".to_string(),
+            known: false,
+            connected: false,
+            signal_dbm: -60,
+            known_network_path: None,
+            ap_count: 1,
+            active_signal_dbm: None,
+        };
+        let row = build_network_row(&net);
+        // The SSID really reached the title, so a missing warning means
+        // something.
+        assert_shows(&row, SSID);
     }
 }

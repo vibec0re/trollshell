@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use chrono::{
-    DateTime, Datelike, Duration as ChronoDuration, Local, NaiveDate, TimeZone as _, Timelike,
+    DateTime, Datelike, Duration as ChronoDuration, Local, NaiveDate, TimeZone, Timelike,
 };
 use hytte::adw::{self, prelude::*};
 use hytte::gtk::{self, gio, glib};
@@ -783,18 +783,7 @@ fn bucket_events_from_anchor<'a>(
     anchor: NaiveDate,
     now: DateTime<Local>,
 ) -> BTreeMap<NaiveDate, Vec<&'a CalendarEvent>> {
-    // Anchor is "today" (the default forward view) → cut off on the live
-    // clock so fully-elapsed events disappear as soon as they're over.
-    // Anchor is some other day the user navigated to → cut off on that day's
-    // midnight instead, so browsing still shows the full set for that day.
-    let threshold = if anchor == now.date_naive() {
-        now
-    } else {
-        Local
-            .from_local_datetime(&anchor.and_hms_opt(0, 0, 0).unwrap_or_default())
-            .earliest()
-            .unwrap_or(now)
-    };
+    let threshold = browse_threshold(anchor, now);
 
     let mut by_day: BTreeMap<NaiveDate, Vec<&'a CalendarEvent>> = BTreeMap::new();
     for ev in events {
@@ -809,6 +798,27 @@ fn bucket_events_from_anchor<'a>(
         by_day.entry(day).or_default().push(ev);
     }
     by_day
+}
+
+/// The cutoff [`bucket_events_from_anchor`] drops events at or before.
+///
+/// Anchor is "today" (the default forward view): the live clock, so
+/// fully-elapsed events disappear as soon as they're over. Anchor is some
+/// other day the user navigated to: the start of that day
+/// ([`calendar::local_midnight`]), so browsing still shows the full set for
+/// it. That start was `.earliest()`, which on Unix `Local` is the later of a
+/// fold's two midnights (hiding the day's first hour), and which a zone that
+/// reads a gap strictly answers with `None`, where `now` stood in and hid
+/// the whole browsed day (#1554).
+///
+/// Generic over the zone so the DST cases can be tested against a real
+/// zone without touching the process-wide `TZ`.
+fn browse_threshold<Tz: TimeZone>(anchor: NaiveDate, now: DateTime<Tz>) -> DateTime<Tz> {
+    if anchor == now.date_naive() {
+        now
+    } else {
+        calendar::local_midnight(anchor, &now.timezone())
+    }
 }
 
 // ── Calendar-source color hashing ────────────────────────────────────────────
@@ -1225,19 +1235,9 @@ mod tests {
     /// Build a 1-day all-day event for `day`. The iCalendar convention for
     /// all-day events is `DTEND = day + 1` at 00:00 (exclusive upper bound).
     fn make_allday_event(day: NaiveDate) -> CalendarEvent {
-        let start_dt = Local
-            .from_local_datetime(&day.and_hms_opt(0, 0, 0).unwrap())
-            .earliest()
-            .unwrap();
+        let start_dt = calendar::local_midnight(day, &Local);
         // iCal DTEND for a 1-day all-day event is the *next* day at 00:00.
-        let end_dt = Local
-            .from_local_datetime(
-                &(day + chrono::Duration::days(1))
-                    .and_hms_opt(0, 0, 0)
-                    .unwrap(),
-            )
-            .earliest()
-            .unwrap();
+        let end_dt = calendar::local_midnight(day + chrono::Duration::days(1), &Local);
         CalendarEvent {
             uid: format!("allday-{day}"),
             summary: "all-day".into(),
@@ -1465,6 +1465,47 @@ mod tests {
             by_day.contains_key(&anchor),
             "browsed day's events must stay visible regardless of the live clock"
         );
+    }
+
+    // ── browse_threshold in a real zone (#1554) ───────────────────────────────
+    //
+    // `bucket_events_from_anchor` runs on `Local`, which is UTC on a CI host,
+    // so its cutoff is driven here through `browse_threshold` with explicit
+    // IANA zones instead.
+
+    fn utc(y: i32, m: u32, d: u32, h: u32) -> DateTime<chrono::Utc> {
+        chrono::Utc.with_ymd_and_hms(y, m, d, h, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn browsing_a_day_whose_midnight_is_skipped_cuts_off_at_its_first_instant() {
+        // Santiago skips 00:00 on Sunday 2026-09-06 (00:00 -04 -> 01:00 -03).
+        // Browsing it from a week later must cut off where that day starts,
+        // not at the live clock, which would hide the whole day.
+        let tz = chrono_tz::America::Santiago;
+        let anchor = NaiveDate::from_ymd_opt(2026, 9, 6).unwrap();
+        let now = tz.with_ymd_and_hms(2026, 9, 13, 14, 0, 0).unwrap();
+        assert_eq!(browse_threshold(anchor, now), utc(2026, 9, 6, 4));
+    }
+
+    #[test]
+    fn browsing_a_day_whose_midnight_is_doubled_cuts_off_at_the_earlier_one() {
+        // Havana's 00:00 happens twice on 2026-11-01 (04:00Z CDT, 05:00Z CST).
+        let tz = chrono_tz::America::Havana;
+        let anchor = NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
+        let now = tz.with_ymd_and_hms(2026, 11, 8, 14, 0, 0).unwrap();
+        assert_eq!(browse_threshold(anchor, now), utc(2026, 11, 1, 4));
+    }
+
+    #[test]
+    fn browse_threshold_is_midnight_on_an_ordinary_day_and_now_on_today() {
+        let tz = chrono_tz::America::Santiago;
+        let anchor = NaiveDate::from_ymd_opt(2026, 6, 10).unwrap();
+        let now = tz.with_ymd_and_hms(2026, 6, 15, 14, 0, 0).unwrap();
+        assert_eq!(browse_threshold(anchor, now), utc(2026, 6, 10, 4));
+        // On the gap day itself the cutoff is the live clock, as for any today.
+        let gap_now = tz.with_ymd_and_hms(2026, 9, 6, 14, 0, 0).unwrap();
+        assert_eq!(browse_threshold(gap_now.date_naive(), gap_now), gap_now);
     }
 
     const LOOKUP_CHILD: &str = "TROLLSHELL_CALENDAR_1441_LOOKUP_CHILD";

@@ -50,6 +50,9 @@ struct PlayerState {
     bus: Rc<RefCell<Option<String>>>,
     track_id: RefCell<Option<String>>,
     length_us: Cell<u64>,
+    /// The art URL the page currently wants: set on every URL change, cleared
+    /// when there is no player. A finished art fetch reads it back to decide
+    /// whether its result is still wanted ([`apply_fetched_art`]).
     last_art_url: RefCell<String>,
 }
 
@@ -415,14 +418,17 @@ fn render_no_player(title: &gtk::Label, w: &InfoWidgets, art: &gtk::Image, state
     *state.bus.borrow_mut() = None;
     *state.track_id.borrow_mut() = None;
     state.length_us.set(0);
+    // Forget the last art URL along with the player: a fetch still in flight
+    // for it is now stale and must not paint over the placeholder, and a
+    // player that comes back with the same URL fetches it again (a cache hit)
+    // instead of being skipped as "unchanged" and left on the placeholder.
+    state.last_art_url.borrow_mut().clear();
     title.set_text("No player");
     w.artist.set_text("");
     w.album.set_text("");
     w.pos.set_text("0:00");
     w.len.set_text("0:00");
-    art.set_paintable(None::<&gdk::Paintable>);
-    art.set_icon_name(Some("audio-x-generic-symbolic"));
-    art.set_pixel_size(scale(200));
+    show_art_placeholder(art);
     w.prev_btn.set_sensitive(false);
     w.play_pause_btn.set_sensitive(false);
     w.next_btn.set_sensitive(false);
@@ -432,7 +438,7 @@ fn render_player(
     title: &gtk::Label,
     w: &InfoWidgets,
     art: &gtk::Image,
-    state: &PlayerState,
+    state: &Rc<PlayerState>,
     player: &mpris::Player,
 ) {
     *state.bus.borrow_mut() = Some(player.bus_name.clone());
@@ -455,23 +461,87 @@ fn render_player(
 
     if *state.last_art_url.borrow() != player.art_url {
         (*state.last_art_url.borrow_mut()).clone_from(&player.art_url);
-        spawn_art_fetch(art.clone(), player.art_url.clone());
+        if player.art_url.is_empty() {
+            // No art for this track: don't leave the previous track's up.
+            show_art_placeholder(art);
+        } else {
+            spawn_art_fetch(art, state, player.art_url.clone());
+        }
     }
 }
 
-fn spawn_art_fetch(art: gtk::Image, url: String) {
+/// The no-art look: the generic audio icon at the art box's size.
+fn show_art_placeholder(art: &gtk::Image) {
+    art.set_paintable(None::<&gdk::Paintable>);
+    art.set_icon_name(Some("audio-x-generic-symbolic"));
+    art.set_pixel_size(scale(200));
+}
+
+/// What a finished art fetch does to the art image — [`art_update`].
+#[derive(Debug, PartialEq, Eq)]
+enum ArtUpdate<'a> {
+    /// The page moved on while this fetch ran (another track, or no player):
+    /// leave the image alone — it belongs to whatever replaced this URL.
+    Stale,
+    /// The current track's art could not be had: show the placeholder rather
+    /// than keep the previous track's cover.
+    Placeholder,
+    /// Decode these bytes and show them.
+    Show(&'a [u8]),
+}
+
+/// Decide what a fetch for `fetched_url` that came back with `bytes` may do,
+/// now that the page wants `wanted_url`.
+///
+/// Fetches are unordered (`mpris::art_for_url` makes no promise about which
+/// of two finishes first), so the URL is compared **after** the await: a slow
+/// fetch for track A that lands after track B's must not overwrite B's cover.
+fn art_update<'a>(wanted_url: &str, fetched_url: &str, bytes: Option<&'a [u8]>) -> ArtUpdate<'a> {
+    if wanted_url != fetched_url {
+        return ArtUpdate::Stale;
+    }
+    bytes.map_or(ArtUpdate::Placeholder, ArtUpdate::Show)
+}
+
+/// Fetch `url`'s art off the main thread and show it if the page still wants
+/// it. The task holds the image and the page state **weakly**: a page torn
+/// down mid-fetch is freed at once, and the result is dropped.
+///
+/// The previous cover stays up while the fetch runs; a fetch that fails, or
+/// bytes that do not decode, end on the placeholder.
+fn spawn_art_fetch(art: &gtk::Image, state: &Rc<PlayerState>, url: String) {
+    let art = art.downgrade();
+    let state = Rc::downgrade(state);
     glib::MainContext::default().spawn_local(async move {
-        let Some(bytes) = mpris::art_for_url(&url).await else {
-            return;
-        };
-        let glib_bytes = glib::Bytes::from(&bytes);
-        let Ok(texture) = gdk::Texture::from_bytes(&glib_bytes) else {
-            return;
-        };
-        art.set_pixel_size(-1);
-        art.set_paintable(Some(&texture));
-        art.set_size_request(scale(200), scale(200));
+        let bytes = mpris::art_for_url(&url).await;
+        if let (Some(art), Some(state)) = (art.upgrade(), state.upgrade()) {
+            apply_fetched_art(&art, &state, &url, bytes.as_deref());
+        }
     });
+}
+
+/// The main-thread end of [`spawn_art_fetch`]: show what the fetch for `url`
+/// brought back, if `state` still wants `url` — see [`art_update`].
+fn apply_fetched_art(art: &gtk::Image, state: &PlayerState, url: &str, bytes: Option<&[u8]>) {
+    let update = art_update(&state.last_art_url.borrow(), url, bytes);
+    match update {
+        ArtUpdate::Stale => {}
+        ArtUpdate::Placeholder => show_art_placeholder(art),
+        ArtUpdate::Show(bytes) => show_art_bytes(art, bytes),
+    }
+}
+
+/// Show encoded image `bytes` as the cover, or the placeholder if they do not
+/// decode.
+fn show_art_bytes(art: &gtk::Image, bytes: &[u8]) {
+    match gdk::Texture::from_bytes(&glib::Bytes::from(bytes)) {
+        Ok(texture) => {
+            art.set_pixel_size(-1);
+            art.set_paintable(Some(&texture));
+            art.set_size_request(scale(200), scale(200));
+        }
+        Err(_) => show_art_placeholder(art),
+    }
 }
 
 fn wire_seek(seek: &gtk::Scale, state: &Rc<PlayerState>) {
@@ -512,6 +582,47 @@ fn send_seek(scale: &gtk::Scale, state: &PlayerState) {
     let pos_fraction = scale.value().clamp(0.0, 1.0);
     let pos_us = cast::f64_to_i64_trunc(pos_fraction * cast::u64_to_f64(length));
     mpris::set_position(b, t, pos_us);
+}
+
+/// What a finished art fetch may do, decided without GTK.
+#[cfg(test)]
+mod art_update_tests {
+    use super::{ArtUpdate, art_update};
+
+    const A: &str = "https://art.example/a.jpg";
+    const B: &str = "https://art.example/b.jpg";
+    const BYTES: &[u8] = b"\x89PNG...";
+
+    /// The race: track A's fetch was slow, track B's already painted B's cover,
+    /// then A's lands. It must not overwrite B — whatever it brought back.
+    #[test]
+    fn a_fetch_for_a_superseded_url_changes_nothing() {
+        assert_eq!(art_update(B, A, Some(BYTES)), ArtUpdate::Stale);
+        assert_eq!(
+            art_update(B, A, None),
+            ArtUpdate::Stale,
+            "a stale failure must not blank B's cover either",
+        );
+    }
+
+    /// The page went to "No player" (which clears the wanted URL) while the
+    /// fetch ran: its result must not paint over the placeholder.
+    #[test]
+    fn a_fetch_finishing_after_the_player_left_changes_nothing() {
+        assert_eq!(art_update("", A, Some(BYTES)), ArtUpdate::Stale);
+    }
+
+    #[test]
+    fn the_current_urls_art_is_shown() {
+        assert_eq!(art_update(A, A, Some(BYTES)), ArtUpdate::Show(BYTES));
+    }
+
+    /// A failed fetch for the current track used to `return` early and leave
+    /// the previous track's cover on screen.
+    #[test]
+    fn a_failed_fetch_for_the_current_url_shows_the_placeholder() {
+        assert_eq!(art_update(A, A, None), ArtUpdate::Placeholder);
+    }
 }
 
 #[cfg(test)]
@@ -628,7 +739,10 @@ mod gtk_tests {
     use hytte::gtk::{self, glib};
     use hytte::services::mpris;
 
-    use super::{InfoPanel, PlayerState, bind_player_info, build_info_panel};
+    use super::{
+        InfoPanel, PlayerState, apply_fetched_art, bind_player_info, build_info_panel,
+        spawn_art_fetch,
+    };
 
     /// Run the GTK main loop until it has nothing left to dispatch.
     fn pump() {
@@ -645,12 +759,11 @@ mod gtk_tests {
     /// and `playable` the three button sensitivities plus the play/pause icon.
     ///
     /// `art_url` is deliberately left at its empty default. `render_player`
-    /// only calls `spawn_art_fetch` when the url *changes*, and that task holds
-    /// a strong `art` for as long as the fetch runs — which is correct and
-    /// self-limiting, but it would leave the art image alive at the end of this
-    /// test and break the assertion that the apply closure was released. An
-    /// empty url on both players means the comparison never fires, so
-    /// `last_art_url` is not one of the witnesses below.
+    /// only calls `spawn_art_fetch` when the url *changes*, and this test is
+    /// about whether the render ran, not about the fetch (which holds the art
+    /// image only weakly — `spawn_art_fetch_holds_the_image_weakly` below pins
+    /// that on its own). An empty url on both players means the comparison
+    /// never fires, so `last_art_url` is not one of the witnesses below.
     fn player(bus: &str, title: &str, length_us: u64, playable: bool) -> mpris::Player {
         mpris::Player {
             bus_name: bus.to_owned(),
@@ -794,5 +907,85 @@ mod gtk_tests {
             "the apply closure must have been released with the page — it is what owns the art \
              image, and what would fetch into it"
         );
+    }
+
+    /// A one-pixel PNG, encoded by GDK itself so it certainly decodes.
+    fn png() -> Vec<u8> {
+        let pixel = glib::Bytes::from_static(&[0xFF, 0x00, 0x00, 0xFF]);
+        gtk::gdk::MemoryTexture::new(1, 1, gtk::gdk::MemoryFormat::R8g8b8a8, &pixel, 4)
+            .save_to_png_bytes()
+            .to_vec()
+    }
+
+    fn state_wanting(url: &str) -> PlayerState {
+        let state = PlayerState::default();
+        url.clone_into(&mut state.last_art_url.borrow_mut());
+        state
+    }
+
+    /// The main-thread end of a fetch, against a real `gtk::Image`: a stale
+    /// result changes nothing, the current URL's art is shown, and a failure or
+    /// undecodable bytes for the current URL end on the placeholder rather than
+    /// on the previous cover.
+    #[gtk::test]
+    fn a_fetch_result_only_lands_on_the_url_it_was_for() {
+        let (a, b) = ("file:///a.png", "file:///b.png");
+        let png = png();
+        let art = gtk::Image::from_icon_name("audio-x-generic-symbolic");
+        let state = state_wanting(b);
+
+        apply_fetched_art(&art, &state, a, Some(&png));
+        assert_eq!(
+            art.storage_type(),
+            gtk::ImageType::IconName,
+            "track A's late fetch must not land once B is wanted",
+        );
+
+        apply_fetched_art(&art, &state, b, Some(&png));
+        assert_eq!(
+            art.storage_type(),
+            gtk::ImageType::Paintable,
+            "B's art shows"
+        );
+
+        apply_fetched_art(&art, &state, a, None);
+        assert_eq!(
+            art.storage_type(),
+            gtk::ImageType::Paintable,
+            "a stale failure must not blank B's cover",
+        );
+
+        apply_fetched_art(&art, &state, b, None);
+        assert_eq!(
+            art.storage_type(),
+            gtk::ImageType::IconName,
+            "a failed fetch for the current url falls back to the placeholder",
+        );
+
+        apply_fetched_art(&art, &state, b, Some(&png));
+        apply_fetched_art(&art, &state, b, Some(b"not an image"));
+        assert_eq!(
+            art.storage_type(),
+            gtk::ImageType::IconName,
+            "bytes that do not decode fall back to the placeholder too",
+        );
+    }
+
+    /// The fetch task holds the image weakly: a page dropped mid-fetch frees
+    /// its art image at once instead of when the fetch (up to its 10 s timeout)
+    /// returns. Falsified by moving a strong `art.clone()` into the task.
+    #[gtk::test]
+    fn spawn_art_fetch_holds_the_image_weakly() {
+        let art = gtk::Image::new();
+        let weak = art.downgrade();
+        let state = Rc::new(state_wanting("file:///nonexistent/cover.png"));
+
+        spawn_art_fetch(&art, &state, "file:///nonexistent/cover.png".to_owned());
+        drop(art);
+        assert!(
+            weak.upgrade().is_none(),
+            "the in-flight fetch must not keep the art image alive",
+        );
+        pump();
     }
 }

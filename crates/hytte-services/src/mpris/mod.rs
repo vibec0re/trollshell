@@ -452,9 +452,14 @@ fn art_cache() -> ArtCacheHandle {
 
 /// Fetch album art bytes for a URL, using an in-memory cache keyed by URL.
 ///
-/// Supports `file://` (read from disk) and `http(s)://` (blocking HTTP via
-/// ureq, capped at 4 MiB). Returns `None` for empty or unsupported URLs, or
-/// on fetch failure.
+/// Supports `file://` (read from disk, regular files only) and `http(s)://`
+/// (blocking HTTP via ureq, bounded by a 10 s global timeout). Either is capped
+/// at 4 MiB. Returns `None` for empty or unsupported URLs, or on fetch failure.
+///
+/// Calls are independent and unordered: a slow fetch for one URL can resolve
+/// after a later call's fetch for another, so a caller that only wants the art
+/// of the *current* track must check, after the await, that the URL it asked
+/// for is still the current one.
 pub async fn art_for_url(url: &str) -> Option<Vec<u8>> {
     if url.is_empty() {
         return None;
@@ -489,23 +494,79 @@ pub async fn art_for_url(url: &str) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// Largest art payload [`art_for_url`] accepts, from a server or from disk.
+const ART_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Wall-clock bound on one HTTP art fetch, connect through last body byte.
+///
+/// The fetch runs on a tokio blocking-pool thread, and a bare `ureq::get` has
+/// **no** timeout at all (every ureq 3 default but `await_100` is `None`), so a
+/// server that accepts and then stalls used to pin that thread for good — one
+/// per stalled track change. Ten seconds is generous for a cover image and
+/// still bounds how long a caller waits on a dead art host.
+const ART_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The one HTTP agent art fetches share: [`ART_FETCH_TIMEOUT`] as its global
+/// timeout, and connection reuse across tracks from the same art host.
+fn art_agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::Agent::config_builder()
+            .timeout_global(Some(ART_FETCH_TIMEOUT))
+            .build()
+            .into()
+    })
+}
+
 /// Synchronous art fetcher, intended to run on a blocking thread via
 /// `spawn_blocking`. Handles `file://` and `http(s)://` URLs.
 fn fetch_art_blocking(url: &str) -> Option<Vec<u8>> {
+    fetch_art_with(art_agent(), url, ART_MAX_BYTES)
+}
+
+/// [`fetch_art_blocking`] with the agent and the size cap as parameters, so a
+/// test can point a short-timeout agent at a loopback server.
+fn fetch_art_with(agent: &ureq::Agent, url: &str, max_bytes: u64) -> Option<Vec<u8>> {
     if let Some(path) = url.strip_prefix("file://") {
-        return std::fs::read(path).ok();
+        return read_art_file(std::path::Path::new(path), max_bytes);
     }
     if url.starts_with("http://") || url.starts_with("https://") {
-        const MAX_BYTES: u64 = 4 * 1024 * 1024;
-        let mut resp = ureq::get(url).call().ok()?;
+        let mut resp = agent.get(url).call().ok()?;
+        // ureq's `limit` refuses a body that *reaches* it — its reader errors
+        // on the read that would have found EOF — so allow one byte more to
+        // accept exactly `max_bytes`, as `read_art_file` does.
         return resp
             .body_mut()
             .with_config()
-            .limit(MAX_BYTES)
+            .limit(max_bytes.saturating_add(1))
             .read_to_vec()
             .ok();
     }
     None
+}
+
+/// Read a `file://` art path, refusing anything that is not a regular file of
+/// at most `max_bytes`.
+///
+/// The URL comes from whatever process owns an MPRIS name on the session bus,
+/// so it is untrusted input: an unbounded `fs::read` of `file:///dev/zero`
+/// grows until the shell runs out of memory, and opening a FIFO blocks the
+/// thread until a writer appears. The metadata check turns both away up front;
+/// the `take` bounds a regular file that grows between that check and the read.
+fn read_art_file(path: &std::path::Path, max_bytes: u64) -> Option<Vec<u8>> {
+    use std::io::Read;
+
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > max_bytes {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (u64::try_from(bytes.len()).ok()? <= max_bytes).then_some(bytes)
 }
 
 // ── Active-player heuristic ───────────────────────────────────────────────────
@@ -1429,6 +1490,149 @@ async fn read_metadata(bus_name: &str) -> (String, String, String, String, u64, 
             0,
             None,
         ),
+    }
+}
+
+/// The art fetcher's bounds, against loopback servers and local files — no
+/// network, no bus.
+#[cfg(test)]
+mod art_fetch_tests {
+    use super::{ART_FETCH_TIMEOUT, art_agent, fetch_art_with, read_art_file};
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
+
+    const CAP: u64 = 16;
+
+    /// An agent like [`art_agent`] but with a timeout a test can wait out.
+    fn short_agent() -> ureq::Agent {
+        ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_millis(200)))
+            .build()
+            .into()
+    }
+
+    /// Read `stream` up to the end of the request head.
+    fn read_request_head(stream: &mut TcpStream) {
+        let mut head = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).is_ok_and(|n| n == 1) {
+            head.push(byte[0]);
+        }
+    }
+
+    /// Serve one request on a loopback port with `run`, returning the URL to
+    /// fetch and the server thread.
+    fn serve_once(run: impl FnOnce(TcpStream) + Send + 'static) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
+        let url = format!(
+            "http://{}/cover.png",
+            listener.local_addr().expect("a bound port")
+        );
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("the fetch connects");
+            run(stream);
+        });
+        (url, server)
+    }
+
+    /// Answer one request with a `200` carrying `body`.
+    fn serve_body(body: Vec<u8>) -> (String, JoinHandle<()>) {
+        serve_once(move |mut stream| {
+            read_request_head(&mut stream);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n",
+                body.len()
+            );
+            // The client may hang up mid-body once it is over the cap.
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(&body);
+        })
+    }
+
+    fn body_of(len: u64) -> Vec<u8> {
+        vec![0xA5; usize::try_from(len).expect("a small test length")]
+    }
+
+    #[test]
+    fn the_shared_agent_carries_the_global_timeout() {
+        assert_eq!(
+            art_agent().config().timeouts().global,
+            Some(ART_FETCH_TIMEOUT)
+        );
+    }
+
+    /// The finding: a server that accepts and then says nothing used to hold
+    /// the blocking-pool thread for as long as it kept the socket open. Here it
+    /// keeps it open for ten seconds unless the client hangs up first, so an
+    /// unbounded fetch fails the elapsed assertion rather than hanging the run.
+    #[test]
+    fn a_stalled_server_costs_the_timeout_not_the_thread() {
+        let (url, server) = serve_once(|mut stream| {
+            read_request_head(&mut stream);
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("set a read timeout");
+            let mut sink = Vec::new();
+            let _ = stream.read_to_end(&mut sink);
+        });
+        let started = Instant::now();
+        assert_eq!(fetch_art_with(&short_agent(), &url, CAP), None);
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_secs(5),
+            "the fetch must give up at its timeout, not when the server does (waited {waited:?})",
+        );
+        server.join().expect("the server thread");
+    }
+
+    #[test]
+    fn a_body_at_the_cap_is_returned_and_one_over_it_is_refused() {
+        let (url, server) = serve_body(body_of(CAP));
+        assert_eq!(
+            fetch_art_with(&short_agent(), &url, CAP),
+            Some(body_of(CAP))
+        );
+        server.join().expect("the server thread");
+
+        let (url, server) = serve_body(body_of(CAP + 1));
+        assert_eq!(fetch_art_with(&short_agent(), &url, CAP), None);
+        server.join().expect("the server thread");
+    }
+
+    #[test]
+    fn a_file_at_the_cap_is_read_and_one_over_it_is_refused() {
+        let dir = tempfile::tempdir().expect("a scratch dir");
+        let at_cap = dir.path().join("at-cap.png");
+        let over = dir.path().join("over.png");
+        std::fs::write(&at_cap, body_of(CAP)).expect("write a file");
+        std::fs::write(&over, body_of(CAP + 1)).expect("write a file");
+
+        assert_eq!(read_art_file(&at_cap, CAP), Some(body_of(CAP)));
+        assert_eq!(read_art_file(&over, CAP), None);
+        let url = format!("file://{}", at_cap.display());
+        assert_eq!(
+            fetch_art_with(&short_agent(), &url, CAP),
+            Some(body_of(CAP)),
+            "a file:// url goes through the same bounded reader",
+        );
+    }
+
+    /// `file:///dev/zero` used to be an unbounded `fs::read` — a player could
+    /// make the shell allocate until it died. Anything that is not a regular
+    /// file is refused before it is opened.
+    #[test]
+    fn only_regular_files_are_read() {
+        let dir = tempfile::tempdir().expect("a scratch dir");
+        assert_eq!(read_art_file(dir.path(), CAP), None, "a directory");
+        let missing = dir.path().join("missing.png");
+        assert_eq!(read_art_file(&missing, CAP), None, "a missing file");
+        let zero = std::path::Path::new("/dev/zero");
+        if zero.exists() {
+            assert_eq!(read_art_file(zero, CAP), None, "a character device");
+        }
     }
 }
 

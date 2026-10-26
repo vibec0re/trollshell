@@ -7,6 +7,7 @@ use hytte::prelude::*;
 use hytte::services::wifi;
 
 use super::pill_label;
+use crate::components::markup;
 use crate::components::reactive_list::reactive_list;
 
 pub(super) fn build_wifi_group() -> adw::PreferencesGroup {
@@ -21,7 +22,7 @@ pub(super) fn build_wifi_group() -> adw::PreferencesGroup {
         }
     };
     bind(combined, &group, |g, (adapter, station, networks)| {
-        let text = wifi_description_text(adapter.as_ref(), station.as_ref(), &networks);
+        let text = wifi_description_markup(adapter.as_ref(), station.as_ref(), &networks);
         g.set_description(Some(&text));
     });
 
@@ -155,6 +156,24 @@ fn build_wifi_header_suffix() -> gtk::Box {
     header
 }
 
+/// [`wifi_description_text`], escaped for the Wi-Fi group's description.
+///
+/// `AdwPreferencesGroup`'s description label is hardcoded `use-markup="True"`
+/// in libadwaita's template, with no property to turn off (see
+/// `components::markup`), and the connected readout leads with the SSID —
+/// a name anyone with a radio in range picks. Unescaped, a café's
+/// `Tom & Jerry` was a markup parse error that blanked the line saying which
+/// network you are on, and a `<span size="xx-large">` SSID re-styled it (#753's
+/// rule; the rows below take `plain_text` instead). Split from the text so the
+/// readout's wording stays testable as plain text.
+fn wifi_description_markup(
+    adapter: Option<&wifi::Adapter>,
+    station: Option<&wifi::Station>,
+    networks: &[wifi::WifiNetwork],
+) -> String {
+    markup::escape(&wifi_description_text(adapter, station, networks))
+}
+
 fn wifi_description_text(
     adapter: Option<&wifi::Adapter>,
     station: Option<&wifi::Station>,
@@ -245,6 +264,11 @@ fn build_network_row(net: &wifi::WifiNetwork) -> adw::ActionRow {
         ))
         .activatable(true)
         .build();
+    // The SSID is whatever any transmitter in radio range advertises: up to 32
+    // arbitrary bytes, so `&`, `<` and `>` are all fair game. As Pango markup
+    // a `Tom & Jerry` blanked the row and a `<span size="xx-large">` restyled
+    // it — markup is never wanted here (#753).
+    markup::plain_text(&row);
 
     let icon = gtk::Image::from_icon_name(signal_icon(net.signal_dbm));
     row.add_prefix(&icon);
@@ -380,7 +404,7 @@ fn signal_icon(dbm: i16) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{ap_count_suffix, wifi, wifi_description_text};
+    use super::{ap_count_suffix, wifi, wifi_description_markup, wifi_description_text};
 
     #[test]
     fn single_ap_gets_no_badge() {
@@ -478,5 +502,58 @@ mod tests {
             &nets,
         );
         assert_eq!(text, "FRITZ!Box \u{00b7} -45 dBm (excellent)");
+    }
+
+    /// The group description is markup, so the SSID it leads with must reach
+    /// it escaped — and the readout's own wording must reach it unchanged.
+    ///
+    /// **Falsification:** return `wifi_description_text(..)` unescaped from
+    /// `wifi_description_markup` → this reds.
+    #[test]
+    fn the_description_escapes_a_hostile_ssid() {
+        let ssid = "Tom & <b>Jerry</b>";
+        let nets = vec![connected_row(ssid, -45, Some(-45))];
+        let markup = wifi_description_markup(
+            Some(&powered_adapter()),
+            Some(&connected_station(ssid)),
+            &nets,
+        );
+        assert_eq!(
+            markup,
+            "Tom &amp; &lt;b&gt;Jerry&lt;/b&gt; \u{00b7} -45 dBm (excellent)"
+        );
+    }
+}
+
+/// The network rows render the SSID **literally** (#753's rule). Needs a
+/// display server to construct the row, hence the `system-tests` gate.
+///
+/// **Falsification:** delete the `markup::plain_text` call in
+/// `build_network_row` → this reds (the `&` blanks the title).
+#[cfg(all(test, feature = "system-tests"))]
+mod markup_tests {
+    use hytte::adw;
+    use hytte::gtk;
+    use hytte::services::wifi;
+
+    use super::build_network_row;
+    use crate::components::markup::test_support::assert_shows;
+
+    #[gtk::test]
+    fn a_network_row_shows_a_hostile_ssid_literally() {
+        adw::init().expect("libadwaita init");
+        let net = wifi::WifiNetwork {
+            path: "/ap/0".to_string(),
+            ssid: "Tom & <span size=\"xx-large\">Jerry</span>".to_string(),
+            security: "psk".to_string(),
+            known: false,
+            connected: false,
+            signal_dbm: -60,
+            known_network_path: None,
+            ap_count: 1,
+            active_signal_dbm: None,
+        };
+        let row = build_network_row(&net);
+        assert_shows(&row, "Tom & <span size=\"xx-large\">Jerry</span>");
     }
 }

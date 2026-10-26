@@ -619,11 +619,12 @@ mod width_tests {
 /// gate.
 #[cfg(all(test, feature = "system-tests"))]
 mod markup_tests {
-    use hytte::adw::{self, prelude::*};
+    use hytte::adw;
     use hytte::gtk;
     use hytte::services::notifications::{HistoryEntry, Urgency};
 
     use super::{build_history_action_row, build_history_app_row_shell};
+    use crate::components::markup::test_support::assert_shows;
 
     fn entry(summary: &str, body: &str) -> HistoryEntry {
         HistoryEntry {
@@ -639,33 +640,6 @@ mod markup_tests {
             created_at: 0,
             dismissed_at: 0,
         }
-    }
-
-    /// Every `GtkLabel` under `root` — the row's title/subtitle labels live in
-    /// libadwaita's template, so walk for them rather than name them.
-    fn label_texts(root: &gtk::Widget) -> Vec<String> {
-        let mut out = Vec::new();
-        let mut stack = vec![root.clone()];
-        while let Some(w) = stack.pop() {
-            if let Some(label) = w.downcast_ref::<gtk::Label>() {
-                out.push(label.text().to_string());
-            }
-            let mut child = w.first_child();
-            while let Some(c) = child {
-                child = c.next_sibling();
-                stack.push(c);
-            }
-        }
-        out
-    }
-
-    fn assert_shows(root: &impl IsA<gtk::Widget>, literal: &str) {
-        let texts = label_texts(root.upcast_ref());
-        assert!(
-            texts.iter().any(|t| t == literal),
-            "no label displays {literal:?} literally — the row parsed it as Pango markup; \
-             labels show {texts:?}"
-        );
     }
 
     /// `notify-send "Tom & Jerry" "Fish & Chips"`: an unescaped `&` is a

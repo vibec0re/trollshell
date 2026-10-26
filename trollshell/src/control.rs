@@ -174,8 +174,16 @@ impl ControlIface {
     /// live; a city that fails to geocode leaves the last good location in
     /// place. Re-query [`get_place`](Self::get_place) shortly after to read
     /// back the resolved label.
-    async fn set_manual_city(&self, city: String) {
+    ///
+    /// # Errors
+    /// A `city` [`check_city`] refuses — blank, or longer than
+    /// [`MAX_CITY_BYTES`] — as a `Failed` reply, with the location left as it
+    /// was. The control-center's Places tab already shows that reply as a
+    /// toast (`places_tab::override_failure`).
+    async fn set_manual_city(&self, city: String) -> zbus::fdo::Result<()> {
+        check_city(&city)?;
         geoclue::set_manual_city(city);
+        Ok(())
     }
 
     /// Toggle auto (`GeoClue2`) vs. manual location. `true` restores
@@ -467,14 +475,16 @@ impl ControlIface {
     /// promptly; the value is never written to disk/config and never logged.
     ///
     /// # Errors
-    /// A slot name [`secrets::is_valid_slot`] refuses, or a keyring that
-    /// cannot be opened, unlocked or written — then nothing is relaunched.
-    /// Both used to be an ordinary empty reply, so the control-center showed
-    /// a key as stored that the keyring had refused: the shape #707 fixed for
-    /// the plugin methods. Neither the reply nor the log line carries the
-    /// value.
+    /// A slot name [`secrets::is_valid_slot`] refuses, a `value`
+    /// [`check_key_value`] refuses, or a keyring that cannot be opened,
+    /// unlocked or written — then nothing is stored and nothing is relaunched.
+    /// The first and last used to be an ordinary empty reply, so the
+    /// control-center showed a key as stored that the keyring had refused (the
+    /// shape #707 fixed for the plugin methods), and the value had no check at
+    /// all. Neither the reply nor the log line carries the value.
     async fn set_ai_key(&self, slot: String, value: String) -> zbus::fdo::Result<()> {
         check_slot(&slot, "SetAiKey")?;
+        check_key_value(&value, "SetAiKey")?;
         secrets::set(&slot, &value)
             .await
             .map_err(|err| key_fail(&slot, &err, "SetAiKey"))?;
@@ -519,6 +529,84 @@ fn check_slot(slot: &str, method: &str) -> zbus::fdo::Result<()> {
     Err(zbus::fdo::Error::Failed(format!(
         "{method} failed: not a valid slot name (a lowercase ASCII letter, then lowercase \
          letters, digits, '-' or '_', at most 64 bytes)"
+    )))
+}
+
+/// The longest API key [`ControlIface::set_ai_key`] stores, in bytes.
+///
+/// Every provider key in use is well under 256 bytes (an `OpenRouter` or
+/// Anthropic key is ~100); 4 KiB leaves an order of magnitude for a token
+/// format nobody ships yet while refusing what is plainly not a key — a pasted
+/// file, or a session-bus client filling the keyring with a megabyte that the
+/// launcher then copies into every relaunch's environment.
+const MAX_KEY_BYTES: usize = 4096;
+
+/// Refuse an AI-key `value` that cannot work as one, before the keyring is
+/// touched, as the same `Failed` shape [`check_slot`] gives:
+///
+/// - **blank** (empty or all whitespace): `hytte_ai_providers::load_key`
+///   trims the injected `<SLOT>_API_KEY` and treats an empty result as no key,
+///   so storing one listed the slot as "key set" while every plugin ran
+///   keyless.
+/// - **a NUL byte**: the launcher hands the value to `systemd-run` as an
+///   environment variable (`Command::env`), and an interior NUL makes `spawn`
+///   fail with `InvalidInput` — every plugin declaring the slot would stop
+///   launching, with nothing pointing at the key. A conformant bus already
+///   refuses a NUL inside a D-Bus string, so over the session bus this is
+///   defence in depth; the check costs one scan and does not depend on which
+///   broker is running.
+/// - **longer than [`MAX_KEY_BYTES`]**.
+///
+/// Neither the reply nor the log line carries the value — not even its
+/// length: the reason names which rule failed, and the caller knows what it
+/// sent.
+fn check_key_value(value: &str, method: &str) -> zbus::fdo::Result<()> {
+    let refused = if value.trim().is_empty() {
+        "the key is empty"
+    } else if value.contains('\0') {
+        "the key contains a NUL byte"
+    } else if value.len() > MAX_KEY_BYTES {
+        "the key is longer than 4096 bytes"
+    } else {
+        return Ok(());
+    };
+    tracing::warn!("{method}: {refused}; refused");
+    Err(zbus::fdo::Error::Failed(format!(
+        "{method} failed: {refused}"
+    )))
+}
+
+/// The longest city name [`ControlIface::set_manual_city`] accepts, in bytes.
+///
+/// Real place names are far shorter — the longest in common use run to ~85
+/// Latin characters, and a non-Latin name at three UTF-8 bytes a character
+/// still fits 85 of them. The bound exists because nothing else did: the
+/// string is held in the place override, echoed by `GetPlace` until the first
+/// resolution, and URL-encoded into the Open-Meteo query, and the session bus
+/// passes messages far larger than any city.
+const MAX_CITY_BYTES: usize = 256;
+
+/// Refuse a `SetManualCity` argument that is blank or longer than
+/// [`MAX_CITY_BYTES`], as a `Failed` reply, before the override is touched.
+///
+/// **Refused, not truncated.** Cutting at a char boundary would forward-
+/// geocode a *prefix* of what was asked for, and a geocoder's search matches
+/// prefixes — so a truncated name can resolve, silently, to a different place,
+/// and the weather would be wrong with nothing saying so. A refusal is a toast
+/// in the control-center. A blank name is refused too: it can never geocode,
+/// so all it did was replace the label with an empty string until the lookup
+/// failed (the control-center already filters it; `busctl` does not).
+fn check_city(city: &str) -> zbus::fdo::Result<()> {
+    let refused = if city.trim().is_empty() {
+        "the city is empty"
+    } else if city.len() > MAX_CITY_BYTES {
+        "the city name is longer than 256 bytes"
+    } else {
+        return Ok(());
+    };
+    tracing::warn!("SetManualCity: {refused}; refused");
+    Err(zbus::fdo::Error::Failed(format!(
+        "SetManualCity failed: {refused}"
     )))
 }
 
@@ -631,6 +719,91 @@ mod tests {
                 "the value reached the journal: {event:?}"
             );
         }
+    }
+
+    /// A key value that cannot work is refused before the keyring is touched —
+    /// which is what makes this hermetic: with a valid slot, a value past the
+    /// check would reach `secrets::set` — and neither the reply nor any log
+    /// line carries it.
+    ///
+    /// The slot is a valid name no provider uses, so a regression that lets a
+    /// value through on a developer's machine with an unlocked keyring writes
+    /// a junk item under `test-never-stored`, not over their real
+    /// `openrouter` key.
+    ///
+    /// **Falsification:** drop the `check_key_value` call from `set_ai_key`
+    /// → each case reaches the keyring and the reply is the keyring's error
+    /// (measured: "The name is not activatable" with no Secret Service on the
+    /// test bus), or `Ok` with one running.
+    #[tokio::test]
+    async fn an_unusable_key_value_is_refused_without_echoing_it() {
+        let oversized = format!("sk-do-not-echo{}", "x".repeat(MAX_KEY_BYTES));
+        let cases = [
+            (String::new(), "the key is empty"),
+            (" \t\n".to_owned(), "the key is empty"),
+            (
+                "sk-do-not-echo\0tail".to_owned(),
+                "the key contains a NUL byte",
+            ),
+            (oversized, "the key is longer than 4096 bytes"),
+        ];
+        let (captured, guard) = hytte_config::test_support::capture();
+        let mut replies = Vec::new();
+        for (value, _) in &cases {
+            replies.push(
+                ControlIface
+                    .set_ai_key("test-never-stored".to_owned(), value.clone())
+                    .await,
+            );
+        }
+        drop(guard);
+        for ((_, why), reply) in cases.iter().zip(replies) {
+            assert_eq!(failed_message(reply), format!("SetAiKey failed: {why}"));
+        }
+        for event in captured.events() {
+            assert!(
+                !format!("{event:?}").contains("sk-do-not-echo"),
+                "the value reached the journal: {event:?}"
+            );
+        }
+    }
+
+    /// The bound is inclusive: a key of exactly [`MAX_KEY_BYTES`] and a
+    /// real-looking one pass, so the check refuses only what it says.
+    #[test]
+    fn a_plausible_key_value_passes() {
+        assert!(check_key_value("sk-or-v1-0123456789abcdef", "SetAiKey").is_ok());
+        assert!(check_key_value(&"k".repeat(MAX_KEY_BYTES), "SetAiKey").is_ok());
+    }
+
+    /// `SetManualCity` refuses a blank or over-long name as a `Failed` reply.
+    /// (`geoclue::set_manual_city` is a no-op without the service, so the
+    /// reply is what this pins.)
+    ///
+    /// **Falsification:** drop the `check_city` call → both replies are `Ok`.
+    #[tokio::test]
+    async fn an_unusable_city_is_refused() {
+        let blank = failed_message(ControlIface.set_manual_city("   ".to_owned()).await);
+        assert_eq!(blank, "SetManualCity failed: the city is empty");
+        let long = failed_message(
+            ControlIface
+                .set_manual_city("a".repeat(MAX_CITY_BYTES + 1))
+                .await,
+        );
+        assert_eq!(
+            long,
+            "SetManualCity failed: the city name is longer than 256 bytes"
+        );
+    }
+
+    /// The city bound counts **bytes** and is inclusive: 85 three-byte
+    /// characters (255 bytes) pass, 86 (258 bytes) do not.
+    #[test]
+    fn the_city_bound_is_bytes_and_inclusive() {
+        assert!(check_city("Llanfairpwllgwyngyll").is_ok());
+        assert!(check_city(&"a".repeat(MAX_CITY_BYTES)).is_ok());
+        assert!(check_city(&"\u{0e01}".repeat(85)).is_ok());
+        assert!(check_city(&"\u{0e01}".repeat(86)).is_err());
     }
 
     /// A keyring failure travels as a `Failed` reply carrying the method, the

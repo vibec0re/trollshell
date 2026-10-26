@@ -25,6 +25,7 @@ use hytte::gtk;
 use hytte::services::clipboard::{self, ClipEntry, ClipKind};
 
 use crate::components::layout::{finish_page, page_box};
+use crate::components::markup;
 use crate::components::reactive_list::reactive_list;
 
 pub fn panel_clipboard() -> gtk::Widget {
@@ -61,6 +62,10 @@ fn build_clipboard_row(entry: &ClipEntry) -> adw::ActionRow {
         .title(&entry.preview)
         .activatable(true)
         .build();
+    // The preview is whatever text some app last copied — any app on the
+    // session can put `&`, `<` or a whole `<span>` on the clipboard, and as
+    // Pango markup that blanked the row or restyled it (#753).
+    markup::plain_text(&row);
     row.set_title_lines(1);
 
     let icon_name = match entry.kind {
@@ -175,6 +180,23 @@ mod tests {
             weak_box.upgrade().is_none(),
             "the popover's child box must go with it, not just the popover"
         );
+    }
+
+    /// Copied text is shown **literally** (#753's rule): an `&` used to blank
+    /// the entry and a tag was obeyed rather than shown.
+    ///
+    /// **Falsification:** delete the `markup::plain_text` call in
+    /// [`build_clipboard_row`] → this reds.
+    #[gtk::test]
+    fn a_clipboard_row_shows_copied_markup_literally() {
+        adw::init().expect("libadwaita init");
+        let preview = "if a && b { <i>x</i> }";
+        let row = build_clipboard_row(&ClipEntry {
+            id: 8,
+            preview: preview.to_owned(),
+            kind: ClipKind::Text,
+        });
+        crate::components::markup::test_support::assert_shows(&row, preview);
     }
 
     /// Depth-first search for the `gtk::MenuButton` in a row's suffix box —

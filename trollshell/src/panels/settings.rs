@@ -37,7 +37,6 @@ use hytte::prelude::*;
 use hytte::services::dnd;
 use hytte::services::power_profiles;
 use hytte::services::recorder;
-use hytte::services::screensaver;
 use hytte::services::theme::{self, Theme};
 
 use crate::companion::{self, Route};
@@ -127,22 +126,10 @@ pub fn panel_settings() -> gtk::Widget {
         .description("Stop the screen dimming or locking while idle")
         .build();
 
-    let awake_row = adw::SwitchRow::builder().title("Keep awake").build();
-    // Two-way: the authoritative signal drives `active` (block guards re-entry
-    // of the programmatic set); a user flip calls the idempotent setter.
-    bind_two_way(
-        screensaver::keep_awake(),
-        &awake_row,
-        adw::SwitchRow::set_active,
-        |r| r.connect_active_notify(|r| screensaver::set_keep_awake(r.is_active())),
-    );
-    // Subtitle: what else is holding the system awake (Firefox, mpv, screen
-    // share, …), so an off toggle doesn't imply the screen will sleep. Reuses
-    // the Power panel's helper for an identical live subtitle.
-    bind(screensaver::other_inhibitors(), &awake_row, |r, others| {
-        r.set_subtitle(&crate::panels::power::keep_awake_subtitle(&others));
-    });
-    awake.add(&awake_row);
+    // The Power panel's own row, not a copy of it: the same bindings and the
+    // same live "Also awake: …" subtitle, and the same plain-text rendering of
+    // the inhibitor names in it.
+    awake.add(&crate::panels::power::keep_awake_switch_row());
 
     column.append(&awake);
 

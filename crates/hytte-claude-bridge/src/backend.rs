@@ -398,7 +398,8 @@ impl Drop for TitleGuard<'_> {
         // Release first: an owned guard holds a strong reference of its own, so
         // the count below could never fall to one while this still held it.
         // A guard dropped while still waiting has nothing to release here: its
-        // reference rode the pending `lock_owned`, which `acquire` drops first.
+        // strong reference lived in the pending `lock_owned`, which is dropped
+        // before this guard (see `acquire`).
         drop(self.held.take());
         let mut by_title = self
             .locks

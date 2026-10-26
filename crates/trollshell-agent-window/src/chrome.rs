@@ -7,8 +7,11 @@
 //! `set_label` calls a single display test can pin.
 
 use hytte_plugin_agents::config::AgentsConfig;
-use hytte_plugin_agents::hive::wire::{Approval, HiveUrls};
-use hytte_plugin_agents::model::{AgentName, PendingApprovals, Status, agent_url, model_family};
+use hytte_plugin_agents::hive::wire::{Approval, HiveUrls, Request};
+use hytte_plugin_agents::model::{
+    AgentName, PendingApprovals, Status, agent_url, model_family, single_line,
+};
+use hytte_plugin_agents::plugin::Shown;
 
 use crate::feed::AgentState;
 
@@ -236,6 +239,17 @@ impl Facts {
 pub struct ApprovalRow {
     /// The queue id — what a click's `Approve { id }` / `Deny { id }` names.
     pub id: i64,
+    /// What this row shows about the request, as the hive sent it — the
+    /// identity its two buttons are bound to ([`Decision::shown`]).
+    ///
+    /// The plugin's own [`Shown`], not a copy of it: the sidebar's consent
+    /// card and this row answer the same queue, so "is this still the request
+    /// the operator saw?" has one answer. The id alone is not that identity —
+    /// a hive whose store was reset or restored hands the same id to a
+    /// different request — so [`crate::ui::Approvals::apply`] keeps a row's
+    /// widgets only while both match, and [`should_send`] sends only while the
+    /// row queued under the id still is this one.
+    pub shown: Shown,
     /// What granting it will do, in English (`ApprovalKind::human`).
     pub title: String,
     /// The manager's description plus the request stamp, bounded.
@@ -266,11 +280,16 @@ impl ApprovalRow {
     pub fn of(approval: &Approval, refused: Option<String>, in_flight: bool) -> Self {
         Self {
             id: approval.id,
+            shown: Shown::of(approval),
+            // Flattened and bounded at its source since #1509 (an unknown
+            // kind's raw token is wire text), so the sidebar and this row
+            // cannot disagree about how tall it may get.
             title: approval.kind.human(),
             // The plugin's own renderer, not a copy of it (#1146's review,
             // M4): the sidebar's consent card and this row show the same
             // manager-written free text under the same bounds, and a shared
-            // function makes that a compile-time fact.
+            // function makes that a compile-time fact. It flattens the
+            // agent-written description to one line before the clamp (#1509).
             detail: hytte_plugin_agents::plugin::detail_line(approval),
             refused,
             in_flight,
@@ -281,13 +300,150 @@ impl ApprovalRow {
     /// line when the last write for this row came back refused (#1141's "a
     /// refused write keeps the row and shows why inline" — this is the
     /// "inline": the row's own text, not a separate banner).
+    ///
+    /// The reason is the hive's free text, so it is flattened to **one** line
+    /// ([`single_line`]) the way the detail line is: the `\n` before it is
+    /// this row's own layout, and a reason carrying line breaks or a bidi
+    /// override of its own would otherwise decide how the rest of the row
+    /// reads, beside the two buttons that answer it.
     #[must_use]
     pub fn subtitle(&self) -> String {
         match &self.refused {
-            Some(reason) => format!("{}\ncouldn't answer: {reason}", self.detail),
+            Some(reason) => format!("{}\ncouldn't answer: {}", self.detail, single_line(reason)),
             None => self.detail.clone(),
         }
     }
+}
+
+/// Which of a row's two buttons was pressed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verb {
+    /// Approve.
+    Approve,
+    /// Deny.
+    Deny,
+}
+
+/// One decision a row's Approve/Deny button asks for (#1141, spec §6.5),
+/// **bound to what that row showed**.
+///
+/// It used to be the bare id, and so did the guard: a click was sent whenever
+/// *some* row was queued under its id. That is the hole #1509 closed for the
+/// sidebar's consent card — a hive that re-numbered its queue (a store reset
+/// or restore, possibly faster than one poll) holds a different request under
+/// the same id, and an `Approve { id }` would spend the operator's authority
+/// on a request this window never showed them. The row's [`Shown`] rides the
+/// click, and [`should_send`] compares it against the row queued now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Decision {
+    /// Which button.
+    pub verb: Verb,
+    /// The queue id the frame will name.
+    pub id: i64,
+    /// What the row showed about the request when it was built.
+    pub shown: Shown,
+}
+
+impl Decision {
+    /// The click on `row`'s `verb` button.
+    #[must_use]
+    pub fn on(row: &ApprovalRow, verb: Verb) -> Self {
+        Self {
+            verb,
+            id: row.id,
+            shown: row.shown.clone(),
+        }
+    }
+
+    /// The frame this decision becomes once [`should_send`] lets it through.
+    #[must_use]
+    pub fn request(&self) -> Request {
+        match self.verb {
+            Verb::Approve => crate::feed::approve(self.id),
+            Verb::Deny => crate::feed::deny(self.id),
+        }
+    }
+}
+
+/// What the approvals group says when the hive refused to hand over the queue
+/// at all (#1146's review, M1) — a state of its own, because the rows are
+/// cleared for this the same way they are cleared for an empty queue.
+pub const APPROVALS_REFUSED: &str = "The hive refused the approval queue";
+
+/// What the approvals group says while the hive is unreachable.
+pub const APPROVALS_UNREACHABLE: &str = "The hive is unreachable";
+
+/// The line under [`APPROVALS_UNREACHABLE`].
+pub const UNREACHABLE_QUEUE: &str = "Its approval queue can't be read, so nothing here can be answered until it is \
+     back. A request that was waiting is still waiting.";
+
+/// What this window knows about its agent's approval queue — the state a
+/// click is judged against, and what the approvals group renders.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Queue {
+    /// Nothing read yet: no status poll has answered since launch. The
+    /// header says "connecting"; the group has nothing to say yet.
+    #[default]
+    Unread,
+    /// The hive's last answer, narrowed to this agent and oldest first
+    /// ([`pending_for`]).
+    Read(Vec<Approval>),
+    /// The status poll answered and the hive refused `Pending`, in its own
+    /// words (#1146's review, M1).
+    Refused(String),
+    /// The status poll failed. The last queue is **forgotten** rather than
+    /// kept, as the plugin forgets its own (#1509): keeping it would leave
+    /// live buttons on rows nobody can vouch for, and a click on one would
+    /// send a bare id to a hive that may come back holding something else
+    /// under it.
+    Unreachable,
+}
+
+impl Queue {
+    /// The rows to render — none unless the hive's last answer is in hand.
+    #[must_use]
+    pub fn rows(&self) -> &[Approval] {
+        match self {
+            Self::Read(rows) => rows,
+            Self::Unread | Self::Refused(_) | Self::Unreachable => &[],
+        }
+    }
+
+    /// Whether the row queued under `id` is still the request `shown`
+    /// describes — `false` for a queue this window cannot read.
+    #[must_use]
+    pub fn holds(&self, id: i64, shown: &Shown) -> bool {
+        self.rows()
+            .iter()
+            .find(|a| a.id == id)
+            .is_some_and(|row| shown.is(row))
+    }
+
+    /// What the group shows **instead of** rows, when it cannot show rows and
+    /// an empty group would read as "nothing to decide".
+    #[must_use]
+    pub fn notice(&self) -> Option<QueueNotice> {
+        match self {
+            Self::Unread | Self::Read(_) => None,
+            Self::Refused(reason) => Some(QueueNotice {
+                title: APPROVALS_REFUSED,
+                detail: reason.clone(),
+            }),
+            Self::Unreachable => Some(QueueNotice {
+                title: APPROVALS_UNREACHABLE,
+                detail: UNREACHABLE_QUEUE.to_owned(),
+            }),
+        }
+    }
+}
+
+/// The one row the approvals group shows in place of a queue it cannot read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueueNotice {
+    /// The row's title.
+    pub title: &'static str,
+    /// Its subtitle.
+    pub detail: String,
 }
 
 /// The `Pending` answer, filtered to this window's one agent.
@@ -308,22 +464,77 @@ pub fn pending_for(name: &AgentName, queue: Vec<Approval>) -> Vec<Approval> {
         .collect()
 }
 
-/// Whether `id` is still worth sending a decision for.
+/// What [`should_send`] makes of one click.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// The row queued under the click's id is still the request it showed:
+    /// send the frame.
+    Send,
+    /// Nothing is queued under that id any more — answered on the dashboard,
+    /// by `hivectl`, or withdrawn, between the render and the click. Spec
+    /// §6.5: "dropped with a debug line, not an error."
+    Gone,
+    /// A **different** request is queued under that id: the hive re-numbered
+    /// its queue. Dropped unsent — the operator never saw what it would
+    /// decide — and the window repaints from the queue as it now is.
+    Replaced,
+    /// The window cannot read the queue right now (the hive is unreachable,
+    /// refused `Pending`, or has not answered yet). Not sent, and **the
+    /// operator is told** ([`not_sent`]): they pressed a button, and silence
+    /// would read as success.
+    Unread,
+}
+
+/// Whether one click is still worth sending, against the queue this window
+/// last read — the guard the window's `on_decision` applies before a
+/// decision becomes a frame.
 ///
-/// Spec §6.5: "an approval that disappears from `Pending` between the prompt
-/// and the answer … is dropped with a debug line, not an error." `pending` is
-/// this window's last-polled, already-filtered queue; a click for an id no
-/// longer in it raced a poll, and the guard is a pure predicate so the race
-/// itself needs no display server to test.
+/// The same rule the plugin's `Agents::decide` applies to the consent card
+/// (#1509), over the same [`Shown`]: the id must still be queued, it must
+/// still be **the request the row showed**, and a queue nobody could read
+/// decides nothing. A pure function, so every race — a poll landing between
+/// the render and the click, a re-numbered id, a hive that went away — needs
+/// no display server to test.
 #[must_use]
-pub fn should_send(pending: &[Approval], id: i64) -> bool {
-    pending.iter().any(|a| a.id == id)
+pub fn should_send(queue: &Queue, decision: &Decision) -> Verdict {
+    let Queue::Read(rows) = queue else {
+        return Verdict::Unread;
+    };
+    match rows.iter().find(|a| a.id == decision.id) {
+        None => Verdict::Gone,
+        Some(row) if decision.shown.is(row) => Verdict::Send,
+        Some(_) => Verdict::Replaced,
+    }
+}
+
+/// The banner for a decision [`should_send`] answered [`Verdict::Unread`]
+/// for.
+///
+/// Named from what the row **showed** rather than from the queue, which is
+/// exactly what is missing at this moment — the same choice the plugin's
+/// "not sent" toast makes (#1509). The kind's wording is already flattened
+/// and bounded at its source (`ApprovalKind::human`).
+#[must_use]
+pub fn not_sent(decision: &Decision) -> String {
+    let what = match decision.verb {
+        Verb::Approve => "approval",
+        Verb::Deny => "denial",
+    };
+    format!(
+        "{what} not sent — the hive's approval queue can't be read right now. \"{}\" (request #{}) \
+         is still waiting on you; answer it here once the hive is back",
+        decision.shown.kind().human(),
+        decision.id
+    )
 }
 
 #[cfg(test)]
 mod approvals_tests {
-    use super::{ApprovalRow, pending_for, should_send};
-    use hytte_plugin_agents::hive::wire::{Approval, ApprovalStatus};
+    use super::{
+        APPROVALS_REFUSED, APPROVALS_UNREACHABLE, ApprovalRow, Decision, Queue, QueueNotice, Verb,
+        Verdict, not_sent, pending_for, should_send,
+    };
+    use hytte_plugin_agents::hive::wire::{Approval, ApprovalKind, ApprovalStatus, Request};
     use hytte_plugin_agents::model::AgentName;
 
     fn name(s: &str) -> AgentName {
@@ -365,19 +576,218 @@ mod approvals_tests {
         );
     }
 
+    /// One row of `approval(id, "stray", Pending)` with a description and a
+    /// stamp — so the identity a decision carries has something in it to
+    /// differ on.
+    fn request(id: i64, description: &str) -> Approval {
+        Approval {
+            description: Some(description.to_owned()),
+            requested_at: "2026-09-12T00:00:00Z".to_owned(),
+            ..approval(id, "stray", ApprovalStatus::Pending)
+        }
+    }
+
+    /// The click on `approval`'s row, as its button would raise it.
+    fn click(approval: &Approval, verb: Verb) -> Decision {
+        Decision::on(&ApprovalRow::of(approval, None, false), verb)
+    }
+
     /// **A stale id is not sent.** `should_send` is the guard
     /// [`crate::window::Window::on_decision`] applies before a click ever
     /// reaches the command lane — an id the last poll no longer carries has
     /// left the queue between the render and the click.
     ///
-    /// Mutation (verified red): return `true` unconditionally and the second
-    /// assertion reds.
+    /// Mutation (verified red): answer `Verdict::Send` for a missing row and
+    /// the `Gone` assertions red.
     #[test]
     fn a_stale_id_is_not_worth_sending() {
-        let pending = vec![approval(7, "stray", ApprovalStatus::Pending)];
-        assert!(should_send(&pending, 7));
-        assert!(!should_send(&pending, 99));
-        assert!(!should_send(&[], 7), "an emptied queue carries nothing");
+        let shown = request(7, "merge PR #12");
+        let decision = click(&shown, Verb::Approve);
+        assert_eq!(
+            should_send(&Queue::Read(vec![shown.clone()]), &decision),
+            Verdict::Send
+        );
+        assert_eq!(
+            should_send(&Queue::Read(vec![request(99, "merge PR #12")]), &decision),
+            Verdict::Gone,
+            "a different id is not this row"
+        );
+        assert_eq!(
+            should_send(&Queue::Read(Vec::new()), &decision),
+            Verdict::Gone,
+            "an emptied queue carries nothing"
+        );
+    }
+
+    /// **A matching request still sends** — the binding refuses nothing it
+    /// should not. The row the click was raised from is still queued under
+    /// its id, unchanged, beside rows that came and went around it; and what
+    /// the guard lets through is the pinned frame for the button pressed.
+    ///
+    /// Mutation (verified red): answer `Replaced` for every row found under
+    /// the id (i.e. a guard so strict it refuses the request it was built
+    /// from) and the first assertion reds.
+    #[test]
+    fn a_matching_request_still_sends() {
+        let shown = request(7, "merge PR #12");
+        let approve = click(&shown, Verb::Approve);
+        let deny = click(&shown, Verb::Deny);
+        let refreshed = Queue::Read(vec![
+            request(3, "an older one"),
+            shown.clone(),
+            request(9, "a newer one"),
+        ]);
+        assert_eq!(should_send(&refreshed, &approve), Verdict::Send);
+        assert_eq!(should_send(&refreshed, &deny), Verdict::Send);
+        assert_eq!(approve.request(), Request::Approve { id: 7 });
+        assert_eq!(deny.request(), Request::Deny { id: 7 });
+    }
+
+    /// **A re-numbered id is not sent** — the hole #1509 closed for the
+    /// sidebar, in this window's own guard.
+    ///
+    /// The row was rendered from request A under id 7. Then the hive's store
+    /// was reset or restored — possibly faster than one poll, so this window
+    /// never saw it go — and id 7 now names request B. A queue refresh
+    /// landing between the render and the click is the same case seen from
+    /// the click's side. An `Approve { id: 7 }` would approve B, which the
+    /// operator never saw; the verdict is `Replaced`, and nothing is sent.
+    /// Every field the row shows is part of that identity, so a change to
+    /// any one of them alone is a different request.
+    ///
+    /// Mutation (verified red): revert `should_send` to the id-only
+    /// `rows.iter().any(|a| a.id == decision.id)` and every assertion here
+    /// answers `Send`.
+    #[test]
+    fn a_renumbered_id_is_not_sent() {
+        let shown = request(7, "merge PR #12");
+        let decision = click(&shown, Verb::Approve);
+
+        let renumbered = request(7, "merge PR #99 (force-push to main)");
+        assert_eq!(
+            should_send(&Queue::Read(vec![renumbered]), &decision),
+            Verdict::Replaced
+        );
+
+        let other_kind = Approval {
+            kind: ApprovalKind::Spawn,
+            ..shown.clone()
+        };
+        let other_stamp = Approval {
+            requested_at: "2026-10-25T09:00:00Z".to_owned(),
+            ..shown.clone()
+        };
+        let no_description = Approval {
+            description: None,
+            ..shown.clone()
+        };
+        let other_agent = Approval {
+            agent: "other-agent".to_owned(),
+            ..shown.clone()
+        };
+        for row in [other_kind, other_stamp, no_description, other_agent] {
+            assert_eq!(
+                should_send(&Queue::Read(vec![row.clone()]), &decision),
+                Verdict::Replaced,
+                "{row:?} is not the request the row showed"
+            );
+        }
+    }
+
+    /// **A stale queue while the hive is unreachable sends nothing, and says
+    /// so.** A window that could not read the queue — the hive is down, it
+    /// refused `Pending`, or it has not answered yet — has no row to vouch
+    /// for, so even the request the click was raised from is `Unread`; and
+    /// the banner names it from what the row showed, since the queue it came
+    /// from is exactly what is missing.
+    ///
+    /// Mutation (verified red): answer `Gone` rather than `Unread` for a
+    /// queue that is not `Read` — the silent drop the plugin keeps for a
+    /// request resolved elsewhere — and the first assertion reds; the
+    /// operator would click and hear nothing.
+    #[test]
+    fn a_stale_queue_while_unreachable_sends_nothing_and_says_so() {
+        let shown = request(7, "merge PR #12");
+        let approve = click(&shown, Verb::Approve);
+        for queue in [
+            Queue::Unreachable,
+            Queue::Refused("permission denied".to_owned()),
+            Queue::Unread,
+        ] {
+            assert_eq!(should_send(&queue, &approve), Verdict::Unread, "{queue:?}");
+            assert!(!queue.holds(7, &approve.shown), "{queue:?}");
+            assert!(queue.rows().is_empty(), "{queue:?} renders no rows");
+        }
+
+        let banner = not_sent(&approve);
+        assert!(banner.starts_with("approval not sent"), "{banner}");
+        assert!(
+            banner.contains(&ApprovalKind::MergeConfigPr.human()),
+            "{banner}"
+        );
+        assert!(banner.contains("#7"), "{banner}");
+        assert!(
+            not_sent(&click(&shown, Verb::Deny)).starts_with("denial not sent"),
+            "a Deny is named as one"
+        );
+    }
+
+    /// **A queue the window cannot read says why, rather than looking empty**
+    /// — the refused state #1146's review (M1) added, and the unreachable one
+    /// beside it. An answered queue, empty or not, has nothing to say instead
+    /// of its rows; neither has a window still connecting, whose header
+    /// already says so.
+    #[test]
+    fn an_unreadable_queue_has_a_notice_and_a_read_one_does_not() {
+        let refused = Queue::Refused("permission denied".to_owned()).notice();
+        assert_eq!(
+            refused,
+            Some(QueueNotice {
+                title: APPROVALS_REFUSED,
+                detail: "permission denied".to_owned(),
+            })
+        );
+        let unreachable = Queue::Unreachable.notice().expect("a notice");
+        assert_eq!(unreachable.title, APPROVALS_UNREACHABLE);
+        assert_eq!(Queue::Read(Vec::new()).notice(), None);
+        assert_eq!(Queue::Read(vec![request(1, "x")]).notice(), None);
+        assert_eq!(Queue::Unread.notice(), None);
+    }
+
+    /// **Everything beside the two buttons is one line of text** (#1509's
+    /// sanitising, reaching this window). The title and the detail line are
+    /// the plugin's own renderers, which flatten the agent-written text; the
+    /// refusal reason is this window's own addition and is flattened here.
+    /// A run of line breaks would otherwise stack the row tall enough to
+    /// push its buttons away, and a right-to-left override would reverse
+    /// the stamp beside them.
+    ///
+    /// Mutation (verified red): drop the `single_line` around the reason in
+    /// `ApprovalRow::subtitle` and the line-count assertion reds.
+    #[test]
+    fn the_text_beside_the_buttons_is_one_line_each() {
+        let hostile = Approval {
+            kind: ApprovalKind::Unknown("spawn\n\n\nreplica".to_owned()),
+            description: Some("looks fine\n\n\n\napproved by annika\u{202E}21# RP".to_owned()),
+            requested_at: "2026-09-12\n00:00".to_owned(),
+            ..approval(11, "stray", ApprovalStatus::Pending)
+        };
+        let row = ApprovalRow::of(
+            &hostile,
+            Some("busy\n\n\nyour approval was accepted\u{202E}".to_owned()),
+            false,
+        );
+        for text in [&row.title, &row.detail] {
+            assert!(!text.contains('\n'), "{text:?}");
+            assert!(!text.contains('\u{202E}'), "{text:?}");
+        }
+        let subtitle = row.subtitle();
+        assert_eq!(
+            subtitle.lines().count(),
+            2,
+            "the detail line and the reason, one line each: {subtitle:?}"
+        );
+        assert!(!subtitle.contains('\u{202E}'), "{subtitle:?}");
     }
 
     /// **A refused write keeps the row** — the row is [`ApprovalRow`], built

@@ -152,8 +152,14 @@ enum Standing {
 /// and neither is a property of the request. `commit_ref` and `fetched_sha`
 /// would pin it tighter still, but the mirror does not carry them (`wire.rs`'s
 /// rule 2), and the card does not show them.
+///
+/// `pub` (with [`Shown::of`], [`Shown::is`] and [`Shown::kind`]) since the
+/// companion window bound its own Approve/Deny rows to it: the window answers
+/// the same queue over the same socket, and two deciders that disagreed about
+/// what "the same request" means would be two answers to one question. The
+/// fields stay private — a `Shown` is only ever read off a row.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Shown {
+pub struct Shown {
     /// [`Approval::agent`] — the headline.
     agent: String,
     /// [`Approval::kind`] — the "wants:" clause.
@@ -165,7 +171,9 @@ struct Shown {
 }
 
 impl Shown {
-    fn of(approval: &Approval) -> Self {
+    /// Record what a surface rendered from `approval` shows about it.
+    #[must_use]
+    pub fn of(approval: &Approval) -> Self {
         Self {
             agent: approval.agent.clone(),
             kind: approval.kind.clone(),
@@ -175,11 +183,19 @@ impl Shown {
     }
 
     /// Whether `row` is still the request this card showed.
-    fn is(&self, row: &Approval) -> bool {
+    #[must_use]
+    pub fn is(&self, row: &Approval) -> bool {
         self.agent == row.agent
             && self.kind == row.kind
             && self.requested_at == row.requested_at
             && self.description == row.description
+    }
+
+    /// The kind the card showed — what a "not sent" message names the request
+    /// by once the queue it came from can no longer be read.
+    #[must_use]
+    pub fn kind(&self) -> &ApprovalKind {
+        &self.kind
     }
 }
 

@@ -109,6 +109,24 @@ impl FakeHive {
         self
     }
 
+    /// Start refusing `cmd` **from now on** — [`FakeHive::refusing`] for a
+    /// hive that changes its mind mid-test, e.g. one that goes away
+    /// (`agent_status` refused is an unreachable hive to the window).
+    pub fn start_refusing(&self, cmd: &str, reason: &str) {
+        self.refusals
+            .lock()
+            .expect("the refusal table is never poisoned")
+            .insert(cmd.to_owned(), reason.to_owned());
+    }
+
+    /// Answer `cmd` again — the hive came back.
+    pub fn stop_refusing(&self, cmd: &str) {
+        self.refusals
+            .lock()
+            .expect("the refusal table is never poisoned")
+            .remove(cmd);
+    }
+
     /// The socket path a client dials.
     #[must_use]
     pub fn path(&self) -> &Path {

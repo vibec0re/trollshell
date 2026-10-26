@@ -6,7 +6,7 @@
 //! their unit tests moved here byte-for-byte out of
 //! `hytte-services::sensors`. That crate's `sensors` module keeps the
 //! `Service`/`SensorsHandles` wrapper, the 1 Hz tick loop, the sparkline
-//! history accumulators, and the `AsyncFd` mount-table watcher — everything
+//! history accumulators, and the `POLLPRI` mount-table watcher — everything
 //! that needs `futures-signals`' `Mutable` or a tokio runtime — and calls
 //! into this crate's `read_*`/`compute_*` functions for the actual sampling.
 //! A plugin cannot subscribe to `hytte-services` directly, so this is what

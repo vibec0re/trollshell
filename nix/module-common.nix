@@ -35,6 +35,12 @@ let
   # of them registers under exactly that id (nix/manifest-id-cases.txt's
   # first thirteen rows, `inferManifestId` below), so declaring one under its
   # own id renders no HYTTE_PLUGIN_ID override.
+  # A plain decimal number as a string ("52.52", "-0.1", "13"). The nightlight
+  # coordinates are spliced into the wlsunset unit's `sh -c '...'` ExecStart, so
+  # a free-form string would be shell and systemd injection; a float is already
+  # safe, and this keeps the string spelling working.
+  decimalDegreesStr = lib.types.strMatching "[-+]?([0-9]+\\.?[0-9]*|\\.[0-9]+)";
+
   bundledPluginIds = map (lib.removePrefix "hytte-plugin-") (import ./bundled-plugins.nix);
 
   # This flake's own package for bundled id `id`, or null for any other id —
@@ -375,10 +381,10 @@ in
             connection to the agent's gateway, verifies the chain that gateway
             presents against these anchors, and then pins that leaf for that
             host only. Rotation-safe, because what it pins is what the gateway
-            presented *this launch*. That connection happens on the window's
-            main thread before the page mounts, so it is bounded in wall clock
-            (`verify::PROBE_DEADLINE`, 8 s) and the window does not repaint
-            while it runs; moving it off that thread is #1246.
+            presented *this launch*. That connection runs off the window's main thread (#1246), so a slow
+            or unroutable hive costs a "verifying…" state rather than a frozen
+            window, and it is bounded in wall clock
+            (`verify::PROBE_DEADLINE`, 8 s).
           - `gateway.pem` — the file nginx serves verbatim, written leaf-first
             with the CA appended and re-signed weekly. Pinned directly, with no
             probe.
@@ -570,7 +576,7 @@ in
     # doc actually show a NixOS reader.
     nightlight = {
       latitude = lib.mkOption {
-        type = lib.types.nullOr (lib.types.either lib.types.float lib.types.str);
+        type = lib.types.nullOr (lib.types.either lib.types.float decimalDegreesStr);
         default = null;
         example = 52.52;
         description = ''
@@ -580,7 +586,9 @@ in
           to pin night light to a fixed place, or if you do not run GeoClue2.
           Leave both null to follow the live fix instead. With neither a fix nor
           these set, the toggle refuses to start the daemon and logs why. May be
-          given as a float (52.52) or a string ("52.52").
+          given as a float (52.52) or a string ("52.52"); a string must be a plain
+          decimal number (it is spliced into the wlsunset unit's `sh -c`, so
+          anything else is refused at evaluation time).
 
           Home-manager only (#657): the wlsunset unit this parameterises is
           declared by the home-manager module (`nix/hm-module.nix`). Setting it
@@ -591,14 +599,14 @@ in
       };
 
       longitude = lib.mkOption {
-        type = lib.types.nullOr (lib.types.either lib.types.float lib.types.str);
+        type = lib.types.nullOr (lib.types.either lib.types.float decimalDegreesStr);
         default = null;
         example = 13.405;
         description = ''
           Longitude in decimal degrees for wlsunset's geo mode
           (`wlsunset -L <longitude>`). Optional, and only used together with
           `latitude` — a half-configured pair is ignored (see `latitude`). May
-          be a float or a string.
+          be a float or a decimal-number string (see `latitude`).
 
           Home-manager only (#657): see `latitude`'s description — the NixOS
           module has no wlsunset unit for this to reach.
@@ -1965,6 +1973,79 @@ in
   # flake.nix's `nixos-module-nightlight` for the same shape used for a
   # different removed knob.
   config.assertions = [
+    # The three launcher-side validity rules, mirrored at eval time. The shell
+    # (`trollshell/src/plugin_launcher.rs`'s `sanitize`) silently DROPS an
+    # entry that breaks one, logging only to the journal, so a typo'd id or
+    # slot "works" at eval and then does nothing. Each regex is the Rust rule
+    # (whole-string, as `builtins.match` is):
+    #   - plugin id, `hytte_services::systemd::is_valid_plugin_id`: 1..=64
+    #     ASCII alphanumerics plus `-`/`_`;
+    #   - secret slot, `trollshell::secrets::is_valid_slot`: 1..=64, first byte
+    #     a lowercase letter, then lowercase letters, digits, `-`/`_`;
+    #   - env key, `sanitize`'s `spec.env.retain`: non-empty, no `=`.
+    (
+      let
+        bad = lib.filter (id: builtins.match "[A-Za-z0-9_-]{1,64}" id == null) (
+          lib.attrNames config.programs.trollshell.plugins
+        );
+      in
+      {
+        assertion = bad == [ ];
+        message = ''
+          ${lib.concatMapStringsSep "\n" (
+            id: "programs.trollshell.plugins.\"${id}\" has an invalid plugin id."
+          ) bad}
+
+          A plugin id (the attribute name) must be 1 to 64 ASCII letters, digits,
+          `-` or `_`; the launcher ignores any other entry, so it would never start.
+        '';
+      }
+    )
+    (
+      let
+        bad = lib.concatLists (
+          lib.mapAttrsToList (
+            id: plugin:
+            map (slot: "programs.trollshell.plugins.${id}.secrets: \"${slot}\"") (
+              lib.filter (slot: builtins.match "[a-z][a-z0-9_-]{0,63}" slot == null) plugin.secrets
+            )
+          ) config.programs.trollshell.plugins
+        );
+      in
+      {
+        assertion = bad == [ ];
+        message = ''
+          Invalid secret slot(s):
+          ${lib.concatStringsSep "\n" bad}
+
+          A slot must be 1 to 64 characters: a lowercase letter first, then
+          lowercase letters, digits, `-` or `_` (it becomes `<SLOT>_API_KEY`). The
+          launcher drops any other slot, so the plugin would run without its key.
+        '';
+      }
+    )
+    (
+      let
+        bad = lib.concatLists (
+          lib.mapAttrsToList (
+            id: plugin:
+            map (key: "programs.trollshell.plugins.${id}.env.\"${key}\"") (
+              lib.filter (key: key == "" || lib.hasInfix "=" key) (lib.attrNames plugin.env)
+            )
+          ) config.programs.trollshell.plugins
+        );
+      in
+      {
+        assertion = bad == [ ];
+        message = ''
+          Invalid plugin environment variable name(s):
+          ${lib.concatStringsSep "\n" bad}
+
+          An env key must be non-empty and contain no `=`; the launcher drops any
+          other key (it would corrupt the `--setenv=K=V` argument).
+        '';
+      }
+    )
     # `plugins.<id>.package` defaults to the bundled package for a bundled
     # id and to null for any other (#1400). A null one is left out of
     # `plugins.json` by `renderPluginEntries` rather than rendered as an

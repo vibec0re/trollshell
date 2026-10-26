@@ -1172,7 +1172,10 @@ mod tests {
     }
 
     /// `dpt_to_zone`'s answer as (UTC instant, all-day).
-    fn due_in<Tz: TimeZone>(dpt: DatePerhapsTime, tz: &Tz) -> Option<(DateTime<chrono::Utc>, bool)> {
+    fn due_in<Tz: TimeZone>(
+        dpt: DatePerhapsTime,
+        tz: &Tz,
+    ) -> Option<(DateTime<chrono::Utc>, bool)> {
         dpt_to_zone(dpt, tz).map(|(t, all_day)| (t.with_timezone(&chrono::Utc), all_day))
     }
 
@@ -1293,16 +1296,41 @@ mod tests {
         for (tz, kind, at, want) in [
             // A floating 03:00 at Berlin's fold's upper bound: 03:00 CET,
             // not 01:00Z (which reads 02:00).
-            (BERLIN, "floating", "2026-10-25T03:00:00", "2026-10-25T02:00:00+00:00"),
+            (
+                BERLIN,
+                "floating",
+                "2026-10-25T03:00:00",
+                "2026-10-25T02:00:00+00:00",
+            ),
             // The same through a TZID icalendar cannot resolve.
-            (BERLIN, "unknown-tzid", "2026-10-25T03:00:00", "2026-10-25T02:00:00+00:00"),
+            (
+                BERLIN,
+                "unknown-tzid",
+                "2026-10-25T03:00:00",
+                "2026-10-25T02:00:00+00:00",
+            ),
             // Santiago falls back at Saturday 24:00: Sunday 00:00 −04.
-            (SANTIAGO, "floating", "2026-04-05T00:00:00", "2026-04-05T04:00:00+00:00"),
+            (
+                SANTIAGO,
+                "floating",
+                "2026-04-05T00:00:00",
+                "2026-04-05T04:00:00+00:00",
+            ),
             // A date-only due on Havana's doubled midnight: the earlier one.
-            (HAVANA, "date", "2026-11-01T00:00:00", "2026-11-01T04:00:00+00:00"),
+            (
+                HAVANA,
+                "date",
+                "2026-11-01T00:00:00",
+                "2026-11-01T04:00:00+00:00",
+            ),
             // A date-only due the day after Cairo's fall-back at 24:00:
             // Friday 00:00 +02, not 23:00 on Thursday.
-            (CAIRO, "date", "2026-10-30T00:00:00", "2026-10-29T22:00:00+00:00"),
+            (
+                CAIRO,
+                "date",
+                "2026-10-30T00:00:00",
+                "2026-10-29T22:00:00+00:00",
+            ),
         ] {
             let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
                 .args([

@@ -2261,14 +2261,8 @@ fn offset_before_gap<Tz: chrono::TimeZone>(
         match tz.offset_from_local_datetime(&probe) {
             MappedLocalTime::Single(offset) => Some(offset),
             MappedLocalTime::Ambiguous(a, b) => match (reads_back(&a), reads_back(&b)) {
-                (true, true) => Some(
-                    if a.fix().local_minus_utc() <= b.fix().local_minus_utc() {
-                        a
-                    } else {
-                        b
-                    },
-                ),
-                (true, false) => Some(a),
+                (true, true) if b.fix().local_minus_utc() < a.fix().local_minus_utc() => Some(b),
+                (true, _) => Some(a),
                 (false, true) => Some(b),
                 (false, false) => None,
             },
@@ -3518,21 +3512,56 @@ mod tests {
         const CAIRO: &str = "EET-2EEST,M4.5.5/0,M10.5.4/24";
         for (tz, naive, want, kind) in [
             // The issue's case: 03:00 CET, not 01:00Z (which reads 02:00).
-            (BERLIN, "2026-10-25T03:00:00", "2026-10-25T02:00:00+00:00", "once"),
+            (
+                BERLIN,
+                "2026-10-25T03:00:00",
+                "2026-10-25T02:00:00+00:00",
+                "once",
+            ),
             // Inside the fold: the first occurrence, 02:30 CEST.
-            (BERLIN, "2026-10-25T02:30:00", "2026-10-25T00:30:00+00:00", "once"),
+            (
+                BERLIN,
+                "2026-10-25T02:30:00",
+                "2026-10-25T00:30:00+00:00",
+                "once",
+            ),
             // In the spring gap: the offset before it, i.e. 03:30 CEST.
-            (BERLIN, "2026-03-29T02:30:00", "2026-03-29T01:30:00+00:00", "gap"),
+            (
+                BERLIN,
+                "2026-03-29T02:30:00",
+                "2026-03-29T01:30:00+00:00",
+                "gap",
+            ),
             // The US falls back at 02:00: 02:00 EST, not 06:00Z (01:00 EST).
-            (NEW_YORK, "2026-11-01T02:00:00", "2026-11-01T07:00:00+00:00", "once"),
+            (
+                NEW_YORK,
+                "2026-11-01T02:00:00",
+                "2026-11-01T07:00:00+00:00",
+                "once",
+            ),
             // Santiago falls back at Saturday 24:00 −03: Sunday 00:00 −04,
             // not 03:00Z (23:00 on Saturday).
-            (SANTIAGO, "2026-04-05T00:00:00", "2026-04-05T04:00:00+00:00", "once"),
+            (
+                SANTIAGO,
+                "2026-04-05T00:00:00",
+                "2026-04-05T04:00:00+00:00",
+                "once",
+            ),
             // Its September gap at 00:00, which this `Local` answers `None`.
-            (SANTIAGO, "2026-09-06T00:30:00", "2026-09-06T04:30:00+00:00", "gap"),
+            (
+                SANTIAGO,
+                "2026-09-06T00:30:00",
+                "2026-09-06T04:30:00+00:00",
+                "gap",
+            ),
             // Cairo falls back at Thursday 24:00 +03: Friday 00:00 +02, not
             // 21:00Z (23:00 on Thursday).
-            (CAIRO, "2026-10-30T00:00:00", "2026-10-29T22:00:00+00:00", "once"),
+            (
+                CAIRO,
+                "2026-10-30T00:00:00",
+                "2026-10-29T22:00:00+00:00",
+                "once",
+            ),
         ] {
             let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
                 .args([

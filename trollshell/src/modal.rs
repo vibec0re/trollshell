@@ -369,7 +369,9 @@ impl Page {
     /// Every drawer page. The single source for reverse lookups
     /// ([`Page::from_stack_name`]); the string mapping still lives only in
     /// [`Page::stack_name`], so a page's token is defined in exactly one place.
-    const ALL: [Self; 21] = [
+    /// `pub(crate)` so a per-page rule elsewhere (`overlays::osd`'s) can be
+    /// tested against every page, not a hand-picked few.
+    pub(crate) const ALL: [Self; 21] = [
         Self::Media,
         Self::Network,
         Self::Vpn,
@@ -502,6 +504,8 @@ struct ModalPanel {
     card: gtk::Overlay,
     /// What the drawer is currently showing (a built-in [`Page`] or a plugin
     /// panel), or `None` when closed (#349 PR2 widened this from `Option<Page>`).
+    /// Outside tests, written only through [`set_current`], which also
+    /// publishes its built-in half to [`ModalPanel::shown_page`].
     current: RefCell<Option<Active>>,
     /// The `.ts-modal` positioner box overlaid on the fullscreen window. It
     /// carries the chrome padding and is aligned to the bar's perp+trailing
@@ -517,11 +521,14 @@ struct ModalPanel {
     /// points (`open_by_key` / `open_plugin_by_key`), which anchor the card
     /// flush with the bar's trailing edge. See [`TriggerAnchor`].
     anchor: RefCell<Option<TriggerAnchor>>,
-    /// Emits `true` while the drawer is open (between `show_panel` and the
-    /// retract animation finishing). Consumers (e.g. `overlays::osd`)
-    /// subscribe through [`drawer_open_signal`]. The bar/drawer seam itself is
-    /// painted by the drawer's cairo silhouette, not by CSS.
-    open_state: Mutable<bool>,
+    /// The built-in [`Page`] the drawer is showing — `current`'s
+    /// [`Active::builtin`], from `show_panel` until the retract animation
+    /// finishes — and `None` while it is closed or showing a plugin's page or
+    /// the Workspaces Edit sub-page. Consumers (e.g. `overlays::osd`, which
+    /// stays quiet only for the control the drawer itself shows) subscribe
+    /// through [`drawer_page_signal`]. The bar/drawer seam itself is painted by
+    /// the drawer's cairo silhouette, not by CSS.
+    shown_page: Mutable<Option<Page>>,
 }
 
 /// What the open drawer's card is centered on: the bar chip that opened it,
@@ -584,10 +591,12 @@ thread_local! {
     /// a `BorrowMutError` unwinding through a glib callback aborts the process.
     /// Mirrors `overlays::osd`'s `OSDS`.
     static PANELS: RefCell<HashMap<String, Rc<ModalPanel>>> = RefCell::new(HashMap::new());
-    /// Per-connector drawer-open state, decoupled from `ModalPanel` lifetime
-    /// so subscribers (OSD, bar CSS) can wire up before `install` runs and
-    /// survive bar rebuilds on hot-plug.
-    static DRAWER_OPEN: RefCell<HashMap<String, Mutable<bool>>> = RefCell::new(HashMap::new());
+    /// Per-connector "which built-in page is the drawer showing" state
+    /// ([`ModalPanel::shown_page`]), decoupled from `ModalPanel` lifetime so
+    /// subscribers (the OSD) can wire up before `install` runs and survive bar
+    /// rebuilds on hot-plug.
+    static DRAWER_PAGE: RefCell<HashMap<String, Mutable<Option<Page>>>> =
+        RefCell::new(HashMap::new());
     /// One [`GateId`] gate per poller-parking consumer, `true` while some
     /// monitor's drawer is currently showing a page matching that gate's
     /// [`GateId::matches`] predicate. Global (not per-monitor) because each
@@ -678,13 +687,28 @@ pub fn media_visible_signal() -> impl Signal<Item = bool> + 'static {
     GATES.with(|gates| gates.mutable(GateId::Media)).signal()
 }
 
-fn drawer_open_state(key: &str) -> Mutable<bool> {
-    DRAWER_OPEN.with(|map| {
+fn drawer_page_state(key: &str) -> Mutable<Option<Page>> {
+    DRAWER_PAGE.with(|map| {
         map.borrow_mut()
             .entry(key.to_string())
-            .or_insert_with(|| Mutable::new(false))
+            .or_insert_with(|| Mutable::new(None))
             .clone()
     })
+}
+
+/// Record what `panel` shows now — `None` once it has closed — and publish its
+/// built-in half to [`ModalPanel::shown_page`]. Every production write of
+/// [`ModalPanel::current`] goes through here, so the page the OSD reads cannot
+/// fall behind a swap the drawer made in place.
+///
+/// The `current` borrow ends with its own statement, before `set_neq` wakes
+/// any subscriber (#643's rule: nothing that can notify runs under a live
+/// borrow). `set_neq`, so a swap between two non-built-in targets — or a
+/// re-show of the same page — is no tick at all.
+fn set_current(panel: &ModalPanel, active: Option<Active>) {
+    let page = active.as_ref().and_then(Active::builtin);
+    *panel.current.borrow_mut() = active;
+    panel.shown_page.set_neq(page);
 }
 
 /// Every mounted drawer, as owned handles with the [`PANELS`] borrow already
@@ -792,7 +816,7 @@ pub fn install(monitor: &Monitor, bar: &BarHandle, edge: Edge, offset: i32) {
                 positioner,
                 geometry,
                 anchor: RefCell::new(None),
-                open_state: drawer_open_state(&key),
+                shown_page: drawer_page_state(&key),
             }),
         )
     }));
@@ -1185,21 +1209,20 @@ fn wire_retract_finish(revealer: &gtk::Revealer, key: String) {
         // (this key is already gone). Benign: `close_all`'s own tail performs
         // everything the `Some` arm below would have — `set_visible(false)`
         // on a window that's being dropped anyway, `*current = None`,
-        // `open_state.set(false)`, and (unconditionally)
+        // `shown_page` back to `None`, and (unconditionally)
         // `set_active_panel(None)` — so doing nothing here just skips
         // redundant work, not a missed teardown.
         //
         // The lookup is a `.cloned()` handle rather than a `Ref` held over the
-        // body (#643): `set_visible(false)` is a GTK call, and `open_state
-        // .set(false)` wakes every drawer-open subscriber — `futures-signals`
+        // body (#643): `set_visible(false)` is a GTK call, and clearing
+        // `shown_page` wakes every drawer-page subscriber — `futures-signals`
         // calls `Waker::wake()` synchronously from `notify`. Both are paths a
         // re-entrant `PANELS` borrow could arrive on.
         let panel = PANELS.with(|panels| panels.borrow().get(&key).map(Rc::clone));
         let closed_plugin_panel = panel.is_some_and(|panel| {
             panel.window.set_visible(false);
             let was_plugin = matches!(&*panel.current.borrow(), Some(Active::Plugin(_)));
-            *panel.current.borrow_mut() = None;
-            panel.open_state.set(false);
+            set_current(&panel, None);
             was_plugin
         });
         // Clear the plugin-panel selection only when *this* drawer was the one
@@ -1241,7 +1264,7 @@ pub fn close_all() {
     for panel in panels {
         panel.window.destroy();
     }
-    reset_drawer_open_states();
+    reset_drawer_page_states();
     // A monitor teardown that held the open plugin panel must clear the
     // selection too, so the v1 "hot-unplug just closes the plugin page with the
     // drawer" default holds (#349 PR2).
@@ -1259,24 +1282,24 @@ pub fn close_all() {
     recompute_gates();
 }
 
-/// The [`DRAWER_OPEN`] half of [`close_all`]: every drawer window is gone, so
-/// clear each state to `false`, then drop the entries that can never be reused.
+/// The [`DRAWER_PAGE`] half of [`close_all`]: every drawer window is gone, so
+/// clear each state to `None`, then drop the entries that can never be reused.
 ///
 /// **Clear (#618).** `close_all` closes the windows but used to leave the
 /// `Mutable`s alone, so a monitor whose drawer was open when a hot-plug /
-/// kanshi profile switch fired kept reading `true` with no drawer attached.
+/// kanshi profile switch fired kept reading "open" with no drawer attached.
 /// That silently poisoned every subscriber for the rest of the session:
-/// `overlays::osd` treats `drawer_open` as "the drawer already shows this
-/// control, the OSD would be redundant" and suppressed volume/mic/brightness
-/// feedback on that output. The overlay rebuild didn't rescue it:
-/// a fresh `OsdView` starts at `false`, but subscribing to a `Mutable` delivers
-/// its current value immediately, so the new view was handed the stale `true`
+/// `overlays::osd` reads the state as "the drawer already shows this control,
+/// the OSD would be redundant" and suppressed volume/mic/brightness feedback
+/// on that output. The overlay rebuild didn't rescue it:
+/// a fresh `OsdView` starts at `None`, but subscribing to a `Mutable` delivers
+/// its current value immediately, so the new view was handed the stale page
 /// right back. Written with `set_neq` so the monitors that were already closed
 /// — every one of them, in the common case — don't emit a redundant tick.
 ///
-/// **Prune.** `DRAWER_OPEN` is keyed per-monitor and deliberately survives a
+/// **Prune.** `DRAWER_PAGE` is keyed per-monitor and deliberately survives a
 /// rebuild for connector-named monitors (so a subscriber wired up before the
-/// rebuild — OSD, bar CSS — keeps working after it). But a connector-less
+/// rebuild — the OSD — keeps working after it). But a connector-less
 /// monitor's fallback key is the now-defunct `GdkMonitor` pointer: the next
 /// rebuild mints a *different* pointer, so that entry can never be looked up
 /// again. Left un-pruned it's a pure leak — one stale `Mutable` per hot-plug
@@ -1285,7 +1308,7 @@ pub fn close_all() {
 /// Clear runs *before* the prune, and that ordering is load-bearing. #618
 /// proposed the reverse — prune, then clear the survivors, to save a wake on
 /// entries about to be dropped — but in `futures-signals` 0.3.34 that strands
-/// subscribers on the stale `true` permanently:
+/// subscribers on the stale page permanently:
 ///
 /// * A signal's `MutableSignalState` holds a strong `Arc` to the shared state,
 ///   but is **not** counted in `senders` — only live `Mutable` handles are.
@@ -1294,13 +1317,13 @@ pub fn close_all() {
 ///   `if is_changed() { … } else if senders == 0 { Poll::Ready(None) }` — a
 ///   permanent end-of-stream.
 /// * `close_all`'s `PANELS` drain has already dropped every
-///   `ModalPanel::open_state` before this runs, so pruning an entry straight
+///   `ModalPanel::shown_page` before this runs, so pruning an entry straight
 ///   off the map — #618's rejected ordering, and the shape this function had
 ///   before #631 — would drop that key's *only remaining* sender while its
-///   value was still `true`, unrecoverably: a `set_neq` loop afterwards can no
+///   value was still `Some`, unrecoverably: a `set_neq` loop afterwards can no
 ///   longer reach an entry already out of the map, and its wakers are gone
 ///   regardless. Clearing first latches `changed` before the senders reach
-///   zero, so the last poll delivers `false` and *then* the stream ends.
+///   zero, so the last poll delivers `None` and *then* the stream ends.
 ///   That's still why clear has to run before prune.
 ///
 /// **#631 changed *where* the last-sender drop happens, not whether clear
@@ -1311,27 +1334,27 @@ pub fn close_all() {
 /// survivor: `retain` dropping a pruned key's map-entry is now an ordinary
 /// decrement, and the real last-sender drop happens only when `states` itself
 /// goes out of scope at the end of the function — after both the reset and
-/// the prune, with no `DRAWER_OPEN` borrow held at all. That's strictly safer
+/// the prune, with no `DRAWER_PAGE` borrow held at all. That's strictly safer
 /// than the pre-#631 shape, whose last-sender drop happened *at* the `retain`
 /// call, inside the active `borrow_mut()`.
 ///
 /// The fallback keys this prunes can have a live subscriber (any
-/// `drawer_open_signal` consumer on an unnamed monitor), so the clear is not
+/// `drawer_page_signal` consumer on an unnamed monitor), so the clear is not
 /// hypothetical either.
-fn reset_drawer_open_states() {
+fn reset_drawer_page_states() {
     // Collect the handles before calling `set_neq` on any of them (#631):
-    // `set_neq` notifies via `Waker::wake()`, and holding `DRAWER_OPEN`
+    // `set_neq` notifies via `Waker::wake()`, and holding `DRAWER_PAGE`
     // borrowed across that call is a latent reentrancy hazard if a woken
     // subscriber ever runs synchronously and turns around to call
-    // `drawer_open_state`/`drawer_open_signal` — both of which also borrow
-    // `DRAWER_OPEN`. `Mutable` is a cheap cloneable handle, so this is just
+    // `drawer_page_state`/`drawer_page_signal` — both of which also borrow
+    // `DRAWER_PAGE`. `Mutable` is a cheap cloneable handle, so this is just
     // moving where the clone happens, not adding real cost.
-    let states: Vec<Mutable<bool>> =
-        DRAWER_OPEN.with(|map| map.borrow().values().cloned().collect());
+    let states: Vec<Mutable<Option<Page>>> =
+        DRAWER_PAGE.with(|map| map.borrow().values().cloned().collect());
     for state in &states {
-        state.set_neq(false);
+        state.set_neq(None);
     }
-    DRAWER_OPEN.with(|map| map.borrow_mut().retain(|key, _| !is_fallback_key(key)));
+    DRAWER_PAGE.with(|map| map.borrow_mut().retain(|key, _| !is_fallback_key(key)));
 }
 
 /// Swap every currently-open panel's visible page to `target`. Drawer pages
@@ -1382,7 +1405,7 @@ pub fn switch_active(target: Page) {
     for panel in live_panels() {
         if panel.current.borrow().is_some() {
             set_stack_page(&panel, target);
-            *panel.current.borrow_mut() = Some(Active::Builtin(target));
+            set_current(&panel, Some(Active::Builtin(target)));
             on_page_show(&panel, target);
             switched = true;
         }
@@ -1432,7 +1455,7 @@ pub fn switch_to_workspace_edit(key: &str) {
             // order: the cap resizes the stack child, which has to exist and be
             // the visible one first.
             on_active_show(&panel, &active);
-            *panel.current.borrow_mut() = Some(active);
+            set_current(&panel, Some(active));
         }
     }
     recompute_gates();
@@ -1473,8 +1496,8 @@ pub fn open(monitor: &Monitor, page: Page) {
 /// main margin = 0). No-op if no drawer is mounted for `key`.
 fn open_by_key(key: &str, page: Page) {
     // Resolve to an owned handle first (#643): `show_panel` presents the
-    // surface and reveals the card — a long run of GTK calls, plus an
-    // `open_state.set(true)` that wakes subscribers synchronously — none of
+    // surface and reveals the card — a long run of GTK calls, plus a
+    // `shown_page` publish that wakes subscribers synchronously — none of
     // which may run under a live `PANELS` borrow.
     if let Some(panel) = live_panel(key) {
         *panel.anchor.borrow_mut() = None;
@@ -1740,7 +1763,7 @@ fn toggle_panel(panel: &ModalPanel, active: Active, trigger: &gtk::Widget, retra
         }
         Some(_) => {
             set_stack_active(panel, &active);
-            *panel.current.borrow_mut() = Some(active.clone());
+            set_current(panel, Some(active.clone()));
             on_active_show(panel, &active);
         }
         None => {
@@ -1776,8 +1799,7 @@ fn show_panel(panel: &ModalPanel, page: Page) {
 fn show_panel_active(panel: &ModalPanel, active: Active) {
     set_stack_active(panel, &active);
     on_active_show(panel, &active);
-    *panel.current.borrow_mut() = Some(active);
-    panel.open_state.set(true);
+    set_current(panel, Some(active));
 
     reposition_card(panel);
 
@@ -2155,14 +2177,16 @@ fn clamp_card_height(monitor_height: i32, bar_reserved: i32, chrome: i32) -> i32
         .max(MIN_CARD_HEIGHT)
 }
 
-/// Signal that emits `true` while the drawer on `monitor` is open (the
-/// retract animation hasn't completed yet), and `false` when it's closed.
-/// Backed by `DRAWER_OPEN` so callers can subscribe before `install` has
-/// run for this monitor — needed because the OSD and bar both wire up
-/// during synchronous boot, while modal panels are built later inside the
-/// `monitors_changed` task.
-pub fn drawer_open_signal(monitor: &Monitor) -> impl Signal<Item = bool> + 'static {
-    drawer_open_state(&monitor_key(monitor)).signal()
+/// Signal of the built-in [`Page`] the drawer on `monitor` is showing: `Some`
+/// from the moment it opens (or swaps in place to that page) until its retract
+/// animation completes, `None` while it is closed — and also while it shows a
+/// plugin's own page or the Workspaces Edit sub-page, which are no built-in
+/// page. Backed by `DRAWER_PAGE` so callers can subscribe before `install` has
+/// run for this monitor — needed because the OSD wires up during synchronous
+/// boot, while modal panels are built later inside the `monitors_changed`
+/// task.
+pub fn drawer_page_signal(monitor: &Monitor) -> impl Signal<Item = Option<Page>> + 'static {
+    drawer_page_state(&monitor_key(monitor)).signal()
 }
 
 /// Per-page side-effects that should run whenever a page becomes visible
@@ -2369,9 +2393,9 @@ fn apply_workspace_edit_width_cap(panel: &ModalPanel) {
 #[cfg(test)]
 mod tests {
     use super::{
-        CARD_CHROME_VERTICAL, DRAWER_OPEN, EAGER_PAGES, MIN_CARD_HEIGHT, Page, Signal,
-        clamp_card_height, clamp_main_margin, close_all, drawer_open_state,
-        reset_drawer_open_states,
+        CARD_CHROME_VERTICAL, DRAWER_PAGE, EAGER_PAGES, MIN_CARD_HEIGHT, Page, Signal,
+        clamp_card_height, clamp_main_margin, close_all, drawer_page_state,
+        reset_drawer_page_states,
     };
     use std::collections::HashSet;
     use std::sync::Arc;
@@ -2901,36 +2925,37 @@ mod tests {
     }
 
     /// #618: after a hot-plug teardown no drawer window exists, so every
-    /// surviving `DRAWER_OPEN` state must read `false`. Leaving a connector's
-    /// entry latched at `true` made `overlays::osd` suppress the volume / mic /
+    /// surviving `DRAWER_PAGE` state must read `None`. Leaving a connector's
+    /// entry latched on a page made `overlays::osd` suppress the volume / mic /
     /// brightness OSD on that output for the rest of the session (it reads the
     /// state as "the drawer already shows this control").
     ///
-    /// Drives [`reset_drawer_open_states`] rather than [`close_all`]: the rest
+    /// Drives [`reset_drawer_page_states`] rather than [`close_all`]: the rest
     /// of `close_all` closes GTK windows and reaches into the plugin service
     /// registry (`plugins::set_active_panel` panics if `plugins::service()`
     /// isn't registered), neither of which exists without a display + a booted
-    /// `App`. This is the whole `DRAWER_OPEN` half of it, unchanged.
+    /// `App`. This is the whole `DRAWER_PAGE` half of it, unchanged.
     #[test]
-    fn reset_clears_surviving_drawer_open_states() {
-        let open = drawer_open_state("DP-1");
-        let already_closed = drawer_open_state("HDMI-A-1");
+    fn reset_clears_surviving_drawer_page_states() {
+        let open = drawer_page_state("DP-1");
+        let already_closed = drawer_page_state("HDMI-A-1");
         // A connector-less monitor: keyed by GdkMonitor pointer, so its entry
         // gets pruned — but a subscriber still holds this handle.
-        let headless = drawer_open_state("monitor:0x1234");
-        open.set(true);
-        headless.set(true);
+        let headless = drawer_page_state("monitor:0x1234");
+        open.set(Some(Page::Audio));
+        headless.set(Some(Page::Power));
 
-        reset_drawer_open_states();
+        reset_drawer_page_states();
 
-        assert!(!open.get(), "connector state stayed latched at true");
-        assert!(!already_closed.get());
-        assert!(
-            !headless.get(),
-            "a pruned entry's live handle stayed latched at true"
+        assert_eq!(open.get(), None, "connector state stayed latched on a page");
+        assert_eq!(already_closed.get(), None);
+        assert_eq!(
+            headless.get(),
+            None,
+            "a pruned entry's live handle stayed latched on a page"
         );
 
-        DRAWER_OPEN.with(|map| {
+        DRAWER_PAGE.with(|map| {
             let map = map.borrow();
             // Connector keys survive the rebuild (subscribers wired up before
             // it must keep working); the unreusable fallback key is pruned.
@@ -2940,14 +2965,14 @@ mod tests {
         });
 
         // The crux of the OSD chain: a fresh subscriber re-minting this key
-        // after the rebuild is handed `false`, not the stale `true`. (A
+        // after the rebuild is handed `None`, not the stale page. (A
         // `Mutable`'s signal re-delivers its current value on subscribe, which
         // is why rebuilding the overlay alone never fixed this.)
-        assert!(!drawer_open_state("DP-1").get());
+        assert_eq!(drawer_page_state("DP-1").get(), None);
     }
 
     /// Companion to the above, pinning [`close_all`] *itself* rather than the
-    /// helper: deleting the `reset_drawer_open_states()` call from `close_all`
+    /// helper: deleting the `reset_drawer_page_states()` call from `close_all`
     /// would leave the helper-level test green, since the helper would still be
     /// correct in isolation. This is the test that actually fails if the fix is
     /// unwired.
@@ -2955,7 +2980,7 @@ mod tests {
     /// `close_all` can't run to completion off a booted `App` — it reaches
     /// `plugins::set_active_panel`, which `.expect()`s the plugin service out of
     /// the thread-local registry. That's an ordinary unwinding panic (no profile
-    /// sets `panic = "abort"`) raised *after* the `DRAWER_OPEN` reset, and
+    /// sets `panic = "abort"`) raised *after* the `DRAWER_PAGE` reset, and
     /// `PANELS` is empty on a test thread so the drain above it touches no GTK.
     /// Catching it is therefore enough to observe the reset. The caught panic's
     /// message shows up in this test's captured output — that's expected, not a
@@ -2967,25 +2992,26 @@ mod tests {
     /// holds; if the reset is ever reordered *after* the panicking call, this
     /// fails loudly, which is the point.
     #[test]
-    fn close_all_resets_drawer_open_state() {
+    fn close_all_resets_drawer_page_state() {
         // A key of its own, so this can't interact with the helper-level test
         // above when libtest runs both on one thread (`--test-threads=1`), where
-        // the `DRAWER_OPEN` thread-local is shared.
-        let open = drawer_open_state("DP-9");
-        open.set(true);
+        // the `DRAWER_PAGE` thread-local is shared.
+        let open = drawer_page_state("DP-9");
+        open.set(Some(Page::Audio));
 
         let _ = std::panic::catch_unwind(close_all);
 
-        assert!(
-            !open.get(),
-            "close_all left the drawer-open state latched — is it still calling \
-             reset_drawer_open_states()?"
+        assert_eq!(
+            open.get(),
+            None,
+            "close_all left the drawer-page state latched — is it still calling \
+             reset_drawer_page_states()?"
         );
     }
 
-    /// A `Waker` whose `wake` re-enters `DRAWER_OPEN` exactly the way a real
-    /// subscriber (OSD, bar CSS) would if woken synchronously: it calls
-    /// [`drawer_open_state`], which needs its own `borrow_mut()` of the same
+    /// A `Waker` whose `wake` re-enters `DRAWER_PAGE` exactly the way a real
+    /// subscriber (the OSD) would if woken synchronously: it calls
+    /// [`drawer_page_state`], which needs its own `borrow_mut()` of the same
     /// thread-local `RefCell`. Built via `std::task::Wake` rather than a raw
     /// `RawWaker`/`RawWakerVTable` — the workspace forbids `unsafe_code`
     /// project-wide, and `Wake` is the safe, stable way to get a `Waker` from
@@ -2994,10 +3020,10 @@ mod tests {
 
     impl Wake for ReentrantWaker {
         fn wake(self: Arc<Self>) {
-            // The key doesn't matter — any key hits the same `DRAWER_OPEN`
+            // The key doesn't matter — any key hits the same `DRAWER_PAGE`
             // `RefCell`. What matters is that this runs synchronously, from
             // inside whatever called `Waker::wake`.
-            let _ = drawer_open_state("reentrant-probe");
+            let _ = drawer_page_state("reentrant-probe");
         }
     }
 
@@ -3011,26 +3037,26 @@ mod tests {
     ///
     /// This is also the one regression in the sweep that would be silent:
     /// every other test in this module would keep passing while this
-    /// function quietly went back to holding `DRAWER_OPEN` borrowed across
+    /// function quietly went back to holding `DRAWER_PAGE` borrowed across
     /// `set_neq`, reopening the reentrancy hazard (and, transitively,
     /// weakening the #618 guarantee the surrounding doc comment argues for).
     ///
     /// Mechanics: register `ReentrantWaker` on a fresh signal for one key,
-    /// set that key's value so `reset_drawer_open_states`'s own `set_neq`
+    /// set that key's value so `reset_drawer_page_states`'s own `set_neq`
     /// call is a real change (a no-op `set_neq` never notifies, so this
     /// wouldn't trigger anything), then run the function under
     /// `catch_unwind`. Pre-#631, the outer `borrow_mut()` was still held
     /// when `set_neq` woke `ReentrantWaker` synchronously, and its nested
-    /// `drawer_open_state` call hit `BorrowMutError`. Post-#631, `set_neq`
-    /// runs with no `DRAWER_OPEN` borrow active at all, so the wake's
+    /// `drawer_page_state` call hit `BorrowMutError`. Post-#631, `set_neq`
+    /// runs with no `DRAWER_PAGE` borrow active at all, so the wake's
     /// re-borrow succeeds.
     ///
-    /// Falsified by temporarily reverting `reset_drawer_open_states` to the
+    /// Falsified by temporarily reverting `reset_drawer_page_states` to the
     /// pre-#631 shape and rerunning: this doesn't just fail the one
     /// `assert!` — `Mutable`'s internal state uses a `std::sync::Mutex`
     /// alongside the borrow, so the `BorrowMutError` panic unwinds through it
     /// mid-notify and poisons it. `catch_unwind` still catches that first
-    /// panic, but the poisoned `Mutable` is still sitting in `DRAWER_OPEN`
+    /// panic, but the poisoned `Mutable` is still sitting in `DRAWER_PAGE`
     /// afterwards, and when the worker thread later tears down its
     /// thread-locals, dropping it re-panics on the poison — from inside a
     /// destructor, where an escaping panic is fatal. The whole test binary
@@ -3039,9 +3065,9 @@ mod tests {
     /// this sweep guards against by a different route: an inner panic
     /// escaping through a context that cannot unwind.
     #[test]
-    fn reset_drawer_open_states_does_not_reenter_the_borrow() {
-        let state = drawer_open_state("reentrant-trigger");
-        state.set(true);
+    fn reset_drawer_page_states_does_not_reenter_the_borrow() {
+        let state = drawer_page_state("reentrant-trigger");
+        state.set(Some(Page::Audio));
 
         let waker = Waker::from(Arc::new(ReentrantWaker));
         let mut cx = Context::from_waker(&waker);
@@ -3049,7 +3075,7 @@ mod tests {
         // The first poll of a fresh signal always delivers the current value
         // regardless of `changed`, so it takes a second poll (which sees no
         // further change) to actually register the waker for the *next*
-        // notify — the one `reset_drawer_open_states`'s `set_neq` will fire.
+        // notify — the one `reset_drawer_page_states`'s `set_neq` will fire.
         loop {
             match sig.as_mut().poll_change(&mut cx) {
                 Poll::Ready(Some(_)) => {}
@@ -3058,12 +3084,12 @@ mod tests {
             }
         }
 
-        let result = std::panic::catch_unwind(reset_drawer_open_states);
+        let result = std::panic::catch_unwind(reset_drawer_page_states);
 
         assert!(
             result.is_ok(),
-            "reset_drawer_open_states panicked — a synchronously-woken subscriber \
-             re-borrowed DRAWER_OPEN while reset_drawer_open_states was still \
+            "reset_drawer_page_states panicked — a synchronously-woken subscriber \
+             re-borrowed DRAWER_PAGE while reset_drawer_page_states was still \
              holding it"
         );
     }
@@ -3078,7 +3104,7 @@ mod tests {
 /// `BarHandle` test for why: the field is private outside that crate, so
 /// only `Bar::new(...).show()` could mint one here, and that needs a whole
 /// bar built). A hand-built `ModalPanel` stands in instead: every field
-/// these tests' code paths touch (`stack`, `current`, `open_state`) is real;
+/// these tests' code paths touch (`stack`, `current`, `shown_page`) is real;
 /// `geometry`/`window`/`positioner`/`card`/`revealer` are wired to plain,
 /// un-parented placeholders that the `Page::Workspaces` arms under test
 /// never dereference past what they already tolerate pre-first-map
@@ -3095,7 +3121,7 @@ mod tests {
 #[cfg(all(test, feature = "system-tests"))]
 mod gtk_tests {
     use super::{
-        Active, BarGeometry, ModalPanel, PANELS, Page, drawer_open_state, monitor_key,
+        Active, BarGeometry, ModalPanel, PANELS, Page, drawer_page_state, monitor_key,
         on_page_show, recompute_gates, toggle, toggle_plugin_under,
     };
     use crate::components::layout::{EDIT_FORM_WIDTH, set_page_width, workspaces_page_width};
@@ -3147,7 +3173,7 @@ mod gtk_tests {
                 bar_window: gtk::Window::new(),
             },
             anchor: RefCell::new(None),
-            open_state: drawer_open_state(&key),
+            shown_page: drawer_page_state(&key),
         })
     }
 
@@ -3390,7 +3416,7 @@ mod gtk_tests {
             .expect("the stand-in clamp is still the visible child");
         assert_eq!(clamp.width_request(), scale(workspaces_page_width(3)));
 
-        // `PANELS`/`GATES`/`DRAWER_OPEN` are process-wide thread-locals
+        // `PANELS`/`GATES`/`DRAWER_PAGE` are process-wide thread-locals
         // shared by every `#[gtk::test]` in this binary (they all run on one
         // thread) — leaving this key behind would leak into whichever test
         // runs next.
@@ -4100,5 +4126,73 @@ mod gtk_tests {
             opened.revealer.set_reveal_child(false);
         }
         elsewhere.destroy();
+    }
+
+    // ── The page the OSD reads ───────────────────────────────────────────────
+
+    /// The state behind [`super::drawer_page_signal`] follows the page the
+    /// drawer shows through every transition that changes it — the open, an
+    /// in-place swap to a plugin's page and back, and the retract — so
+    /// `overlays::osd` reads the control that is actually on screen and stays
+    /// quiet only under that control's own page. Before this the drawer
+    /// published one `bool`, `true` for every page alike.
+    ///
+    /// The retract is a real one: `wire_retract_finish` is wired to the
+    /// harness revealer, which is unparented and so never mapped, and an
+    /// unmapped revealer completes `set_reveal_child(false)` — emitting
+    /// `child-revealed` — inside the call.
+    ///
+    /// **Falsification:** write `current` directly in `toggle_panel`'s swap arm
+    /// (the pre-fix `*panel.current.borrow_mut() = Some(active.clone())`) → the
+    /// swap assertions red; the same in `wire_retract_finish` → the closing
+    /// assertion reds.
+    #[gtk::test]
+    fn the_drawer_publishes_the_builtin_page_it_shows() {
+        use super::{toggle_builtin_under, wire_retract_finish};
+
+        const KEY: &str = "test-osd-page";
+        if !crate::plugins::host_is_live() {
+            crate::plugins::install_test_handles();
+        }
+        let (panel, chip) = builtin_drawer(&test_monitor(), KEY);
+        let _mounted = Mounted {
+            keys: &[KEY],
+            panels: vec![panel.clone()],
+        };
+        wire_retract_finish(&panel.revealer, KEY.to_owned());
+        // Every harness panel shares the test monitor's state, and the other
+        // tests here finish their retracts by hand, so it starts wherever the
+        // last one left it.
+        panel.shown_page.set(None);
+
+        assert!(toggle_builtin_under(chip.upcast_ref(), Page::Audio));
+        assert_eq!(panel.shown_page.get(), Some(Page::Audio), "the open");
+
+        assert!(toggle_plugin_under(chip.upcast_ref(), "osd-page"));
+        assert_eq!(
+            *panel.current.borrow(),
+            Some(Active::Plugin("osd-page".to_owned())),
+            "premise: an in-place swap, not a close",
+        );
+        assert_eq!(
+            panel.shown_page.get(),
+            None,
+            "a plugin's page is no built-in page — the Audio sliders are gone",
+        );
+
+        assert!(toggle_builtin_under(chip.upcast_ref(), Page::Audio));
+        assert_eq!(
+            panel.shown_page.get(),
+            Some(Page::Audio),
+            "the swap back to a built-in page"
+        );
+
+        assert!(toggle_builtin_under(chip.upcast_ref(), Page::Audio));
+        assert_eq!(
+            *panel.current.borrow(),
+            None,
+            "premise: the retract finished"
+        );
+        assert_eq!(panel.shown_page.get(), None, "the close");
     }
 }

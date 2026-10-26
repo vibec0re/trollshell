@@ -335,12 +335,30 @@ pub enum LoadFailure {
 /// agreed to show. (`decide` already cancels such a navigation before it
 /// can fail; this does not rely on that.)
 ///
+/// # And only on the port the hive named
+///
+/// [`navigable_in_place`] ignores the port (its docs say why; the question
+/// is open on #1542), so on its own it would let a link in the agent's
+/// output to another port of the hive's host — `https://hive.local:8444/`,
+/// clicked, loaded in place — become a reload loop: refused, put behind
+/// "the hive's gateway did not answer", and dialled again on the backoff for
+/// as long as the window stays open, while the gateway is fine (#1578
+/// review, LOW 1). So a reload also needs the failing URI's port to be the
+/// hive's own, by [`crate::tls::port_of`], which fills in the scheme's
+/// default — `WebKit` drops a default `:443` from the URIs it hands over, so
+/// the window's own page still matches. A failure on another port takes
+/// `WebKit`'s own route, as every failure did before #1557: one error page,
+/// no loop. The target stays the URI that failed, so a sub-page of the hive
+/// is asked for again as itself.
+///
 /// How *often* is not this function's: the window queues the reload on the
 /// same backoff its probe retry uses (`window.rs`'s `retry_delay`), from the
 /// poll interval doubling up to a minute.
 #[must_use]
 pub fn reload_after(embedded: &str, failing: &str, failure: LoadFailure) -> bool {
-    failure == LoadFailure::NoAnswer && navigable_in_place(embedded, failing)
+    failure == LoadFailure::NoAnswer
+        && navigable_in_place(embedded, failing)
+        && crate::tls::port_of(embedded) == crate::tls::port_of(failing)
 }
 
 #[cfg(test)]
@@ -886,10 +904,10 @@ mod tests {
     ///
     /// The rows are what `load-failed` hands over on the routes with no
     /// probe: the window's own first load (the embed URL, as `WebKit` spells
-    /// it), a page the hive's frontend moved to, a deep link with its own
-    /// query, and the same hive on its own port. Before this nothing reloaded
-    /// any of them, so a gateway that was down at open left `WebKit`'s error
-    /// page up for good.
+    /// it), a page the hive's frontend moved to, and a deep link with its own
+    /// query. Before this nothing reloaded any of them, so a gateway that was
+    /// down at open left `WebKit`'s error page up for good. (A hive on a port
+    /// of its own is `a_reload_stays_on_the_port_the_hive_named`'s.)
     ///
     /// Mutation (run this round, red): make `reload_after` answer `false`
     /// for `NoAnswer` — no reload, the bug as it stood — and the first row
@@ -900,7 +918,6 @@ mod tests {
             PAGE,
             "https://hive.local/agent/stray/turn/3",
             "https://hive.local/agent/other/?tab=todos",
-            "https://hive.local:8443/agent/stray/",
         ] {
             assert!(
                 reload_after(PAGE, failing, LoadFailure::NoAnswer),
@@ -946,5 +963,53 @@ mod tests {
             !reload_after("", PAGE, LoadFailure::NoAnswer),
             "a window with no origin of its own reloads nothing"
         );
+    }
+
+    /// **A reload stays on the port the hive named** — #1578 review, LOW 1.
+    ///
+    /// [`navigable_in_place`] ignores the port (#1542), so a link in the
+    /// agent's output to another port of the hive's host loads in place when
+    /// it is clicked. If nothing listens there, reloading it would be a loop
+    /// against a port the hive never named, behind a card that blames the
+    /// gateway. The first rows are that: another port, either way round, is
+    /// not reloaded. The rest say the rule still reloads what it should — a
+    /// sub-page on the hive's own port (the target stays the URI that
+    /// failed), a hive that names a port of its own, and a hive that spells
+    /// out the default `:443` `WebKit` drops from what it hands over.
+    ///
+    /// Mutation (run this round, red): drop the `port_of` conjunct from
+    /// [`reload_after`] and the first row reds.
+    #[test]
+    fn a_reload_stays_on_the_port_the_hive_named() {
+        for (embedded, failing) in [
+            (PAGE, "https://hive.local:8444/"),
+            (PAGE, "https://hive.local:8443/agent/stray/"),
+            (
+                "https://hive.local:8443/agent/stray/",
+                "https://hive.local/agent/stray/",
+            ),
+        ] {
+            assert!(
+                !reload_after(embedded, failing, LoadFailure::NoAnswer),
+                "{failing} is admitted in place (#1542), but it is not on the port {embedded} \
+                 names: it is not the hive's page to keep dialling"
+            );
+        }
+        for (embedded, failing) in [
+            (PAGE, "https://hive.local/agent/stray/turn/3"),
+            (
+                "https://hive.local:8443/agent/stray/",
+                "https://hive.local:8443/agent/other/",
+            ),
+            (
+                "https://hive.local:443/agent/stray/",
+                "https://hive.local/agent/stray/",
+            ),
+        ] {
+            assert!(
+                reload_after(embedded, failing, LoadFailure::NoAnswer),
+                "{failing} is on the port {embedded} names: ask again"
+            );
+        }
     }
 }

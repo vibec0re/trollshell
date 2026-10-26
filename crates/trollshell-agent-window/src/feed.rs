@@ -325,7 +325,7 @@ pub async fn run(
                 // immediate poll rides the already-scheduled tick instead of
                 // buying a second pair of round trips (and a reset that would
                 // push that tick further out). See the "Parking" section.
-                let recent = last_immediate.is_some_and(|t| t.elapsed() < interval);
+                let recent = !resume_acts_now(last_immediate.map(|t| t.elapsed()), interval);
                 if opened && recent {
                     tracing::debug!(
                         "presented again inside one poll interval — the scheduled tick reconciles \
@@ -412,6 +412,25 @@ pub async fn run(
             }
         }
     }
+}
+
+/// The flap guard [`run`]'s "Parking" section describes, as a rule with no
+/// clock of its own: may a presentation edge back (a window the compositor
+/// starts presenting again) buy an immediate round trip, given how long ago
+/// the last edge-driven one ran — `None` if none has?
+///
+/// Once per `interval`, and no more often: the `SUSPENDED` bit flips on every
+/// workspace switch across the window, so without this a burst of switches is
+/// a burst of round trips. A resume inside the interval is answered `false`
+/// and rides whatever is already scheduled.
+///
+/// Its own function since #1557 item 3, when the window's **retry** started
+/// parking on the same signal: `crate::window` asks this exact question of an
+/// edge before it runs a waiting retry, so the poll and the retry cannot come
+/// to disagree about what a flap is.
+#[must_use]
+pub(crate) fn resume_acts_now(since_last: Option<Duration>, interval: Duration) -> bool {
+    since_last.is_none_or(|elapsed| elapsed >= interval)
 }
 
 /// The `Urls` answer, fetched once — but **retried** until it lands.
@@ -580,13 +599,45 @@ async fn poll_once(
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentState, approve, deny, set_paused, start, stop};
+    use super::{AgentState, approve, deny, resume_acts_now, set_paused, start, stop};
     use hytte_plugin_agents::hive::client::HiveError;
     use hytte_plugin_agents::hive::wire::{AgentStatusRow, Response};
     use hytte_plugin_agents::model::{AgentName, Status};
+    use std::time::Duration;
 
     fn name(s: &str) -> AgentName {
         AgentName::parse(s).expect("a legal test name")
+    }
+
+    /// **The flap guard, as a rule** — the predicate `run`'s visibility arm
+    /// and the window's retry both ask (#1557 item 3).
+    ///
+    /// The first resume always acts; one inside the interval of the last does
+    /// not; one a whole interval later does again. `run`'s own use of it is
+    /// pinned end to end by `tests/feed.rs`'s
+    /// `a_burst_of_presentation_edges_inside_one_cadence_costs_one_poll`,
+    /// which drives the loop rather than the rule.
+    ///
+    /// Mutations (run this round, red): answer `true` always and the
+    /// mid-interval row reds; flip `>=` to `>` and the exact-interval row
+    /// reds, which is the boundary `run` had before the extraction (`recent`
+    /// was `elapsed < interval`).
+    #[test]
+    fn a_resume_acts_once_per_interval() {
+        let interval = Duration::from_secs(2);
+        assert!(resume_acts_now(None, interval), "the first resume acts");
+        for inside in [Duration::ZERO, Duration::from_millis(1999)] {
+            assert!(
+                !resume_acts_now(Some(inside), interval),
+                "{inside:?} after the last is a flap"
+            );
+        }
+        for past in [interval, Duration::from_mins(1)] {
+            assert!(
+                resume_acts_now(Some(past), interval),
+                "{past:?} after the last is a genuine return"
+            );
+        }
     }
 
     /// One good `AgentStatus` answer, in the shape the client hands over.

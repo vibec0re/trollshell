@@ -139,11 +139,30 @@ pub fn embed_url(base: &str) -> String {
 /// rule refuses rather than guesses at (the same reasoning that keeps the
 /// `https://` test above case-sensitive).
 ///
-/// Nothing else is folded. A trailing dot is kept on both sides because
-/// `WebKit` keeps it (`hive.local.` is its own origin there too), and a
-/// non-ASCII name is left as the hive wrote it, so a hive URL in Unicode —
-/// which `WebKit` turns into punycode — still refuses its own page: closed,
-/// and rare enough not to buy an IDNA implementation for.
+/// Nothing else is folded **here**. A trailing dot is kept on both sides
+/// because `WebKit` keeps it (`hive.local.` is its own origin there too).
+///
+/// # A name in Unicode: both sides in A-labels (#1557 item 4)
+///
+/// `WebKit` hands `decide-policy` a non-ASCII host in its IDNA A-label
+/// spelling (`https://bücher.example/` arrives as
+/// `https://xn--bcher-kva.example/`), and the hive's own string is compared
+/// in that spelling too. The conversion is not this function's:
+/// [`crate::tls::host_of`] reads through `GUri`, which IDNA-encodes any
+/// non-ASCII DNS host it parses, so both arguments arrive here in A-labels
+/// and the comparison stays byte for byte. This paragraph used to say the
+/// opposite — that a Unicode hive refused its own page — and it had been
+/// false since #1488 moved `host_of` onto `GUri`, with nothing pinning
+/// either reading; `an_idn_hive_url_loads_its_own_page` pins the true one.
+///
+/// `GLib`'s IDNA is not `WebKit`'s in every corner (it drops a zero-width
+/// joiner WHATWG refuses, for one), and that is safe here for a reason worth
+/// writing down: this predicate gates the window's **own first load** too —
+/// [`decide`]'s `InPlace` is the only way the hive's page gets into the
+/// view. So a name the two parsers read differently refuses the hive's own
+/// page, and with no hive document in the view there is nothing left to
+/// issue the navigation such a disagreement would admit. It fails closed; it
+/// cannot widen.
 #[must_use]
 pub fn navigable_in_place(embedded: &str, candidate: &str) -> bool {
     // A page with no host of its own admits nothing: there is no origin to
@@ -286,10 +305,67 @@ pub fn may_leave(uri: &str) -> bool {
     uri.starts_with("https://") || uri.starts_with("http://")
 }
 
+/// Why one of the view's own loads failed, as far as asking again goes —
+/// what `webview.rs` makes of the `GError` that `load-failed` carries
+/// (#1557 item 2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoadFailure {
+    /// The certificate. That is the TLS card's to explain, and asking again
+    /// would be handed the same certificate: never retried, so the route a
+    /// TLS failure takes is exactly the one it took before #1557.
+    Tls,
+    /// Nothing answered: the connection was refused, the name did not
+    /// resolve, the route or the wait ran out. A gateway that is down — the
+    /// one failure that can mend itself while the window stays open.
+    NoAnswer,
+    /// Anything else: a cancellation (a newer load superseding this one, a
+    /// policy decision), a protocol error, a scheme `WebKit` cannot load.
+    /// Asking again would get the same answer, or was never asked for.
+    Other,
+}
+
+/// Load `failing` again, after a load of it failed with `failure`? —
+/// #1557 item 2.
+///
+/// Only when **nothing answered**, and only for the **hive's own origin**,
+/// by the very test [`navigable_in_place`] puts every navigation to. The
+/// second half is what makes a reload loop impossible off the hive: a URI
+/// the policy would cancel can never be the one reloaded, whatever its load
+/// failed with, so the window cannot be made to hammer a host it never
+/// agreed to show. (`decide` already cancels such a navigation before it
+/// can fail; this does not rely on that.)
+///
+/// # And only on the port the hive named
+///
+/// [`navigable_in_place`] ignores the port (its docs say why; the question
+/// is open on #1542), so on its own it would let a link in the agent's
+/// output to another port of the hive's host — `https://hive.local:8444/`,
+/// clicked, loaded in place — become a reload loop: refused, put behind
+/// "the hive's gateway did not answer", and dialled again on the backoff for
+/// as long as the window stays open, while the gateway is fine (#1578
+/// review, LOW 1). So a reload also needs the failing URI's port to be the
+/// hive's own, by [`crate::tls::port_of`], which fills in the scheme's
+/// default — `WebKit` drops a default `:443` from the URIs it hands over, so
+/// the window's own page still matches. A failure on another port takes
+/// `WebKit`'s own route, as every failure did before #1557: one error page,
+/// no loop. The target stays the URI that failed, so a sub-page of the hive
+/// is asked for again as itself.
+///
+/// How *often* is not this function's: the window queues the reload on the
+/// same backoff its probe retry uses (`window.rs`'s `retry_delay`), from the
+/// poll interval doubling up to a minute.
+#[must_use]
+pub fn reload_after(embedded: &str, failing: &str, failure: LoadFailure) -> bool {
+    failure == LoadFailure::NoAnswer
+        && navigable_in_place(embedded, failing)
+        && crate::tls::port_of(embedded) == crate::tls::port_of(failing)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        Decision, HIDE_QUERY, Refusal, Target, decide, embed_url, may_leave, navigable_in_place,
+        Decision, HIDE_QUERY, LoadFailure, Refusal, Target, decide, embed_url, may_leave,
+        navigable_in_place, reload_after,
     };
 
     /// **Only the agent's own origin loads in our chrome.** The reviewer's
@@ -437,6 +513,103 @@ mod tests {
                 "{hostile} must not load in a window opened on {page}"
             );
         }
+    }
+
+    /// **A hive named in Unicode loads its own page** — #1557 item 4.
+    ///
+    /// Each candidate is what `decide-policy` is handed for the hive URL
+    /// beside it: `WebKit`'s WHATWG spelling, the host in IDNA A-labels
+    /// (`xn--bcher-kva` is RFC 3492's own worked example for `bücher`, so the
+    /// literal is the standard's, not a recomputation). The first row is the
+    /// window's own first `load_uri`; the others say the conversion composes
+    /// with the M2 case fold, with a port, and with a trailing dot, which the
+    /// URL Standard keeps and so must the hive's side.
+    ///
+    /// Mutations (run this round, red): parse with `UriFlags::NON_DNS` in
+    /// `tls::authority_of` and the first row reds — the hive's host stays
+    /// `bücher.example` while `WebKit`'s is `xn--bcher-kva.example`, which is
+    /// the refusal the issue describes; drop `tls::host_of`'s trailing-dot
+    /// re-append and the trailing-dot row reds.
+    #[test]
+    fn an_idn_hive_url_loads_its_own_page() {
+        for (embedded, canonical) in [
+            (
+                "https://bücher.example/agent/stray/?hide=header",
+                "https://xn--bcher-kva.example/agent/stray/?hide=header",
+            ),
+            (
+                "https://Bücher.Example/agent/stray/?hide=header",
+                "https://xn--bcher-kva.example/agent/other/",
+            ),
+            (
+                "https://bücher.example:8443/agent/stray/",
+                "https://xn--bcher-kva.example:8443/agent/stray/turn/3",
+            ),
+            (
+                "https://bücher.example./agent/stray/",
+                "https://xn--bcher-kva.example./agent/stray/",
+            ),
+            (
+                "https://XN--BCHER-KVA.example/agent/stray/",
+                "https://xn--bcher-kva.example/agent/stray/",
+            ),
+        ] {
+            assert!(
+                navigable_in_place(embedded, canonical),
+                "{canonical} is what WebKit makes of {embedded}, so it is the hive"
+            );
+            assert_eq!(
+                decide(embedded, canonical, Target::ThisView, false),
+                Decision::InPlace,
+                "…and the window's own gesture-less load of it goes in place"
+            );
+        }
+    }
+
+    /// …and **one origin still means one**: the A-label fold admits the
+    /// hive's own name in `WebKit`'s spelling and nothing else.
+    ///
+    /// The rows are the shapes the ASCII rule already refuses, spelled for an
+    /// IDN hive: the plain-ASCII look-alike (`bucher`, the homograph a reader
+    /// might expect a "normalisation" to fold in), another IDN name
+    /// (`münchen`), the trailing dot the hive did not write, a subdomain
+    /// either way round, userinfo, a path that names the hive, and the
+    /// downgrade — plus the converse, an ASCII hive refusing its IDN
+    /// look-alike.
+    ///
+    /// Mutations (run this round, red): strip a trailing dot from both hosts
+    /// before comparing — the "normalisation" a reader might add next to an
+    /// IDNA one — and the `xn--bcher-kva.example.` row reds, a second origin
+    /// by `WebKit`'s reckoning compared equal; match the hive's host as a
+    /// suffix and the `www.` row reds. The issue's other suggested fix,
+    /// running the candidate's host through `glib::hostname_to_ascii` as
+    /// well, leaves this test green — `g_hostname_to_ascii` keeps the dot on
+    /// an A-label and changes nothing else here — and reds
+    /// `a_candidate_not_in_webkits_spelling_is_still_refused` instead, because
+    /// it folds the candidate's case. Converting only the hive's side, to the
+    /// spelling `WebKit` already uses, is what keeps the rule one-sided.
+    #[test]
+    fn another_idn_host_is_still_another_host() {
+        let page = "https://bücher.example/agent/stray/?hide=header";
+        for hostile in [
+            "https://bucher.example/agent/stray/",
+            "https://xn--mnchen-3ya.example/agent/stray/",
+            "https://xn--bcher-kva.example./agent/stray/",
+            "https://www.xn--bcher-kva.example/agent/stray/",
+            "https://xn--bcher-kva.example.evil.example/login",
+            "https://xn--bcher-kva.example@evil.example/login",
+            "https://evil.example/xn--bcher-kva.example/",
+            "http://xn--bcher-kva.example/agent/stray/",
+        ] {
+            assert!(
+                !navigable_in_place(page, hostile),
+                "{hostile} must not load in a window opened on {page}"
+            );
+        }
+        assert!(!navigable_in_place(
+            "https://bucher.example/agent/stray/",
+            "https://xn--bcher-kva.example/agent/stray/"
+        ));
     }
 
     /// The fold is **one-sided**: the hive's spelling is put into `WebKit`'s,
@@ -722,6 +895,120 @@ mod tests {
             assert!(
                 !navigable_in_place(PAGE, spelled),
                 "{spelled} must not load in this window"
+            );
+        }
+    }
+
+    /// **A load of the hive's own page that nothing answered is asked
+    /// again** — #1557 item 2.
+    ///
+    /// The rows are what `load-failed` hands over on the routes with no
+    /// probe: the window's own first load (the embed URL, as `WebKit` spells
+    /// it), a page the hive's frontend moved to, and a deep link with its own
+    /// query. Before this nothing reloaded any of them, so a gateway that was
+    /// down at open left `WebKit`'s error page up for good. (A hive on a port
+    /// of its own is `a_reload_stays_on_the_port_the_hive_named`'s.)
+    ///
+    /// Mutation (run this round, red): make `reload_after` answer `false`
+    /// for `NoAnswer` — no reload, the bug as it stood — and the first row
+    /// reds.
+    #[test]
+    fn a_hive_page_nothing_answered_is_loaded_again() {
+        for failing in [
+            PAGE,
+            "https://hive.local/agent/stray/turn/3",
+            "https://hive.local/agent/other/?tab=todos",
+        ] {
+            assert!(
+                reload_after(PAGE, failing, LoadFailure::NoAnswer),
+                "{failing} is the hive's own page and nothing answered it: ask again"
+            );
+        }
+    }
+
+    /// …and **nothing else is**: not a certificate failure, not a
+    /// cancellation, and not anything off the hive, whatever its load failed
+    /// with.
+    ///
+    /// The certificate rows are the route the TLS card owns — asking again
+    /// would be handed the same certificate, and the card is the operator's
+    /// to act on — and a cancellation is a newer load or the policy having
+    /// already decided. The off-hive rows are the reload-loop guard: a URI
+    /// the policy cancels can never be the one the window keeps reloading,
+    /// even if a failure for it somehow reached `load-failed`.
+    ///
+    /// Mutations (run this round, red): drop the `failure ==
+    /// LoadFailure::NoAnswer` conjunct and the `Tls` row reds; drop the
+    /// `navigable_in_place` conjunct and the first off-hive row reds.
+    #[test]
+    fn only_no_answer_on_the_hive_is_loaded_again() {
+        for failure in [LoadFailure::Tls, LoadFailure::Other] {
+            assert!(
+                !reload_after(PAGE, PAGE, failure),
+                "{failure:?} is not asked again — the answer would be the same"
+            );
+        }
+        for hostile in OFF_THE_HIVE.into_iter().chain([
+            "file:///etc/passwd",
+            "about:blank",
+            "data:text/html,<h1>hi",
+            "",
+        ]) {
+            assert!(
+                !reload_after(PAGE, hostile, LoadFailure::NoAnswer),
+                "{hostile:?} is not the hive: it must never be the URI the window reloads"
+            );
+        }
+        assert!(
+            !reload_after("", PAGE, LoadFailure::NoAnswer),
+            "a window with no origin of its own reloads nothing"
+        );
+    }
+
+    /// **A reload stays on the port the hive named** — #1578 review, LOW 1.
+    ///
+    /// [`navigable_in_place`] ignores the port (#1542), so a link in the
+    /// agent's output to another port of the hive's host loads in place when
+    /// it is clicked. If nothing listens there, reloading it would be a loop
+    /// against a port the hive never named, behind a card that blames the
+    /// gateway. The first rows are that: another port, either way round, is
+    /// not reloaded. The rest say the rule still reloads what it should — a
+    /// sub-page on the hive's own port (the target stays the URI that
+    /// failed), a hive that names a port of its own, and a hive that spells
+    /// out the default `:443` `WebKit` drops from what it hands over.
+    ///
+    /// Mutation (run this round, red): drop the `port_of` conjunct from
+    /// [`reload_after`] and the first row reds.
+    #[test]
+    fn a_reload_stays_on_the_port_the_hive_named() {
+        for (embedded, failing) in [
+            (PAGE, "https://hive.local:8444/"),
+            (PAGE, "https://hive.local:8443/agent/stray/"),
+            (
+                "https://hive.local:8443/agent/stray/",
+                "https://hive.local/agent/stray/",
+            ),
+        ] {
+            assert!(
+                !reload_after(embedded, failing, LoadFailure::NoAnswer),
+                "{failing} is admitted in place (#1542), but it is not on the port {embedded} \
+                 names: it is not the hive's page to keep dialling"
+            );
+        }
+        for (embedded, failing) in [
+            (PAGE, "https://hive.local/agent/stray/turn/3"),
+            (
+                "https://hive.local:8443/agent/stray/",
+                "https://hive.local:8443/agent/other/",
+            ),
+            (
+                "https://hive.local:443/agent/stray/",
+                "https://hive.local/agent/stray/",
+            ),
+        ] {
+            assert!(
+                reload_after(embedded, failing, LoadFailure::NoAnswer),
+                "{failing} is on the port {embedded} names: ask again"
             );
         }
     }

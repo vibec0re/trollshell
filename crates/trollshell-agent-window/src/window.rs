@@ -150,6 +150,90 @@ fn retry_delay(base: std::time::Duration, misses: u32) -> std::time::Duration {
     base.saturating_mul(factor).min(RETRY_CEILING.max(base))
 }
 
+/// What a retry does when it comes due — the two things a window asks a
+/// gateway that did not answer again for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Attempt {
+    /// Probe again through [`Window::load_page`]: no page is mounted yet,
+    /// because the launch-time probe got no verdict (#1274's dead worker, or
+    /// the October 2026 audit's M1, an unreachable gateway).
+    Probe,
+    /// Load this URI in the mounted view again: the page is mounted, and its
+    /// own load got no answer — #1557 item 2, the routes with no probe
+    /// (`PinLeaf`, the system store), where nothing used to ask again at all.
+    /// The URI is the one that failed, which [`page::reload_after`] has
+    /// already confirmed is on the hive's own origin.
+    Reload(String),
+}
+
+/// A retry that is waiting: on its timer, or — when the timer came due while
+/// the compositor was not presenting the window — parked until it is
+/// (#1557 item 3).
+#[derive(Debug)]
+struct Queued {
+    attempt: Attempt,
+    /// The timer, while it runs. `None` once it has come due and the attempt
+    /// is parked: the source is spent then, and holding its id would let
+    /// `Window::cancel_retry` remove a source `GLib` has already destroyed
+    /// (`SourceId::remove` panics on one).
+    source: Option<glib::SourceId>,
+}
+
+/// How a waiting retry is waiting — what [`on_resume`] needs to know of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Waiting {
+    /// Its timer is still running.
+    Armed,
+    /// Its timer came due while the window was not being presented.
+    Parked,
+}
+
+/// What a presentation edge back does to the retry — #1557 item 3.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OnResume {
+    /// Nothing is waiting, or the edge is a flap and the retry's own timer
+    /// is still running: leave it be.
+    Leave,
+    /// Run the waiting attempt now.
+    RunNow,
+    /// The edge is a flap, and the attempt is parked with no timer at all:
+    /// give it one again, due when the flap guard next lets an edge act.
+    Rearm(std::time::Duration),
+}
+
+/// The retry's half of the poll's parking rule, with nothing to own.
+///
+/// `feed::run` parks its ticker while the compositor is not presenting the
+/// window, and on the edge back polls **once**, at once, unless an
+/// edge-driven poll already ran inside the last interval
+/// ([`feed::resume_acts_now`], the flap guard). A waiting retry is treated
+/// the same way, through the same predicate: an operator who switches back
+/// to a window whose gateway was down is looking at it *now*, so that is
+/// when to ask, not at the end of a backoff step that may be a minute long —
+/// and a burst of workspace switches is still one attempt per interval, not
+/// one per switch.
+///
+/// A flap leaves an armed timer alone (it is at most a backoff step away and
+/// fires on its own), but a parked attempt has no timer left, so it is
+/// re-armed for whatever remains of the interval since the last edge-driven
+/// attempt — the moment the guard would have let this edge through.
+fn on_resume(
+    waiting: Option<Waiting>,
+    since_last: Option<std::time::Duration>,
+    interval: std::time::Duration,
+) -> OnResume {
+    let Some(waiting) = waiting else {
+        return OnResume::Leave;
+    };
+    if feed::resume_acts_now(since_last, interval) {
+        return OnResume::RunNow;
+    }
+    match waiting {
+        Waiting::Armed => OnResume::Leave,
+        Waiting::Parked => OnResume::Rearm(interval.saturating_sub(since_last.unwrap_or_default())),
+    }
+}
+
 /// One agent's window.
 pub struct Window {
     /// This window, weakly — the handle the probe's continuation upgrades
@@ -220,11 +304,29 @@ pub struct Window {
     /// which removes it ([`Window::retry_now`]). The id is taken out of here
     /// by the source itself when it fires, so a `remove` is only ever called
     /// on one that has not.
-    retry: RefCell<Option<glib::SourceId>>,
-    /// How many probes in a row came back with no verdict — what
+    ///
+    /// Since #1557 it carries **what** to do as well as when ([`Attempt`]):
+    /// the mounted page's own reload rides the same slot, the same backoff
+    /// and the same "Try again now", and a retry that comes due while the
+    /// compositor is not presenting the window stays here **parked** — still
+    /// holding the latch, with no timer — until [`Window::presentation_changed`]
+    /// sees the window again.
+    retry: RefCell<Option<Queued>>,
+    /// How many attempts in a row got no answer — what
     /// [`Window::next_retry_delay`] doubles on. Back to zero the moment one
-    /// settles.
+    /// settles: a probe's verdict, or (#1557 item 2) the mounted page
+    /// reporting [`webview::Gateway::Answered`] after a reload.
     unanswered: std::cell::Cell<u32>,
+    /// Whether the compositor is presenting this window — the poll's own
+    /// signal ([`watch_presentation`]), followed here for the retry
+    /// (#1557 item 3). `true` until a source says otherwise, which is what a
+    /// window built by [`Window::assemble`] with no source at all gets.
+    presented: std::cell::Cell<bool>,
+    /// When a presentation edge last ran a waiting retry — the flap guard's
+    /// only state, exactly as `last_immediate` is `feed::run`'s. Only edges
+    /// stamp it: a timer firing, or a click on "Try again now", is not a
+    /// flap.
+    last_resume: std::cell::Cell<Option<std::time::Instant>>,
     /// What the probe runs — see [`TrustResolver`].
     trust: TrustResolver,
     cfg: AgentsConfig,
@@ -298,6 +400,9 @@ impl Window {
         // does, and dropping the window is what ends `feed::run`'s parking
         // loop (`visible_open` latches `false` once they are all gone).
         let visible_rx = watch_presentation(&this.toplevel);
+        // …and the retry parks on the very same signal (#1557 item 3): a
+        // second receiver, not a second watch.
+        this.follow_presentation(visible_rx.clone());
 
         runtime.spawn(feed::run(
             std::path::PathBuf::from(&this.cfg.socket),
@@ -423,6 +528,8 @@ impl Window {
             probe: RefCell::new(None),
             retry: RefCell::new(None),
             unanswered: std::cell::Cell::new(0),
+            presented: std::cell::Cell::new(true),
+            last_resume: std::cell::Cell::new(None),
             trust,
             cfg,
             name: name.clone(),
@@ -782,47 +889,211 @@ impl Window {
         retry_delay(self.cfg.poll_interval(), misses)
     }
 
-    /// Ask again after `wait`, through [`Window::retry_load_page`], and hold
-    /// [`Window::load_page`] shut until then.
+    /// Run `attempt` after `wait`, and hold [`Window::load_page`] shut until
+    /// then.
     ///
-    /// The one retry path both no-verdict arms take (#1274's dead worker, and
-    /// M1's unreachable gateway), so they share the backoff and the latch
-    /// rather than each carrying a timer of its own. The source holds the
-    /// window weakly, for [`Window::me`]'s reason.
-    fn schedule_retry(&self, wait: std::time::Duration) {
+    /// The one retry path every no-answer arm takes — #1274's dead worker,
+    /// M1's unreachable gateway, and since #1557 item 2 the mounted page's
+    /// own load — so they share the backoff and the latch rather than each
+    /// carrying a timer of its own. The source holds the window weakly, for
+    /// [`Window::me`]'s reason.
+    fn schedule_retry(&self, wait: std::time::Duration, attempt: Attempt) {
         self.cancel_retry();
         let me = std::rc::Weak::clone(&self.me);
         let source = glib::timeout_add_local_once(wait, move || {
             if let Some(window) = me.upgrade() {
-                // This source is spent the moment it fires: forgetting its id
-                // here, rather than removing it, is what keeps
-                // `cancel_retry` from ever removing a source GLib has already
-                // destroyed (`SourceId::remove` panics on one).
-                *window.retry.borrow_mut() = None;
-                window.retry_load_page();
+                window.retry_due();
             }
         });
-        *self.retry.borrow_mut() = Some(source);
+        *self.retry.borrow_mut() = Some(Queued {
+            attempt,
+            source: Some(source),
+        });
     }
 
-    /// Drop a queued retry, if there is one — the source is removed, so it
-    /// never fires.
-    fn cancel_retry(&self) {
-        let pending = self.retry.borrow_mut().take();
-        if let Some(source) = pending {
-            source.remove();
+    /// The retry's timer fired: run its attempt — **unless the compositor is
+    /// not presenting this window**, in which case it parks (#1557 item 3).
+    ///
+    /// Parked, the attempt stays in [`Window::retry`] with no timer, so it
+    /// keeps `load_page` latched exactly as a queued one does, and
+    /// [`Window::presentation_changed`] runs it on the edge back. That is
+    /// `feed::run`'s rule for the poll, applied to the retry: a window nobody
+    /// is being shown spends nothing — at the ceiling a down gateway used to
+    /// cost one TLS connect a minute for as long as the window sat on a
+    /// workspace nobody looked at.
+    fn retry_due(&self) {
+        // This source is spent the moment it fires, so its id is dropped
+        // here rather than removed — see `Queued::source`.
+        let queued = self.retry.borrow_mut().take();
+        let Some(Queued { attempt, .. }) = queued else {
+            return;
+        };
+        if self.presented.get() {
+            self.run_attempt(attempt);
+        } else {
+            tracing::debug!(
+                ?attempt,
+                "a retry came due while the compositor is not presenting this window; parked \
+                 until it is"
+            );
+            *self.retry.borrow_mut() = Some(Queued {
+                attempt,
+                source: None,
+            });
         }
     }
 
-    /// The unreachable card's "Try again now": skip the rest of the backoff
-    /// step and ask the gateway at once.
+    /// Do what a retry was waiting to do.
+    fn run_attempt(&self, attempt: Attempt) {
+        match attempt {
+            Attempt::Probe => self.retry_load_page(),
+            Attempt::Reload(uri) => self.reload_page(&uri),
+        }
+    }
+
+    /// Take the waiting retry out of its slot, removing its timer if one is
+    /// running, and hand back what it would have done.
+    fn take_retry(&self) -> Option<Attempt> {
+        let pending = self.retry.borrow_mut().take()?;
+        if let Some(source) = pending.source {
+            source.remove();
+        }
+        Some(pending.attempt)
+    }
+
+    /// Drop a waiting retry, if there is one — a running timer is removed, so
+    /// it never fires, and a parked attempt is forgotten.
+    fn cancel_retry(&self) {
+        drop(self.take_retry());
+    }
+
+    /// The cards' "Try again now": skip the rest of the backoff step and ask
+    /// the gateway at once.
     ///
     /// The backoff itself is left where it is — a click is an operator saying
     /// "I just fixed it", and if they were wrong the next wait is the one the
-    /// misses so far have earned, not the first step again.
+    /// misses so far have earned, not the first step again. With nothing
+    /// waiting (the last attempt is still in flight) it falls back to
+    /// [`Window::retry_load_page`], which every latch already makes harmless.
     fn retry_now(&self) {
-        self.cancel_retry();
-        self.retry_load_page();
+        match self.take_retry() {
+            Some(attempt) => self.run_attempt(attempt),
+            None => self.retry_load_page(),
+        }
+    }
+
+    /// Follow the compositor's presentation of this window — the poll's own
+    /// [`watch_presentation`] signal, through a second receiver — so the
+    /// retry parks while nobody is shown the window (#1557 item 3).
+    ///
+    /// `tokio::sync::watch` is executor-agnostic, the reason `Window::build`
+    /// can already await `tokio` channels on the main context. The loop ends
+    /// when the senders do — they live in the toplevel's own signal handlers
+    /// — or when the window is gone.
+    fn follow_presentation(&self, mut visible: tokio::sync::watch::Receiver<bool>) {
+        self.presented.set(*visible.borrow_and_update());
+        let me = std::rc::Weak::clone(&self.me);
+        glib::spawn_future_local(async move {
+            while visible.changed().await.is_ok() {
+                let now = *visible.borrow_and_update();
+                let Some(window) = me.upgrade() else {
+                    break;
+                };
+                window.presentation_changed(now);
+            }
+        });
+    }
+
+    /// The compositor started or stopped presenting this window.
+    ///
+    /// Stopping changes nothing at once: a timer still running is left to
+    /// run, and [`Window::retry_due`] parks it if it comes due before the
+    /// window is shown again. Starting is the edge [`on_resume`] decides — a
+    /// waiting retry runs now, at most once per poll interval, by the flap
+    /// guard the poll itself uses.
+    fn presentation_changed(&self, now: bool) {
+        let was = self.presented.replace(now);
+        if !now || was {
+            return;
+        }
+        let waiting = self.retry.borrow().as_ref().map(|q| {
+            if q.source.is_some() {
+                Waiting::Armed
+            } else {
+                Waiting::Parked
+            }
+        });
+        let since_last = self.last_resume.get().map(|at| at.elapsed());
+        match on_resume(waiting, since_last, self.cfg.poll_interval()) {
+            OnResume::Leave => {}
+            OnResume::RunNow => {
+                self.last_resume.set(Some(std::time::Instant::now()));
+                if let Some(attempt) = self.take_retry() {
+                    tracing::debug!(?attempt, "shown again: running the waiting retry now");
+                    self.run_attempt(attempt);
+                }
+            }
+            OnResume::Rearm(wait) => {
+                if let Some(attempt) = self.take_retry() {
+                    self.schedule_retry(wait, attempt);
+                }
+            }
+        }
+    }
+
+    /// What the mounted page reports about its own loads — #1557 item 2.
+    ///
+    /// [`webview::Gateway::Unanswered`] is a load of the hive's own page that
+    /// nothing answered (the gateway refused the connection, did not resolve,
+    /// timed out): the page's stack puts up the same card M1's probe does,
+    /// and a reload of the failed URI is queued on the same backoff. Before
+    /// this, on the routes with no probe (`PinLeaf`, the system store),
+    /// `WebKit`'s error page stayed up and nothing ever reloaded it — the
+    /// gateway coming back changed nothing until the window was closed.
+    ///
+    /// [`webview::Gateway::Answered`] is something answering while that card
+    /// was up — a load committing, or (#1578 review, LOW 2) one failing in a
+    /// way asking again cannot mend: the gateway is back, so the backoff
+    /// starts over and anything still waiting is dropped — a reload queued
+    /// behind a page that already came back would throw away whatever the
+    /// operator has typed into it.
+    fn on_gateway(&self, event: webview::Gateway) {
+        match event {
+            webview::Gateway::Unanswered { uri, why } => {
+                let wait = self.next_retry_delay();
+                tracing::warn!(
+                    %uri,
+                    %why,
+                    retry_in = ?wait,
+                    "nothing answered the agent's page; reloading it on the backoff"
+                );
+                if let Some(page) = self.page_slot.first_child() {
+                    let me = std::rc::Weak::clone(&self.me);
+                    let tried =
+                        format!("asked {uri} for the agent's page, and nothing answered ({why})");
+                    webview::show_unanswered(
+                        &page,
+                        &webview::unreachable(Some(&tried), wait, move || {
+                            if let Some(window) = me.upgrade() {
+                                window.retry_now();
+                            }
+                        }),
+                    );
+                }
+                self.schedule_retry(wait, Attempt::Reload(uri));
+            }
+            webview::Gateway::Answered => {
+                self.unanswered.set(0);
+                self.cancel_retry();
+            }
+        }
+    }
+
+    /// Load `uri` in the mounted page again — [`Attempt::Reload`].
+    fn reload_page(&self, uri: &str) {
+        if let Some(page) = self.page_slot.first_child() {
+            webview::reload(&page, uri);
+        }
     }
 
     /// Paint the verifying state, then check the hive's certificate **on a
@@ -920,7 +1191,7 @@ impl Window {
                         );
                         window.probe.borrow_mut().take();
                         window.fill_page_slot(&webview::probe_died(&host));
-                        window.schedule_retry(window.next_retry_delay());
+                        window.schedule_retry(window.next_retry_delay(), Attempt::Probe);
                         return;
                     };
                     window.finish_probe(&embedded, &trust);
@@ -977,7 +1248,7 @@ impl Window {
                     }
                 },
             ));
-            self.schedule_retry(wait);
+            self.schedule_retry(wait, Attempt::Probe);
             return;
         }
         self.unanswered.set(0);
@@ -987,7 +1258,12 @@ impl Window {
             tls_tried = trust.tried.as_deref().unwrap_or("nothing — the system trust store"),
             "loading the agent's page"
         );
-        self.fill_page_slot(&webview::page(embedded, trust));
+        let me = std::rc::Weak::clone(&self.me);
+        self.fill_page_slot(&webview::page(embedded, trust, move |event| {
+            if let Some(window) = me.upgrade() {
+                window.on_gateway(event);
+            }
+        }));
         *self.page_loaded.borrow_mut() = true;
     }
 
@@ -1032,6 +1308,16 @@ impl Window {
         self.retry.borrow().is_some()
     }
 
+    /// What the waiting retry would do, and whether it is parked (its timer
+    /// came due while the window was hidden) — #1557's read-back.
+    #[cfg(all(test, feature = "system-tests"))]
+    fn waiting(&self) -> Option<(Attempt, bool)> {
+        self.retry
+            .borrow()
+            .as_ref()
+            .map(|q| (q.attempt.clone(), q.source.is_none()))
+    }
+
     /// The banner's own title label, as GTK renders it — not the `title`
     /// property, which reads back whatever was set whether it parsed or not.
     #[cfg(all(test, feature = "system-tests"))]
@@ -1071,9 +1357,65 @@ impl Window {
 /// wiring itself is pinned, and `docs/live-verify.md` for the rest).
 #[cfg(test)]
 mod tests {
-    use super::{RETRY_CEILING, presenting, retry_delay};
+    use super::{OnResume, RETRY_CEILING, Waiting, on_resume, presenting, retry_delay};
     use gtk::gdk::ToplevelState;
     use std::time::Duration;
+
+    /// **Shown again, a waiting retry runs — once per interval** — #1557
+    /// item 3, the decision with no window and no clock.
+    ///
+    /// The poll's rule (`feed::run`'s "Parking"), applied to the retry
+    /// through the same `feed::resume_acts_now`: the first edge back acts,
+    /// whether the retry's timer is still running or it came due while the
+    /// window was hidden and parked; an edge inside one interval of the last
+    /// edge-driven attempt is a flap, which leaves a running timer alone and
+    /// gives a parked attempt a timer for the rest of that interval; and an
+    /// edge with nothing waiting does nothing at all.
+    ///
+    /// Mutations (run this round, red): answer `RunNow` without asking
+    /// `resume_acts_now` (no flap guard) and the armed-flap row reds; answer
+    /// `Leave` for a parked flap (no re-arm) and the parked-flap row reds
+    /// — that attempt would have no timer and no edge to run it, which is
+    /// the M1 latch again.
+    #[test]
+    fn a_waiting_retry_runs_when_shown_again_once_per_interval() {
+        let interval = Duration::from_secs(2);
+        for waiting in [Waiting::Armed, Waiting::Parked] {
+            assert_eq!(
+                on_resume(Some(waiting), None, interval),
+                OnResume::RunNow,
+                "{waiting:?}: the first edge back asks at once"
+            );
+            assert_eq!(
+                on_resume(Some(waiting), Some(interval), interval),
+                OnResume::RunNow,
+                "{waiting:?}: a whole interval later is a genuine return"
+            );
+            assert_eq!(
+                on_resume(None, Some(Duration::ZERO), interval),
+                OnResume::Leave,
+                "nothing waiting, nothing to run"
+            );
+        }
+        assert_eq!(
+            on_resume(
+                Some(Waiting::Armed),
+                Some(Duration::from_millis(500)),
+                interval
+            ),
+            OnResume::Leave,
+            "a flap leaves a running timer to fire on its own"
+        );
+        assert_eq!(
+            on_resume(
+                Some(Waiting::Parked),
+                Some(Duration::from_millis(500)),
+                interval
+            ),
+            OnResume::Rearm(Duration::from_millis(1500)),
+            "a flap gives a parked attempt a timer for the rest of the interval — not nothing"
+        );
+    }
 
     /// **The retry backs off, and stops backing off at the ceiling** — the
     /// October 2026 audit's M1, the half of it that needs no display.
@@ -3076,5 +3418,232 @@ mod gtk_tests {
             "the embedded page must survive a poll — the latch is the same one #1130 added"
         );
         assert_eq!(runs_so_far(&runs), 1, "…and no second probe ran");
+    }
+
+    /// **A retry that comes due while the window is hidden parks, and runs
+    /// the moment the window is shown again** — #1557 item 3.
+    ///
+    /// The compositor's `SUSPENDED` flip cannot be produced here (see
+    /// [`the_presentation_watch_follows_map_and_unmap`] for why), so the
+    /// window is handed a `watch` it does not own, through
+    /// [`Window::follow_presentation`] — the same call `Window::build` makes
+    /// with [`super::watch_presentation`]'s receiver — and the test plays the
+    /// compositor on the sending end.
+    ///
+    /// Mutations (run this round, red): make `retry_due` run the attempt
+    /// whatever `presented` says — the retry as it shipped — and the second
+    /// probe runs while hidden (`calls` reds at 2); drop the
+    /// `presentation_changed` call from `follow_presentation`'s loop and the
+    /// window never learns it was hidden, so the same assertion reds the same
+    /// way.
+    #[gtk::test]
+    fn a_retry_due_while_hidden_parks_and_runs_when_shown_again() {
+        let (trust, calls) = scripted_answers(vec![unreachable_answer()]);
+        let (w, _rx) = window_with_trust(trust);
+        let _quiet = RetryGuard(Rc::clone(&w));
+        let (shown, visible) = tokio::sync::watch::channel(true);
+        w.follow_presentation(visible);
+
+        w.update(Update::State(up(row_with_page())));
+        assert!(
+            pump_until(Duration::from_secs(10), || !w.probing()),
+            "the probe never answered"
+        );
+        assert_eq!(
+            w.waiting(),
+            Some((super::Attempt::Probe, false)),
+            "the gateway did not answer, so a probe is queued on its timer"
+        );
+
+        shown.send(false).expect("the window follows the watch");
+        // The timer coming due shows either way: parked, or — the bug —
+        // a second probe.
+        assert!(
+            pump_until(Duration::from_secs(10), || {
+                calls.load(Ordering::SeqCst) > 1 || w.waiting().is_some_and(|(_, parked)| parked)
+            }),
+            "the retry's timer never came due"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a hidden window's retry dials nothing — it parks"
+        );
+        assert_eq!(w.waiting(), Some((super::Attempt::Probe, true)), "parked");
+        assert!(!w.probing());
+        // Parked still holds `load_page`'s latch, so a poll arriving meanwhile
+        // (the feed parks too, but a command's reconciling poll does not) does
+        // not start the probe behind the retry's back.
+        w.update(Update::State(up(AgentStatusRow {
+            status_text: Some("still working".to_owned()),
+            ..row_with_page()
+        })));
+        assert!(!w.probing(), "a parked retry still latches the page");
+
+        shown.send(true).expect("the window follows the watch");
+        assert!(
+            pump_until(Duration::from_secs(2), || w.probing()),
+            "shown again, the parked retry runs at once"
+        );
+        assert!(
+            pump_until(Duration::from_secs(10), || !w.probing()),
+            "the resumed probe never answered"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            w.waiting(),
+            Some((super::Attempt::Probe, false)),
+            "still down: the next step is queued on its timer again"
+        );
+    }
+
+    /// **A burst of edges back runs one waiting retry, not one per edge** —
+    /// #1557 item 3, the flap guard the poll uses, asked of the retry.
+    ///
+    /// Every workspace switch across the window is an edge; without the guard
+    /// each one would be an immediate TLS probe against a gateway that is
+    /// down. The first edge back runs the waiting retry at once; a second one
+    /// inside the poll interval leaves the newly queued step on its timer.
+    ///
+    /// Mutation (run this round, red): make `on_resume` answer `RunNow`
+    /// without asking `feed::resume_acts_now` and the second edge starts a
+    /// third probe (`probing()` reds).
+    #[gtk::test]
+    fn a_burst_of_edges_back_runs_one_waiting_retry() {
+        let (trust, calls) = scripted_answers(vec![unreachable_answer()]);
+        let (w, _rx) = window_with_trust(trust);
+        let _quiet = RetryGuard(Rc::clone(&w));
+        let (shown, visible) = tokio::sync::watch::channel(true);
+        w.follow_presentation(visible);
+        let flip = |to: bool| {
+            shown.send(to).expect("the window follows the watch");
+            assert!(
+                pump_until(Duration::from_secs(2), || w.presented.get() == to),
+                "the edge to {to} never reached the window"
+            );
+        };
+
+        w.update(Update::State(up(row_with_page())));
+        assert!(pump_until(Duration::from_secs(10), || !w.probing()));
+        assert!(w.retrying(), "the first step is queued");
+
+        flip(false);
+        flip(true);
+        assert!(
+            w.probing(),
+            "the first edge back asks at once, ahead of the timer"
+        );
+        assert!(pump_until(Duration::from_secs(10), || !w.probing()));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(w.retrying(), "still down: the next step is queued");
+
+        flip(false);
+        flip(true);
+        assert!(
+            !w.probing(),
+            "a second edge inside one interval is a flap: it rides the queued step"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(w.retrying(), "…which is still waiting on its timer");
+    }
+
+    /// **A mounted page whose load nothing answered is reloaded on the
+    /// shared backoff, and the backoff starts over once it answers** —
+    /// #1557 item 2, the window's half.
+    ///
+    /// The page's report is delivered straight to [`Window::on_gateway`];
+    /// `webview.rs`'s own tests drive the signal half. The reload is observed
+    /// through `WebViewExt::uri`, which `load_uri` sets before any decision is
+    /// made.
+    ///
+    /// # The page in the slot reports to nobody
+    ///
+    /// The slot holds a real system-store [`webview::page`] — what
+    /// `finish_probe` mounts on the route with no probe — but one built here,
+    /// whose reports go nowhere, on a host that cannot resolve. A page the
+    /// window mounted itself would report to `on_gateway`, and **its own first
+    /// load is real where `checks.system-tests` runs**: that derivation exports
+    /// llvmpipe's EGL vendor for the GL tests, which gets `WebKit`'s web process
+    /// past the `EGL_BAD_PARAMETER` abort it dies of under a bare `xvfb-run`
+    /// (the only setting `webview.rs`'s `gtk_tests` module doc measured). There
+    /// the load fails on the hive's name and reports a second, real
+    /// [`webview::Gateway::Unanswered`] while this test pumps for its timer —
+    /// and the window does what it should with a newer failure: the page's own
+    /// URI replaces the scripted reload. That was #1578's CI red (`left:
+    /// …?hide=header`, `right: …/turn/3`), reproduced by running this test
+    /// with the derivation's four GL variables exported. This test is about
+    /// what the window does with one report, so it hears exactly one, with the
+    /// real timer and the real reload left in. `.invalid` (RFC 6761) keeps the
+    /// page's own load harmless too: it never reaches a server, so it can
+    /// neither raise the TLS card, behind which [`webview::reload`] refuses to
+    /// load, nor commit.
+    ///
+    /// Mutations (run this round, red): drop `on_gateway`'s
+    /// `schedule_retry` and nothing is queued (the `waiting` assertion reds);
+    /// drop its `unanswered.set(0)` on `Answered` and the backoff reds at 2;
+    /// drop its `cancel_retry` there and a reload stays queued behind a page
+    /// that came back; make `schedule_retry`'s timer not call `retry_due` and
+    /// the queued reload never fires.
+    #[gtk::test]
+    fn an_unanswered_page_is_reloaded_on_the_shared_backoff() {
+        let (w, _rx) = window();
+        let _quiet = RetryGuard(Rc::clone(&w));
+        let page = webview::page(
+            "https://hive.invalid/agent/stray/?hide=header",
+            &tls::Resolved::default(),
+            |_| {},
+        );
+        w.fill_page_slot(&page);
+        let view = webview::view_of(&page).expect("a page widget carries its view");
+
+        let again = "https://hive.invalid/agent/stray/turn/3";
+        w.on_gateway(webview::Gateway::Unanswered {
+            uri: again.to_owned(),
+            why: "Could not connect: Connection refused".to_owned(),
+        });
+        assert!(
+            webview::shows_unanswered(&page),
+            "the card stands in front of the view"
+        );
+        assert_eq!(
+            w.waiting(),
+            Some((super::Attempt::Reload(again.to_owned()), false)),
+            "a reload of the URI that failed is queued"
+        );
+        assert_eq!(
+            w.unanswered.get(),
+            1,
+            "…on the same backoff the probe retry counts on"
+        );
+        assert_eq!(
+            page,
+            w.page_child().expect("the slot is still filled"),
+            "the view is kept, not rebuilt"
+        );
+
+        assert!(
+            pump_until(Duration::from_secs(10), || !w.retrying()),
+            "the queued reload never fired"
+        );
+        assert_eq!(
+            webkit::prelude::WebViewExt::uri(&view).as_deref(),
+            Some(again),
+            "the reload loads the failed URI in the same view"
+        );
+
+        // Still down: the next failure waits a step longer.
+        w.on_gateway(webview::Gateway::Unanswered {
+            uri: again.to_owned(),
+            why: "Could not connect: Connection refused".to_owned(),
+        });
+        assert_eq!(w.unanswered.get(), 2, "the backoff grows on a second miss");
+
+        // …and the hive answers.
+        w.on_gateway(webview::Gateway::Answered);
+        assert!(
+            !w.retrying(),
+            "nothing stays queued behind a page that came back"
+        );
+        assert_eq!(w.unanswered.get(), 0, "the backoff starts over");
     }
 }

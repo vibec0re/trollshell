@@ -527,9 +527,34 @@ pub fn failure_description(host: &str, tried: Option<&str>) -> String {
 /// reading can only equal the hive's name where `WebKit`'s does too, so a
 /// comparison against it refuses on its own.
 ///
-/// Nothing is normalised on the way out: no lower-casing and no trailing-dot
-/// stripping, so another spelling of a host compares unequal and fails
-/// closed rather than being guessed into a match.
+/// # One normalisation, and it is the parser's
+///
+/// Nothing is lower-cased here and no trailing dot is stripped, so another
+/// spelling of an ASCII host compares unequal and fails closed rather than
+/// being guessed into a match.
+///
+/// A **non-ASCII** host is the exception, and the parser makes it, not this
+/// function: parsed without `G_URI_FLAGS_NON_DNS`, `GUri` treats the host as
+/// a DNS name and runs one with non-ASCII in it through
+/// `g_hostname_to_ascii`, so `https://bücher.example/` comes back as
+/// `xn--bcher-kva.example` (measured, glib 2.88). That is the IDNA A-label
+/// spelling, and it is the one every consumer of this host needs: `WebKit`'s
+/// WHATWG parser hands `decide-policy` the A-label (so
+/// [`crate::page::navigable_in_place`] matches an IDN hive's own page), its
+/// certificate exception is looked up under the URL's host, which is the
+/// A-label too, and DNS only knows A-labels. Before #1557 these docs said the
+/// opposite, and nothing pinned the conversion, so a change of flags here
+/// would have quietly broken all three;
+/// `an_idn_host_comes_back_in_the_a_label_spelling` pins it now.
+///
+/// `g_hostname_to_ascii` drops a trailing dot as it converts (measured), and
+/// the URL Standard keeps one: `WebKit` serialises `hive.local.` with its
+/// dot, as its own origin (`URLParser.cpp` strips nothing from an ASCII
+/// host), and its IDNA step runs with the empty-label error tolerated. So
+/// that one dot is put back from the host as written
+/// (`written_with_a_trailing_dot`), and an IDN host keeps its dot exactly as
+/// an ASCII one does. If `WebKit` ever did drop it for an IDN host, the
+/// hive's own page would be refused — closed, not open.
 #[must_use]
 pub fn host_of(url: &str) -> Option<String> {
     let uri = authority_of(url)?;
@@ -539,11 +564,28 @@ pub fn host_of(url: &str) -> Option<String> {
     }
     // `GUri` hands an IPv6 literal back without the brackets the URL spelled
     // it in; this function's contract is the bracketed form.
-    Some(if host.contains(':') {
+    let mut host = if host.contains(':') {
         format!("[{host}]")
     } else {
         host.to_string()
-    })
+    };
+    if !host.ends_with('.') && written_with_a_trailing_dot(url) {
+        host.push('.');
+    }
+    Some(host)
+}
+
+/// Whether the host `url` spells ends in a root dot, read **as written** —
+/// with `G_URI_FLAGS_NON_DNS`, which is `GUri`'s own switch for "do not treat
+/// the host as a DNS name", so no IDNA conversion runs and nothing is dropped.
+///
+/// Only [`host_of`] asks, and only to put back the dot `g_hostname_to_ascii`
+/// strips from a non-ASCII host; for an ASCII host `GUri` already keeps it.
+fn written_with_a_trailing_dot(url: &str) -> bool {
+    glib::Uri::parse(url.trim(), glib::UriFlags::NON_DNS)
+        .ok()
+        .and_then(|uri| uri.host())
+        .is_some_and(|host| host.ends_with('.'))
 }
 
 /// `url` parsed by `GUri`, if it parses and its authority is one this window
@@ -991,8 +1033,54 @@ mod tests {
         }
     }
 
-    /// Nothing is normalised: another spelling of a host is another host, so
-    /// every comparison built on [`host_of`] fails **closed** for it.
+    /// **An IDN host comes back in the A-label spelling** — the one `WebKit`
+    /// hands `decide-policy`, the one its certificate exception is looked up
+    /// under, and the one DNS resolves (#1557 item 4).
+    ///
+    /// The expected values are literals, not `g_hostname_to_ascii`'s output
+    /// recomputed: `xn--bcher-kva` is RFC 3492's own worked example for
+    /// `bücher`, so a disagreement here is the conversion's and not the
+    /// test's. Rows: the plain case; upper case and a port, which the
+    /// conversion folds and drops like any other host; the trailing dot,
+    /// which `g_hostname_to_ascii` drops and [`host_of`] puts back because
+    /// `WebKit` keeps it; and a host the hive already wrote in A-labels,
+    /// which `GUri` leaves exactly as written (the M2 case fold in
+    /// `navigable_in_place` is what takes care of its case).
+    ///
+    /// Mutations (run this round, red): parse with `UriFlags::NON_DNS` in
+    /// `authority_of` — the "host as written" a reader might reach for — and
+    /// the first row reds with the Unicode name; drop the
+    /// `written_with_a_trailing_dot` re-append and the trailing-dot row reds
+    /// without its dot.
+    #[test]
+    fn an_idn_host_comes_back_in_the_a_label_spelling() {
+        for (url, read) in [
+            ("https://bücher.example/agent/x/", "xn--bcher-kva.example"),
+            ("https://Bücher.Example:8443/x", "xn--bcher-kva.example"),
+            ("https://b%C3%BCcher.example/x", "xn--bcher-kva.example"),
+            ("https://bücher.example./agent/x/", "xn--bcher-kva.example."),
+            ("https://XN--BCHER-KVA.example/x", "XN--BCHER-KVA.example"),
+        ] {
+            assert_eq!(host_of(url).as_deref(), Some(read), "{url}");
+        }
+        // …and the dot is put back only where the URL wrote one.
+        assert_eq!(
+            host_of("https://hive.local./x").as_deref(),
+            Some("hive.local.")
+        );
+        assert_eq!(
+            host_of("https://hive.local/x").as_deref(),
+            Some("hive.local")
+        );
+        assert_eq!(
+            identity_host("xn--bcher-kva.example"),
+            "xn--bcher-kva.example",
+            "the pin and the probe take the A-label as it is"
+        );
+    }
+
+    /// Nothing else is normalised: another spelling of a host is another host,
+    /// so every comparison built on [`host_of`] fails **closed** for it.
     ///
     /// Upper case and a trailing dot both come back as written — never
     /// folded into `hive.local`, which is what keeps

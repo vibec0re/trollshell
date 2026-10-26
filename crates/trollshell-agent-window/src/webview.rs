@@ -30,13 +30,38 @@
 use adw::prelude::*;
 use webkit::prelude::*;
 
-use crate::page::{Decision, Refusal, Target, decide, may_leave};
+use crate::page::{Decision, LoadFailure, Refusal, Target, decide, may_leave, reload_after};
 use crate::tls::{CERT_ENV, Pinned, Resolved, TlsPolicy, failure_description};
 
-/// The `Stack` child names — the page, and the TLS failure state that replaces
-/// it.
+/// The `Stack` child names — the page, the TLS failure state that replaces
+/// it, and (#1557 item 2) the card that stands in front of it while a gateway
+/// that did not answer is asked again.
 const PAGE: &str = "page";
 const TLS_FAILED: &str = "tls-failed";
+const UNANSWERED: &str = "unanswered";
+
+/// What the page reports to the window holding it about its own loads —
+/// #1557 item 2. The window owns the backoff, the timer and the parking;
+/// this file only says what happened.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Gateway {
+    /// A main-frame load of the hive's own page got no answer
+    /// ([`reload_after`] said to ask again). The page's stack now shows
+    /// [`show_unanswered`]'s card when the window hands it one; `uri` is the
+    /// URI to load again, `why` the engine's own words for the failure.
+    Unanswered {
+        /// The URI whose load failed — `WebKit`'s spelling, on the hive's
+        /// own origin.
+        uri: String,
+        /// The `GError`'s message, for the card and the journal.
+        why: String,
+    },
+    /// Something answered while that card was up: a main-frame load
+    /// committed, or one failed in a way asking again cannot mend (a
+    /// redirect off the hive the policy refused, say). The card is already
+    /// down when this is sent.
+    Answered,
+}
 
 /// The widget name [`verifying`] stamps on its state, and the whole of how
 /// [`is_verifying`] recognises it.
@@ -74,8 +99,12 @@ const UNREACHABLE: &str = "tls-unreachable";
 /// [`Fail`](webkit::TLSErrorsPolicy::Fail), see [`crate::tls`]) rather than
 /// left at the default, so a reader of this file can see that nothing here
 /// turns verification off.
+///
+/// `gateway` hears about the page's own loads ([`Gateway`]) — how the window
+/// learns that a gateway that was down at open has to be asked again, on a
+/// route where no probe ever ran (#1557 item 2).
 #[must_use]
-pub fn page(url: &str, trust: &Resolved) -> gtk::Widget {
+pub fn page(url: &str, trust: &Resolved, gateway: impl Fn(Gateway) + 'static) -> gtk::Widget {
     let policy = &trust.policy;
     // **Ephemeral**, not `NetworkSession::default()`: the default is the
     // persistent one, which accumulates cookies, cache and `IndexedDB` under
@@ -166,8 +195,239 @@ pub fn page(url: &str, trust: &Resolved) -> gtk::Widget {
         false
     });
 
+    watch_loads(&view, &stack, url, gateway);
+
     view.load_uri(url);
     stack.upcast()
+}
+
+/// Wire the view's own load signals to `gateway` — #1557 item 2.
+///
+/// # `load-failed`: which failures are asked again
+///
+/// [`load_failure`] reads the `GError` and [`reload_after`] decides, so the
+/// whole decision is two pure functions and this is only their sink. Only a
+/// load of the hive's own page that **nothing answered** is reported; for it
+/// the handler returns `true`, so `WebKit` draws no error page of its own —
+/// the window's card stands in front of the view instead, and whatever
+/// document was there (if the failure was a later navigation, not the first
+/// load) is left alone underneath.
+///
+/// Everything else returns `false`, which is exactly what happened before
+/// #1557: `WebKit`'s default handler draws its error page, or draws nothing
+/// for a cancellation. In particular a **TLS** failure: `WebKit` emits
+/// `load-failed` for it as well, right after `load-failed-with-tls-errors`
+/// returns `false`, and by then that handler has put the TLS card up — so
+/// [`load_failure`] reads the card as well as the error, and a certificate
+/// failure takes the TLS card's route and no other.
+///
+/// # `load-changed`: when the gateway is back
+///
+/// A main-frame load **committing** means something answered it with a
+/// response (`load-changed` is main-frame only, as `load-failed` is). If the
+/// unanswered card is up at that moment, it comes down here — the view is the
+/// page again — and the window is told, so the backoff starts over. It is the
+/// card's own state that is checked, not the URI: whichever load got through,
+/// the page is back.
+///
+/// # A failure asking again cannot mend, while the card is up
+///
+/// A reload can also be refused for a reason other than silence. That is not
+/// left to `load-changed`, because `WebKit` does not always draw anything for
+/// it: its default `load-failed` handler (`webkitWebViewLoadFail`,
+/// `WebKitWebView.cpp:594-609` in the webkitgtk 2.52.6 the flake links)
+/// returns early, with no error page and so no commit, for a cancellation
+/// (`WebKitNetworkError` 302) and a policy interruption (`WebKitPolicyError`
+/// 102). Those are exactly what the one-origin rule produces when a gateway
+/// that has come back answers the reload with a redirect off the hive. Left
+/// to the commit, the card stayed up promising a retry nobody had queued,
+/// and "Try again now" found nothing to run (#1578 review, LOW 2).
+///
+/// So the `load-failed` handler itself takes the card down when it declines a
+/// failure while the unanswered card is showing, and tells the window
+/// [`Gateway::Answered`]: something did answer, the backoff starts over and
+/// nothing stays queued. The view then shows whatever `WebKit` makes of that
+/// failure: its error page where it draws one, which commits onto a page the
+/// card no longer covers and so is not reported twice, or the document
+/// underneath where it draws none. A certificate failure is still the
+/// exception: its card is up before `load-failed` runs, so the unanswered
+/// card is not the one showing and nothing here touches either.
+fn watch_loads(
+    view: &webkit::WebView,
+    stack: &gtk::Stack,
+    embedded: &str,
+    gateway: impl Fn(Gateway) + 'static,
+) {
+    let gateway = std::rc::Rc::new(gateway);
+
+    // Weakly: the stack owns the view these handlers live on, so a strong
+    // clone would be a cycle through the view's own signal table.
+    let failed = stack.downgrade();
+    let origin = embedded.to_owned();
+    let report = std::rc::Rc::clone(&gateway);
+    view.connect_load_failed(move |_, _, failing_uri, error| {
+        let Some(stack) = failed.upgrade() else {
+            return false;
+        };
+        let tls_card_up = stack.visible_child_name().as_deref() == Some(TLS_FAILED);
+        let failure = load_failure(error, tls_card_up);
+        if !reload_after(&origin, failing_uri, failure) {
+            tracing::debug!(
+                uri = failing_uri,
+                ?failure,
+                error = %error,
+                "the page's load failed; not one that asking again can mend"
+            );
+            // Something answered, just not with the page: the card cannot
+            // wait for a commit `WebKit` may never make (see this function's
+            // docs, and the #1578 review's LOW 2).
+            if stack.visible_child_name().as_deref() == Some(UNANSWERED) {
+                stack.set_visible_child_name(PAGE);
+                report(Gateway::Answered);
+            }
+            return false;
+        }
+        report(Gateway::Unanswered {
+            uri: failing_uri.to_owned(),
+            why: error.message().to_owned(),
+        });
+        true
+    });
+
+    let answered = stack.downgrade();
+    view.connect_load_changed(move |_, event| {
+        let Some(stack) = answered.upgrade() else {
+            return;
+        };
+        if event == webkit::LoadEvent::Committed
+            && stack.visible_child_name().as_deref() == Some(UNANSWERED)
+        {
+            stack.set_visible_child_name(PAGE);
+            gateway(Gateway::Answered);
+        }
+    });
+}
+
+/// `WebKit`'s own load timeout: domain `WebKitNetworkError`, code **-1001**,
+/// which is no `WEBKIT_NETWORK_ERROR_*` value (`ResourceErrorSoup.cpp`'s
+/// `timeoutError`, raised by `NetworkDataTaskSoup.cpp`; webkitgtk 2.52.6, the
+/// version the flake links, and 2.54.1 alike).
+const WEBKIT_TIMEOUT: i32 = -1001;
+
+/// Classify the `GError` a `load-failed` carries, for [`reload_after`].
+///
+/// `tls_card_up` is whether `load-failed-with-tls-errors` has already put the
+/// TLS card in front of the view — see [`watch_loads`] for why a certificate
+/// failure arrives here at all.
+///
+/// # What `WebKit` actually hands over (read in webkitgtk's source)
+///
+/// Read in 2.54.1 first; the flake's devShell and package link **2.52.6**,
+/// and every file this cites (`WebKitNavigationClient.cpp`,
+/// `ResourceErrorSoup.cpp`, `WebKitPrivate.cpp`, and the
+/// `acceptCertificate`/`timeoutFired`/`sendRequestCallback` paths of
+/// `NetworkDataTaskSoup.cpp`) reads the same in both (#1578 review).
+///
+/// - A **connection** failure keeps the domain and code `GLib` gave it:
+///   libsoup returns `GSocketClient`'s error as is, `ResourceError::httpError`
+///   copies its domain string and code, and the UI process rebuilds the
+///   `GError` from them (`WebKitNavigationClient.cpp`), passing every code
+///   that is not one of `WebKit`'s own straight through (`toWebKitError`). So
+///   a refused connection is `g-io-error-quark` 39, an unreachable host 37 or
+///   38, a name that did not resolve `g-resolver-error-quark`. These, and
+///   `WebKit`'s own timeout ([`WEBKIT_TIMEOUT`]), are the failures nothing
+///   answered: [`LoadFailure::NoAnswer`].
+/// - A **certificate** failure is `g-tls-error-quark`
+///   (`G_TLS_ERROR_BAD_CERTIFICATE`), emitted as `load-failed` right after
+///   `load-failed-with-tls-errors` returns `false`:
+///   [`LoadFailure::Tls`], as is anything at all once the TLS card is up.
+/// - A **cancellation** (a newer load superseding this one) is
+///   `WebKitNetworkError` 302, an ignored redirect or response
+///   `WebKitPolicyError` 102, a refused port `WebKitPolicyError` 103, too
+///   many redirects a `SoupSessionError`: all [`LoadFailure::Other`], with
+///   everything not named above. An allow-list, so a failure this has never
+///   seen is never retried on a guess.
+fn load_failure(error: &gtk::glib::Error, tls_card_up: bool) -> LoadFailure {
+    use gtk::gio::{IOErrorEnum, ResolverError, TlsError};
+    use gtk::glib::error::ErrorDomain as _;
+    if tls_card_up || error.kind::<TlsError>().is_some() {
+        return LoadFailure::Tls;
+    }
+    if let Some(io) = error.kind::<IOErrorEnum>() {
+        return match io {
+            IOErrorEnum::ConnectionRefused
+            | IOErrorEnum::HostUnreachable
+            | IOErrorEnum::NetworkUnreachable
+            | IOErrorEnum::HostNotFound
+            | IOErrorEnum::TimedOut
+            | IOErrorEnum::BrokenPipe
+            | IOErrorEnum::NotConnected
+            | IOErrorEnum::ProxyFailed => LoadFailure::NoAnswer,
+            _ => LoadFailure::Other,
+        };
+    }
+    if let Some(resolver) = error.kind::<ResolverError>() {
+        return match resolver {
+            ResolverError::NotFound | ResolverError::TemporaryFailure => LoadFailure::NoAnswer,
+            _ => LoadFailure::Other,
+        };
+    }
+    if error.domain() == webkit::NetworkError::domain() && error.code() == WEBKIT_TIMEOUT {
+        return LoadFailure::NoAnswer;
+    }
+    LoadFailure::Other
+}
+
+/// Put `card` in front of the view inside a widget [`page`] returned — the
+/// window's unanswered card (#1557 item 2), replacing the one an earlier
+/// failure put there.
+///
+/// The view stays in the stack underneath, so the page the operator had (if
+/// the failure was a later navigation) is still there when the gateway
+/// answers. A no-op for anything that is not a [`page`] widget, and while the
+/// TLS card is up: that card is the operator's to act on, and nothing here
+/// takes it down.
+pub fn show_unanswered(page: &gtk::Widget, card: &gtk::Widget) {
+    let Some(stack) = page.downcast_ref::<gtk::Stack>() else {
+        return;
+    };
+    if stack.visible_child_name().as_deref() == Some(TLS_FAILED) {
+        return;
+    }
+    if let Some(old) = stack.child_by_name(UNANSWERED) {
+        stack.remove(&old);
+    }
+    stack.add_named(card, Some(UNANSWERED));
+    stack.set_visible_child_name(UNANSWERED);
+}
+
+/// Whether a widget [`page`] returned is showing the unanswered card.
+///
+/// `None`-free and total, like [`view_of`].
+#[must_use]
+pub fn shows_unanswered(page: &gtk::Widget) -> bool {
+    page.downcast_ref::<gtk::Stack>()
+        .is_some_and(|stack| stack.visible_child_name().as_deref() == Some(UNANSWERED))
+}
+
+/// Load `uri` in the view inside a widget [`page`] returned — the window's
+/// queued reload (#1557 item 2).
+///
+/// Through `load_uri`, so the request meets `decide-policy` like any other
+/// navigation; `uri` is one [`reload_after`] already found on the hive's own
+/// origin. Not while the TLS card is up: a reload there would only be handed
+/// the same certificate, and that card is the operator's to act on.
+pub fn reload(page: &gtk::Widget, uri: &str) {
+    let Some(stack) = page.downcast_ref::<gtk::Stack>() else {
+        return;
+    };
+    if stack.visible_child_name().as_deref() == Some(TLS_FAILED) {
+        tracing::debug!(%uri, "not reloading behind the TLS card");
+        return;
+    }
+    if let Some(view) = view_of(page) {
+        view.load_uri(uri);
+    }
 }
 
 /// What to pin and **under which spelling of the host**, or `None` when the
@@ -372,6 +632,16 @@ pub fn is_verifying(widget: &gtk::Widget) -> bool {
 ///
 /// Escaped, like every other description in this file: `tried` carries a path
 /// and the GIO error's own words, and neither is markup.
+///
+/// # The same card for a mounted page (#1557 item 2)
+///
+/// On the routes with no probe there is no verdict to wait for, so the page
+/// mounts and `WebKit`'s own load is what finds the gateway down. The window
+/// puts this card in front of the view then too ([`show_unanswered`]), with
+/// `tried` naming the URI that got no answer and the engine's own words for
+/// it, and its button skips the backoff of the queued reload instead of a
+/// queued probe. One card for one condition — the gateway did not answer —
+/// whichever step found it out.
 #[must_use]
 pub fn unreachable(
     tried: Option<&str>,
@@ -581,9 +851,107 @@ fn elsewhere(uri: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{elsewhere, pin_for};
+    use super::{WEBKIT_TIMEOUT, elsewhere, load_failure, pin_for};
+    use crate::page::LoadFailure;
     use crate::tls::{Pinned, TlsPolicy};
+    use gtk::gio::{IOErrorEnum, ResolverError, TlsError};
+    use gtk::glib;
     use std::path::PathBuf;
+
+    /// **Which load failures mean "nothing answered"** — #1557 item 2's
+    /// classifier, against `GError`s in the shapes `WebKit` hands
+    /// `load-failed` (domains and codes read in webkitgtk's source, the same
+    /// in the 2.52.6 the flake links and in 2.54.1; see [`load_failure`]'s
+    /// docs for where each comes from).
+    ///
+    /// A gateway that is down answers `NoAnswer`: refused, unreachable, a
+    /// name that did not resolve, a timeout of `GLib`'s or of `WebKit`'s own
+    /// (`WebKitNetworkError` -1001, which no enum value names). A certificate
+    /// answers `Tls`, and so does **anything** once the TLS card is up. The
+    /// rest — a cancellation, a policy decision, a redirect loop, an error
+    /// this has never seen — answers `Other`, because an allow-list is what
+    /// keeps a guess from turning into a reload loop.
+    ///
+    /// Mutations (run this round, red): drop the `tls_card_up` term and the
+    /// card-up row reads `NoAnswer`; return `NoAnswer` for every
+    /// `IOErrorEnum` and the `Cancelled` row does; drop the
+    /// [`WEBKIT_TIMEOUT`] arm and `WebKit`'s own timeout reads `Other`.
+    #[test]
+    fn a_load_nothing_answered_is_told_from_one_that_was_refused() {
+        let webkit_timeout = glib::Error::with_domain(
+            <webkit::NetworkError as glib::error::ErrorDomain>::domain(),
+            WEBKIT_TIMEOUT,
+            "Load request timed out",
+        );
+        for (error, expected) in [
+            (
+                glib::Error::new(IOErrorEnum::ConnectionRefused, "Connection refused"),
+                LoadFailure::NoAnswer,
+            ),
+            (
+                glib::Error::new(IOErrorEnum::HostUnreachable, "No route to host"),
+                LoadFailure::NoAnswer,
+            ),
+            (
+                glib::Error::new(IOErrorEnum::NetworkUnreachable, "Network is unreachable"),
+                LoadFailure::NoAnswer,
+            ),
+            (
+                glib::Error::new(IOErrorEnum::TimedOut, "Socket I/O timed out"),
+                LoadFailure::NoAnswer,
+            ),
+            (
+                glib::Error::new(ResolverError::NotFound, "Name not known"),
+                LoadFailure::NoAnswer,
+            ),
+            (
+                glib::Error::new(ResolverError::TemporaryFailure, "Temporary failure"),
+                LoadFailure::NoAnswer,
+            ),
+            (webkit_timeout, LoadFailure::NoAnswer),
+            (
+                glib::Error::new(TlsError::BadCertificate, "Unacceptable TLS certificate"),
+                LoadFailure::Tls,
+            ),
+            (
+                glib::Error::new(webkit::NetworkError::Cancelled, "Load request cancelled"),
+                LoadFailure::Other,
+            ),
+            (
+                glib::Error::new(
+                    webkit::PolicyError::FrameLoadInterruptedByPolicyChange,
+                    "Frame load was interrupted",
+                ),
+                LoadFailure::Other,
+            ),
+            (
+                glib::Error::new(IOErrorEnum::Cancelled, "Operation was cancelled"),
+                LoadFailure::Other,
+            ),
+            (
+                glib::Error::with_domain(
+                    glib::Quark::from_str("soup-session-error-quark"),
+                    3,
+                    "Too many redirects",
+                ),
+                LoadFailure::Other,
+            ),
+            (
+                glib::Error::new(ResolverError::Internal, "Internal resolver error"),
+                LoadFailure::Other,
+            ),
+        ] {
+            assert_eq!(load_failure(&error, false), expected, "{error:?}");
+        }
+        assert_eq!(
+            load_failure(
+                &glib::Error::new(IOErrorEnum::ConnectionRefused, "Connection refused"),
+                true
+            ),
+            LoadFailure::Tls,
+            "once the TLS card is up, every failure is the card's"
+        );
+    }
 
     /// **An IPv6 pin is stored under the spelling `WebKit` looks it up by** —
     /// the bare literal, not the bracketed one (#1242 review, finding 3;
@@ -641,6 +1009,8 @@ mod tests {
 mod gtk_tests {
     use super::{PAGE, TLS_FAILED, page, settings, view_of};
     use crate::tls::Resolved;
+    use std::cell::Cell;
+    use std::rc::Rc;
     use webkit::prelude::*;
 
     /// # Why there is no end-to-end "the view refused it" test here
@@ -752,7 +1122,11 @@ mod gtk_tests {
     #[gtk::test]
     fn the_view_carries_those_settings() {
         use gtk::glib::object::ObjectExt as _;
-        let w = page("https://hive.local/agent/stray/", &Resolved::default());
+        let w = page(
+            "https://hive.local/agent/stray/",
+            &Resolved::default(),
+            |_| {},
+        );
         let view = view_of(&w).expect("the page widget carries the view");
         let s =
             webkit::prelude::WebViewExt::settings(&view).expect("the view was built with settings");
@@ -766,7 +1140,11 @@ mod gtk_tests {
     /// on a normal open.
     #[gtk::test]
     fn the_page_starts_on_the_view_not_on_the_error_state() {
-        let w = page("https://hive.local/agent/stray/", &Resolved::default());
+        let w = page(
+            "https://hive.local/agent/stray/",
+            &Resolved::default(),
+            |_| {},
+        );
         let stack = w
             .downcast_ref::<gtk::Stack>()
             .expect("the page widget is a stack");
@@ -777,6 +1155,232 @@ mod gtk_tests {
         );
     }
 
+    /// What [`page`] hands its `gateway` callback, collected.
+    type Heard = std::rc::Rc<std::cell::RefCell<Vec<super::Gateway>>>;
+
+    /// A page on `url` whose reports land in the returned log, and a counter
+    /// of the `load-failed` emissions that got **past** this file's handler.
+    ///
+    /// The counter is a second handler connected after `page` connected its
+    /// own: `load-failed` stops at the first handler that returns `true`
+    /// (`g_signal_accumulator_true_handled`), so it moves exactly when ours
+    /// declined the failure — which is when `WebKit`'s own class handler
+    /// would draw its error page. The emission's return value cannot say
+    /// that: the class handler answers `true` itself after drawing one.
+    fn listening_page(url: &str) -> (gtk::Widget, webkit::WebView, Heard, Rc<Cell<u32>>) {
+        let heard: Heard = std::rc::Rc::default();
+        let log = std::rc::Rc::clone(&heard);
+        let w = page(url, &Resolved::default(), move |event| {
+            log.borrow_mut().push(event);
+        });
+        let view = view_of(&w).expect("the page widget carries the view");
+        let declined = Rc::new(Cell::new(0_u32));
+        let count = Rc::clone(&declined);
+        view.connect_load_failed(move |_, _, _, _| {
+            count.set(count.get() + 1);
+            // Declined here too, so the emission carries on to `WebKit`'s
+            // own handler exactly as it would without this probe.
+            false
+        });
+        (w, view, heard, declined)
+    }
+
+    /// Emit `load-failed` on `view` the way `WebKit` does, and answer whether
+    /// this file's handler **took** it (so `WebKit` draws no error page).
+    ///
+    /// No web process runs here (this module's doc), so `WebKit` itself never
+    /// emits it; `GLib`'s own dispatch reaches the very closure
+    /// `watch_loads` connected, which is the wiring under test.
+    fn fail(
+        view: &webkit::WebView,
+        declined: &Cell<u32>,
+        uri: &str,
+        error: &gtk::glib::Error,
+    ) -> bool {
+        use gtk::glib::object::ObjectExt as _;
+        let before = declined.get();
+        let _: bool = view.emit_by_name("load-failed", &[&webkit::LoadEvent::Started, &uri, error]);
+        declined.get() == before
+    }
+
+    /// **A load of the hive's page that nothing answered reaches the window,
+    /// and the card comes down when one commits** — #1557 item 2, the
+    /// signal half (`window.rs`'s
+    /// `an_unanswered_page_is_reloaded_on_the_shared_backoff` is the
+    /// window's).
+    ///
+    /// Mutations (run this round, red): make the `load-failed` handler return
+    /// `false` without reporting — no general handler, the bug as it stood —
+    /// and the first assertion reds, the failure going on to `WebKit`'s own
+    /// error page with nothing reported; drop the `load-changed` flip and the
+    /// card stays up over a page that answered.
+    #[gtk::test]
+    fn a_hive_page_nothing_answered_is_reported_and_its_card_lifts_on_commit() {
+        let url = "https://hive.local/agent/stray/?hide=header";
+        let (w, view, heard, declined) = listening_page(url);
+        let refused = gtk::glib::Error::new(
+            gtk::gio::IOErrorEnum::ConnectionRefused,
+            "Could not connect to hive.local: Connection refused",
+        );
+
+        assert!(
+            fail(&view, &declined, url, &refused),
+            "the window takes this failure — WebKit draws no error page over the card"
+        );
+        assert_eq!(
+            heard.borrow().as_slice(),
+            [super::Gateway::Unanswered {
+                uri: url.to_owned(),
+                why: "Could not connect to hive.local: Connection refused".to_owned(),
+            }]
+        );
+
+        super::show_unanswered(&w, &gtk::Label::new(Some("card")).upcast());
+        assert!(super::shows_unanswered(&w));
+
+        {
+            use gtk::glib::object::ObjectExt as _;
+            view.emit_by_name::<()>("load-changed", &[&webkit::LoadEvent::Committed]);
+        }
+        assert!(
+            !super::shows_unanswered(&w),
+            "something answered: the page is back"
+        );
+        let stack = w.downcast_ref::<gtk::Stack>().expect("a stack");
+        assert_eq!(stack.visible_child_name().as_deref(), Some(PAGE));
+        assert_eq!(heard.borrow().last(), Some(&super::Gateway::Answered));
+
+        // A commit with no card up is the ordinary case and says nothing.
+        let before = heard.borrow().len();
+        {
+            use gtk::glib::object::ObjectExt as _;
+            view.emit_by_name::<()>("load-changed", &[&webkit::LoadEvent::Committed]);
+        }
+        assert_eq!(heard.borrow().len(), before);
+    }
+
+    /// …and **nothing else reaches it**: a failure off the hive, a
+    /// certificate failure (by its error, or because the TLS card is already
+    /// up), and a cancellation all go `WebKit`'s own way, as every failure did
+    /// before #1557 — and behind the TLS card neither a new card nor a reload
+    /// gets in.
+    ///
+    /// Mutations (run this round, red): drop `load_failure`'s `tls_card_up`
+    /// term and the TLS-card row reports; reload regardless of the TLS card
+    /// in [`super::reload`] and the view's URI moves behind it.
+    #[gtk::test]
+    fn only_the_hives_own_unanswered_load_is_reported() {
+        use gtk::gio::{IOErrorEnum, TlsError};
+        let url = "https://hive.local/agent/stray/?hide=header";
+        let (w, view, heard, declined) = listening_page(url);
+        let refused = gtk::glib::Error::new(IOErrorEnum::ConnectionRefused, "refused");
+
+        assert!(
+            !fail(&view, &declined, "https://evil.example/", &refused),
+            "off the hive"
+        );
+        assert!(
+            !fail(
+                &view,
+                &declined,
+                url,
+                &gtk::glib::Error::new(TlsError::BadCertificate, "bad certificate")
+            ),
+            "a certificate failure is the TLS card's"
+        );
+        assert!(
+            !fail(
+                &view,
+                &declined,
+                url,
+                &gtk::glib::Error::new(webkit::NetworkError::Cancelled, "cancelled")
+            ),
+            "a cancellation is a newer load or the policy, not an outage"
+        );
+        assert!(heard.borrow().is_empty(), "{:?}", heard.borrow());
+
+        let stack = w.downcast_ref::<gtk::Stack>().expect("a stack");
+        stack.set_visible_child_name(TLS_FAILED);
+        assert!(
+            !fail(&view, &declined, url, &refused),
+            "behind the TLS card even a refused connection takes the card's route"
+        );
+        assert!(heard.borrow().is_empty(), "{:?}", heard.borrow());
+
+        super::show_unanswered(&w, &gtk::Label::new(Some("card")).upcast());
+        assert_eq!(
+            stack.visible_child_name().as_deref(),
+            Some(TLS_FAILED),
+            "nothing takes the TLS card down"
+        );
+        let before = view.uri();
+        super::reload(&w, "https://hive.local/agent/stray/turn/3");
+        assert_eq!(view.uri(), before, "and nothing reloads behind it");
+    }
+
+    /// **A reload the policy refuses takes the card down** — #1578 review,
+    /// LOW 2.
+    ///
+    /// The gateway is down at open, so the card is up and a reload is
+    /// queued; then it comes back and answers the reload with a redirect off
+    /// the hive. `decide-policy` refuses that, and `WebKit` reports a policy
+    /// interruption (102) or a cancellation (302) — the two failures its
+    /// default handler draws **no** page for, so nothing commits and the
+    /// `load-changed` flip never runs. Each row starts from the card and
+    /// checks that the failure itself takes it down and tells the window,
+    /// and that the commit of whatever `WebKit` loads next is not reported a
+    /// second time.
+    ///
+    /// Mutations (run this round, red): drop the card-lifting branch from the
+    /// `load-failed` handler — the card left up, the review's finding — and
+    /// the first row's `shows_unanswered` assertion reds; lift the card but
+    /// drop the `Answered` report and the `heard` assertion reds, which is
+    /// the window keeping its queue and its backoff behind a page that
+    /// answered.
+    #[gtk::test]
+    fn a_reload_the_policy_refuses_takes_the_card_down() {
+        let url = "https://hive.local/agent/stray/?hide=header";
+        let (w, view, heard, declined) = listening_page(url);
+        let refused = gtk::glib::Error::new(gtk::gio::IOErrorEnum::ConnectionRefused, "refused");
+        for answer in [
+            gtk::glib::Error::new(
+                webkit::PolicyError::FrameLoadInterruptedByPolicyChange,
+                "Frame load was interrupted",
+            ),
+            gtk::glib::Error::new(webkit::NetworkError::Cancelled, "Load request cancelled"),
+        ] {
+            assert!(fail(&view, &declined, url, &refused));
+            super::show_unanswered(&w, &gtk::Label::new(Some("card")).upcast());
+            let before = heard.borrow().len();
+
+            assert!(
+                !fail(&view, &declined, url, &answer),
+                "{answer:?} still goes WebKit's own way"
+            );
+            assert!(
+                !super::shows_unanswered(&w),
+                "{answer:?}: something answered, so the card comes down"
+            );
+            let stack = w.downcast_ref::<gtk::Stack>().expect("a stack");
+            assert_eq!(stack.visible_child_name().as_deref(), Some(PAGE));
+            assert_eq!(
+                heard.borrow()[before..],
+                [super::Gateway::Answered],
+                "{answer:?}: the window is told once, so nothing stays queued"
+            );
+
+            {
+                use gtk::glib::object::ObjectExt as _;
+                view.emit_by_name::<()>("load-changed", &[&webkit::LoadEvent::Committed]);
+            }
+            assert_eq!(
+                heard.borrow().len(),
+                before + 1,
+                "{answer:?}: a later commit is not reported a second time"
+            );
+        }
+    }
+
     /// The session is **ephemeral**: no cookies, cache or `IndexedDB` left under
     /// `$XDG_{DATA,CACHE}_HOME` after the window closes (#1130 L6).
     ///
@@ -784,7 +1388,11 @@ mod gtk_tests {
     /// `NetworkSession::default()` — the persistent one — and this reds.
     #[gtk::test]
     fn the_network_session_is_ephemeral() {
-        let w = page("https://hive.local/agent/stray/", &Resolved::default());
+        let w = page(
+            "https://hive.local/agent/stray/",
+            &Resolved::default(),
+            |_| {},
+        );
         let view = view_of(&w).expect("the page widget carries the view");
         assert!(
             view.network_session()

@@ -18,7 +18,7 @@ use hytte_bus::{OwnNameSignal, OwnState};
 use hytte_reactive::{Service, registry, runtime, shared};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::task::AbortHandle;
 use zbus::object_server::SignalEmitter;
@@ -102,11 +102,13 @@ pub struct Action {
 
 /// An image attached to a notification.
 ///
-/// Priority (highest first): `image-data` hint → `image-path` hint →
-/// `app_icon` argument.
+/// Priority (highest first): `image-data` / `image_data` hint →
+/// `image-path` / `image_path` hint → `app_icon` argument → legacy
+/// `icon_data` hint — the spec's single-image order (see `parse_image`).
 #[derive(Clone, Debug)]
 pub enum NotificationImage {
-    /// In-memory raw image from the `image-data` (or legacy `icon_data`) hint.
+    /// In-memory raw image from the `image-data` hint (or its deprecated
+    /// spellings, `image_data` and `icon_data`).
     ///
     /// Bytes are straight (non-premultiplied) RGBA or RGB depending on
     /// `has_alpha`. Pass `rowstride` directly to `gdk::MemoryTexture::new`
@@ -210,7 +212,6 @@ impl Service for NotificationsService {
         let iface = NotificationsIface {
             active: active.clone(),
             next_id: next_id.clone(),
-            history: history.clone(),
         };
 
         // Own the well-known name + mount the interface. The bus layer handles
@@ -325,78 +326,145 @@ pub fn clear_history() {
 /// 4 = undefined.
 ///
 /// Removes the notification from the active list, pushes it to history, and
-/// emits `NotificationClosed` on the session bus.
+/// emits `NotificationClosed` on the session bus — **only if `id` is live**.
+/// For any other id it is a no-op: no history entry, and above all no signal.
+/// The spec invalidates an id "before the signal is sent", so a second
+/// `NotificationClosed` for one id, or one for an id never issued, is a close
+/// event for a notification that does not exist — which a client that
+/// filters the broadcast by id (libnotify does) may take for one of its own.
+/// Pre-fix both happened: `CloseNotification 999` emitted
+/// `NotificationClosed(999, 3)`, and a click landing as the expiry timer fired
+/// emitted the close twice, once per reason.
+///
+/// Every close path funnels through here — auto-expiry, the user, and the
+/// D-Bus `CloseNotification` — so this one gate covers all of them.
 ///
 /// Safe to call from any thread (GTK widget handlers, hytte-tokio workers,
 /// the auto-expire timer in `notify()`). The local mutation runs
 /// synchronously on the calling thread; the bus signal emit is spawned onto
 /// the runtime.
 pub fn dismiss(id: u32, reason: u32) {
-    // Local state mutation. Synchronous — Mutable is thread-safe.
-    if let Some(shared) = shared::get::<NotificationsShared>() {
-        let removed = {
-            let mut list = shared.active.lock_mut();
-            let pos = list.iter().position(|n| n.id == id);
-            pos.map(|i| list.remove(i))
-        };
-        if let Some(n) = removed {
-            let dismissed_at = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let entry = HistoryEntry {
-                id: n.id,
-                app_name: n.app_name,
-                app_icon: n.app_icon,
-                summary: n.summary,
-                body: n.body,
-                urgency: n.urgency,
-                image: n.image,
-                actions: n.actions,
-                reason,
-                created_at: n.created_at,
-                dismissed_at,
-            };
-            let mut hist = shared.history.lock_mut();
-            hist.insert(0, entry);
-            hist.truncate(100);
-        }
+    close(id, reason, None);
+}
 
-        // Drop any local-dispatch callback still registered for `id` — this
-        // close path (expiry, user dismiss, or `close_notification`'s call
-        // into `dismiss`) means the action can never be invoked again. A
-        // cheap no-op for externally-posted notifications, which never
-        // populate this map.
-        if let Ok(mut map) = shared.local_actions.lock() {
-            clear_local_actions(&mut map, id);
-        }
+/// [`dismiss`], plus the one thing an expiry has to prove first: `expiry` is
+/// the [`TimerEntry::arming`] the firing sleep was armed with, and the close
+/// goes ahead only while that is still the entry's current arming (see
+/// [`closable`]). `None` — the user, `CloseNotification` — closes
+/// unconditionally.
+fn close(id: u32, reason: u32, expiry: Option<u64>) {
+    let Some(shared) = shared::get::<NotificationsShared>() else {
+        return;
+    };
 
-        // Cancel and drop any armed expiry timer for this id. Every close path
-        // (auto-expiry, user dismiss, `CloseNotification`) funnels through
-        // `dismiss`, so this is the one place the timer bookkeeping is
-        // reclaimed — no leaked entry or orphaned sleep task (#567). Runs
-        // unconditionally (like the `local_actions` sweep above): a
-        // `close_notification` that already pulled the notification out of the
-        // active list still needs its timer torn down here.
-        if let Ok(mut timers) = shared.timers.lock() {
+    // Local state mutation. Synchronous — Mutable is thread-safe. The
+    // position is read through `Deref` and only a real removal goes through
+    // `DerefMut`, so a no-op close does not wake the toast consumer.
+    //
+    // `timers` is taken *inside* the `active` guard — the `active` → `timers`
+    // order `notify` / `post_local` already use for `set_expiry` — so the
+    // arming check and the removal are one step against every re-post: a
+    // re-post either ran entirely before this (and its re-arm makes a stale
+    // expiry's arming not current) or runs entirely after (and finds the id
+    // closed, so allocates fresh). The entry is reclaimed in the same step —
+    // no leaked entry or orphaned sleep task (#567) — and only on a real
+    // close: an entry exists exactly while its notification is live
+    // (`set_expiry` creates it under the guard that publishes the
+    // notification) and a non-live id is never re-created (`notify_id`), so a
+    // no-op close has nothing to reclaim. A poisoned `timers` lock is still
+    // read: every critical section on it is plain map surgery, and refusing
+    // here would leave every toast on screen forever.
+    let removed = {
+        let mut list = shared.active.lock_mut();
+        let mut timers = shared.timers.lock().unwrap_or_else(PoisonError::into_inner);
+        closable(&list, &timers, id, expiry).map(|at| {
             clear_timer(&mut timers, id);
-        }
+            list.remove(at)
+        })
+    };
+    let Some(n) = removed else {
+        tracing::debug!(
+            id,
+            reason,
+            stale_expiry = expiry.is_some(),
+            "close for an id that is not live, or by a superseded expiry; nothing to do"
+        );
+        return;
+    };
+
+    let dismissed_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let entry = HistoryEntry {
+        id: n.id,
+        app_name: n.app_name,
+        app_icon: n.app_icon,
+        summary: n.summary,
+        body: n.body,
+        urgency: n.urgency,
+        image: n.image,
+        actions: n.actions,
+        reason,
+        created_at: n.created_at,
+        dismissed_at,
+    };
+    {
+        let mut hist = shared.history.lock_mut();
+        hist.insert(0, entry);
+        hist.truncate(100);
+    }
+
+    // Drop any local-dispatch callback still registered for `id` — this
+    // close path (expiry, user dismiss, or `close_notification`'s call
+    // into `dismiss`) means the action can never be invoked again. A
+    // cheap no-op for externally-posted notifications, which never
+    // populate this map.
+    if let Ok(mut map) = shared.local_actions.lock() {
+        clear_local_actions(&mut map, id);
     }
 
     // Emit the NotificationClosed signal directly on the owned connection.
-    if let Some(shared) = shared::get::<NotificationsShared>() {
-        let ownership = shared.ownership.clone();
-        runtime::handle().spawn(async move {
-            let result = ownership
-                .emit("/org/freedesktop/Notifications", |emitter| async move {
-                    NotificationsIface::notification_closed(&emitter, id, reason).await
-                })
-                .await;
-            if let Err(e) = result {
-                tracing::warn!(error = %e, id, reason, "NotificationClosed emit failed");
-            }
-        });
+    let ownership = shared.ownership.clone();
+    runtime::handle().spawn(async move {
+        let result = ownership
+            .emit("/org/freedesktop/Notifications", |emitter| async move {
+                NotificationsIface::notification_closed(&emitter, id, reason).await
+            })
+            .await;
+        if let Err(e) = result {
+            tracing::warn!(error = %e, id, reason, "NotificationClosed emit failed");
+        }
+    });
+}
+
+/// Where `id` sits in the live list, if it is there to close; `None` makes
+/// the close a no-op. The one gate on every side effect of [`dismiss`], the
+/// `NotificationClosed` emit included — factored out so the gate itself is
+/// unit-testable without the process-global shared registry or a bus.
+///
+/// An expiry (`expiry: Some(arming)`) must also still be `id`'s *current*
+/// arming. `AbortHandle::abort` cannot stop a sleep task that is already past
+/// its `sleep` and blocked on the `active` lock inside `close`: there is no
+/// `.await` left in it for the abort to land on. Before this check, such a
+/// task — superseded by a `replaces_id` re-post that held the lock, or by a
+/// hover that paused it — went on to close whatever was live under the id
+/// once the lock came free: the fresh replacement, with reason 1, right
+/// after it appeared. Every re-post and every pause bumps the arming
+/// ([`TimerEntry::disarm`]), so the superseded task's no longer matches; a
+/// missing entry means the notification already closed.
+fn closable(
+    live: &[Notification],
+    timers: &TimerMap,
+    id: u32,
+    expiry: Option<u64>,
+) -> Option<usize> {
+    if let Some(arming) = expiry
+        && timers.get(&id).is_none_or(|entry| entry.arming != arming)
+    {
+        return None;
     }
+    live.iter().position(|n| n.id == id)
 }
 
 /// Dismiss every currently-active notification (reason 2 = dismissed-by-user)
@@ -629,8 +697,10 @@ enum TimerAction {
 /// preserves: `timeout: Some` with `hover_count == 0` and no `deadline`;
 /// `timeout: None` with an armed `deadline`; `hover_count > 0` with an armed
 /// `deadline`; a `deadline` without its `abort` (or vice versa, save for the
-/// inherent race where a sleep has fired but its `dismiss` — which drops the
-/// whole entry — hasn't run yet).
+/// inherent window where a sleep has fired but its close — which drops the
+/// whole entry — hasn't run yet; harmless, because that close presents its
+/// [`TimerEntry::arming`] and is refused if anything re-armed or paused the
+/// entry in the meantime).
 ///
 /// [`start`]: TimerState::start
 #[derive(Debug, Default)]
@@ -737,18 +807,47 @@ impl TimerState {
 struct TimerEntry {
     state: TimerState,
     abort: Option<AbortHandle>,
+    /// Which arming of this entry the live sleep belongs to. Bumped by every
+    /// [`disarm`](Self::disarm) — so by every re-post, every pausing hover and
+    /// every re-arm — and handed to the task [`arm`](Self::arm) spawns, which
+    /// presents it when it fires; [`closable`] refuses an expiry whose arming
+    /// is no longer this one. `abort` alone cannot be the record: a task past
+    /// its `sleep` has no `.await` left for an abort to land on. Wraps rather
+    /// than overflows; 2⁶⁴ re-arms of one toast are not a concern.
+    arming: u64,
+}
+
+impl TimerEntry {
+    /// Cancel the armed sleep, if any, and supersede it — including a sleep
+    /// that has already fired and whose close is still waiting on the
+    /// `active` lock, which the abort cannot reach.
+    fn disarm(&mut self) {
+        if let Some(handle) = self.abort.take() {
+            handle.abort();
+        }
+        self.arming = self.arming.wrapping_add(1);
+    }
+
+    /// Supersede whatever was armed and arm a fresh sleep through `spawn`,
+    /// which receives the arming the task must present when it fires.
+    fn arm(&mut self, spawn: impl FnOnce(u64) -> Option<AbortHandle>) {
+        self.disarm();
+        self.abort = spawn(self.arming);
+    }
 }
 
 /// Per-id expiry timers backing [`NotificationsShared::timers`].
 type TimerMap = HashMap<u32, TimerEntry>;
 
-/// Spawn the `sleep(dur) → dismiss(id, 1 = expired)` task and return its abort
-/// handle. Runs on the shared runtime so it's callable from any thread.
-fn spawn_expiry(id: u32, dur: Duration) -> AbortHandle {
+/// Spawn the `sleep(dur) → close(id, 1 = expired)` task for `arming` and
+/// return its abort handle. Runs on the shared runtime so it's callable from
+/// any thread. The close is refused if `arming` has been superseded by the
+/// time it gets the `active` lock (see [`closable`]).
+fn spawn_expiry(id: u32, dur: Duration, arming: u64) -> AbortHandle {
     runtime::handle()
         .spawn(async move {
             tokio::time::sleep(dur).await;
-            dismiss(id, 1); // 1 = expired
+            close(id, 1, Some(arming)); // 1 = expired
         })
         .abort_handle()
 }
@@ -756,8 +855,8 @@ fn spawn_expiry(id: u32, dur: Duration) -> AbortHandle {
 /// Record `id`'s resolved timeout — `Some` finite, `None` sticky — creating the
 /// bookkeeping entry on first post and re-arming (or standing down) the sleep on
 /// every `replaces_id` re-post. The one entry point for "what is this
-/// notification's timeout now"; [`dismiss`] is the only thing that removes an
-/// entry.
+/// notification's timeout now"; [`close`] (behind [`dismiss`]) is the only
+/// thing that removes an entry.
 ///
 /// Called synchronously by the D-Bus `Notify` handler / [`post_local`] **while
 /// they hold the `active` write guard**, before the notification becomes
@@ -776,18 +875,19 @@ fn set_expiry(id: u32, timeout: Option<Duration>) {
         return;
     };
     if let Ok(mut timers) = shared.timers.lock() {
-        apply_expiry(&mut timers, id, timeout, Instant::now(), |dur| {
-            Some(spawn_expiry(id, dur))
+        apply_expiry(&mut timers, id, timeout, Instant::now(), |dur, arming| {
+            Some(spawn_expiry(id, dur, arming))
         });
     }
 }
 
 /// Map-level half of [`set_expiry`]: create-or-update `id`'s entry for a
-/// (re-)post that resolved to `timeout`, cancel whatever that entry had armed,
-/// and — when the transition calls for a fresh countdown — install the handle
-/// `spawn` returns for it.
+/// (re-)post that resolved to `timeout`, cancel and supersede whatever that
+/// entry had armed, and — when the transition calls for a fresh countdown —
+/// install the handle `spawn` returns for it. `spawn` gets the duration and
+/// the [`TimerEntry::arming`] the task must present.
 ///
-/// **Never removes an entry.** [`clear_timer`], from [`dismiss`], is the only
+/// **Never removes an entry.** [`clear_timer`], from [`close`], is the only
 /// remover; a sticky re-post stands the countdown down in place, keeping the
 /// hover count a mounted card may still be holding. That is the whole of #619,
 /// so it is asserted directly in the hermetic tests — which is also why the
@@ -799,23 +899,23 @@ fn apply_expiry(
     id: u32,
     timeout: Option<Duration>,
     now: Instant,
-    spawn: impl FnOnce(Duration) -> Option<AbortHandle>,
+    spawn: impl FnOnce(Duration, u64) -> Option<AbortHandle>,
 ) {
     let entry = timers.entry(id).or_default();
-    // Cancel any task already armed for this id (a `replaces_id` re-post) so a
-    // stale sleep can't dismiss the refreshed notification early — or "expire"
-    // one that just turned sticky. Unconditional rather than driven off the
-    // returned action: it must cover `Nothing` too (a re-post arriving while a
-    // hover is held), and aborting an already-cleared handle is free.
-    if let Some(handle) = entry.abort.take() {
-        handle.abort();
-    }
+    // Cancel and supersede any task already armed for this id (a `replaces_id`
+    // re-post) so a stale sleep can't dismiss the refreshed notification early
+    // — or "expire" one that just turned sticky — even if it has already fired
+    // and is waiting on the `active` guard this re-post holds. Unconditional
+    // rather than driven off the returned action: it must cover `Nothing` too
+    // (a re-post arriving while a hover is held), and disarming an
+    // already-cleared entry is free.
+    entry.disarm();
     if let TimerAction::Arm(dur) = entry.state.start(timeout, now) {
-        entry.abort = spawn(dur);
+        entry.arm(|arming| spawn(dur, arming));
     }
 }
 
-/// Remove and cancel the expiry timer for `id`. Called from [`dismiss`] — the
+/// Remove and cancel the expiry timer for `id`. Called from [`close`] — the
 /// funnel for every close path — so a closed toast leaves behind no armed task
 /// or bookkeeping entry. The *only* place an entry is dropped: a notification
 /// that merely turned sticky keeps its entry (and its hover count) via
@@ -848,12 +948,20 @@ pub fn pause_expiry(id: u32) {
     let Some(shared) = shared::get::<NotificationsShared>() else {
         return;
     };
-    if let Ok(mut timers) = shared.timers.lock()
-        && let Some(entry) = timers.get_mut(&id)
-        && entry.state.pause(Instant::now()) == TimerAction::Abort
-        && let Some(handle) = entry.abort.take()
+    if let Ok(mut timers) = shared.timers.lock() {
+        apply_pause(&mut timers, id, Instant::now());
+    }
+}
+
+/// Map-level half of [`pause_expiry`], factored out (like [`apply_expiry`])
+/// so a test drives the real surgery with no runtime.
+fn apply_pause(timers: &mut TimerMap, id: u32, now: Instant) {
+    if let Some(entry) = timers.get_mut(&id)
+        && entry.state.pause(now) == TimerAction::Abort
     {
-        handle.abort();
+        // Superseding, not just aborting: a sleep that fired a moment before
+        // the pointer arrived must not close the toast now under it.
+        entry.disarm();
     }
 }
 
@@ -871,12 +979,9 @@ pub fn resume_expiry(id: u32) {
         && let TimerAction::Arm(dur) = entry.state.resume(Instant::now(), MIN_RESUME)
     {
         // Invariant: `abort` is None here (the matching pause cleared it).
-        // Cancel defensively regardless so a logic drift can never strand a
-        // live task behind a freshly-armed one.
-        if let Some(handle) = entry.abort.take() {
-            handle.abort();
-        }
-        entry.abort = Some(spawn_expiry(id, dur));
+        // `arm` supersedes defensively regardless, so a logic drift can never
+        // strand a live task behind a freshly-armed one.
+        entry.arm(|arming| Some(spawn_expiry(id, dur, arming)));
     }
 }
 
@@ -1056,50 +1161,27 @@ pub fn post_local_with_actions(
 
 // ── D-Bus interface ───────────────────────────────────────────────────────────
 
+/// The mounted `org.freedesktop.Notifications` object. Closing goes through
+/// [`dismiss`] and the shared registry, like every other close path, so the
+/// interface holds only what `Notify` writes: the live list and the id
+/// counter. (It used to carry the history too, for a `close_notification` that
+/// pulled the notification out itself before calling `dismiss` — which is
+/// what left `dismiss` emitting `NotificationClosed` for ids it had not
+/// removed, since from there it could not tell a close it was finishing from
+/// one for an id that was never live.)
 #[derive(Clone)]
 struct NotificationsIface {
     active: Mutable<Vec<Notification>>,
     next_id: Arc<AtomicU32>,
-    history: Mutable<Vec<HistoryEntry>>,
-}
-
-impl NotificationsIface {
-    /// Remove `id` from the active list and push it to history.
-    /// Returns the removed notification if found.
-    fn remove_from_active(&self, id: u32) -> Option<Notification> {
-        let mut list = self.active.lock_mut();
-        let pos = list.iter().position(|n| n.id == id)?;
-        Some(list.remove(pos))
-    }
-
-    fn push_to_history(&self, n: Notification, reason: u32) {
-        let dismissed_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let entry = HistoryEntry {
-            id: n.id,
-            app_name: n.app_name,
-            app_icon: n.app_icon,
-            summary: n.summary,
-            body: n.body,
-            urgency: n.urgency,
-            image: n.image,
-            actions: n.actions,
-            reason,
-            created_at: n.created_at,
-            dismissed_at,
-        };
-        let mut hist = self.history.lock_mut();
-        hist.insert(0, entry);
-        hist.truncate(100);
-    }
 }
 
 // zbus's `#[interface]` macro requires every method to be `async fn` even
-// when the body doesn't await. Allowing at the impl-block keeps the noise
-// out of each method.
-#[allow(clippy::unused_async)]
+// when the body doesn't await, and to take `&self` even when it reaches no
+// state through it (`close_notification` calls the free `dismiss`; the
+// capability/identity handlers return constants). Allowing at the impl-block
+// keeps the noise out of each method — `screensaver.rs`'s and `control.rs`'s
+// shape.
+#[allow(clippy::unused_async, clippy::unused_self)]
 #[zbus::interface(name = "org.freedesktop.Notifications")]
 impl NotificationsIface {
     /// Show a notification. Returns the notification id.
@@ -1122,13 +1204,6 @@ impl NotificationsIface {
         hints: HashMap<String, OwnedValue>,
         expire_timeout: i32,
     ) -> u32 {
-        // Determine id: honour replaces_id or allocate a new one.
-        let id = if replaces_id != 0 {
-            replaces_id
-        } else {
-            self.next_id.fetch_add(1, Ordering::Relaxed)
-        };
-
         // Parse urgency from hints (key "urgency", type u8).
         let urgency = hints
             .get("urgency")
@@ -1158,22 +1233,15 @@ impl NotificationsIface {
             .unwrap_or_default()
             .as_secs();
 
-        let notification = Notification {
-            id,
-            app_name: app_name.to_string(),
-            app_icon: app_icon.to_string(),
-            summary: summary.to_string(),
-            body: body_clean,
-            urgency,
-            timeout,
-            actions: parsed_actions,
-            image,
-            created_at,
-        };
-
-        // Record the resolved timeout on the hover-pausable expiry bookkeeping,
-        // then update the active list (replace in-place if same id, else push) —
-        // both under the one `active` write guard, expiry FIRST.
+        // Decide the id, record the resolved timeout on the hover-pausable
+        // expiry bookkeeping, then update the active list (replace in-place if
+        // the id is live, else push) — all under the one `active` write guard,
+        // in that order.
+        //
+        // The id is decided *inside* the guard because it depends on what is
+        // live (see `notify_id`): decided outside, the notification `replaces_id`
+        // names could expire between the check and the write, and the re-post
+        // would land as a new notification under an id that is no longer live.
         //
         // `set_expiry` arms the auto-dismiss sleep for a finite timeout; for a
         // sticky one (`timeout == None`) it stands the countdown down —
@@ -1191,32 +1259,49 @@ impl NotificationsIface {
         // also stops a 1ms `expire_timeout` from running `dismiss` before the
         // notification is in the list at all, which would strand it on screen
         // with no timer. Both mutexes are taken in the `active` → `timers` order
-        // `dismiss` uses, so the pair cannot invert.
-        {
+        // `close` uses for its arming check, so the pair cannot invert.
+        let id = {
             let mut list = self.active.lock_mut();
+            let id = notify_id(&list, replaces_id, &self.next_id);
             crate::notifications::set_expiry(id, timeout);
+            let notification = Notification {
+                id,
+                app_name: app_name.to_string(),
+                app_icon: app_icon.to_string(),
+                summary: summary.to_string(),
+                body: body_clean,
+                urgency,
+                timeout,
+                actions: parsed_actions,
+                image,
+                created_at,
+            };
             if let Some(existing) = list.iter_mut().find(|n| n.id == id) {
-                *existing = notification.clone();
+                *existing = notification;
             } else {
-                list.push(notification.clone());
+                list.push(notification);
             }
-        }
+            id
+        };
 
-        tracing::debug!(id, app_name, summary, "notification added");
+        tracing::debug!(id, replaces_id, app_name, summary, "notification added");
 
         id
     }
 
     /// Close a notification by id (reason 3 = closed by call).
+    ///
+    /// All of it is [`dismiss`]'s, which emits `NotificationClosed` only for an
+    /// id that was live. For any other id this replies success and emits
+    /// nothing — mako's behaviour. The spec asks for "an empty D-Bus Error
+    /// message" there instead; that is a client-visible change (libnotify
+    /// surfaces it as a `GError` from `notify_notification_close`) left for a
+    /// separate decision.
     async fn close_notification(&self, id: u32) {
-        if let Some(n) = self.remove_from_active(id) {
-            self.push_to_history(n, 3);
-        }
         crate::notifications::dismiss(id, 3);
     }
 
     /// Return the capabilities this server implements.
-    #[allow(clippy::unused_self)]
     fn get_capabilities(&self) -> Vec<String> {
         vec![
             "body".to_string(),
@@ -1226,7 +1311,6 @@ impl NotificationsIface {
     }
 
     /// Return server identification tuple.
-    #[allow(clippy::unused_self)]
     fn get_server_information(&self) -> (&str, &str, &str, &str) {
         ("trollshell", "hannig.cc", "0.4.0", "1.2")
     }
@@ -1249,6 +1333,36 @@ impl NotificationsIface {
         id: u32,
         action_key: &str,
     ) -> zbus::Result<()>;
+}
+
+// ── Helper: resolve id ────────────────────────────────────────────────────────
+
+/// The id a `Notify` call's notification takes: `replaces_id` when it names a
+/// notification that is **live** in `live`, a fresh one from `next_id`
+/// otherwise — `0` ("replace nothing") included.
+///
+/// The spec says "if `replaces_id` is not 0, the returned value is the same
+/// value as `replaces_id`", but that sentence presupposes something to replace.
+/// Honouring it for an id that is not live is how two notifications came to
+/// share one: `Notify(replaces_id = 5000)` returned 5000 for something this
+/// daemon never issued and left the counter where it was, so when the counter
+/// later reached 5000 a different app's notification replaced the first in
+/// place — inheriting its timer entry — and each sender read the other's
+/// `NotificationClosed` as its own. A `replaces_id` naming a notification that
+/// already *closed* (the common case: a progress update arriving just after
+/// the toast expired) is the same bug in miniature, minus the counter.
+///
+/// mako makes the same call ("either we had no `replaces_id`, or the id given
+/// was invalid. Either way, make a new notification"), and libnotify adopts
+/// whatever id `Notify` returns, so a client's later update finds the fresh
+/// one. Must be called under the `active` write guard the result is written
+/// back under: the answer is only as current as `live`.
+fn notify_id(live: &[Notification], replaces_id: u32, next_id: &AtomicU32) -> u32 {
+    if replaces_id != 0 && live.iter().any(|n| n.id == replaces_id) {
+        replaces_id
+    } else {
+        next_id.fetch_add(1, Ordering::Relaxed)
+    }
 }
 
 // ── Helper: resolve timeout ───────────────────────────────────────────────────
@@ -1299,27 +1413,41 @@ fn parse_actions(raw: &[String]) -> Vec<Action> {
 
 /// Resolve the image for a notification.
 ///
-/// Priority: `image-data` hint (or legacy `icon_data`) > `image-path` hint >
-/// `app_icon` argument.
+/// The spec's single-image order ("Icons and Images"), with each hint's
+/// deprecated spec-1.1 spelling straight after its own:
+///
+/// 1. `image-data`, then `image_data` (1.1);
+/// 2. `image-path`, then `image_path` (1.1);
+/// 3. the `app_icon` argument;
+/// 4. `icon_data` (pre-1.1), last — the spec keeps it only "for compatibility",
+///    *after* `app_icon`.
+///
+/// The toast shows one picture (the overlay falls back to `app_icon` only
+/// when this is `None`), so the single-image order is the one that applies.
+/// Before this, `image_data` was not read at all — a 1.1 client's image was
+/// silently dropped — and `icon_data` outranked both `image-path` and
+/// `app_icon`. A hint that is present but unusable (a malformed raw image, an
+/// empty or non-string path) falls through to the next one.
 fn parse_image(hints: &HashMap<String, OwnedValue>, app_icon: &str) -> Option<NotificationImage> {
-    // 1. Try image-data (modern key) then icon_data (legacy underscore key).
-    for key in &["image-data", "icon_data"] {
-        if let Some(val) = hints.get(*key)
-            && let Some(img) = decode_image_data(val)
-        {
-            return Some(img);
-        }
-    }
+    let raw = |key: &str| hints.get(key).and_then(decode_image_data);
+    let path = |key: &str| {
+        hints
+            .get(key)
+            .and_then(|v| String::try_from(v.try_clone().ok()?).ok())
+            .filter(|p| !p.is_empty())
+            .map(NotificationImage::Path)
+    };
+    raw("image-data")
+        .or_else(|| raw("image_data"))
+        .or_else(|| path("image-path"))
+        .or_else(|| path("image_path"))
+        .or_else(|| app_icon_image(app_icon))
+        .or_else(|| raw("icon_data"))
+}
 
-    // 2. Try image-path hint.
-    if let Some(val) = hints.get("image-path")
-        && let Ok(path) = String::try_from(val.try_clone().ok()?)
-        && !path.is_empty()
-    {
-        return Some(NotificationImage::Path(path));
-    }
-
-    // 3. Fall back to app_icon argument.
+/// The `app_icon` argument as an image: a path or `file://` URL, else a
+/// themed icon name; `None` when empty.
+fn app_icon_image(app_icon: &str) -> Option<NotificationImage> {
     if app_icon.is_empty() {
         return None;
     }
@@ -1370,12 +1498,13 @@ fn image_data_consistent(
     i64::try_from(data_len).is_ok_and(|len| len >= needed)
 }
 
-/// Decode an `image-data` / `icon_data` `OwnedValue` of type `(iiibiiay)`.
+/// Decode an `image-data` / `image_data` / `icon_data` `OwnedValue` of type
+/// `(iiibiiay)`.
 ///
 /// Returns `None` for a malformed payload (bad dimensions/stride or a buffer too
-/// short for the declared geometry) so `parse_image` falls through to the
-/// `image-path` / `app_icon` path rather than the shell panicking when the
-/// widget builds the texture.
+/// short for the declared geometry) so `parse_image` falls through to the next
+/// hint in its order rather than the shell panicking when the widget builds
+/// the texture.
 fn decode_image_data(val: &OwnedValue) -> Option<NotificationImage> {
     // The spec defines image-data as (iiibiiay):
     //   width: i32, height: i32, rowstride: i32, has_alpha: bool,
@@ -1397,7 +1526,7 @@ fn decode_image_data(val: &OwnedValue) -> Option<NotificationImage> {
             has_alpha,
             channels,
             data_len = data.len(),
-            "rejecting malformed notification image-data; falling back to image-path/app_icon"
+            "rejecting malformed notification image data; falling back to the next image hint"
         );
         return None;
     }
@@ -1413,36 +1542,211 @@ fn decode_image_data(val: &OwnedValue) -> Option<NotificationImage> {
 
 // ── Helper: strip HTML-like markup ───────────────────────────────────────────
 
-/// Conservatively strip `<...>` tags from notification body text.
+/// Turn a notification body into the plain text the shell renders: strip the
+/// tags of the spec's markup subset, decode XML character references, and
+/// keep everything else — a `<` or `&` that starts neither — literally.
 ///
-/// The freedesktop spec allows a small HTML subset, but v0.4.0 renders
-/// notifications as plain text.
+/// # Why strip at all
+///
+/// [`GetCapabilities`](NotificationsIface::get_capabilities) does **not**
+/// advertise `body-markup`, so by the letter of the spec the body is plain
+/// text and the client should have stripped its own markup. Real clients send
+/// it anyway — mako and dunst both advertise `body-markup`, so apps written
+/// against them assume it — and the spec designs its tags "in a way that
+/// allows them to be stripped out". So tags go; their text stays.
+///
+/// A `<` is a tag only when it is followed by an optional `/`, an ASCII
+/// letter, and then a `>` before any further `<` — the shape every tag in the
+/// spec's subset (`b`, `i`, `u`, `a`, `img`) and every tag a client actually
+/// sends has. Anything else is text. The pre-fix stripper entered "in a tag"
+/// on *any* `<` and left only on a `>`, so `notify-send t "errors < 5 in
+/// foo.rs"` rendered `errors ` and silently dropped the rest of the body.
+///
+/// # Why decode entities too
+///
+/// A client that sends markup escapes its text for markup — that is what
+/// makes it markup — so a body of `<b>Tom &amp; Jerry</b>` *means* "Tom &
+/// Jerry". Stripping its tags but not its entities would render `Tom &amp;
+/// Jerry`: half a decode, strictly worse for exactly the clients this
+/// stripper exists for. The five predefined XML entities are decoded, and so
+/// are numeric character references, because `g_markup_escape_text` —
+/// glib's escaper, the one most C/Python clients here reach for — writes an
+/// apostrophe as `&#39;`, so "it's" arrives as `it&#39;s`. The cost is a
+/// plain-text body that *literally* contains `&amp;` rendering as `&`, which
+/// is the rarer of the two by far. A bare `&` (`Fish & Chips`), an unknown
+/// name (`&nbsp;`), and a reference to no valid character (`&#0;`,
+/// `&#xD800;`) all stay exactly as sent.
+///
+/// One pass, so a decoded `&lt;b&gt;` becomes the text `<b>` and is never
+/// re-read as a tag. Linear in the input: a tag scan stops at the next `<`,
+/// so no two scans overlap, and an entity scan is bounded by
+/// [`MAX_ENTITY_NAME`].
 fn strip_markup(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut in_tag = false;
-    for ch in s.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' if in_tag => in_tag = false,
-            _ if !in_tag => out.push(ch),
-            _ => {}
+    let mut rest = s;
+    while let Some(at) = rest.find(['<', '&']) {
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        if let Some(len) = tag_len(rest) {
+            rest = &rest[len..];
+        } else if let Some((ch, len)) = char_reference(rest) {
+            out.push(ch);
+            rest = &rest[len..];
+        } else {
+            // A `<` or `&` that starts neither — text. Both are one byte.
+            out.push_str(&rest[..1]);
+            rest = &rest[1..];
         }
     }
+    out.push_str(rest);
     out
+}
+
+/// Byte length of the tag `s` starts with, or `None` if `s` does not start
+/// with one — see [`strip_markup`] for the shape that counts.
+fn tag_len(s: &str) -> Option<usize> {
+    let inner = s.strip_prefix('<')?;
+    let name = inner.strip_prefix('/').unwrap_or(inner);
+    if !name.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let end = inner.find(['<', '>'])?;
+    (inner.as_bytes()[end] == b'>').then_some(1 + end + 1)
+}
+
+/// Longest name between `&` and `;` that [`char_reference`] will look at —
+/// `#x10FFFF`, the longest valid reference, is 8. Bounds the scan, so a body
+/// of a million `&`s with no `;` costs a million short looks rather than a
+/// quadratic walk on the D-Bus handler.
+const MAX_ENTITY_NAME: usize = 10;
+
+/// The character the reference `s` starts with stands for, and the
+/// reference's byte length; `None` if `s` does not start with one we decode
+/// (see [`strip_markup`]).
+fn char_reference(s: &str) -> Option<(char, usize)> {
+    let body = s.strip_prefix('&')?;
+    let semi = body
+        .bytes()
+        .take(MAX_ENTITY_NAME + 1)
+        .position(|b| b == b';')?;
+    let name = &body[..semi];
+    let ch = match name {
+        "amp" => '&',
+        "lt" => '<',
+        "gt" => '>',
+        "quot" => '"',
+        "apos" => '\'',
+        _ => {
+            let number = name.strip_prefix('#')?;
+            let (digits, radix) = match number.strip_prefix(['x', 'X']) {
+                Some(hex) => (hex, 16),
+                None => (number, 10),
+            };
+            // `from_str_radix` alone would take a leading `+`.
+            if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+                return None;
+            }
+            let code = u32::from_str_radix(digits, radix).ok()?;
+            char::from_u32(code).filter(|&c| c != '\0')?
+        }
+    };
+    Some((ch, 1 + semi + 1))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_TIMEOUT, LocalActionMap, MIN_RESUME, RateLimitMap, TimerAction, TimerEntry,
-        TimerMap, TimerState, apply_expiry, clear_local_actions, clear_timer,
-        image_data_consistent, rate_limit_check, register_local_action, resolve_timeout,
-        take_local_action,
+        DEFAULT_TIMEOUT, HashMap, LocalActionMap, MIN_RESUME, Mutable, Notification,
+        NotificationImage, NotificationsIface, OwnedValue, RateLimitMap, TimerAction, TimerEntry,
+        TimerMap, TimerState, Urgency, apply_expiry, apply_pause, clear_local_actions, clear_timer,
+        closable, image_data_consistent, notify_id, parse_image, rate_limit_check,
+        register_local_action, resolve_timeout, strip_markup, take_local_action,
     };
     use std::cell::Cell;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::time::{Duration, Instant};
+    use zbus::zvariant::{Str, Structure, Value};
+
+    // ── Image hint precedence ────────────────────────────────────────────────
+
+    /// An `(iiibiiay)` raw-image hint: `side`×`side` RGBA, tightly packed. The
+    /// side length is how a test tells which hint won; `side = 0` is a
+    /// malformed payload `decode_image_data` rejects.
+    fn raw_hint(side: i32) -> OwnedValue {
+        let len = usize::try_from(side * side * 4).expect("non-negative side");
+        let tuple = (side, side, side * 4, true, 8_i32, 4_i32, vec![0_u8; len]);
+        OwnedValue::try_from(Value::from(Structure::from(tuple))).expect("no fds in an image")
+    }
+
+    fn str_hint(s: &str) -> OwnedValue {
+        OwnedValue::from(Str::from(s))
+    }
+
+    fn hints(pairs: &[(&str, OwnedValue)]) -> HashMap<String, OwnedValue> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.try_clone().expect("no fds")))
+            .collect()
+    }
+
+    /// Which hint `parse_image` picked, as something `assert_eq!` can print.
+    fn picked(hints: &HashMap<String, OwnedValue>, app_icon: &str) -> String {
+        match parse_image(hints, app_icon) {
+            None => "none".to_string(),
+            Some(NotificationImage::Raw { width, .. }) => format!("raw {width}"),
+            Some(NotificationImage::Path(p)) => format!("path {p}"),
+            Some(NotificationImage::IconName(n)) => format!("icon {n}"),
+        }
+    }
+
+    #[test]
+    fn image_data_spec_1_1_spelling_is_read() {
+        // The reported gap: a spec-1.1 client's `image_data` was ignored and
+        // the toast showed its app icon (or nothing) instead.
+        let h = hints(&[("image_data", raw_hint(2))]);
+        assert_eq!(picked(&h, ""), "raw 2");
+        assert_eq!(picked(&h, "firefox"), "raw 2");
+        let h = hints(&[("image_path", str_hint("/tmp/b.png"))]);
+        assert_eq!(picked(&h, "firefox"), "path /tmp/b.png");
+    }
+
+    #[test]
+    fn image_hints_follow_the_spec_order() {
+        // Peel the winner off one at a time, from all five down to none:
+        // image-data > image_data > image-path > image_path > app_icon >
+        // icon_data.
+        let mut all = vec![
+            ("image-data", raw_hint(1)),
+            ("image_data", raw_hint(2)),
+            ("image-path", str_hint("/tmp/a.png")),
+            ("image_path", str_hint("/tmp/b.png")),
+            ("icon_data", raw_hint(3)),
+        ];
+        let expected = ["raw 1", "raw 2", "path /tmp/a.png", "path /tmp/b.png"];
+        for want in expected {
+            assert_eq!(picked(&hints(&all), "firefox"), want);
+            all.remove(0);
+        }
+        // Only `icon_data` left: the spec ranks it *below* `app_icon`…
+        assert_eq!(picked(&hints(&all), "firefox"), "icon firefox");
+        // …so it is shown only when there is no `app_icon` either.
+        assert_eq!(picked(&hints(&all), ""), "raw 3");
+        assert_eq!(picked(&hints(&[]), ""), "none");
+    }
+
+    #[test]
+    fn an_unusable_image_hint_falls_through_to_the_next() {
+        // Malformed raw data, an empty path, a non-string path: each costs
+        // only its own rank.
+        let h = hints(&[("image-data", raw_hint(0)), ("image_data", raw_hint(2))]);
+        assert_eq!(picked(&h, ""), "raw 2");
+        let h = hints(&[
+            ("image-path", str_hint("")),
+            ("image_path", OwnedValue::from(7_u32)),
+        ]);
+        assert_eq!(picked(&h, "/usr/share/a.svg"), "path /usr/share/a.svg");
+    }
 
     // ── image-data validation (the #425 panic guard) ─────────────────────────
 
@@ -1488,6 +1792,112 @@ mod tests {
         // Bogus giant dims must be rejected by the sane-bound guard, never panic.
         assert!(!image_data_consistent(i32::MAX, i32::MAX, i32::MAX, 4, 16));
         assert!(!image_data_consistent(1 << 20, 1, 1 << 22, 4, 8));
+    }
+
+    // ── Body markup stripping ────────────────────────────────────────────────
+
+    #[test]
+    fn strip_markup_keeps_a_bare_less_than_and_the_rest_of_the_body() {
+        // The reported repro: the old stripper entered "in a tag" here and
+        // never left, so the body rendered as `errors `.
+        assert_eq!(strip_markup("errors < 5 in foo.rs"), "errors < 5 in foo.rs");
+        // Not a tag either: no letter after the `<`, or no `>` to close it.
+        assert_eq!(strip_markup("a <5 b"), "a <5 b");
+        assert_eq!(strip_markup("see <foo"), "see <foo");
+        assert_eq!(strip_markup("a </ b"), "a </ b");
+        assert_eq!(strip_markup("x < y > z"), "x < y > z");
+        assert_eq!(strip_markup("trailing <"), "trailing <");
+    }
+
+    #[test]
+    fn strip_markup_strips_the_spec_subset_and_keeps_its_text() {
+        assert_eq!(
+            strip_markup("<b>bold</b>, <i>it</i>, <u>un</u>"),
+            "bold, it, un"
+        );
+        assert_eq!(
+            strip_markup(r#"see <a href="https://example.org/?q=1">the page</a>"#),
+            "see the page"
+        );
+        assert_eq!(
+            strip_markup(r#"pic: <img src="/tmp/a.png" alt="a"/>!"#),
+            "pic: !"
+        );
+        assert_eq!(strip_markup("line<br/>line"), "lineline");
+    }
+
+    #[test]
+    fn strip_markup_a_tag_like_run_interrupted_by_another_lt_is_text() {
+        // `<b ` reaches no `>` before the next `<`, so it is text; the `<i>`
+        // after it is still a tag.
+        assert_eq!(strip_markup("a <b <i>x</i>"), "a <b x");
+    }
+
+    #[test]
+    fn strip_markup_leaves_a_literal_ampersand_alone() {
+        assert_eq!(strip_markup("Fish & Chips"), "Fish & Chips");
+        assert_eq!(strip_markup("a && b; c"), "a && b; c");
+        assert_eq!(strip_markup("trailing &"), "trailing &");
+        // Unknown names are not ours to guess at.
+        assert_eq!(strip_markup("a&nbsp;b"), "a&nbsp;b");
+    }
+
+    #[test]
+    fn strip_markup_decodes_the_xml_entities() {
+        assert_eq!(strip_markup("Fish &amp; Chips"), "Fish & Chips");
+        assert_eq!(
+            strip_markup("<b>Tom &amp; Jerry</b>"),
+            "Tom & Jerry",
+            "a markup client's escaped text must come out as the text it meant"
+        );
+        assert_eq!(strip_markup("&lt; &gt; &quot; &apos; &amp;"), "< > \" ' &");
+    }
+
+    #[test]
+    fn strip_markup_decodes_numeric_references() {
+        // `g_markup_escape_text`'s apostrophe.
+        assert_eq!(strip_markup("it&#39;s"), "it's");
+        assert_eq!(strip_markup("&#x27;&#X27;&#x1F600;"), "''\u{1F600}");
+        // Not references to a character: kept as sent.
+        for raw in [
+            "&#0;",
+            "&#xD800;",
+            "&#x110000;",
+            "&#+65;",
+            "&#x;",
+            "&#;",
+            "&#65",
+        ] {
+            assert_eq!(strip_markup(raw), raw);
+        }
+    }
+
+    #[test]
+    fn strip_markup_never_reads_a_decoded_lt_as_a_tag() {
+        // The escaped form of a tag is text the sender wanted shown.
+        assert_eq!(strip_markup("&lt;b&gt;hi&lt;/b&gt;"), "<b>hi</b>");
+    }
+
+    #[test]
+    fn capabilities_do_not_advertise_body_markup() {
+        // `strip_markup`'s whole argument starts here: without `body-markup`
+        // the body is plain text by the spec, and stripping is a courtesy to
+        // clients that send markup regardless. Advertising it would turn that
+        // courtesy into a promise to *render* markup, which nothing does.
+        let iface = NotificationsIface {
+            active: Mutable::new(Vec::new()),
+            next_id: Arc::new(AtomicU32::new(1)),
+        };
+        let caps = iface.get_capabilities();
+        assert!(caps.iter().any(|c| c == "body"), "{caps:?}");
+        assert!(!caps.iter().any(|c| c == "body-markup"), "{caps:?}");
+    }
+
+    #[test]
+    fn strip_markup_passes_plain_and_non_ascii_text_through() {
+        assert_eq!(strip_markup(""), "");
+        assert_eq!(strip_markup("plain text"), "plain text");
+        assert_eq!(strip_markup("Grüße <b>ü</b> → ok"), "Grüße ü → ok");
     }
 
     #[test]
@@ -1559,6 +1969,116 @@ mod tests {
         let c = iface_side.fetch_add(1, Ordering::Relaxed); // another Notify
         assert_eq!((a, b, c), (1, 2, 3));
         assert!(a != b && b != c && a != c);
+    }
+
+    // ── Notify id resolution: `replaces_id` is honoured only when live ──────
+
+    /// A live notification with `id` and nothing else worth reading.
+    fn live(id: u32) -> Notification {
+        Notification {
+            id,
+            app_name: String::new(),
+            app_icon: String::new(),
+            summary: String::new(),
+            body: String::new(),
+            urgency: Urgency::Normal,
+            timeout: Some(DEFAULT_TIMEOUT),
+            actions: Vec::new(),
+            image: None,
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn replaces_id_zero_allocates_fresh_ids() {
+        let counter = AtomicU32::new(1);
+        assert_eq!(notify_id(&[], 0, &counter), 1);
+        assert_eq!(notify_id(&[live(1)], 0, &counter), 2);
+        assert_eq!(counter.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn replaces_id_of_a_live_notification_keeps_its_id() {
+        let counter = AtomicU32::new(4);
+        let list = [live(1), live(3)];
+        assert_eq!(notify_id(&list, 3, &counter), 3);
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            4,
+            "an in-place replace must not burn a counter value"
+        );
+    }
+
+    #[test]
+    fn replaces_id_never_issued_gets_a_fresh_id_and_cannot_collide_later() {
+        // The reported repro: `Notify(app, 5000, …)` used to return 5000 —
+        // never issued — without moving the counter, so the 5000th ordinary
+        // notification replaced it in place and shared its timer entry.
+        let counter = AtomicU32::new(2); // id 1 was issued, and is live
+        let mut list = vec![live(1)];
+        let bogus = notify_id(&list, 5000, &counter);
+        assert_eq!(bogus, 2, "a non-live replaces_id must allocate, not echo");
+        list.push(live(bogus));
+
+        // Walk the counter all the way past 5000: nothing it hands out may
+        // equal an id that is already live.
+        counter.store(4999, Ordering::Relaxed);
+        for _ in 0..3 {
+            let next = notify_id(&list, 0, &counter);
+            assert!(
+                list.iter().all(|n| n.id != next),
+                "fresh id {next} collides with a live notification"
+            );
+            list.push(live(next));
+        }
+    }
+
+    #[test]
+    fn replaces_id_of_a_closed_notification_gets_a_fresh_id() {
+        // A progress update arriving just after its toast expired: id 7 was
+        // real, but it is gone, so the update is a new notification.
+        let counter = AtomicU32::new(8);
+        assert_eq!(notify_id(&[live(6)], 7, &counter), 8);
+    }
+
+    // ── Close gate: `NotificationClosed` only for an id that was live ───────
+    //
+    // `dismiss` returns before its history push, its sweeps and its emit
+    // whenever `closable` says `None`, so these pin what reaches the bus.
+
+    #[test]
+    fn closing_an_id_that_was_never_live_is_a_no_op() {
+        // `gdbus call … CloseNotification 999` used to emit
+        // `NotificationClosed(999, 3)` for an id this daemon never issued.
+        let list = [live(1), live(2)];
+        assert_eq!(closable(&list, &TimerMap::new(), 999, None), None);
+        assert_eq!(closable(&[], &TimerMap::new(), 1, None), None);
+    }
+
+    #[test]
+    fn a_live_id_is_closable_where_it_sits() {
+        let list = [live(1), live(2), live(3)];
+        assert_eq!(closable(&list, &TimerMap::new(), 2, None), Some(1));
+    }
+
+    #[test]
+    fn a_second_close_of_one_id_is_a_no_op() {
+        // A click landing as the expiry timer fires: `dismiss(id, 2)` and
+        // `dismiss(id, 1)` both ran their emit, so the sender saw the one
+        // notification close twice, with two different reasons.
+        let mut list = vec![live(1), live(2)];
+        let at = closable(&list, &TimerMap::new(), 2, None).expect("live on the first close");
+        list.remove(at);
+        assert_eq!(
+            closable(&list, &TimerMap::new(), 2, None),
+            None,
+            "the second close must emit nothing"
+        );
+        assert_eq!(
+            closable(&list, &TimerMap::new(), 1, None),
+            Some(0),
+            "a sibling is untouched"
+        );
     }
 
     #[test]
@@ -1963,19 +2483,30 @@ mod tests {
     // returns `None` (no `AbortHandle` without a runtime) and records what it was
     // asked to arm, which is the observable that matters.
 
-    /// Collect what [`apply_expiry`] would have armed, without a runtime.
+    /// Collect what [`apply_expiry`] would have armed — the duration, and the
+    /// arming the task would present when it fires — without a runtime.
+    fn armed_with(
+        timers: &mut TimerMap,
+        id: u32,
+        timeout: Option<Duration>,
+        now: Instant,
+    ) -> Option<(Duration, u64)> {
+        let armed = Cell::new(None);
+        apply_expiry(timers, id, timeout, now, |dur, arming| {
+            armed.set(Some((dur, arming)));
+            None
+        });
+        armed.get()
+    }
+
+    /// The duration half of [`armed_with`].
     fn armed_by(
         timers: &mut TimerMap,
         id: u32,
         timeout: Option<Duration>,
         now: Instant,
     ) -> Option<Duration> {
-        let armed = Cell::new(None);
-        apply_expiry(timers, id, timeout, now, |dur| {
-            armed.set(Some(dur));
-            None
-        });
-        armed.get()
+        armed_with(timers, id, timeout, now).map(|(dur, _)| dur)
     }
 
     #[test]
@@ -2086,5 +2617,78 @@ mod tests {
         // Clearing an unknown id is a no-op.
         clear_timer(&mut map, 999);
         assert_eq!(map.len(), 1);
+    }
+
+    // ── Superseded expiries: a fired sleep must still be the current arming ─
+    //
+    // `abort()` cannot reach a sleep task that is past its `sleep` and blocked
+    // on the `active` lock inside `close` — there is no `.await` left for it to
+    // land on — so the arming the task presents is what decides.
+
+    #[test]
+    fn a_superseded_expiry_cannot_close_the_replacement() {
+        // The race: id 7's sleep fires and its close blocks on `active`, held
+        // by a `Notify(replaces_id = 7)`. Pre-fix the close ran as soon as the
+        // re-post released the lock and expired the brand-new replacement,
+        // reason 1, the moment it appeared.
+        let mut map = TimerMap::new();
+        let t0 = Instant::now();
+        let five = Duration::from_secs(5);
+        let (_, fired) = armed_with(&mut map, 7, Some(five), t0).expect("a finite post arms");
+        // The re-post, under the guard the fired close is waiting on.
+        let (_, fresh) =
+            armed_with(&mut map, 7, Some(five), t0 + five).expect("a finite re-post re-arms");
+        let list = [live(7)];
+        assert_eq!(
+            closable(&list, &map, 7, Some(fired)),
+            None,
+            "the superseded expiry must not close the replacement"
+        );
+        assert_eq!(
+            closable(&list, &map, 7, Some(fresh)),
+            Some(0),
+            "the replacement's own expiry still closes it"
+        );
+    }
+
+    #[test]
+    fn a_sticky_repost_supersedes_a_fired_expiry() {
+        // Same race, re-posted sticky: nothing is re-armed, and the fired
+        // sleep still must not "expire" a notification that no longer expires.
+        let mut map = TimerMap::new();
+        let t0 = Instant::now();
+        let (_, fired) = armed_with(&mut map, 7, Some(Duration::from_secs(5)), t0).expect("arms");
+        assert_eq!(armed_with(&mut map, 7, None, t0), None);
+        assert_eq!(closable(&[live(7)], &map, 7, Some(fired)), None);
+    }
+
+    #[test]
+    fn an_expiry_superseded_by_a_hover_cannot_close() {
+        // The pointer lands as the sleep fires: the hover's pause must win, or
+        // the toast closes out from under the pointer that is holding it.
+        let mut map = TimerMap::new();
+        let t0 = Instant::now();
+        let five = Duration::from_secs(5);
+        let (_, fired) = armed_with(&mut map, 7, Some(five), t0).expect("arms");
+        apply_pause(&mut map, 7, t0 + five);
+        assert_eq!(map[&7].state.hover_count, 1);
+        assert_eq!(closable(&[live(7)], &map, 7, Some(fired)), None);
+    }
+
+    #[test]
+    fn an_expiry_for_a_closed_notification_is_a_no_op() {
+        // No entry: another path already closed it and reclaimed the timer.
+        assert_eq!(closable(&[], &TimerMap::new(), 7, Some(0)), None);
+    }
+
+    #[test]
+    fn a_user_or_bus_close_ignores_the_arming() {
+        // Only an expiry has anything to prove; a click or `CloseNotification`
+        // closes whatever is live under the id.
+        let mut map = TimerMap::new();
+        let t0 = Instant::now();
+        armed_with(&mut map, 7, Some(Duration::from_secs(5)), t0);
+        armed_with(&mut map, 7, Some(Duration::from_secs(5)), t0);
+        assert_eq!(closable(&[live(7)], &map, 7, None), Some(0));
     }
 }

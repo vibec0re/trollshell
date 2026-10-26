@@ -219,6 +219,19 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
         know `detached`, runs the terminal attached, and kills it at 10 s with
         `ok: false`. Nothing warns — that is the accepted price of not bumping
         `VOCAB` (a bump would make the old shell refuse the plugin outright).
+- [ ] **(#1529)** **A drop flood leaves the audit trail intact.** Have a
+      `RunCommand`-granted plugin launch something once, so the audit log
+      gains its `decision=allowed` line. Then point a scratch plugin at the
+      live socket with **no** capabilities and have it send `Render` frames
+      of a few thousand `OpenPage` effects each in a tight loop for a minute.
+      `~/.local/state/trollshell/effects-audit.log` gains 16
+      `decision=dropped(ungranted-capability)` lines for it, then about one
+      every ten seconds, each ending `suppressed=<n>`. Neither the live file
+      nor `.log.1` rotates the `allowed` line away. Stop the scratch plugin:
+      one `effect=* decision=dropped suppressed=<n>` line closes the run.
+      Meanwhile `top -H -p "$(systemctl --user show -p MainPID --value trollshell)"`
+      shows no runtime worker pegged by the audit, and the shell's RSS stays
+      flat. The writer is its own `effects-audit` thread now.
 - [ ] **(#553)** Generic `Datasource` capability: `hytte-plugin-departures` /
       `hytte-plugin-weather` now answer `get departures` / `get weather`
       routed **through the running provider plugins** over the host protocol

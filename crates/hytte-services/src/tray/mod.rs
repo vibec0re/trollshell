@@ -468,8 +468,8 @@ impl Watcher {
 
         tracing::debug!(bus_name, object_path, "RegisterStatusNotifierItem");
 
-        // Initial property read.
-        match read_item_props(&bus_name, &object_path).await {
+        // Initial property read, retried once after a grace delay (#1559).
+        match read_item_props_with_retry(&bus_name, &object_path).await {
             Ok(item) => {
                 let key = item.key.clone();
                 self.state.registered.lock().await.insert(key.clone(), item);
@@ -980,6 +980,87 @@ impl Identity {
     }
 }
 
+/// How long to wait before the one retry of a failed initial read.
+///
+/// An app that calls `RegisterStatusNotifierItem` before it has exported its
+/// object (Qt and GTK tray libraries both do this on a busy start-up) usually
+/// finishes within a main-loop tick or two; 400 ms covers that with room to
+/// spare while a user cannot see the row appear that much later. It also
+/// delays the `RegisterStatusNotifierItem` reply by the same amount, which no
+/// tray library minds.
+const INITIAL_READ_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// What to do after one attempt at an item's initial property read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitialRead {
+    /// The read worked: publish the row.
+    Accept,
+    /// It failed but the item may still be on its way: wait and read again.
+    Retry,
+    /// It failed for good: no row.
+    Drop,
+}
+
+/// The decision for one attempt.
+///
+/// - a successful read is always accepted;
+/// - a failed read whose peer is **known gone** (`peer_alive == Some(false)`)
+///   is dropped at once: that is #1494's ghost-row protection, and waiting
+///   would not help;
+/// - otherwise (peer alive, or the owner check itself unanswered, which is
+///   treated as alive like the rest of this module) the first failure is
+///   retried and the second is dropped.
+fn decide_initial_read(read_ok: bool, is_retry: bool, peer_alive: Option<bool>) -> InitialRead {
+    if read_ok {
+        InitialRead::Accept
+    } else if peer_alive == Some(false) || is_retry {
+        InitialRead::Drop
+    } else {
+        InitialRead::Retry
+    }
+}
+
+/// Drive [`decide_initial_read`] over a reader and an owner check, so the
+/// loop is testable without a bus.
+async fn read_with_retry<T, E, R, RFut, P, PFut>(
+    mut read: R,
+    mut peer_alive: P,
+    delay: std::time::Duration,
+) -> Result<T, E>
+where
+    R: FnMut() -> RFut,
+    RFut: std::future::Future<Output = Result<T, E>>,
+    P: FnMut() -> PFut,
+    PFut: std::future::Future<Output = Option<bool>>,
+{
+    let mut is_retry = false;
+    loop {
+        match read().await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                let alive = peer_alive().await;
+                match decide_initial_read(false, is_retry, alive) {
+                    InitialRead::Retry => {
+                        is_retry = true;
+                        tokio::time::sleep(delay).await;
+                    }
+                    InitialRead::Drop | InitialRead::Accept => return Err(e),
+                }
+            }
+        }
+    }
+}
+
+/// [`read_item_props`] with the one grace retry of [`INITIAL_READ_RETRY_DELAY`].
+async fn read_item_props_with_retry(bus_name: &str, object_path: &str) -> Result<TrayItem> {
+    read_with_retry(
+        || read_item_props(bus_name, object_path),
+        || name_has_owner(bus_name),
+        INITIAL_READ_RETRY_DELAY,
+    )
+    .await
+}
+
 /// Read every property a [`TrayItem`] carries.
 ///
 /// # Errors
@@ -1361,6 +1442,89 @@ mod tests {
             1,
             "only the survivor is re-read"
         );
+    }
+
+    // ── #1559: the initial read retries once ─────────────────────────────────
+
+    use super::{InitialRead, decide_initial_read, read_with_retry};
+
+    #[test]
+    fn initial_read_decision_covers_every_arm() {
+        use InitialRead::{Accept, Drop, Retry};
+        // success is accepted whatever else is true
+        for retry in [false, true] {
+            for peer in [None, Some(true), Some(false)] {
+                assert_eq!(decide_initial_read(true, retry, peer), Accept);
+            }
+        }
+        // first failure, peer alive or unknown: retry
+        assert_eq!(decide_initial_read(false, false, Some(true)), Retry);
+        assert_eq!(decide_initial_read(false, false, None), Retry);
+        // first failure, peer gone: drop (ghost-row protection)
+        assert_eq!(decide_initial_read(false, false, Some(false)), Drop);
+        // second failure: drop
+        assert_eq!(decide_initial_read(false, true, Some(true)), Drop);
+        assert_eq!(decide_initial_read(false, true, None), Drop);
+        assert_eq!(decide_initial_read(false, true, Some(false)), Drop);
+    }
+
+    /// Run `read_with_retry` over scripted read results and one owner answer,
+    /// returning the outcome and (reads, owner checks) made.
+    async fn drive(
+        reads: Vec<Result<u8, &'static str>>,
+        peer: Option<bool>,
+    ) -> (Result<u8, &'static str>, usize, usize) {
+        let mut reads: VecDeque<_> = reads.into();
+        let n_read = Arc::new(AtomicUsize::new(0));
+        let n_peer = Arc::new(AtomicUsize::new(0));
+        let (r, p) = (n_read.clone(), n_peer.clone());
+        let out = read_with_retry(
+            move || {
+                r.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(reads.pop_front().unwrap_or(Err("exhausted")))
+            },
+            move || {
+                p.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(peer)
+            },
+            std::time::Duration::ZERO,
+        )
+        .await;
+        (
+            out,
+            n_read.load(Ordering::SeqCst),
+            n_peer.load(Ordering::SeqCst),
+        )
+    }
+
+    /// An item that registers before exporting: first read fails, second works.
+    /// Falsifiable: with no retry this is `Err` after one read.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_late_exporting_item_appears_on_the_retry() {
+        let (out, reads, _) = drive(vec![Err("early"), Ok(7)], Some(true)).await;
+        assert_eq!(out, Ok(7));
+        assert_eq!(reads, 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_read_that_works_first_time_asks_nothing_else() {
+        let (out, reads, peers) = drive(vec![Ok(1)], Some(true)).await;
+        assert_eq!((out, reads, peers), (Ok(1), 1, 0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_second_failure_drops_the_item_after_exactly_one_retry() {
+        let (out, reads, _) = drive(vec![Err("a"), Err("b"), Ok(9)], Some(true)).await;
+        assert_eq!(out, Err("b"));
+        assert_eq!(reads, 2);
+    }
+
+    /// #1494's ghost rows: a peer that already left is not waited for.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_gone_peer_is_dropped_without_a_retry() {
+        let (out, reads, _) = drive(vec![Err("gone"), Ok(9)], Some(false)).await;
+        assert_eq!(out, Err("gone"));
+        assert_eq!(reads, 1);
     }
 
     // ── Ghost rows: the identity check and the owner check ──────────────────

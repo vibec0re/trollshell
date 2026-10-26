@@ -359,8 +359,8 @@ fn warning_toast(baseline: Option<WarningLevel>, next: WarningLevel) -> Option<U
 #[derive(Debug, PartialEq)]
 struct WarningToast {
     summary: &'static str,
-    /// `"N% remaining"`, or empty when `Percentage` has not loaded yet — the
-    /// toast renders a summary-only card rather than claiming `0%`.
+    /// `"N% remaining"`. Never empty: [`WarningWatch::observe`] holds a toast
+    /// until `Percentage` has loaded rather than post a summary-only card.
     body: String,
     urgency: Urgency,
 }
@@ -388,6 +388,13 @@ struct WarningToast {
 struct WarningWatch {
     /// The last level `UPower` reported; `None` until it has reported one.
     baseline: Option<WarningLevel>,
+    /// A rising edge seen while `Percentage` was still `Loading`: the toast is
+    /// held here and posted by the first `observe` that has the number
+    /// (#1559). `UPower` serves both properties from the same device, so the
+    /// wait is the gap between two `Get`s, not a state that can last; held
+    /// rather than posted bodiless because a card that says "Battery low" with
+    /// no figure is never revised once the figure arrives.
+    pending: Option<WarningLevel>,
 }
 
 impl WarningWatch {
@@ -406,20 +413,30 @@ impl WarningWatch {
             return None;
         };
         let level = WarningLevel::from_u32(*raw);
-        let urgency = warning_toast(self.baseline, level);
+        let edge = warning_toast(self.baseline, level);
         self.baseline = Some(level);
-        let urgency = urgency?;
-        let summary = match level {
+        if edge.is_some() {
+            self.pending = Some(level);
+        } else if self
+            .pending
+            .is_some_and(|held| warning_tier(level) < warning_tier(held))
+        {
+            // The level fell back before the percentage arrived (charger
+            // plugged in): the condition the held toast announced is over.
+            self.pending = None;
+        }
+        let (PropState::Loaded(p) | PropState::Stale(p)) = percentage else {
+            return None;
+        };
+        let held = self.pending.take()?;
+        let urgency = warning_toast(Some(WarningLevel::Unknown), held)?;
+        let summary = match held {
             WarningLevel::Critical | WarningLevel::Action => "Battery critical",
             _ => "Battery low",
         };
-        let body = match percentage {
-            PropState::Loaded(p) | PropState::Stale(p) => format!("{p:.0}% remaining"),
-            PropState::Loading => String::new(),
-        };
         Some(WarningToast {
             summary,
-            body,
+            body: format!("{p:.0}% remaining"),
             urgency,
         })
     }
@@ -802,10 +819,14 @@ mod tests {
         assert_eq!(watch.observe(&PropState::Loaded(LOW), &pct), None);
     }
 
-    /// `WarningLevel` can land before `Percentage`; the body must not then
-    /// claim `0% remaining` off the unloaded default.
+    /// `WarningLevel` can land before `Percentage`: the toast is held until
+    /// the percentage loads, then posted once with its body (#1559). Before,
+    /// it went out with an empty body and was never filled in.
+    ///
+    /// Falsifiable: posting on the edge (the old behaviour) fails the first
+    /// `None`; dropping the held edge fails the `Some`.
     #[test]
-    fn the_body_omits_a_percentage_that_has_not_loaded() {
+    fn a_toast_waits_for_a_percentage_that_has_not_loaded() {
         let mut watch = WarningWatch::default();
         assert_eq!(
             watch.observe(&PropState::Loaded(NONE), &PropState::Loading),
@@ -813,13 +834,62 @@ mod tests {
         );
         assert_eq!(
             watch.observe(&PropState::Loaded(LOW), &PropState::Loading),
+            None,
+            "held, not posted bodiless"
+        );
+        assert_eq!(
+            watch.observe(&PropState::Loaded(LOW), &PropState::Loaded(14.4)),
             Some(WarningToast {
                 summary: "Battery low",
-                body: String::new(),
+                body: "14% remaining".to_string(),
                 urgency: Urgency::Normal,
             })
         );
+        assert_eq!(
+            watch.observe(&PropState::Loaded(LOW), &PropState::Loaded(14.0)),
+            None,
+            "posted once"
+        );
+    }
 
+    /// A held toast whose condition ended before the percentage arrived is
+    /// dropped, not posted late.
+    #[test]
+    fn a_held_toast_is_dropped_if_the_level_recovers() {
+        let mut watch = WarningWatch::default();
+        watch.observe(&PropState::Loaded(NONE), &PropState::Loading);
+        assert_eq!(
+            watch.observe(&PropState::Loaded(LOW), &PropState::Loading),
+            None
+        );
+        assert_eq!(
+            watch.observe(&PropState::Loaded(NONE), &PropState::Loading),
+            None
+        );
+        assert_eq!(
+            watch.observe(&PropState::Loaded(NONE), &PropState::Loaded(80.0)),
+            None
+        );
+    }
+
+    /// The held level is the toast's severity: Low held, then Critical before
+    /// the percentage arrives, posts one critical toast.
+    #[test]
+    fn a_held_toast_posts_at_the_latest_severity() {
+        let mut watch = WarningWatch::default();
+        watch.observe(&PropState::Loaded(NONE), &PropState::Loading);
+        watch.observe(&PropState::Loaded(LOW), &PropState::Loading);
+        watch.observe(&PropState::Loaded(CRITICAL), &PropState::Loading);
+        assert_eq!(
+            watch
+                .observe(&PropState::Loaded(CRITICAL), &PropState::Loaded(4.0))
+                .map(|t| (t.summary, t.urgency)),
+            Some(("Battery critical", Urgency::Critical))
+        );
+    }
+
+    #[test]
+    fn the_body_carries_a_loaded_percentage() {
         let mut watch = WarningWatch::default();
         assert_eq!(
             watch.observe(&PropState::Loaded(NONE), &PropState::Loaded(9.6)),

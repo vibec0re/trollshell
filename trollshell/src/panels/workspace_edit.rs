@@ -2722,12 +2722,24 @@ mod tests {
         pump();
 
         // Both end before the main loop turns again.
-        finish_save(reply_a, "talk", Err("a workspace called talk already exists".to_owned()));
+        finish_save(
+            reply_a,
+            "talk",
+            Err("a workspace called talk already exists".to_owned()),
+        );
         finish_save(reply_b, "talk", Err("no overlay path".to_owned()));
         pump();
 
-        assert_eq!(pending_a.get(), None, "the first form never saw its outcome");
-        assert_eq!(pending_b.get(), None, "the second form never saw its outcome");
+        assert_eq!(
+            pending_a.get(),
+            None,
+            "the first form never saw its outcome"
+        );
+        assert_eq!(
+            pending_b.get(),
+            None,
+            "the second form never saw its outcome"
+        );
         assert_eq!(
             refusal_a.text(),
             "talk was not saved: a workspace called talk already exists"

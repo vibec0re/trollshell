@@ -310,7 +310,8 @@ fn watch_loads(
 
 /// `WebKit`'s own load timeout: domain `WebKitNetworkError`, code **-1001**,
 /// which is no `WEBKIT_NETWORK_ERROR_*` value (`ResourceErrorSoup.cpp`'s
-/// `timeoutError`, raised by `NetworkDataTaskSoup.cpp`; webkitgtk 2.54.1).
+/// `timeoutError`, raised by `NetworkDataTaskSoup.cpp`; webkitgtk 2.52.6, the
+/// version the flake links, and 2.54.1 alike).
 const WEBKIT_TIMEOUT: i32 = -1001;
 
 /// Classify the `GError` a `load-failed` carries, for [`reload_after`].
@@ -319,7 +320,13 @@ const WEBKIT_TIMEOUT: i32 = -1001;
 /// TLS card in front of the view — see [`watch_loads`] for why a certificate
 /// failure arrives here at all.
 ///
-/// # What `WebKit` actually hands over (read in webkitgtk 2.54.1's source)
+/// # What `WebKit` actually hands over (read in webkitgtk's source)
+///
+/// Read in 2.54.1 first; the flake's devShell and package link **2.52.6**,
+/// and every file this cites (`WebKitNavigationClient.cpp`,
+/// `ResourceErrorSoup.cpp`, `WebKitPrivate.cpp`, and the
+/// `acceptCertificate`/`timeoutFired`/`sendRequestCallback` paths of
+/// `NetworkDataTaskSoup.cpp`) reads the same in both (#1578 review).
 ///
 /// - A **connection** failure keeps the domain and code `GLib` gave it:
 ///   libsoup returns `GSocketClient`'s error as is, `ResourceError::httpError`
@@ -853,8 +860,9 @@ mod tests {
 
     /// **Which load failures mean "nothing answered"** — #1557 item 2's
     /// classifier, against `GError`s in the shapes `WebKit` hands
-    /// `load-failed` (domains and codes read in webkitgtk 2.54.1's source;
-    /// see [`load_failure`]'s docs for where each comes from).
+    /// `load-failed` (domains and codes read in webkitgtk's source, the same
+    /// in the 2.52.6 the flake links and in 2.54.1; see [`load_failure`]'s
+    /// docs for where each comes from).
     ///
     /// A gateway that is down answers `NoAnswer`: refused, unreachable, a
     /// name that did not resolve, a timeout of `GLib`'s or of `WebKit`'s own
@@ -1323,9 +1331,12 @@ mod gtk_tests {
     /// and that the commit of whatever `WebKit` loads next is not reported a
     /// second time.
     ///
-    /// Mutation (run this round, red): drop the card-lifting branch from the
+    /// Mutations (run this round, red): drop the card-lifting branch from the
     /// `load-failed` handler — the card left up, the review's finding — and
-    /// the first row's `shows_unanswered` assertion reds.
+    /// the first row's `shows_unanswered` assertion reds; lift the card but
+    /// drop the `Answered` report and the `heard` assertion reds, which is
+    /// the window keeping its queue and its backoff behind a page that
+    /// answered.
     #[gtk::test]
     fn a_reload_the_policy_refuses_takes_the_card_down() {
         let url = "https://hive.local/agent/stray/?hide=header";

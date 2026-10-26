@@ -234,7 +234,7 @@ pub use region::set_drawer_panel_shown;
 // The slot-visibility **edge** counter (#1361 review, HIGH-2). Test-only: a
 // `watch` receiver coalesces a `true → false → true` flap into one latest-value
 // read, so the edge is counted where it is emitted instead.
-#[cfg(test)]
+#[cfg(all(test, feature = "system-tests"))]
 pub(crate) use pump::{reset_visibility_edges, visibility_edges};
 // The dialog's contribution to the slot-visibility aggregates (#1010 §4), so a
 // sidebar plugin whose page is up in the dialog with the sidebar closed is still
@@ -708,7 +708,7 @@ pub fn host_is_live() -> bool {
 /// `set_dialog_visibility`, which `.expect()` these handles out of the registry,
 /// and `PluginHandles`' fields are private to this module so no caller can build
 /// one itself.
-#[cfg(test)]
+#[cfg(all(test, feature = "system-tests"))]
 pub(crate) fn install_test_handles() {
     struct TestService;
 

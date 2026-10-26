@@ -395,8 +395,10 @@ pub(super) async fn run_wifi_watcher(
             continue 'discovery;
         };
 
-        // The station's own properties, subscribed before anything below
-        // reads them.
+        // The station's own properties, subscribed as soon as the snapshot
+        // names the station, and so before the network read below. Its path
+        // is not known before the snapshot, so a station change between the
+        // snapshot and this line still waits for the station's next change.
         let station_sub = station_props_signal(station_path.as_str());
         let mut station_events = station_sub.events();
 

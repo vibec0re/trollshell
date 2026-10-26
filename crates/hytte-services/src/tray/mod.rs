@@ -982,12 +982,17 @@ impl Identity {
 
 /// How long to wait before the one retry of a failed initial read.
 ///
-/// An app that calls `RegisterStatusNotifierItem` before it has exported its
-/// object (Qt and GTK tray libraries both do this on a busy start-up) usually
-/// finishes within a main-loop tick or two; 400 ms covers that with room to
-/// spare while a user cannot see the row appear that much later. It also
-/// delays the `RegisterStatusNotifierItem` reply by the same amount, which no
-/// tray library minds.
+/// The retry is for an item whose properties do not answer yet when it
+/// registers: an app that calls `RegisterStatusNotifierItem` before its object
+/// is exported, or a read that failed in passing. Not every tray library can
+/// cause the first: libayatana-appindicator's `check_connect` exports the
+/// object with `g_dbus_connection_register_object` before it registers, and
+/// its comment there says the order matters. For an app that does register
+/// first, 400 ms is time to finish exporting, and it is short enough that a
+/// row appearing that much later goes unnoticed. The read runs inside the
+/// `RegisterStatusNotifierItem` handler, so the reply waits as well;
+/// libayatana-appindicator makes that call with `GDBus`'s default timeout
+/// (25 s), well clear of it.
 const INITIAL_READ_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
 
 /// What to do after one attempt at an item's initial property read.
@@ -1005,8 +1010,10 @@ enum InitialRead {
 ///
 /// - a successful read is always accepted;
 /// - a failed read whose peer is **known gone** (`peer_alive == Some(false)`)
-///   is dropped at once: that is #1494's ghost-row protection, and waiting
-///   would not help;
+///   is dropped at once, since the retry could only fail again. That only
+///   skips the wait: a failed read never makes a row either way. What stops a
+///   peer that leaves after a *successful* read from leaving a ghost row is
+///   [`watch_liveness`]'s owner check on the item's first `Live` (#1494);
 /// - otherwise (peer alive, or the owner check itself unanswered, which is
 ///   treated as alive like the rest of this module) the first failure is
 ///   retried and the second is dropped.
@@ -1460,7 +1467,7 @@ mod tests {
         // first failure, peer alive or unknown: retry
         assert_eq!(decide_initial_read(false, false, Some(true)), Retry);
         assert_eq!(decide_initial_read(false, false, None), Retry);
-        // first failure, peer gone: drop (ghost-row protection)
+        // first failure, peer gone: drop without waiting
         assert_eq!(decide_initial_read(false, false, Some(false)), Drop);
         // second failure: drop
         assert_eq!(decide_initial_read(false, true, Some(true)), Drop);
@@ -1519,7 +1526,7 @@ mod tests {
         assert_eq!(reads, 2);
     }
 
-    /// #1494's ghost rows: a peer that already left is not waited for.
+    /// A peer that already left is not waited for: the retry could only fail.
     #[tokio::test(flavor = "current_thread")]
     async fn a_gone_peer_is_dropped_without_a_retry() {
         let (out, reads, _) = drive(vec![Err("gone"), Ok(9)], Some(false)).await;

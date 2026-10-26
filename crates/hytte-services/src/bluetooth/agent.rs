@@ -15,8 +15,8 @@
 //! agent + anchor name both on the system bus.
 
 use super::shared_state;
-use crate::retry;
 use super::types::{AgentReply, PairPrompt, PromptKind};
+use crate::retry;
 use futures_signals::signal::Mutable;
 use futures_util::{Stream, StreamExt};
 use hytte_bus::{BusKind, SignalItem};
@@ -259,7 +259,10 @@ async fn await_reply_in(
         // without anyone answering it. [`OwnBanner`] frees the slot when that
         // happens, but only if it can take the lock right then, so this is
         // the backstop for when it could not.
-        if guard.as_ref().is_some_and(|waiting| !waiting.tx.is_closed()) {
+        if guard
+            .as_ref()
+            .is_some_and(|waiting| !waiting.tx.is_closed())
+        {
             // Another pairing already pending — refuse cleanly so BlueZ
             // doesn't pile up coincident prompts.
             return AgentReply::Reject;
@@ -438,7 +441,8 @@ async fn agent_loop<S, R, RF, H, HF>(
         }
         want = false;
         tracing::debug!("bluetooth agent: registering with bluetoothd");
-        let mut registering = std::pin::pin!(register_until_accepted(&register, &has_owner, policy));
+        let mut registering =
+            std::pin::pin!(register_until_accepted(&register, &has_owner, policy));
         loop {
             tokio::select! {
                 () = &mut registering => break,
@@ -1117,7 +1121,11 @@ mod registration_tests {
             tx.unbounded_send(noc_item("org.bluez", ":1.6", ""))
                 .expect("loop is listening");
             tokio::time::sleep(Duration::from_secs(30)).await;
-            assert_eq!(attempts.get(), before, "no attempt while bluetoothd is gone");
+            assert_eq!(
+                attempts.get(),
+                before,
+                "no attempt while bluetoothd is gone"
+            );
             tx.unbounded_send(noc_item("org.bluez", "", ":1.7"))
                 .expect("loop is listening");
             tokio::time::sleep(Duration::from_millis(1)).await;

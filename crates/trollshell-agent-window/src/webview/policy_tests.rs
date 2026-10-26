@@ -938,10 +938,7 @@ fn a_real_click_off_the_hive_is_handed_off_once_and_the_view_stays() {
         || rig.handed.borrow().len() >= 2,
         || format!("{:?}", rig.asked.borrow()),
     );
-    assert_eq!(
-        rig.asked_about(&blank),
-        [Asked::new_window(&blank, true)]
-    );
+    assert_eq!(rig.asked_about(&blank), [Asked::new_window(&blank, true)]);
     pump_for(SETTLE);
     assert_eq!(
         *rig.handed.borrow(),
@@ -1015,7 +1012,11 @@ fn the_page_widget_installs_the_policy() {
     }
     // As in the first test: the main frame's `load` event waited for both
     // frames.
-    assert_eq!(elsewhere.requests(), Vec::<String>::new(), "the frame never left");
+    assert_eq!(
+        elsewhere.requests(),
+        Vec::<String>::new(),
+        "the frame never left"
+    );
     assert!(
         hive.requests().iter().any(|p| p == "/agent/stray/inner"),
         "the hive's own frame loads: {:?}",

@@ -462,10 +462,7 @@ impl ControlIface {
     /// every provider as "No key set" while their keys sat in a keyring the
     /// shell could not read. It shows "Unavailable" for an error.
     async fn list_ai_keys(&self) -> zbus::fdo::Result<Vec<String>> {
-        secrets::list().await.map_err(|err| {
-            tracing::warn!(%err, "ListAiKeys failed");
-            zbus::fdo::Error::Failed(format!("ListAiKeys failed: {err:#}"))
-        })
+        list_keys(&LoginKeyring).await
     }
 
     /// Store `value` as the API key for `slot` (e.g. `"openrouter"`) in the
@@ -483,15 +480,7 @@ impl ControlIface {
     /// shape #707 fixed for the plugin methods), and the value had no check at
     /// all. Neither the reply nor the log line carries the value.
     async fn set_ai_key(&self, slot: String, value: String) -> zbus::fdo::Result<()> {
-        check_slot(&slot, "SetAiKey")?;
-        check_key_value(&value, "SetAiKey")?;
-        secrets::set(&slot, &value)
-            .await
-            .map_err(|err| key_fail(&slot, &err, "SetAiKey"))?;
-        tracing::info!(%slot, "stored AI key; relaunching affected plugins");
-        hytte::reactive::runtime::handle()
-            .spawn(async move { plugin_launcher::relaunch_for_secret(&slot).await });
-        Ok(())
+        set_key(&LoginKeyring, slot, &value).await
     }
 
     /// Delete the stored API key for `slot`, then relaunch the running plugins
@@ -503,15 +492,77 @@ impl ControlIface {
     /// cannot be opened, unlocked or written — then nothing is relaunched,
     /// and the key is still stored.
     async fn clear_ai_key(&self, slot: String) -> zbus::fdo::Result<()> {
-        check_slot(&slot, "ClearAiKey")?;
-        secrets::clear(&slot)
-            .await
-            .map_err(|err| key_fail(&slot, &err, "ClearAiKey"))?;
-        tracing::info!(%slot, "cleared AI key; relaunching affected plugins");
+        clear_key(&LoginKeyring, slot).await
+    }
+}
+
+/// What the AI-key methods need from the login keyring and the launcher: the
+/// seam a test replaces so a keyring refusal can be driven without a Secret
+/// Service (#1558). Production is [`LoginKeyring`], which makes exactly the
+/// calls the handlers made before the seam existed.
+trait KeyStore {
+    /// [`secrets::list`].
+    async fn list(&self) -> anyhow::Result<Vec<String>>;
+    /// [`secrets::set`].
+    async fn set(&self, slot: &str, value: &str) -> anyhow::Result<()>;
+    /// [`secrets::clear`].
+    async fn clear(&self, slot: &str) -> anyhow::Result<()>;
+    /// Relaunch the running plugins that declare `slot`, off the caller's task.
+    fn relaunch(&self, slot: String);
+}
+
+/// The real keyring ([`crate::secrets`]) and the real launcher.
+struct LoginKeyring;
+
+impl KeyStore for LoginKeyring {
+    async fn list(&self) -> anyhow::Result<Vec<String>> {
+        secrets::list().await
+    }
+    async fn set(&self, slot: &str, value: &str) -> anyhow::Result<()> {
+        secrets::set(slot, value).await
+    }
+    async fn clear(&self, slot: &str) -> anyhow::Result<()> {
+        secrets::clear(slot).await
+    }
+    fn relaunch(&self, slot: String) {
         hytte::reactive::runtime::handle()
             .spawn(async move { plugin_launcher::relaunch_for_secret(&slot).await });
-        Ok(())
     }
+}
+
+/// `ListAiKeys` over `store`: a keyring failure is a `Failed` reply.
+async fn list_keys(store: &impl KeyStore) -> zbus::fdo::Result<Vec<String>> {
+    store.list().await.map_err(|err| {
+        tracing::warn!(%err, "ListAiKeys failed");
+        zbus::fdo::Error::Failed(format!("ListAiKeys failed: {err:#}"))
+    })
+}
+
+/// `SetAiKey` over `store`: validate, store, then relaunch. A refusal returns
+/// before the relaunch.
+async fn set_key(store: &impl KeyStore, slot: String, value: &str) -> zbus::fdo::Result<()> {
+    check_slot(&slot, "SetAiKey")?;
+    check_key_value(value, "SetAiKey")?;
+    store
+        .set(&slot, value)
+        .await
+        .map_err(|err| key_fail(&slot, &err, "SetAiKey"))?;
+    tracing::info!(%slot, "stored AI key; relaunching affected plugins");
+    store.relaunch(slot);
+    Ok(())
+}
+
+/// `ClearAiKey` over `store`: validate, clear, then relaunch. A refusal
+/// returns before the relaunch.
+async fn clear_key(store: &impl KeyStore, slot: String) -> zbus::fdo::Result<()> {
+    check_slot(&slot, "ClearAiKey")?;
+    store
+        .clear(&slot)
+        .await
+        .map_err(|err| key_fail(&slot, &err, "ClearAiKey"))?;
+    tracing::info!(%slot, "cleared AI key; relaunching affected plugins");
+    store.relaunch(slot);
+    Ok(())
 }
 
 /// Refuse a slot name [`secrets::is_valid_slot`] rejects, before the keyring
@@ -818,5 +869,116 @@ mod tests {
             message,
             "SetAiKey for slot openrouter failed: storing the key: the secret service is not running"
         );
+    }
+
+    /// A [`KeyStore`] that answers from a script and records what it was asked.
+    struct FakeKeys {
+        refuse: bool,
+        relaunched: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FakeKeys {
+        fn new(refuse: bool) -> Self {
+            Self {
+                refuse,
+                relaunched: std::sync::Mutex::default(),
+            }
+        }
+        fn answer<T>(&self, ok: T) -> anyhow::Result<T> {
+            if self.refuse {
+                Err(anyhow::anyhow!("the keyring is locked"))
+            } else {
+                Ok(ok)
+            }
+        }
+    }
+
+    impl KeyStore for FakeKeys {
+        async fn list(&self) -> anyhow::Result<Vec<String>> {
+            self.answer(vec!["openrouter".to_owned()])
+        }
+        async fn set(&self, _slot: &str, _value: &str) -> anyhow::Result<()> {
+            self.answer(())
+        }
+        async fn clear(&self, _slot: &str) -> anyhow::Result<()> {
+            self.answer(())
+        }
+        fn relaunch(&self, slot: String) {
+            self.relaunched.lock().unwrap().push(slot);
+        }
+    }
+
+    /// A keyring that refuses a set reaches the caller as a `Failed` reply
+    /// naming the cause, nothing is relaunched, and the value is in neither
+    /// the reply nor the log.
+    ///
+    /// **Falsification:** make `set_key` swallow the refusal (`.ok()` in place
+    /// of the `map_err(..)?`) -> the reply is `Ok` and this goes red.
+    #[tokio::test]
+    async fn a_keyring_that_refuses_a_set_fails_the_caller() {
+        let keys = FakeKeys::new(true);
+        let (captured, guard) = hytte_config::test_support::capture();
+        let reply = set_key(&keys, "openrouter".to_owned(), "sk-do-not-echo").await;
+        drop(guard);
+        let message = failed_message(reply);
+        assert!(
+            message.starts_with("SetAiKey for slot openrouter failed:"),
+            "{message}"
+        );
+        assert!(message.contains("the keyring is locked"), "{message}");
+        assert!(!message.contains("sk-do-not-echo"), "{message}");
+        assert!(keys.relaunched.lock().unwrap().is_empty());
+        for event in captured.events() {
+            assert!(
+                !format!("{event:?}").contains("sk-do-not-echo"),
+                "the value reached the journal: {event:?}"
+            );
+        }
+    }
+
+    /// A keyring that refuses a clear is a `Failed` reply and no relaunch.
+    ///
+    /// **Falsification:** swallow the refusal in `clear_key` -> red.
+    #[tokio::test]
+    async fn a_keyring_that_refuses_a_clear_fails_the_caller() {
+        let keys = FakeKeys::new(true);
+        let message = failed_message(clear_key(&keys, "openrouter".to_owned()).await);
+        assert!(
+            message.starts_with("ClearAiKey for slot openrouter failed:"),
+            "{message}"
+        );
+        assert!(message.contains("the keyring is locked"), "{message}");
+        assert!(keys.relaunched.lock().unwrap().is_empty());
+    }
+
+    /// A keyring that cannot be listed is a `Failed` reply, not an empty list
+    /// (which says no key is stored).
+    ///
+    /// **Falsification:** make `list_keys` return `Ok(vec![])` on error -> red.
+    #[tokio::test]
+    async fn a_keyring_that_fails_a_list_fails_the_caller() {
+        let keys = FakeKeys::new(true);
+        let reply = list_keys(&keys).await;
+        let Err(zbus::fdo::Error::Failed(message)) = reply else {
+            panic!("expected a Failed reply, got {reply:?}");
+        };
+        assert!(message.starts_with("ListAiKeys failed:"), "{message}");
+        assert!(message.contains("the keyring is locked"), "{message}");
+    }
+
+    /// The success path: set and clear reply `Ok` and relaunch the slot once
+    /// each; list returns the keyring's slots.
+    #[tokio::test]
+    async fn a_keyring_that_accepts_replies_ok_and_relaunches() {
+        let keys = FakeKeys::new(false);
+        set_key(&keys, "openrouter".to_owned(), "sk-or-v1-0123456789abcdef")
+            .await
+            .unwrap();
+        clear_key(&keys, "openrouter".to_owned()).await.unwrap();
+        assert_eq!(
+            *keys.relaunched.lock().unwrap(),
+            ["openrouter", "openrouter"]
+        );
+        assert_eq!(list_keys(&keys).await.unwrap(), ["openrouter"]);
     }
 }

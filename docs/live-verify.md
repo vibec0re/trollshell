@@ -5740,6 +5740,18 @@ trollshell`. Expect the cards to come back Active and **no notification at
       file is `0644` and carries `Environment="OPENROUTER_API_KEY=sk-…"`, held
       in by `/run/user/<uid>`'s `0700`. In scope per #956 and true before #984
       as well as after; don't read it as a regression when you look.
+- [ ] **A key the keyring refuses is an error, not "stored".** Lock the login
+      keyring (Seahorse → _Login_ → _Lock_), then run
+      `busctl --user call mov.vibec0re.trollshell.Control /mov/vibec0re/trollshell/Control mov.vibec0re.trollshell.Control SetAiKey ss openrouter sk-test`
+      and press **Cancel** on the unlock prompt. `busctl` reports a failed
+      call, _"SetAiKey for slot openrouter failed: unlocking the keyring: …"_
+      (not an empty success), the shell's journal has one `SetAiKey failed`
+      line naming the slot and not `sk-test`, and no `trollshell-plugin-*`
+      unit is relaunched. `ClearAiKey s openrouter` behaves the same, and so
+      does `ListAiKeys` (Cancel its prompt too), which the AI Keys tab then
+      shows as "Unavailable" rather than "No key set". `SetAiKey ss 'Not A Slot' x`
+      fails at once, without a prompt. Unlock the keyring and repeat the
+      first call: it succeeds, as before.
 - [ ] **(#984)** …nor in the launch **argv**. The channel the list above left
       out: `/proc/<pid>/environ` is `0400` but `/proc/<pid>/cmdline` is `0444`,
       so a `--setenv=OPENROUTER_API_KEY=sk-…` argument was readable by any local

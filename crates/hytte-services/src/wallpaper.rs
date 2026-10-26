@@ -552,8 +552,8 @@ fn load_state() -> WallpaperState {
 /// Run one loaded path through [`clean`]'s rule. An invalid one is dropped
 /// (`None`) with one warning naming `what` (the field or output), never the
 /// raw path.
-fn clean_loaded(what: &str, path: String) -> Option<String> {
-    if let Some(value) = clean(&path) {
+fn clean_loaded(what: &str, path: &str) -> Option<String> {
+    if let Some(value) = clean(path) {
         return Some(value);
     }
     tracing::warn!(
@@ -572,7 +572,7 @@ fn sanitize_loaded(mut state: WallpaperState) -> WallpaperState {
     state.default = state
         .default
         .take()
-        .and_then(|p| clean_loaded("default", p));
+        .and_then(|p| clean_loaded("default", &p));
     state.outputs = std::mem::take(&mut state.outputs)
         .into_iter()
         .filter_map(|(name, path)| {
@@ -582,7 +582,7 @@ fn sanitize_loaded(mut state: WallpaperState) -> WallpaperState {
                 );
                 return None;
             }
-            let value = clean_loaded(&format!("output {name:?}"), path)?;
+            let value = clean_loaded(&format!("output {name:?}"), &path)?;
             Some((name, value))
         })
         .collect();
@@ -590,16 +590,16 @@ fn sanitize_loaded(mut state: WallpaperState) -> WallpaperState {
     r.morning = r
         .morning
         .take()
-        .and_then(|p| clean_loaded("rotation.morning", p));
-    r.day = r.day.take().and_then(|p| clean_loaded("rotation.day", p));
+        .and_then(|p| clean_loaded("rotation.morning", &p));
+    r.day = r.day.take().and_then(|p| clean_loaded("rotation.day", &p));
     r.evening = r
         .evening
         .take()
-        .and_then(|p| clean_loaded("rotation.evening", p));
+        .and_then(|p| clean_loaded("rotation.evening", &p));
     r.night = r
         .night
         .take()
-        .and_then(|p| clean_loaded("rotation.night", p));
+        .and_then(|p| clean_loaded("rotation.night", &p));
     state
 }
 

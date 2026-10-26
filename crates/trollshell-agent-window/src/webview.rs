@@ -741,18 +741,21 @@ pub fn is_probe_died(widget: &gtk::Widget) -> bool {
 ///
 /// # Why `hand_off` is a parameter
 ///
-/// [`page`] passes [`elsewhere`], and that is the **only** call site — nothing
-/// in the tree passes anything else today (#1130 N5, which caught this doc
-/// claiming otherwise).
+/// [`page`] passes [`elsewhere`], and that is the **only** call site that
+/// ships (#1130 N5 caught this doc claiming otherwise). The one other caller
+/// is the `policy_tests` module, which passes a recorder (#1584).
 ///
 /// It is a seam rather than a hard-coded call because **an ignored policy
 /// decision is silent**: `WebKit` aborts the load and emits no `load-failed`,
 /// no `load-changed`, nothing — and `WebViewExt::uri` is set by `load_uri`
 /// *before* any decision, so it reads back the refused URI either way
-/// (measured, both). So the day a web process can start where these tests run,
-/// watching what this hands out is the only way to observe the real handler
-/// through `WebKit`'s real dispatch; until then it costs one parameter and
-/// nothing else. See `gtk_tests`' module doc for why that day is not today.
+/// (measured, both). So watching what this hands out is the way to observe
+/// the real handler through `WebKit`'s real dispatch — and that dispatch does
+/// run where `checks.system-tests` runs, whose llvmpipe EGL vendor gets the
+/// web process started (#1584; a bare `xvfb-run` still has none, and the web
+/// process aborts there). `policy_tests` hands this a recorder and clicks with
+/// a real pointer; a test that passed [`elsewhere`] would open the
+/// developer's browser.
 fn install_policy(view: &webkit::WebView, embedded: &str, hand_off: std::rc::Rc<dyn Fn(&str)>) {
     let origin = std::rc::Rc::<str>::from(embedded);
     let (policy_origin, policy_hand_off) =
@@ -1007,61 +1010,77 @@ mod tests {
 
 #[cfg(all(test, feature = "system-tests"))]
 mod gtk_tests {
+    //! The page widget on a display: its settings, its stack, its session,
+    //! and its load-signal wiring, driven by emitting the signals by hand.
+    //!
+    //! # Where `WebKit` runs, and what that means here
+    //!
+    //! Measured with the constraints the nix build sandbox imposes (#1130,
+    //! then #1584):
+    //!
+    //! - With `WebKit`'s sandbox on, creating a `WebView` **aborts the whole
+    //!   test binary**: `bwrap: Can't mount proc on /newroot/proc: Operation
+    //!   not permitted`, then `Failed to fully launch dbus-proxy`, SIGABRT.
+    //!   Nested user namespaces are not available. So both
+    //!   `nix/devshell.nix` and `nix/checks/system-tests.nix` set
+    //!   `WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1`.
+    //! - With it off, under a **bare `xvfb-run`** (the devShell), the view is
+    //!   built and the web process still dies at once: `Could not create
+    //!   default EGL display: EGL_BAD_PARAMETER. Aborting...`, then
+    //!   `web-process-terminated: Crashed`, and no `load-changed`, no
+    //!   `load-failed` and no `decide-policy` (a #1130 diagnostic run saw that
+    //!   one signal and nothing else over a 20 s main-loop budget).
+    //! - Under **`checks.system-tests`** the web process **runs**. That check
+    //!   exports llvmpipe's EGL vendor for `hytte-ui`'s GL tests (#1036), and
+    //!   that is what the web process was missing: there it loads pages and
+    //!   dispatches `decide-policy`. #1578 met it first, as a real load racing
+    //!   a scripted one, and #1584 measured it. Until #1584 this doc said the
+    //!   process died in both settings, which was only ever measured under a
+    //!   bare `xvfb-run`.
+    //!
+    //! The tests in this module build pages on `hive.local` and never iterate
+    //! the main context after building one, so the page's own load (real in
+    //! CI, where it fails on a name the sandbox cannot resolve) never reaches
+    //! what they assert on. A display test that does pump has to keep its
+    //! page's own load out of its assertions: `window.rs`'s
+    //! `an_unanswered_page_is_reloaded_on_the_shared_backoff` (#1578) is the
+    //! pattern, a gateway that hears nothing and a `.invalid` host.
+    //!
+    //! The end-to-end policy tests (a real load, a real `decide-policy`, a
+    //! real click) are the `policy_tests` module beside this one. They skip
+    //! where the web process cannot start, and fail there instead when
+    //! `TROLLSHELL_REQUIRE_GL=1`, which `checks.system-tests` exports.
+    //!
+    //! # Where H1's evidence lives
+    //!
+    //! | claim | where |
+    //! | --- | --- |
+    //! | which URIs may load in place | `page::navigable_in_place`'s tests — hermetic, and the mutation reds |
+    //! | which refusals reach the desktop (a click on http(s), nothing else) | `page::decide`'s tests — hermetic, and the mutations red |
+    //! | the page cannot open windows or reach `data:`/`file:` | `the_settings_are_the_ones_we_state` below, on the real `Settings` object |
+    //! | `page` installs the handler; it refuses through `WebKit`'s own dispatch and a refused request never reaches its server; `is_user_gesture` reads true for a real click and false for a frame, a meta refresh or a script; a click off the hive is handed off once, a `_blank` one too and never reaches `create`; a script's `window.open` asks for nothing | `policy_tests` — runs under `checks.system-tests`, skips under a bare `xvfb-run` |
+    //! | `elsewhere` reaches a real browser; a click on niri's glass (Wayland input, not `XTest`); hyperhive's real feed markup | **live-verify** (`docs/live-verify.md`, "The view stays on the hive" and "Nothing opens without a click") |
+    //!
+    //! (The **network** process dials even where the web process dies:
+    //! `window.rs`'s
+    //! `gtk_tests::a_second_activation_during_the_probe_opens_no_second_connection`
+    //! asserts it reaching a fixture gateway once, strictly pre-mount, and
+    //! that test's doc records a second connection once the page mounts —
+    //! `WebKit`'s network process opening the view's `load_uri`, #1274 N3. It
+    //! carries no navigation policy of its own; `decide-policy` is dispatched
+    //! from the web process.)
+    //!
+    //! (`WebViewExt::uri` is no way to tell whether a navigation was refused:
+    //! `load_uri` sets it *before* any decision, so it reads back a refused
+    //! URI unchanged. Measured — it was the first shape tried. `policy_tests`
+    //! reads `location.href` from the page instead.)
+
     use super::{PAGE, TLS_FAILED, page, settings, view_of};
     use crate::tls::Resolved;
     use std::cell::Cell;
     use std::rc::Rc;
     use webkit::prelude::*;
 
-    /// # Why there is no end-to-end "the view refused it" test here
-    ///
-    /// The #1130 review supplied one — `load_uri` a foreign origin, iterate the
-    /// main context, assert the view did not take it — and it cannot run in any
-    /// environment this repo's CI has. Measured, in this container and with the
-    /// same constraints the nix build sandbox imposes:
-    ///
-    /// - With `WebKit`'s sandbox on, creating a `WebView` **aborts the whole test
-    ///   binary**: `bwrap: Can't mount proc on /newroot/proc: Operation not
-    ///   permitted`, then `Failed to fully launch dbus-proxy`, SIGABRT. Nested
-    ///   user namespaces are not available here.
-    /// - With `WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1` (which
-    ///   `nix/checks/system-tests.nix` sets for the test derivation, so the
-    ///   suite survives at all) the view is constructed — and the web process
-    ///   still dies: a diagnostic run recorded exactly one signal,
-    ///   `web-process-terminated: Crashed`, with no `load-changed` and no
-    ///   `load-failed`, over a 20 s blocking main-loop budget.
-    ///
-    /// No web process means no navigation, which means `decide-policy` is never
-    /// dispatched, which means the handler cannot be observed firing. The
-    /// reviewer's own note that "`decide-policy` runs before any request, so
-    /// this needs no network" is right about the *network* and does not save
-    /// it: the decision is still made by a process that cannot start.
-    ///
-    /// (The **network** process is a different story, and it does dial —
-    /// `window.rs`'s `gtk_tests::a_second_activation_during_the_probe_opens_no_second_connection`
-    /// asserts it reaching a fixture gateway once, strictly pre-mount (its
-    /// `seen` snapshot is only ever taken while the probe is still in
-    /// flight); that test's own doc additionally records, measured under
-    /// mutation, a second connection once the page mounts — `WebKit`'s
-    /// network process opening the embedded view's `load_uri`, #1274 N3.
-    /// That process carries no navigation policy of its own; it is
-    /// `decide-policy`, dispatched on the *web* process above, that this file
-    /// cannot observe.)
-    ///
-    /// (`WebViewExt::uri` is no substitute either, and that is worth recording
-    /// separately: it is set by `load_uri` *before* any decision, so it reads
-    /// back a refused URI unchanged. Measured — it was the first shape tried.)
-    ///
-    /// So the H1 evidence is split, with nothing claimed that was not run:
-    ///
-    /// | claim | where |
-    /// | --- | --- |
-    /// | which URIs may load in place | `page::navigable_in_place`'s tests — hermetic, and the mutation reds |
-    /// | which refusals reach the desktop (a click on http(s), nothing else) | `page::decide`'s tests — hermetic, and the mutations red |
-    /// | the page cannot open windows or reach `data:`/`file:` | [`the_settings_are_the_ones_we_state`] below, on the real `Settings` object |
-    /// | the handler is installed, refuses through `WebKit`'s dispatch, and `is_user_gesture` reads true for a click and false for a frame or a script | **live-verify** (`docs/live-verify.md`, "The view stays on the hive" and "Nothing opens without a click") — it needs a machine with a working web process |
-    ///
-    /// [`the_settings_are_the_ones_we_state`]: gtk_tests::the_settings_are_the_ones_we_state
     /// **The page's permissions are the ones this file states**, read back off
     /// the real `Settings` object rather than trusted to the constructor.
     ///
@@ -1188,9 +1207,12 @@ mod gtk_tests {
     /// Emit `load-failed` on `view` the way `WebKit` does, and answer whether
     /// this file's handler **took** it (so `WebKit` draws no error page).
     ///
-    /// No web process runs here (this module's doc), so `WebKit` itself never
-    /// emits it; `GLib`'s own dispatch reaches the very closure
-    /// `watch_loads` connected, which is the wiring under test.
+    /// `GLib`'s own dispatch reaches the very closure `watch_loads` connected,
+    /// which is the wiring under test. `WebKit`'s own emissions are not in the
+    /// way: under a bare `xvfb-run` there is no web process to make them, and
+    /// under `checks.system-tests`, where there is, they are only delivered
+    /// when the main context is iterated, which nothing here does after the
+    /// page is built (this module's doc).
     fn fail(
         view: &webkit::WebView,
         declined: &Cell<u32>,
@@ -1402,3 +1424,6 @@ mod gtk_tests {
         );
     }
 }
+
+#[cfg(all(test, feature = "system-tests"))]
+mod policy_tests;

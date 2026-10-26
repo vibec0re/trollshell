@@ -176,16 +176,19 @@ craneLib.mkCargoDerivation (
       # that ships: the packaged window (nix/agent-window.nix) sets no such
       # variable and runs a fully sandboxed engine on a real desktop.
       #
-      # It does not buy a *working* web process, and nothing here pretends
-      # otherwise: with the sandbox off the process still terminates
-      # (`web-process-terminated: Crashed`, measured), so no page ever loads
-      # and no navigation policy is ever dispatched under this check. The tests
-      # that run here are the ones that need only the widget — the settings the
-      # view carries, the stack's shape, the session's ephemerality. The
-      # end-to-end "a foreign link does not move the window" assertion is a
-      # live-verify item (docs/live-verify.md, #950), and `webview.rs`'s
-      # `gtk_tests` module doc records the whole measurement so nobody re-adds
-      # a test that cannot run.
+      # With the software-GL exports below (the #1036 llvmpipe env, there for
+      # the GL tests) the web process does start under this check and
+      # navigates: pages load from a loopback server, and `decide-policy`
+      # fires as the window's navigation policy assumes (#1584, measured). A
+      # plain devShell `xvfb-run` has no such env, and there the web process
+      # aborts at once on `EGL_BAD_PARAMETER`, so locally nothing is
+      # dispatched. The policy-dispatch half of the "a foreign link does not
+      # move the window" assertion is therefore pinned in CI
+      # (`webview/policy_tests.rs`; those tests fail rather than skip here via
+      # `TROLLSHELL_REQUIRE_GL=1`), and only the on-glass half stays in
+      # docs/live-verify.md. `webview.rs`'s module doc records the measurement.
+      # Any agent-window test whose view gets a real URI can now race a real
+      # load: give it a silent sink and a `.invalid` host (#1578).
       export WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1
       export XDG_DATA_DIRS="${pkgs.adwaita-icon-theme}/share''${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
       export TROLLSHELL_REQUIRE_ICON_THEME=1

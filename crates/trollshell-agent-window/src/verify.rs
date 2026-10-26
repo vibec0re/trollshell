@@ -962,11 +962,13 @@ pub(crate) mod tls_tests {
     //! loopback socket, the window's own [`probe`] on the other, and the
     //! four verdicts asserted through the same code a launch runs.
     //!
-    //! **No `WebView` is constructed here and no page is loaded.** That
-    //! remains impossible under the check (`webview.rs`'s `gtk_tests` module
-    //! doc has the measurement: the web process dies even with the sandbox
-    //! disabled). What is testable is everything *before* `WebKit` — which is
-    //! where all of #1234's logic lives.
+    //! **No `WebView` is constructed here and no page is loaded**: everything
+    //! #1234 added runs *before* `WebKit`, so that is what this module tests.
+    //! A page can be loaded under the check, though. `checks.system-tests`'
+    //! llvmpipe EGL vendor gets `WebKit`'s web process started there (it only
+    //! dies under a bare `xvfb-run`; `webview.rs`'s `gtk_tests` module doc has
+    //! the measurement), and `webview.rs`'s `policy_tests` serves real pages
+    //! over TLS from these same fixtures, through a pinned leaf (#1584).
     //!
     //! # The fixture gateways are `pub(crate)`
     //!

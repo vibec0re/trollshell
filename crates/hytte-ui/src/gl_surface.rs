@@ -1906,6 +1906,132 @@ mod imp {
             }
         }
 
+        /// **`hytte-gl`'s safety contract, invariant 2, against a real
+        /// driver.** A handle deletes its object only while the context that
+        /// created it is current; dropped under another context, or under
+        /// none, it leaks the object instead.
+        ///
+        /// This widget's own teardown makes its context current before it
+        /// drops anything (`unrealize`), but nothing made a *failed*
+        /// `make_current` — which GDK answers with a warning, leaving the
+        /// thread's previous binding in place — anything other than a delete
+        /// in whichever context that was. Two `GtkGLArea`s give two real
+        /// contexts in one share group, which is the whole situation.
+        ///
+        /// Four halves, each observed through GL itself (`glIs*`), not
+        /// through the decision function `hytte-gl` tests hermetically:
+        ///
+        /// 1. **Same context: deleted.** The case that must keep working; a
+        ///    check that leaked here would be a GPU leak per resize. Also
+        ///    the proof that the context probe *sees* this driver's contexts
+        ///    at all — a blind probe would record no owner and fall back to
+        ///    the unchecked delete, which this half cannot tell apart, so
+        ///    half 2 is what pins that.
+        /// 2. **Another context, shared object: kept.** A texture is shared
+        ///    across the group, so a delete issued under B would remove A's
+        ///    texture — the premise asserts B can see it. Unconditional, and
+        ///    the falsifier: reverting any `Drop` to a bare `glDelete*`
+        ///    reds it.
+        /// 3. **Another context, container object: B's own VAO survives.**
+        ///    VAOs are per context, so A's VAO and B's first VAO can carry
+        ///    the same name, and a delete of A's under B removes **B's**
+        ///    — the shape of the hazard for GTK's own objects. Asserted only
+        ///    where this driver numbered them alike (it says so otherwise).
+        /// 4. **No context current: kept, and no abort.** Through glvnd a
+        ///    delete with nothing bound is a no-op anyway, so this half
+        ///    cannot fail the old code here; it pins that the path which can
+        ///    `abort()` on the libepoxy route is not taken.
+        ///
+        /// **Falsified** by making `hytte_gl::release` delete
+        /// unconditionally: half 2 reds (`glIsTexture` is false under A),
+        /// and half 3 reds wherever its premise holds.
+        #[gtk::test]
+        fn a_handle_is_deleted_only_under_the_context_that_made_it() {
+            let Some((window_a, area_a, gl)) =
+                real_gl_or_skip("a_handle_is_deleted_only_under_the_context_that_made_it")
+            else {
+                return;
+            };
+            let (window_b, area_b, _) = real_gl().unwrap_or_else(|why| {
+                panic!("the display gave one GL context but not a second: {why}")
+            });
+            let texture = |what: &str| {
+                hgl::Texture::new(&gl, hgl::Format::R8, 1, 1)
+                    .unwrap_or_else(|error| panic!("a 1x1 R8 texture for {what}: {error}"))
+            };
+
+            // 1. Same context.
+            area_a.make_current();
+            let same = texture("half 1");
+            let name = same.name_for_test();
+            assert!(
+                hgl::is_texture_for_test(&gl, name),
+                "the premise: it exists in A"
+            );
+            drop(same);
+            assert!(
+                !hgl::is_texture_for_test(&gl, name),
+                "dropped under the context that made it, a texture must be deleted",
+            );
+
+            // 2. Another context, shared object.
+            area_a.make_current();
+            let shared = texture("half 2");
+            let name = shared.name_for_test();
+            area_b.make_current();
+            assert!(
+                hgl::is_texture_for_test(&gl, name),
+                "the premise: GDK's contexts share, so B sees A's texture {name} — and a \
+                 delete issued here would remove it",
+            );
+            drop(shared);
+            area_a.make_current();
+            assert!(
+                hgl::is_texture_for_test(&gl, name),
+                "A's texture {name} must survive its handle being dropped while B was current",
+            );
+
+            // 3. Another context, container object.
+            area_b.make_current();
+            let vao_b = hgl::VertexArray::new(&gl).expect("a VAO in B");
+            vao_b.bind(&gl);
+            area_a.make_current();
+            let vao_a = hgl::VertexArray::new(&gl).expect("a VAO in A");
+            vao_a.bind(&gl);
+            let (name_a, name_b) = (vao_a.name_for_test(), vao_b.name_for_test());
+            area_b.make_current();
+            drop(vao_a);
+            if name_a == name_b {
+                assert!(
+                    hgl::is_vertex_array_for_test(&gl, name_b),
+                    "B's own VAO {name_b} must survive A's VAO of the same name being dropped \
+                     while B was current — a delete there removes B's object, not A's",
+                );
+            } else {
+                eprintln!(
+                    "a_handle_is_deleted_only_under_the_context_that_made_it: half 3 not \
+                     asserted — this driver named A's VAO {name_a} and B's {name_b}, so there \
+                     is no collision to observe",
+                );
+            }
+            drop(vao_b);
+
+            // 4. No context current.
+            area_a.make_current();
+            let orphan = texture("half 4");
+            let name = orphan.name_for_test();
+            gdk::GLContext::clear_current();
+            drop(orphan);
+            area_a.make_current();
+            assert!(
+                hgl::is_texture_for_test(&gl, name),
+                "dropped with no context current, a texture must be leaked, not deleted",
+            );
+
+            window_a.destroy();
+            window_b.destroy();
+        }
+
         /// **#979.** `ensure_resources` must rebuild — not reuse — when the
         /// program changes at a constant grid. Registers two pipelines that
         /// compile a different number of programs, builds `Resources` for the

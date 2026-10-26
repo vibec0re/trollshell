@@ -1272,7 +1272,10 @@ mod gtk_tests {
             }
             other => panic!("expected a scoped Start, got {other:?}"),
         }
-        assert_eq!(Scope::agent("stray").agent_names(), [String::from("stray")]);
+        assert_eq!(
+            Scope::agent(&name("stray")).agent_names(),
+            [String::from("stray")]
+        );
     }
 
     /// The hive's `Urls` answer reaches the Settings tab.

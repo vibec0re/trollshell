@@ -4,7 +4,7 @@
 //! and [`crate::view`] projects it. That is what makes the status precedence
 //! and the grouping testable without a socket, a host, or a wall clock.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use crate::config::AgentsConfig;
 use crate::hive::wire::{AgentStatusRow, Approval, ApprovalStatus, VersionMismatch};
@@ -288,12 +288,33 @@ impl PendingApprovals {
     ///   ascending id *is* oldest-first — and it is a total order over `i64`,
     ///   where `requested_at` is a free-text timestamp the mirror deliberately
     ///   keeps unparsed (the [`AgentStatusRow::status_set_at`] rule).
+    /// - **Drop a row with no usable id.** [`Approval::id`] is
+    ///   `#[serde(default)]` (mirror rule 1), so a row that omits the key
+    ///   decodes as id `0` — and every such row as the *same* `0`. The hive's
+    ///   ids start at 1, so a non-positive one names no row it would act on,
+    ///   and offering it on a card would send `Approve { id: 0 }` for a request
+    ///   the hive never addressed. Dropped with one debug line per answer, and
+    ///   the row is still there on the dashboard.
     #[must_use]
     pub fn new(queue: Vec<Approval>) -> Self {
+        let mut unaddressable = 0_usize;
         let mut queue: Vec<Approval> = queue
             .into_iter()
             .filter(|a| a.status == ApprovalStatus::Pending)
+            .filter(|a| {
+                let usable = a.id > 0;
+                if !usable {
+                    unaddressable += 1;
+                }
+                usable
+            })
             .collect();
+        if unaddressable > 0 {
+            tracing::debug!(
+                rows = unaddressable,
+                "pending approvals with no positive id dropped; answer them on the dashboard"
+            );
+        }
         queue.sort_by_key(|a| a.id);
         Self { queue }
     }
@@ -312,7 +333,17 @@ impl PendingApprovals {
     /// "dropped with a debug line, not an error".
     #[must_use]
     pub fn contains(&self, id: i64) -> bool {
-        self.queue.iter().any(|a| a.id == id)
+        self.get(id).is_some()
+    }
+
+    /// The approval queued under `id`, if one is still waiting on a human.
+    ///
+    /// What a decision path compares against what its card showed: an id is
+    /// only the hive's handle for a row, and a hive that re-numbered its queue
+    /// can hand the same one to a different request.
+    #[must_use]
+    pub fn get(&self, id: i64) -> Option<&Approval> {
+        self.queue.iter().find(|a| a.id == id)
     }
 
     /// How many approvals `agent` is waiting on — the badge's count.
@@ -329,12 +360,15 @@ impl PendingApprovals {
 
     /// The oldest approval no prompt has been raised for yet.
     ///
-    /// `prompted` is the dedup set: an approval prompts **once** and then waits
-    /// for a decision or a badge click, so a hive with one unanswered approval
-    /// does not raise a modal every poll.
+    /// `prompted` answers the dedup question for one row: an approval prompts
+    /// **once** and then waits for a decision or a badge click, so a hive with
+    /// one unanswered approval does not raise a modal every poll. It is a
+    /// predicate over the whole row rather than a set of ids so the caller can
+    /// bind "already asked" to the request it asked about, not to an id the
+    /// hive may since have handed to another one.
     #[must_use]
-    pub fn oldest_unprompted<'a>(&'a self, prompted: &BTreeSet<i64>) -> Option<&'a Approval> {
-        self.queue.iter().find(|a| !prompted.contains(&a.id))
+    pub fn oldest_unprompted(&self, prompted: impl Fn(&Approval) -> bool) -> Option<&Approval> {
+        self.queue.iter().find(|a| !prompted(a))
     }
 }
 
@@ -605,6 +639,68 @@ pub fn model_family(raw: &str) -> Option<String> {
     Some(head.to_uppercase().chain(chars).collect())
 }
 
+/// Flatten free text another process wrote to **one line**: every run of
+/// whitespace, control characters and bidi embedding/override/isolate controls
+/// becomes a single space, and the ends are trimmed.
+///
+/// A character cap alone does not bound how tall a wrapping label gets. 230
+/// `\n`s are well under any cap here and still draw 230 lines, which is enough
+/// to push a consent card's buttons off its surface — or to draw a convincing
+/// line of the agent's own above the stamp the plugin appends. The approval's
+/// description is written by the agent that asked, so it is exactly the text
+/// that can be prompt-injected into doing that. `char::is_whitespace` covers
+/// the Unicode line and paragraph separators (U+2028, U+2029, U+0085) Pango also
+/// breaks on; `char::is_control` covers the rest of C0/C1.
+///
+/// The bidi controls are flattened for the same reason one line is: a
+/// right-to-left override in the description runs on to the end of the
+/// paragraph, so without this it would draw the stamp after it reversed.
+///
+/// Run it **before** [`clamp`], so the cap counts what is drawn.
+#[must_use]
+pub fn single_line(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut gap = false;
+    for c in s.chars() {
+        if c.is_whitespace() || c.is_control() || is_bidi_control(c) {
+            gap = true;
+            continue;
+        }
+        if gap && !out.is_empty() {
+            out.push(' ');
+        }
+        gap = false;
+        out.push(c);
+    }
+    out
+}
+
+/// Truncate on a **char** boundary, appending an ellipsis when it bit.
+///
+/// `&s[..n]` would panic mid-codepoint, and a description is arbitrary UTF-8
+/// somebody else wrote — a plugin that panicked on an emoji in a PR title would
+/// take its whole session down.
+///
+/// `pub` since #1141's review (M4), with [`crate::plugin::detail_line`], and
+/// still reachable at `crate::plugin::clamp`; it moved here so the wire mirror
+/// can bound [`ApprovalKind::Unknown`](crate::hive::wire::ApprovalKind::Unknown)'s
+/// wording at its source.
+#[must_use]
+pub fn clamp(s: &str, chars: usize) -> String {
+    if s.chars().count() <= chars {
+        return s.to_owned();
+    }
+    let head: String = s.chars().take(chars).collect();
+    format!("{head}…")
+}
+
+/// The explicit bidi embedding, override and isolate controls (Unicode
+/// UAX #9, §2.1–2.4): LRE/RLE/PDF/LRO/RLO and LRI/RLI/FSI/PDI. The implicit
+/// marks (LRM, RLM, ALM) change no run past their own position, so they stay.
+fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -653,6 +749,30 @@ mod tests {
         );
     }
 
+    /// A row with no usable id never reaches the queue. `Approval::id` is
+    /// `#[serde(default)]`, so a row that omits the key decodes as `0` — every
+    /// one of them as the same `0` — and a card for it would send
+    /// `{"cmd":"approve","id":0}` for a request the hive never addressed.
+    ///
+    /// Falsification: drop the `a.id > 0` filter in `PendingApprovals::new`
+    /// and the decoded and the explicit non-positive rows all reappear.
+    #[test]
+    fn a_row_without_a_positive_id_is_dropped() {
+        let missing: Approval =
+            serde_json::from_str(r#"{"agent":"argus","status":"pending"}"#).expect("decodes");
+        assert_eq!(missing.id, 0, "the defaulted id this guards against");
+
+        let q = PendingApprovals::new(vec![
+            missing,
+            queued(0, "argus", ApprovalStatus::Pending),
+            queued(-1, "argus", ApprovalStatus::Pending),
+            queued(4, "argus", ApprovalStatus::Pending),
+        ]);
+        assert_eq!(q.all().iter().map(|a| a.id).collect::<Vec<_>>(), vec![4]);
+        assert_eq!(q.count_for("argus"), 1, "and no badge counts them");
+        assert!(!q.contains(0));
+    }
+
     /// An [`ApprovalStatus::Unknown`] is **not** waiting: a build that cannot
     /// name a state must not offer the operator a card that resolves it.
     #[test]
@@ -686,12 +806,15 @@ mod tests {
         assert!(q.contains(7) && !q.contains(8));
 
         let mut prompted = BTreeSet::new();
-        assert_eq!(q.oldest_unprompted(&prompted).map(|a| a.id), Some(5));
+        let unasked = |p: &BTreeSet<i64>| q.oldest_unprompted(|a| p.contains(&a.id)).map(|a| a.id);
+        assert_eq!(unasked(&prompted), Some(5));
         prompted.insert(5);
-        assert_eq!(q.oldest_unprompted(&prompted).map(|a| a.id), Some(7));
+        assert_eq!(unasked(&prompted), Some(7));
         prompted.insert(7);
         prompted.insert(9);
-        assert_eq!(q.oldest_unprompted(&prompted), None);
+        assert_eq!(unasked(&prompted), None);
+        assert_eq!(q.get(7).map(|a| a.agent.as_str()), Some("bosun"));
+        assert_eq!(q.get(8), None);
     }
 
     fn agent(name: &str, row: AgentStatusRow) -> Agent {

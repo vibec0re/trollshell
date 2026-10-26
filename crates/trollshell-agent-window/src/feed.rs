@@ -129,7 +129,7 @@ pub enum Update {
 #[must_use]
 pub fn start(name: &AgentName) -> Request {
     Request::Start {
-        scope: Scope::agent(name.as_str()),
+        scope: Scope::agent(name),
     }
 }
 
@@ -138,7 +138,7 @@ pub fn start(name: &AgentName) -> Request {
 #[must_use]
 pub fn stop(name: &AgentName) -> Request {
     Request::Stop {
-        scope: Scope::agent(name.as_str()),
+        scope: Scope::agent(name),
         graceful: true,
     }
 }

@@ -111,7 +111,9 @@ pub(crate) fn starting() -> impl Signal<Item = BTreeSet<String>> {
 
 /// Serializes the **plan-and-name** phase of every Start in this process: from
 /// the housekeeping's first snapshot to the read-back that shows the name
-/// landed ([`start`]'s steps 1–4).
+/// landed ([`start`]'s steps 1–4). An ephemeral card's Save ([`save`]) names a
+/// workspace too, and holds it for the whole of its check, write, name and
+/// read-back.
 ///
 /// [`plan_start`] decides from a snapshot, and only a name that has landed makes
 /// a workspace unavailable to the next plan. So two Starts of different stacks
@@ -2102,6 +2104,19 @@ pub(crate) fn spawn_move_to_monitor(name: String, monitor: String, workspace: Op
 /// **before** the file is written. Getting that order wrong would leave a stack
 /// in the file that can never be this workspace.
 ///
+/// All of it runs under [`PLAN_AND_NAME`], the lock a Start's plan-and-name
+/// phase holds, from the name check to the read-back (#1559, left open by
+/// #1576). The file write is what puts `name`'s Inactive card on the page, so a
+/// ▶ on it can start a Start of `name` while this Save's `SetName` is still on
+/// its way. Without the lock that Start planned from a niri where the name was
+/// still free, took the spare workspace, and sent a batch whose `SetName` niri
+/// then ignored but whose `Focus` landed: the user's focus jumped to an empty
+/// workspace and the card reported "niri did not take the name". Under it, the
+/// Start's snapshot is read after this Save's name is on its workspace, so its
+/// plan refuses with [`StartError::NameTaken`] and sends nothing. Neither this
+/// function nor anything it calls takes the lock again: `Ops::save_stack` takes
+/// only the config file's own write lock.
+///
 /// # Errors
 /// A name niri already holds, a file the writer refused, or a naming that did
 /// not land — each as a line for the user.
@@ -2111,6 +2126,7 @@ pub(crate) async fn save(
     name: &str,
     stack: &Stack,
 ) -> Result<(), String> {
+    let _naming = PLAN_AND_NAME.lock().await;
     let workspaces = ops.workspaces().await?;
     if named(&workspaces, name).is_some() {
         return Err(StartError::NameTaken.to_string());

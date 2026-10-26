@@ -789,19 +789,29 @@ fn a_second_start_during_the_first_ones_grace_window_takes_a_new_workspace() {
 /// its first poll runs one `join!`ed Start to the end before the other begins,
 /// so they would never overlap. This is the smallest world that shows it: the
 /// three actions a Start's naming sends, applied to a list, behind calls that
-/// yield. Everything else answers as an empty session would.
+/// yield. Everything else answers as an empty session would, except for the
+/// windows a test puts on it ([`Compositor::holding`]) and the `workspaces.toml`
+/// writes it records ([`Compositor::saved`]).
 struct Compositor {
     workspaces: RefCell<Vec<Workspace>>,
+    /// The session's windows. They never change: no transaction here launches
+    /// anything that opens one.
+    windows: Vec<Window>,
     /// How many executor turns a **non-empty** batch takes to land. An empty
     /// one connects nothing (`send_actions_over`), so it always takes one.
     batch_turns: usize,
+    /// Every stack name `save_stack` was asked to write, in order. Recorded,
+    /// never written: see `Ops::save_stack`'s doc.
+    saved: RefCell<Vec<String>>,
 }
 
 impl Compositor {
     fn with(workspaces: Vec<Workspace>) -> Self {
         Self {
             workspaces: RefCell::new(workspaces),
+            windows: Vec::new(),
             batch_turns: 1,
+            saved: RefCell::default(),
         }
     }
 
@@ -811,9 +821,14 @@ impl Compositor {
     /// workspace.
     fn with_slow_batches(workspaces: Vec<Workspace>) -> Self {
         Self {
-            workspaces: RefCell::new(workspaces),
             batch_turns: 16,
+            ..Self::with(workspaces)
         }
+    }
+
+    /// The same niri with `windows` open on it.
+    fn holding(self, windows: Vec<Window>) -> Self {
+        Self { windows, ..self }
     }
 
     /// The name on workspace `id` right now.
@@ -823,6 +838,20 @@ impl Compositor {
             .iter()
             .find(|w| w.id == id)
             .and_then(|w| w.name.clone())
+    }
+
+    /// The focused workspace right now.
+    fn focused(&self) -> Option<u64> {
+        self.workspaces
+            .borrow()
+            .iter()
+            .find(|w| w.is_focused)
+            .map(|w| w.id)
+    }
+
+    /// The stack names written so far.
+    fn saved(&self) -> Vec<String> {
+        self.saved.borrow().clone()
     }
 }
 
@@ -878,15 +907,18 @@ impl Ops for Compositor {
 
     async fn windows(&self) -> Result<Vec<Window>, String> {
         tokio::task::yield_now().await;
-        Ok(Vec::new())
+        Ok(self.windows.clone())
     }
 
     async fn launch(&self, _launch: &Launch) -> Result<(), String> {
         Ok(())
     }
 
-    async fn save_stack(&self, _name: &str, _stack: &Stack) -> Result<(), String> {
-        Err("this world has no workspaces.toml".to_owned())
+    /// No executor turn, as `Live`'s: the real write is a synchronous file
+    /// replace inside an `async fn`, so it completes on its first poll.
+    async fn save_stack(&self, name: &str, _stack: &Stack) -> Result<(), String> {
+        self.saved.borrow_mut().push(name.to_owned());
+        Ok(())
     }
 
     async fn set_monitor(&self, _name: &str, _monitor: &str) -> Result<(), String> {
@@ -1009,6 +1041,62 @@ fn the_plan_and_name_lock_spans_the_batch_as_well_as_the_snapshot() {
     assert_ne!(a.workspace, b.workspace, "both Starts took one workspace");
     assert_eq!(niri.name_of(a.workspace).as_deref(), Some(first));
     assert_eq!(niri.name_of(b.workspace).as_deref(), Some(second));
+}
+
+/// **#1559, left open by #1576.** An ephemeral card's Save and a Start of the
+/// same name at once: the Start waits for the Save's name to land, and its own
+/// plan refuses, sending niri nothing.
+///
+/// The shape it happens in: workspace 1 is the ephemeral card being saved as
+/// `name` (focused, with a window on it, as an ephemeral workspace always has),
+/// and the file write puts `name`'s Inactive card on the page, whose ▶ starts a
+/// Start of `name` while the Save's `SetName` is still on its way. The Save is
+/// polled first here for that reason: the Start can only exist once the Save
+/// has written.
+///
+/// Under `PLAN_AND_NAME` the Start's snapshot is read after the Save's
+/// read-back, so it sees `name` on workspace 1 and refuses with
+/// [`StartError::NameTaken`]. Without it the Start plans from a niri where the
+/// name is still free and takes the spare: its `SetName` is ignored, since the
+/// Save's landed first, but its `Focus` lands, so the user's focus jumps off the
+/// workspace they just saved onto an empty one.
+///
+/// **Mutations:** drop the lock from `save`, or release it right after the
+/// file write (before the `SetName` batch); either reds this, the Start failing
+/// with "niri did not take the name" instead of the plan's refusal. Batches are
+/// slow here for the second one, as in the test above.
+#[test]
+fn a_save_and_a_start_of_one_name_at_once_take_turns() {
+    let name = "saveracer";
+    let saved = stacked(&[(name, Stack::default())]);
+    let niri = Compositor::with_slow_batches(vec![
+        ws_focused(1, 1, LEFT, None),
+        ws(2, 2, LEFT, None, false),
+    ])
+    .holding(vec![win(10, 1, "foot")]);
+
+    let empty = Stack::default();
+    let (saving, starting) = run(async {
+        tokio::join!(
+            save(&niri, 1, name, &empty),
+            start(&niri, name, &empty, &saved),
+        )
+    });
+
+    saving.expect("the Save");
+    assert_eq!(niri.saved(), vec![name.to_owned()]);
+    assert_eq!(niri.name_of(1).as_deref(), Some(name), "the Save named its card");
+    assert_eq!(
+        starting.expect_err("the Start"),
+        StartError::NameTaken.to_string(),
+        "the Start must be refused by its plan, before it sends niri anything"
+    );
+    assert_eq!(niri.name_of(2), None);
+    assert_eq!(
+        niri.focused(),
+        Some(1),
+        "the focus left the workspace the user just saved"
+    );
 }
 
 /// **MEDIUM-1.** The *fallback* leg takes an **empty** workspace too, not just

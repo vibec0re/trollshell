@@ -2774,14 +2774,19 @@ mod tests {
 
     /// **Cancel writes nothing** (#1071 §5) — observable after all.
     ///
-    /// `EditContext` does not make this testable in a tempdir: the write
-    /// destination is `xdg::overlay_path` inside `save_edit`, which takes no
-    /// path parameter, and redirecting `$XDG_CONFIG_HOME` from a test needs
-    /// `std::env::set_var`, `unsafe` in edition 2024 and this crate forbids
-    /// it. It is testable anyway, because every write the form can start
-    /// claims a ticket from `workspace_stacks::next_save_ticket` — a
-    /// process-wide `AtomicU64` — before it spawns, so a Cancel that starts no
-    /// write claims none (#1121, adopted from the #1113 re-verification).
+    /// Not by looking for a file in a tempdir. The writers do take explicit
+    /// layers now (`config::workspaces::save_stack_in`/`save_edit_in`, #1576),
+    /// but the form never reaches them with layers a test chose: `commit`
+    /// hands this ephemeral draft to `workspace_stacks::spawn_save`, whose
+    /// `Live::save_stack` calls `save_stack`, and a saved card's draft to
+    /// `spawn_save_edit`, which calls `save_edit`, and both of those resolve
+    /// the process's own layers through `xdg::config_layers`. Redirecting
+    /// `$XDG_CONFIG_HOME` from a test needs `std::env::set_var`, `unsafe` in
+    /// edition 2024, and this crate forbids it. It is testable anyway, because
+    /// every write the form can start claims a ticket from
+    /// `workspace_stacks::next_save_ticket` — a process-wide `AtomicU64` —
+    /// before it spawns, so a Cancel that starts no write claims none (#1121,
+    /// adopted from the #1113 re-verification).
     ///
     /// **The mutation**: giving the Cancel handler Save's `Ok(plan)` arm
     /// (i.e. having Cancel commit) reds this — on the assertion, not on an

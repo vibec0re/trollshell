@@ -39,6 +39,7 @@
 
 mod fetch;
 mod location;
+mod schedule;
 
 use hytte_plugin::proto::{
     Capability, DatasourceError, DatasourceOutcome, Dir, Effect, EventKind, Manifest, Mount, Node,
@@ -46,6 +47,8 @@ use hytte_plugin::proto::{
 };
 use hytte_plugin::tokio_stream::wrappers::UnboundedReceiverStream;
 use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin};
+use std::time::SystemTime;
+
 use tokio::sync::mpsc;
 
 /// Stable plugin id — the host's region key and audit-log subject.
@@ -146,8 +149,8 @@ pub(crate) enum WeatherCmd {
 enum View {
     /// No reading yet — a compact placeholder.
     Loading,
-    /// Last-good reading.
-    Resolved(Snapshot),
+    /// Last-good reading, with the wall-clock time it was fetched.
+    Resolved(Snapshot, SystemTime),
     /// An error line (network blip with no prior data, or no location).
     Error(String),
 }
@@ -163,19 +166,19 @@ struct Weather {
 
 impl Weather {
     /// Fold one worker message into the model.
-    fn on_msg(&mut self, msg: WeatherMsg) {
+    fn on_msg(&mut self, msg: WeatherMsg, now: SystemTime) {
         match msg {
-            WeatherMsg::Weather(snap) => self.state = View::Resolved(snap),
+            WeatherMsg::Weather(snap) => self.state = View::Resolved(snap, now),
             // Keep a good prior reading rather than flashing an error on a
             // transient blip — exactly the native card's stance.
             WeatherMsg::FetchError => {
-                if !matches!(self.state, View::Resolved(_)) {
+                if !matches!(self.state, View::Resolved(..)) {
                     self.state = View::Error(NETWORK_ERR.to_owned());
                 }
             }
             // Only surface "no location" when there's nothing good to show.
             WeatherMsg::NoLocation => {
-                if !matches!(self.state, View::Resolved(_)) {
+                if !matches!(self.state, View::Resolved(..)) {
                     self.state = View::Error(NO_LOCATION_MSG.to_owned());
                 }
             }
@@ -184,9 +187,17 @@ impl Weather {
 
     /// Answer a `weather` datasource query (#509) from the current reading. Served
     /// from the model — Loading / an error surface as a provider-sourced failure.
-    fn answer_query(&self, request_id: u64) -> Effect {
+    fn answer_query(&self, request_id: u64, now: SystemTime) -> Effect {
         let outcome = match &self.state {
-            View::Resolved(snap) => {
+            // A reading past `schedule::STALE_AFTER` is a provider failure, not
+            // data: a requester must not mistake days-old weather for current.
+            View::Resolved(_, fetched_at) if schedule::is_stale(*fetched_at, now) => {
+                DatasourceOutcome::Failed {
+                    error: DatasourceError::Provider,
+                    message: stale_message(*fetched_at, now),
+                }
+            }
+            View::Resolved(snap, _) => {
                 let payload = WeatherJson {
                     location: &snap.location,
                     temp_c: snap.temp_c,
@@ -287,7 +298,7 @@ impl Plugin for Weather {
 
     fn update(&mut self, input: Input<Self::Msg>) -> Vec<Effect> {
         match input {
-            Input::App(msg) => self.on_msg(msg),
+            Input::App(msg) => self.on_msg(msg, SystemTime::now()),
             // Fire-and-forget: a card click is plugin I/O (a refresh), not a
             // shell effect, so the view and the effect batch are both unchanged.
             // `send` errs only mid-teardown — safe to drop.
@@ -300,7 +311,7 @@ impl Plugin for Weather {
             // (the card keeps it live off its worker, so there's nothing to fetch).
             // The single scope carries no params, so both are ignored.
             Input::DatasourceQuery { request_id, .. } => {
-                return vec![self.answer_query(request_id)];
+                return vec![self.answer_query(request_id, SystemTime::now())];
             }
             // Weather subscribes to no state and issues no effects, so `Snapshot`
             // and `EffectResult` (and a foreign/scroll `Event`) are no-ops.
@@ -313,9 +324,33 @@ impl Plugin for Weather {
     }
 
     fn view(&self) -> hytte_plugin::View {
+        self.view_at(SystemTime::now())
+    }
+}
+
+/// The warning line for a reading that has outlived `schedule::STALE_AFTER`.
+fn stale_message(fetched_at: SystemTime, now: SystemTime) -> String {
+    match schedule::age_text(fetched_at, now) {
+        Some(age) => format!("Stale: last updated {age} ago"),
+        None => "Stale: last update time unknown".to_owned(),
+    }
+}
+
+impl Weather {
+    /// The card as of wall-clock `now`: a stale reading keeps its numbers but
+    /// gains a warning line saying how old it is.
+    fn view_at(&self, now: SystemTime) -> hytte_plugin::View {
         let content = match &self.state {
             View::Loading => loading_content(),
-            View::Resolved(snap) => resolved_content(snap),
+            View::Resolved(snap, fetched_at) if schedule::is_stale(*fetched_at, now) => vbox(
+                4,
+                Vec::new(),
+                vec![
+                    resolved_content(snap),
+                    error_content(&stale_message(*fetched_at, now)),
+                ],
+            ),
+            View::Resolved(snap, _) => resolved_content(snap),
             View::Error(msg) => error_content(msg),
         };
         // The whole card is a flat button — the refresh target. `flat` (an
@@ -515,8 +550,11 @@ mod tests {
         CARD_BTN, COND_ID, Condition, ICON_ID, LOADING_TEXT, LOC_ID, NETWORK_ERR, NO_LOCATION_MSG,
         Snapshot, TEMP_ID, View, Weather, WeatherCmd, WeatherMsg, condition_for_code,
     };
-    use hytte_plugin::proto::{EventKind, Manifest, Mount, Node};
+    use hytte_plugin::proto::{
+        DatasourceError, DatasourceOutcome, Effect, EventKind, Manifest, Mount, Node,
+    };
     use hytte_plugin::{CmdReceiver, Input, Plugin};
+    use std::time::{Duration, SystemTime};
 
     /// A fresh model plus a probe on its command lane (the test plays the role
     /// the runtime normally does, keeping the receiver to assert dispatches).
@@ -701,7 +739,7 @@ mod tests {
     fn resolved_view_renders_every_native_field() {
         let (mut m, _rx) = model();
         let _ = m.update(Input::App(WeatherMsg::Weather(sample())));
-        assert!(matches!(m.state, View::Resolved(_)));
+        assert!(matches!(m.state, View::Resolved(..)));
         let tree = m.view().tree;
 
         assert_eq!(find_text(&tree, LOC_ID).as_deref(), Some("OBERSCHÖNEWEIDE"));
@@ -763,7 +801,7 @@ mod tests {
         let _ = m.update(Input::App(WeatherMsg::Weather(sample())));
         let _ = m.update(Input::App(WeatherMsg::FetchError));
         assert!(
-            matches!(m.state, View::Resolved(_)),
+            matches!(m.state, View::Resolved(..)),
             "a network blip must not clobber a good card"
         );
         assert_eq!(find_text(&m.view().tree, TEMP_ID).as_deref(), Some("18°"));
@@ -793,7 +831,7 @@ mod tests {
         let (mut m, _rx) = model();
         let _ = m.update(Input::App(WeatherMsg::Weather(sample())));
         let _ = m.update(Input::App(WeatherMsg::NoLocation));
-        assert!(matches!(m.state, View::Resolved(_)));
+        assert!(matches!(m.state, View::Resolved(..)));
     }
 
     // ── Click → command lane ─────────────────────────────────────────────────
@@ -839,6 +877,83 @@ mod tests {
         let fx = m.update(Input::SlotVisible(false));
         assert!(fx.is_empty());
         assert_eq!(m.view(), before, "ignored inputs leave the card unchanged");
+    }
+
+    // ── staleness (wall-clock stamped readings) ──────────────────────────────
+
+    fn t(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000 + secs)
+    }
+
+    /// A model holding `sample()` fetched at `t(0)`, then `fails` failed fetches
+    /// folded at `t(at)`.
+    fn offline_after_good_reading(at: u64) -> Weather {
+        let (mut m, _rx) = model();
+        m.on_msg(WeatherMsg::Weather(sample()), t(0));
+        m.on_msg(WeatherMsg::FetchError, t(at));
+        m
+    }
+
+    #[test]
+    fn failed_fetch_keeps_the_reading_and_its_original_stamp() {
+        let m = offline_after_good_reading(900);
+        assert!(matches!(m.state, View::Resolved(_, f) if f == t(0)));
+    }
+
+    #[test]
+    fn fresh_reading_has_no_stale_line_and_is_served_ready() {
+        let m = offline_after_good_reading(900);
+        assert!(!tree_has_text(
+            &m.view_at(t(3599)).tree,
+            "Stale: last updated 59 min ago"
+        ));
+        assert!(matches!(
+            m.answer_query(1, t(3599)),
+            Effect::DatasourceResult {
+                outcome: DatasourceOutcome::Ready(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn hour_old_reading_is_marked_stale_in_view_and_datasource() {
+        let m = offline_after_good_reading(900);
+        let now = t(3 * 3600);
+        let tree = m.view_at(now).tree;
+        assert!(tree_has_text(&tree, "Stale: last updated 3 h ago"));
+        assert_eq!(
+            find_text(&tree, TEMP_ID).as_deref(),
+            Some("18°"),
+            "the stale numbers stay visible"
+        );
+        match m.answer_query(7, now) {
+            Effect::DatasourceResult {
+                request_id: 7,
+                outcome: DatasourceOutcome::Failed { error, message },
+            } => {
+                assert_eq!(error, DatasourceError::Provider);
+                assert!(message.contains("Stale"), "{message}");
+            }
+            other => panic!("expected a stale failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_successful_refresh_clears_staleness() {
+        let mut m = offline_after_good_reading(900);
+        m.on_msg(WeatherMsg::Weather(sample()), t(4 * 3600));
+        assert!(!tree_has_text(
+            &m.view_at(t(4 * 3600 + 60)).tree,
+            "Stale: last updated 1 min ago"
+        ));
+        assert!(matches!(
+            m.answer_query(1, t(4 * 3600 + 60)),
+            Effect::DatasourceResult {
+                outcome: DatasourceOutcome::Ready(_),
+                ..
+            }
+        ));
     }
 
     // ── small test helpers ───────────────────────────────────────────────────

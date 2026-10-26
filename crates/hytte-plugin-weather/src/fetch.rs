@@ -3,8 +3,9 @@
 //! A single task owns both directions of the plugin's I/O (the SDK's #280
 //! idiom): it drains the command lane (`RefreshNow` from a card click) and
 //! re-emits fetch results as [`WeatherMsg`]s the reducer folds in. Location is
-//! resolved once at startup ([`crate::location`], retried with backoff), then
-//! open-meteo is fetched every [`POLL_INTERVAL`] and on demand.
+//! resolved at startup ([`crate::location`], retried with backoff) and again
+//! hourly and on resume ([`schedule`]); open-meteo is fetched every
+//! [`POLL_INTERVAL`] of wall-clock time, on demand, and when the place moved.
 //!
 //! HTTP is blocking `ureq` on a `spawn_blocking` thread — the house idiom
 //! (`hytte-services`' weather fetcher, the pet's brain). The parse/mapping code
@@ -12,15 +13,17 @@
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::location::{self, LocationSnapshot};
+use crate::schedule;
 use crate::{Snapshot, WeatherCmd, WeatherMsg, condition_for_code};
 
-/// Periodic refresh cadence (native: 15 minutes). tokio's first `interval` tick
-/// fires immediately, so startup fetches once without waiting.
+/// Periodic refresh cadence (native: 15 minutes), judged against the wall clock
+/// on each [`schedule::TICK`] wake so a suspend cannot delay it. The first
+/// wake fetches immediately.
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_mins(15);
 
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -31,22 +34,48 @@ pub(crate) async fn run(
     mut cmd_rx: hytte_plugin::CmdReceiver<WeatherCmd>,
     msg_tx: UnboundedSender<WeatherMsg>,
 ) {
-    let Some(location) = resolve_location(&msg_tx).await else {
+    let Some(mut location) = resolve_location(&msg_tx).await else {
         return; // session torn down while still resolving
     };
 
-    let mut tick = tokio::time::interval(POLL_INTERVAL);
+    let mut loc_checked = SystemTime::now();
+    let mut last_attempt: Option<SystemTime> = None;
+    let mut last_wake = SystemTime::now();
+    let mut tick = tokio::time::interval(schedule::TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        tokio::select! {
-            _ = tick.tick() => {}
+        let forced = tokio::select! {
+            _ = tick.tick() => false,
             cmd = cmd_rx.recv() => match cmd {
                 // Coalesce a burst of clicks into a single fetch (politeness to
                 // open-meteo / Nominatim).
-                Some(WeatherCmd::RefreshNow) => while cmd_rx.try_recv().is_ok() {},
+                Some(WeatherCmd::RefreshNow) => {
+                    while cmd_rx.try_recv().is_ok() {}
+                    true
+                }
                 None => return, // command lane closed → session teardown
             },
+        };
+
+        let now = SystemTime::now();
+        let resumed = schedule::resumed(last_wake, now);
+        last_wake = now;
+
+        // Re-resolve the location hourly and straight after a resume. A failed
+        // re-resolve keeps the previous location rather than blanking the card.
+        let mut moved = false;
+        if resumed || schedule::due(Some(loc_checked), now, schedule::LOCATION_RECHECK) {
+            if let Some(fresh) = location::resolve_once().await {
+                moved = !schedule::same_place(&location, &fresh);
+                location = fresh;
+            }
+            loc_checked = SystemTime::now();
         }
+
+        if !(forced || moved || schedule::due(last_attempt, now, POLL_INTERVAL)) {
+            continue;
+        }
+        last_attempt = Some(now);
 
         let loc = location.clone();
         let msg = match tokio::task::spawn_blocking(move || fetch_weather(&loc)).await {

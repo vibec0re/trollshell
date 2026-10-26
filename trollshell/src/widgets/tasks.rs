@@ -14,10 +14,11 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveTime, TimeZone};
+use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone};
 use hytte::adw::{self, prelude::*};
 use hytte::gtk::{self, glib};
 use hytte::prelude::*;
+use hytte::services::calendar::local_midnight;
 use hytte::services::tasks::{self, Task, TaskList};
 
 /// Build the sidebar tasks widget. Owns its own subscription to
@@ -712,6 +713,34 @@ enum DueMode {
     Pick,
 }
 
+/// [`DuePicker::value`]'s pure part: the due instant `mode` (and, in "Pick"
+/// mode, the `selected` date) stands for, read in `now`'s zone. A day is
+/// the instant it starts ([`hytte::services::calendar::local_midnight`]).
+///
+/// That was local 00:00 via `.single()`, which is `None` on a day whose
+/// midnight happens twice (a fall-back fold at 00:00, e.g. Havana's November
+/// Sunday) and, in a zone that reads a gap strictly, on one whose midnight
+/// is skipped. `None` is this picker's "No date", so saving such a day
+/// created the task with no due date, and editing a task due that day
+/// removed its due date (#1554).
+///
+/// Generic over the zone so those days can be tested against a real zone
+/// without touching the process-wide `TZ`.
+fn due_value<Tz: TimeZone>(
+    mode: DueMode,
+    selected: Option<NaiveDate>,
+    now: &DateTime<Tz>,
+) -> Option<DateTime<Tz>> {
+    let today = now.date_naive();
+    let date = match mode {
+        DueMode::None => return None,
+        DueMode::Today => today,
+        DueMode::Tomorrow => today + chrono::Duration::days(1),
+        DueMode::Pick => selected?,
+    };
+    Some(local_midnight(date, &now.timezone()))
+}
+
 impl DuePicker {
     fn new() -> Self {
         let container = gtk::Box::new(gtk::Orientation::Vertical, 6);
@@ -897,18 +926,13 @@ impl DuePicker {
         }
     }
 
-    /// Current value as a local-midnight `DateTime<Local>`. Returns `None`
-    /// when the picker is in "No date" mode.
+    /// Current value as the start of the chosen day, in local time. Returns
+    /// `None` when the picker is in "No date" mode, or in "Pick" mode with no
+    /// date selected yet. See [`due_value`].
     fn value(&self) -> Option<DateTime<Local>> {
-        let date = match *self.mode.borrow() {
-            DueMode::None => return None,
-            DueMode::Today => Local::now().date_naive(),
-            DueMode::Tomorrow => Local::now().date_naive() + chrono::Duration::days(1),
-            DueMode::Pick => (*self.selected.borrow())?,
-        };
-        Local
-            .from_local_datetime(&date.and_time(NaiveTime::from_hms_opt(0, 0, 0)?))
-            .single()
+        let mode = *self.mode.borrow();
+        let selected = *self.selected.borrow();
+        due_value(mode, selected, &Local::now())
     }
 
     /// Seed the picker from an existing task. Picks "Today"/"Tomorrow" when
@@ -1005,6 +1029,65 @@ fn month(m: u32) -> &'static str {
         11 => "Nov",
         12 => "Dec",
         _ => "?",
+    }
+}
+
+/// [`due_value`] against real IANA zones (#1554). Hermetic, unlike the GTK
+/// modules below: the pure part needs no display, and an explicit zone is
+/// what makes a DST day reachable on a UTC CI host.
+#[cfg(test)]
+mod due_value_tests {
+    use super::{DueMode, due_value};
+    use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+    use chrono_tz::America::{Havana, Santiago};
+    use chrono_tz::Tz;
+
+    fn ymd(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    fn utc(y: i32, m: u32, d: u32, h: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(y, m, d, h, 0, 0).unwrap()
+    }
+
+    /// [`due_value`] in `now`'s zone, as the instant it names.
+    fn due(
+        mode: DueMode,
+        selected: Option<NaiveDate>,
+        now: &DateTime<Tz>,
+    ) -> Option<DateTime<Utc>> {
+        due_value(mode, selected, now).map(|t| t.with_timezone(&Utc))
+    }
+
+    #[test]
+    fn a_due_date_whose_midnight_is_skipped_is_kept() {
+        // Santiago skips 00:00 on Sunday 2026-09-06 (00:00 -04 -> 01:00 -03).
+        // `None` would be "No date": the task would be saved without one.
+        let now = Santiago.with_ymd_and_hms(2026, 9, 1, 9, 0, 0).unwrap();
+        let picked = due(DueMode::Pick, Some(ymd(2026, 9, 6)), &now);
+        assert_eq!(picked, Some(utc(2026, 9, 6, 4)));
+        // "Tomorrow" from the day before reaches the same day.
+        let eve = Santiago.with_ymd_and_hms(2026, 9, 5, 21, 0, 0).unwrap();
+        assert_eq!(due(DueMode::Tomorrow, None, &eve), Some(utc(2026, 9, 6, 4)));
+    }
+
+    #[test]
+    fn a_due_date_whose_midnight_is_doubled_is_kept_at_the_earlier_one() {
+        // Havana's 00:00 happens twice on 2026-11-01 (04:00Z CDT, 05:00Z CST).
+        let now = Havana.with_ymd_and_hms(2026, 11, 1, 9, 0, 0).unwrap();
+        assert_eq!(due(DueMode::Today, None, &now), Some(utc(2026, 11, 1, 4)));
+    }
+
+    #[test]
+    fn an_ordinary_due_date_is_local_midnight_and_no_date_stays_none() {
+        let now = Santiago.with_ymd_and_hms(2026, 6, 10, 9, 0, 0).unwrap();
+        assert_eq!(due(DueMode::Today, None, &now), Some(utc(2026, 6, 10, 4)));
+        assert_eq!(
+            due(DueMode::Pick, Some(ymd(2026, 6, 20)), &now),
+            Some(utc(2026, 6, 20, 4))
+        );
+        assert_eq!(due(DueMode::None, Some(ymd(2026, 6, 20)), &now), None);
+        assert_eq!(due(DueMode::Pick, None, &now), None);
     }
 }
 

@@ -95,6 +95,8 @@ wayland-client = "0.31.10"
 wayland-protocols = { version = "0.32.13", features = ["staging", "client"] }
 
 [dev-dependencies]
+# Real IANA zones for `calendar::local_midnight`'s DST gap/fold tests (#1554).
+chrono-tz.workspace = true
 futures-executor.workspace = true
 # `hytte-config`'s `test_support` (#1044): `scratch_home`, the one helper that
 # keeps a path-resolving test out of the real `~/.config/trollshell` and

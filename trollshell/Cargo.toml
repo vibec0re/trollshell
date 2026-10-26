@@ -146,3 +146,5 @@ tokio = { workspace = true, features = [
 # The `socket_in_use` single-instancing probe test (#436) binds a real
 # `UnixListener` in a scratch dir; tempfile gives it (and cleans it up).
 tempfile.workspace = true
+# Real IANA zones for the calendar/tasks widgets' local-midnight tests (#1554).
+chrono-tz.workspace = true

@@ -1,7 +1,7 @@
 //! `/proc/self/mountinfo` parsing, disk usage via `statvfs`, and process
 //! counting via `/proc`.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -187,7 +187,6 @@ const BLOCKING_FSTYPES: &[&str] = &[
     "glusterfs",
     "lustre",
     "ncpfs",
-    "fuse",
 ];
 
 /// How long one tick waits, in total, for the mounts that may block. Short
@@ -197,19 +196,50 @@ const STATVFS_DEADLINE: Duration = Duration::from_secs(1);
 
 /// True for a filesystem whose `statvfs` is run under [`STATVFS_DEADLINE`].
 fn may_block(fstype: &str) -> bool {
-    fstype.starts_with("fuse.") || BLOCKING_FSTYPES.contains(&fstype)
+    // `fuse`, `fuse.<subtype>` and `fuseblk` (ntfs-3g, FUSE exfat).
+    fstype.starts_with("fuse") || BLOCKING_FSTYPES.contains(&fstype)
 }
 
-/// Mount points whose side-thread `statvfs` is still outstanding. A call
-/// stuck on a dead server never returns, so without this a new thread would
-/// be spawned for the same mount on every tick and pile up; instead the mount
-/// is skipped (no row) until the earlier call finally comes back.
-static IN_FLIGHT: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+/// How long the last good row of a side-thread mount keeps being served after
+/// it was measured. A slow-but-alive NAS (say 1.5 s per `statvfs`) misses
+/// [`STATVFS_DEADLINE`] every tick, so its row is always the previous call's
+/// result - one or two ticks old. Disk usage moves slowly, so that is
+/// harmless; 60 s is long enough to ride out a server stalling for a few
+/// ticks without the row flickering away, and short enough that a mount that
+/// has really died stops showing numbers within a minute.
+const STALE_AFTER: Duration = Duration::from_mins(1);
 
-fn in_flight() -> std::sync::MutexGuard<'static, BTreeSet<String>> {
-    IN_FLIGHT
+/// Per-mount state of the side-thread `statvfs`, shared across ticks.
+#[derive(Default)]
+struct MountSlot {
+    /// A call on this mount is still running. A stuck call never returns, so
+    /// without this a new thread would be spawned every tick and pile up;
+    /// instead the running call is reused and the last row served meanwhile.
+    in_flight: bool,
+    /// The most recent successful row and when it landed - written by the
+    /// thread itself, so a result that arrives after its tick's deadline is
+    /// still picked up by the next tick.
+    last: Option<(DiskMount, Instant)>,
+}
+
+static SLOTS: Mutex<BTreeMap<String, MountSlot>> = Mutex::new(BTreeMap::new());
+
+fn slots() -> std::sync::MutexGuard<'static, BTreeMap<String, MountSlot>> {
+    SLOTS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Clears a mount's `in_flight` flag when dropped - including when `stat`
+/// panics and unwinds - so a panicking call cannot skip the mount forever.
+struct InFlight(String);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if let Some(slot) = slots().get_mut(&self.0) {
+            slot.in_flight = false;
+        }
+    }
 }
 
 /// `statvfs` one mount point into a row; `None` when the call fails.
@@ -236,44 +266,66 @@ fn stat_mount(path: &str) -> Option<DiskMount> {
 
 #[must_use]
 pub fn read_disk_for_specs(specs: &[MountSpec]) -> DiskUsage {
-    read_disk_with(specs, STATVFS_DEADLINE, stat_mount)
+    read_disk_with(specs, STATVFS_DEADLINE, STALE_AFTER, stat_mount)
 }
 
-/// [`read_disk_for_specs`] over an injected `statvfs` and deadline, so the
-/// hung-mount path is testable with a probe that sleeps.
+/// [`read_disk_for_specs`] over an injected `statvfs`, deadline and staleness
+/// bound, so the slow and hung mount paths are testable with probes that sleep.
 fn read_disk_with(
     specs: &[MountSpec],
     deadline: Duration,
+    stale_after: Duration,
     stat: fn(&str) -> Option<DiskMount>,
 ) -> DiskUsage {
     // One slot per spec, so the original mount order survives the split into
     // inline and side-thread work.
-    let mut slots: Vec<Option<DiskMount>> = vec![None; specs.len()];
-    let (tx, rx) = mpsc::channel::<(usize, Option<DiskMount>)>();
+    let mut rows: Vec<Option<DiskMount>> = vec![None; specs.len()];
+    let (tx, rx) = mpsc::channel::<()>();
     let mut pending = 0usize;
+
+    // Forget slots that can no longer serve a row (mount gone, or dead for
+    // longer than the staleness bound) and are not mid-call.
+    let t = Instant::now();
+    slots().retain(|_, s| {
+        s.in_flight
+            || s.last
+                .as_ref()
+                .is_some_and(|(_, at)| t.saturating_duration_since(*at) <= STALE_AFTER)
+    });
 
     for (i, spec) in specs.iter().enumerate() {
         if !may_block(&spec.fstype) {
-            slots[i] = stat(&spec.path);
+            rows[i] = stat(&spec.path);
             continue;
         }
-        if !in_flight().insert(spec.path.clone()) {
-            continue; // an earlier call on this mount is still stuck
+        // Reuse a call that is still running instead of spawning another; the
+        // last good row is served for it below.
+        let spawn_new = {
+            let mut all = slots();
+            let slot = all.entry(spec.path.clone()).or_default();
+            !std::mem::replace(&mut slot.in_flight, true)
+        };
+        if !spawn_new {
+            continue;
         }
         let path = spec.path.clone();
         let tx = tx.clone();
         let spawned = std::thread::Builder::new()
             .name("statvfs".into())
             .spawn(move || {
+                let _clear = InFlight(path.clone());
                 let row = stat(&path);
-                in_flight().remove(&path);
-                // The receiver is gone if the deadline passed; that is fine.
-                let _ = tx.send((i, row));
+                if let Some(slot) = slots().get_mut(&path) {
+                    slot.last = row.map(|r| (r, Instant::now()));
+                }
+                // The receiver is gone if the deadline passed; the result is
+                // already in the slot for the next tick.
+                let _ = tx.send(());
             });
         if spawned.is_ok() {
             pending += 1;
-        } else {
-            in_flight().remove(&spec.path);
+        } else if let Some(slot) = slots().get_mut(&spec.path) {
+            slot.in_flight = false;
         }
     }
     drop(tx);
@@ -283,15 +335,29 @@ fn read_disk_with(
         let Some(left) = end.checked_duration_since(Instant::now()) else {
             break;
         };
-        let Ok((i, row)) = rx.recv_timeout(left) else {
+        if rx.recv_timeout(left).is_err() {
             break;
-        };
-        slots[i] = row;
+        }
         pending -= 1;
     }
 
+    // Side-thread mounts: whatever each slot holds now - this tick's result if
+    // it made the deadline, otherwise the previous call's, while it is fresh.
+    let now = Instant::now();
+    {
+        let all = slots();
+        for (i, spec) in specs.iter().enumerate() {
+            if may_block(&spec.fstype)
+                && let Some((row, at)) = all.get(&spec.path).and_then(|s| s.last.as_ref())
+                && now.saturating_duration_since(*at) <= stale_after
+            {
+                rows[i] = Some(row.clone());
+            }
+        }
+    }
+
     DiskUsage {
-        mounts: slots.into_iter().flatten().collect(),
+        mounts: rows.into_iter().flatten().collect(),
     }
 }
 
@@ -465,6 +531,11 @@ not a real line at all
         if path == "/test-hung-mount" {
             std::thread::sleep(Duration::from_secs(4));
         }
+        if path == "/test-slow-mount" {
+            // 1.5x the 300 ms deadline the tests use: slow but alive.
+            std::thread::sleep(Duration::from_millis(450));
+        }
+        assert!(path != "/test-panic-mount", "stat blew up");
         if path == "/test-unreadable" {
             return None;
         }
@@ -479,7 +550,16 @@ not a real line at all
 
     #[test]
     fn network_and_fuse_filesystems_are_the_ones_that_may_block() {
-        for t in ["nfs", "nfs4", "cifs", "smb3", "9p", "fuse.sshfs", "fuse"] {
+        for t in [
+            "nfs",
+            "nfs4",
+            "cifs",
+            "smb3",
+            "9p",
+            "fuse.sshfs",
+            "fuse",
+            "fuseblk",
+        ] {
             assert!(may_block(t), "{t}");
         }
         for t in ["ext4", "btrfs", "xfs", "vfat", "zfs", "f2fs"] {
@@ -497,7 +577,7 @@ not a real line at all
             spec("/mnt/healthy-nas", "cifs"),
         ];
         let started = Instant::now();
-        let usage = read_disk_with(&specs, Duration::from_millis(300), fake_stat);
+        let usage = read_disk_with(&specs, DL, STALE, fake_stat);
         assert!(
             started.elapsed() < Duration::from_secs(3),
             "the deadline did not bound the read"
@@ -510,8 +590,68 @@ not a real line at all
         );
         // While the stuck call is outstanding the mount is skipped, not
         // re-spawned onto yet another thread.
-        assert!(in_flight().contains("/test-hung-mount"));
-        let again = read_disk_with(&specs[1..2], Duration::from_millis(50), fake_stat);
+        assert!(slots()["/test-hung-mount"].in_flight);
+        let again = read_disk_with(&specs[1..2], Duration::from_millis(50), STALE, fake_stat);
         assert!(again.mounts.is_empty());
+    }
+
+    const DL: Duration = Duration::from_millis(300);
+    const STALE: Duration = Duration::from_mins(1);
+
+    /// The regression this pins: a NAS that answers in 1.5x the deadline used
+    /// to miss it every tick, send its result to a dropped receiver and never
+    /// show. The late result now lands in the slot and the next tick shows it.
+    #[test]
+    fn a_slow_but_alive_mount_shows_on_the_next_tick() {
+        let specs = [spec("/test-slow-mount", "nfs4")];
+        let first = read_disk_with(&specs, DL, STALE, fake_stat);
+        assert!(first.mounts.is_empty(), "nothing measured yet on tick 1");
+        // Tick 2 (just after the slow call completes): its result is served
+        // and, the call being done, a fresh one is started.
+        std::thread::sleep(Duration::from_millis(400));
+        let second = read_disk_with(&specs, DL, STALE, fake_stat);
+        assert_eq!(second.mounts.len(), 1, "the late result never landed");
+        assert_eq!(second.mounts[0].path, "/test-slow-mount");
+        // Tick 3 lands inside the second call: no new thread, last row kept.
+        let third = read_disk_with(&specs, Duration::from_millis(10), STALE, fake_stat);
+        assert_eq!(third.mounts.len(), 1, "row dropped while a call is running");
+    }
+
+    #[test]
+    fn a_row_that_stops_refreshing_goes_stale() {
+        let specs = [spec("/test-stale-mount", "cifs")];
+        let _ = read_disk_with(&specs, DL, Duration::from_millis(100), fake_stat);
+        assert_eq!(
+            read_disk_with(&specs, DL, Duration::from_millis(100), fake_stat)
+                .mounts
+                .len(),
+            1
+        );
+        // The mount dies: its last row ages past the bound and is dropped.
+        let slot_age = Duration::from_millis(150);
+        std::thread::sleep(slot_age);
+        let gone = read_disk_with(
+            &specs,
+            Duration::from_millis(1),
+            Duration::from_millis(100),
+            |p| {
+                std::thread::sleep(Duration::from_secs(2));
+                fake_stat(p)
+            },
+        );
+        assert!(gone.mounts.is_empty(), "served a row past the bound");
+    }
+
+    #[test]
+    fn a_panicking_stat_does_not_skip_the_mount_forever() {
+        let specs = [spec("/test-panic-mount", "nfs4")];
+        let _ = read_disk_with(&specs, DL, STALE, fake_stat);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !slots()
+                .get("/test-panic-mount")
+                .is_some_and(|s| s.in_flight),
+            "the in-flight flag survived a panic"
+        );
     }
 }

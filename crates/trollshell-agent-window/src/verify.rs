@@ -1405,6 +1405,10 @@ pub(crate) mod tls_tests {
             "https://hive.local/agent/stray/",
         );
         assert_eq!(resolved.policy, TlsPolicy::SystemStore);
+        assert!(
+            !resolved.unreachable,
+            "nothing was contacted, so there is no gateway to ask again — the file is the fault"
+        );
         let tried = resolved.tried.expect("the card names the file");
         assert!(tried.contains("README.md"), "{tried}");
         assert!(tried.contains(super::CA_ENV), "{tried}");
@@ -1724,6 +1728,11 @@ pub(crate) mod tls_tests {
             &format!("https://127.0.0.1:{port}/agent/stray/"),
         );
         assert_eq!(resolved.policy, TlsPolicy::SystemStore);
+        assert!(
+            resolved.unreachable,
+            "a gateway nobody could reach is the one verdict worth asking again — the window \
+             retries on it rather than latching the page (the October 2026 audit, M1)"
+        );
         let tried = resolved.tried.expect("the card says what was tried");
         assert!(
             tried.contains("connection problem"),
@@ -1755,6 +1764,7 @@ pub(crate) mod tls_tests {
         };
         assert_eq!(host, "localhost");
         assert!(pem.contains("BEGIN CERTIFICATE"), "{pem}");
+        assert!(!resolved.unreachable, "a verified leaf is a settled answer");
 
         let tried = resolved.tried.as_deref().expect("…and says so");
         assert!(tried.contains("fixture-ca.pem"), "{tried}");
@@ -1779,6 +1789,10 @@ pub(crate) mod tls_tests {
             resolved.policy,
             TlsPolicy::SystemStore,
             "a refused chain must never be pinned anyway"
+        );
+        assert!(
+            !resolved.unreachable,
+            "the gateway answered and was judged — asking again would get the same no"
         );
         let tried = resolved.tried.expect("the card says which check failed");
         assert!(tried.contains("UNKNOWN_CA"), "{tried}");

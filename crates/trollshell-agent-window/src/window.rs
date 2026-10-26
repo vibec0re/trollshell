@@ -130,6 +130,26 @@ pub(crate) fn watch_presentation(
 /// that is not `tls::resolve` (see [`Window::assemble`]).
 type TrustResolver = std::sync::Arc<dyn Fn(&str) -> tls::Resolved + Send + Sync>;
 
+/// The longest the window waits between two attempts to reach a gateway that
+/// is not answering — where [`Window::next_retry_delay`]'s doubling stops.
+///
+/// A minute: long enough that a hive down for the afternoon costs one refused
+/// connect a minute (or one [`PROBE_DEADLINE`](crate::verify::PROBE_DEADLINE)
+/// on a worker, for a blackholed one), short enough that the page is there
+/// within a minute of the gateway coming back without anyone touching it.
+const RETRY_CEILING: std::time::Duration = std::time::Duration::from_mins(1);
+
+/// [`Window::next_retry_delay`]'s arithmetic, with nothing to own: `base`
+/// (the poll interval) doubled `misses` times, stopped at [`RETRY_CEILING`] —
+/// or at `base` itself when a configured poll interval is longer than that,
+/// so a slow poll is never answered by a faster retry. Saturating throughout,
+/// because a window left open on a dead hive counts misses for as long as it
+/// likes.
+fn retry_delay(base: std::time::Duration, misses: u32) -> std::time::Duration {
+    let factor = 1_u32.checked_shl(misses).unwrap_or(u32::MAX);
+    base.saturating_mul(factor).min(RETRY_CEILING.max(base))
+}
+
 /// One agent's window.
 pub struct Window {
     /// This window, weakly — the handle the probe's continuation upgrades
@@ -186,6 +206,25 @@ pub struct Window {
     /// [`Window::page_loaded`] latches *after* the answer lands; between the
     /// two, this is the latch.
     probe: RefCell<Option<String>>,
+    /// The retry [`Window::schedule_retry`] has queued, while one is — the
+    /// **third** latch on [`Window::load_page`], beside `probe` and
+    /// `page_loaded`.
+    ///
+    /// A probe that got no verdict (the gateway did not answer, or the worker
+    /// died) leaves the page unlatched on purpose so that asking again can
+    /// work (the October 2026 audit, M1). Unlatched alone, though, *every*
+    /// poll would ask: [`Window::apply`] ends in `load_page` and the hive's
+    /// status text moves every few seconds while an agent works, so the
+    /// backoff would be whatever the agent's chattiness made it. While this
+    /// holds a source, `load_page` waits for it — or for the card's button,
+    /// which removes it ([`Window::retry_now`]). The id is taken out of here
+    /// by the source itself when it fires, so a `remove` is only ever called
+    /// on one that has not.
+    retry: RefCell<Option<glib::SourceId>>,
+    /// How many probes in a row came back with no verdict — what
+    /// [`Window::next_retry_delay`] doubles on. Back to zero the moment one
+    /// settles.
+    unanswered: std::cell::Cell<u32>,
     /// What the probe runs — see [`TrustResolver`].
     trust: TrustResolver,
     cfg: AgentsConfig,
@@ -316,6 +355,12 @@ impl Window {
         let header = ui::Header::new();
         let settings = ui::Settings::new();
         let banner = adw::Banner::new("");
+        // The title is `ui::refusal` around the hive's own reason, which is
+        // text, not markup — and `AdwBanner:use-markup` defaults to TRUE, so a
+        // reason carrying a `<` or an `&` failed to parse and blanked the
+        // banner (the October 2026 audit, LOW). `ui.rs`'s rows have said the
+        // same thing with `.use_markup(false)` since #1130.
+        banner.set_use_markup(false);
         banner.set_revealed(false);
 
         let page_slot = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -370,6 +415,8 @@ impl Window {
             page_slot,
             page_loaded: RefCell::new(false),
             probe: RefCell::new(None),
+            retry: RefCell::new(None),
+            unanswered: std::cell::Cell::new(0),
             trust,
             cfg,
             name: name.clone(),
@@ -600,8 +647,17 @@ impl Window {
     /// steps with a worker thread between them: [`Window::probe`] holds the
     /// window from the moment a probe starts, [`Window::page_loaded`] from the
     /// moment its answer lands. Either one means "do not start another".
+    ///
+    /// Since the October 2026 audit's M1 there is a third, [`Window::retry`],
+    /// and `page_loaded` no longer latches on every answer: a probe that could
+    /// not reach the gateway mounts nothing ([`Window::finish_probe`]), so the
+    /// page stays open to a later attempt, and `retry` is what makes that
+    /// attempt wait for its backoff step instead of the next poll.
     fn load_page(&self, state: &AgentState) {
-        if *self.page_loaded.borrow() || self.probe.borrow().is_some() {
+        if *self.page_loaded.borrow()
+            || self.probe.borrow().is_some()
+            || self.retry.borrow().is_some()
+        {
             return;
         }
         let Some(url) = state.agent().and_then(agent_url) else {
@@ -627,18 +683,81 @@ impl Window {
     /// Retry [`Window::load_page`] once, against whatever state is current —
     /// #1274 item 1's other retry route.
     ///
-    /// [`Window::begin_probe`]'s `Err` arm schedules exactly one call to this
-    /// after a dead worker clears the probe latch. The latch being clear only
-    /// buys a retry if something calls `load_page` again, and on a steady
-    /// hive nothing else does: `feed::poll_once` dedups an unchanged row's
-    /// `Update::State` (`feed.rs:552`), and a second activation's route
-    /// (`main.rs`) never reaches `load_page` at all. Reads `self.last`
-    /// rather than the URL the dead probe was given, so a row that changed
-    /// in the meantime is retried against its *current* state, not a stale
-    /// one.
+    /// [`Window::schedule_retry`] queues a call to this after a probe that
+    /// produced no verdict: a dead worker ([`Window::begin_probe`]'s `Err`
+    /// arm, #1274) or, since the October 2026 audit's M1, a gateway that did
+    /// not answer ([`Window::finish_probe`]). Neither latches the page, but
+    /// an unlatched page only buys a retry if something calls `load_page`
+    /// again, and on a steady hive nothing else does: `feed::poll_once`
+    /// dedups an unchanged row's `Update::State` (`feed.rs:552`), and a
+    /// second activation's route (`main.rs`) never reaches `load_page` at
+    /// all. Reads `self.last` rather than the URL the last probe was given,
+    /// so a row that changed in the meantime is retried against its
+    /// *current* state, not a stale one.
     fn retry_load_page(&self) {
         let state = self.last.borrow();
         self.load_page(&state);
+    }
+
+    /// How long to wait before asking a gateway that did not answer again,
+    /// counting this miss: the poll interval, doubled per consecutive miss,
+    /// up to [`RETRY_CEILING`] (or the poll interval itself, if that is
+    /// configured longer).
+    ///
+    /// Starting at the poll interval keeps the first retry on the cadence the
+    /// header already moves at — a gateway that was restarting is back on the
+    /// next step — and the doubling is what stops a gateway that stays down
+    /// from being dialled every two seconds for as long as the window is open.
+    /// There is deliberately no *count* bound: a count would bring M1's latch
+    /// back after the last attempt, and a gateway that comes back after an
+    /// hour is still one the operator wants the page from.
+    fn next_retry_delay(&self) -> std::time::Duration {
+        let misses = self.unanswered.get();
+        self.unanswered.set(misses.saturating_add(1));
+        retry_delay(self.cfg.poll_interval(), misses)
+    }
+
+    /// Ask again after `wait`, through [`Window::retry_load_page`], and hold
+    /// [`Window::load_page`] shut until then.
+    ///
+    /// The one retry path both no-verdict arms take (#1274's dead worker, and
+    /// M1's unreachable gateway), so they share the backoff and the latch
+    /// rather than each carrying a timer of its own. The source holds the
+    /// window weakly, for [`Window::me`]'s reason.
+    fn schedule_retry(&self, wait: std::time::Duration) {
+        self.cancel_retry();
+        let me = std::rc::Weak::clone(&self.me);
+        let source = glib::timeout_add_local_once(wait, move || {
+            if let Some(window) = me.upgrade() {
+                // This source is spent the moment it fires: forgetting its id
+                // here, rather than removing it, is what keeps
+                // `cancel_retry` from ever removing a source GLib has already
+                // destroyed (`SourceId::remove` panics on one).
+                *window.retry.borrow_mut() = None;
+                window.retry_load_page();
+            }
+        });
+        *self.retry.borrow_mut() = Some(source);
+    }
+
+    /// Drop a queued retry, if there is one — the source is removed, so it
+    /// never fires.
+    fn cancel_retry(&self) {
+        let pending = self.retry.borrow_mut().take();
+        if let Some(source) = pending {
+            source.remove();
+        }
+    }
+
+    /// The unreachable card's "Try again now": skip the rest of the backoff
+    /// step and ask the gateway at once.
+    ///
+    /// The backoff itself is left where it is — a click is an operator saying
+    /// "I just fixed it", and if they were wrong the next wait is the one the
+    /// misses so far have earned, not the first step again.
+    fn retry_now(&self) {
+        self.cancel_retry();
+        self.retry_load_page();
     }
 
     /// Paint the verifying state, then check the hive's certificate **on a
@@ -726,18 +845,17 @@ impl Window {
                         // `an_unchanged_hive_sends_one_state_not_one_per_poll`),
                         // and a second activation's route (`main.rs`) never
                         // reaches `load_page` at all — so nothing else would
-                        // ever call it again on a steady hive.
+                        // ever call it again on a steady hive. Since the
+                        // October 2026 audit's M1 that retry is
+                        // `schedule_retry`'s, shared with the unreachable
+                        // gateway's: the same backoff, and the same latch
+                        // keeping a poll from jumping it.
                         tracing::error!(
                             "the TLS probe thread died without a verdict; the page was not loaded"
                         );
                         window.probe.borrow_mut().take();
                         window.fill_page_slot(&webview::probe_died(&host));
-                        let retry = std::rc::Weak::clone(&window.me);
-                        glib::timeout_add_local_once(window.cfg.poll_interval(), move || {
-                            if let Some(window) = retry.upgrade() {
-                                window.retry_load_page();
-                            }
-                        });
+                        window.schedule_retry(window.next_retry_delay());
                         return;
                     };
                     window.finish_probe(&embedded, &trust);
@@ -760,9 +878,44 @@ impl Window {
     }
 
     /// The probe's answer, back on the GTK main thread: mount the page under
-    /// the policy it settled on and close the in-flight slot.
+    /// the policy it settled on and close the in-flight slot — **unless the
+    /// probe never reached the gateway**.
+    ///
+    /// That answer ([`tls::Resolved::unreachable`]) used to mount the page
+    /// too, under the system store, and latch `page_loaded` with it. The
+    /// October 2026 audit (M1) is what that cost: with the gateway down at
+    /// open, `WebKit`'s load failed on the connection into its own error page,
+    /// and when the gateway came back nothing asked again — the view had no
+    /// pin, `load_page` returned early for good, and only closing the window
+    /// got the page. So that answer now puts up [`webview::unreachable`],
+    /// leaves `page_loaded` alone and [schedules](Window::schedule_retry) the
+    /// next attempt; every other answer is a verdict, mounts the page as
+    /// before, and resets the backoff.
     fn finish_probe(&self, embedded: &str, trust: &tls::Resolved) {
         self.probe.borrow_mut().take();
+        if trust.unreachable {
+            let wait = self.next_retry_delay();
+            tracing::warn!(
+                url = %embedded,
+                tls_tried = trust.tried.as_deref().unwrap_or("nothing"),
+                retry_in = ?wait,
+                "the hive's gateway did not answer the certificate check; not loading the agent's \
+                 page yet, and asking again"
+            );
+            let me = std::rc::Weak::clone(&self.me);
+            self.fill_page_slot(&webview::unreachable(
+                trust.tried.as_deref(),
+                wait,
+                move || {
+                    if let Some(window) = me.upgrade() {
+                        window.retry_now();
+                    }
+                },
+            ));
+            self.schedule_retry(wait);
+            return;
+        }
+        self.unanswered.set(0);
         tracing::info!(
             url = %embedded,
             tls_host = ?trust.policy.scoped_host(),
@@ -807,6 +960,32 @@ impl Window {
         self.probe.borrow().is_some()
     }
 
+    /// Whether a retry is queued — the display tests' way to see M1's third
+    /// latch without waiting the backoff out.
+    #[cfg(all(test, feature = "system-tests"))]
+    fn retrying(&self) -> bool {
+        self.retry.borrow().is_some()
+    }
+
+    /// The banner's own title label, as GTK renders it — not the `title`
+    /// property, which reads back whatever was set whether it parsed or not.
+    #[cfg(all(test, feature = "system-tests"))]
+    fn banner_rendered(&self) -> Vec<String> {
+        fn labels(widget: &gtk::Widget, out: &mut Vec<String>) {
+            if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+                out.push(label.text().to_string());
+            }
+            let mut child = widget.first_child();
+            while let Some(c) = child {
+                labels(&c, out);
+                child = c.next_sibling();
+            }
+        }
+        let mut out = Vec::new();
+        labels(self.banner.upcast_ref(), &mut out);
+        out
+    }
+
     /// The header, for the tests that assert what it shows.
     #[cfg(all(test, feature = "system-tests"))]
     fn header(&self) -> &ui::Header {
@@ -827,8 +1006,46 @@ impl Window {
 /// wiring itself is pinned, and `docs/live-verify.md` for the rest).
 #[cfg(test)]
 mod tests {
-    use super::presenting;
+    use super::{RETRY_CEILING, presenting, retry_delay};
     use gtk::gdk::ToplevelState;
+    use std::time::Duration;
+
+    /// **The retry backs off, and stops backing off at the ceiling** — the
+    /// October 2026 audit's M1, the half of it that needs no display.
+    ///
+    /// Starts on the poll interval (a gateway that was mid-restart is back on
+    /// the header's own cadence), doubles per miss, and never waits past
+    /// [`RETRY_CEILING`] — unless the poll itself is configured slower, which
+    /// the retry then matches rather than outrunning. The last default row is
+    /// a window left open on a dead hive for a very long time: saturating, not
+    /// overflowing.
+    ///
+    /// Mutations (run this round, red): drop the `.min(…)` and the five-miss
+    /// row reds at 64 s; drop the shift (always `base`) and the one-miss row
+    /// reds at 2 s; drop the `.max(base)` and the hour-long poll's rows red at
+    /// 60 s.
+    #[test]
+    fn the_retry_doubles_from_the_poll_interval_up_to_the_ceiling() {
+        let two = Duration::from_secs(2);
+        for (misses, expected) in [
+            (0, two),
+            (1, Duration::from_secs(4)),
+            (4, Duration::from_secs(32)),
+            (5, RETRY_CEILING),
+            (31, RETRY_CEILING),
+            (u32::MAX, RETRY_CEILING),
+        ] {
+            assert_eq!(retry_delay(two, misses), expected, "{misses} misses");
+        }
+        let hour = Duration::from_hours(1);
+        for misses in [0, 3, u32::MAX] {
+            assert_eq!(
+                retry_delay(hour, misses),
+                hour,
+                "a poll configured slower than the ceiling is not answered by a faster retry"
+            );
+        }
+    }
 
     /// **Suspended is the only state that parks the poll.** Focus in
     /// particular must not: a visible-but-unfocused window keeps its header
@@ -1046,6 +1263,69 @@ mod gtk_tests {
         }
     }
 
+    /// Cancels a window's queued retry when it drops — [`HeartbeatGuard`]'s
+    /// shape, for the source the October 2026 audit's M1 fix queues.
+    ///
+    /// A probe with no verdict leaves a `glib` timeout on the one
+    /// `MainContext` every `#[gtk::test]` shares, and the windows here are
+    /// never dropped (see [`Window::me`] for the cycles that keep them), so
+    /// left alone that source fires inside whichever test runs next and its
+    /// probe dials **this** test's port — closed by then, and so free for a
+    /// sibling's `serve()` to be handed and its one accept stolen: #1458's
+    /// race, through a different door. Every test whose probe can end
+    /// without a verdict holds one. It cancels what is *queued*; a probe still
+    /// in flight when a test fails part-way is past its reach, which costs
+    /// nothing a passing run can meet.
+    struct RetryGuard(Rc<Window>);
+
+    impl Drop for RetryGuard {
+        fn drop(&mut self) {
+            self.0.cancel_retry();
+        }
+    }
+
+    /// What a probe that could not reach the gateway answers — the shape
+    /// `tls::verify_then_pin`'s `Unreachable` arm builds, canned, so the tests
+    /// that use it are about what the window does with the answer rather than
+    /// about loopback timing. That the real arm sets the flag is
+    /// `verify::tls_tests::a_gateway_that_does_not_answer_is_a_reachability_failure_not_a_trust_one`'s,
+    /// against a real closed port.
+    fn unreachable_answer() -> tls::Resolved {
+        tls::Resolved {
+            tried: Some(
+                "could not check hive.local against the anchors in /fixture/trust-bundle.pem \
+                 (test): could not reach hive.local:443 (Connection refused)"
+                    .to_owned(),
+            ),
+            unreachable: true,
+            ..tls::Resolved::default()
+        }
+    }
+
+    /// A [`TrustResolver`] that answers `script[n]` on its `n`-th call (and
+    /// the last entry on every call after), counting the calls.
+    fn scripted_answers(script: Vec<tls::Resolved>) -> (TrustResolver, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let resolver: TrustResolver = Arc::new(move |_url: &str| {
+            let n = counted.fetch_add(1, Ordering::SeqCst);
+            script
+                .get(n)
+                .or_else(|| script.last())
+                .cloned()
+                .expect("a script with at least one answer")
+        });
+        (resolver, calls)
+    }
+
+    /// [`row`] with a page URL — none of the tests using it dial anything.
+    fn row_with_page() -> AgentStatusRow {
+        AgentStatusRow {
+            url: Some("https://hive.local/agent/stray/".to_owned()),
+            ..row()
+        }
+    }
+
     /// A heartbeat on the main context, and a guard that stops it when it
     /// drops.
     ///
@@ -1250,6 +1530,42 @@ mod gtk_tests {
             rx.try_recv(),
             Ok(Request::Stop { graceful: true, .. })
         ));
+    }
+
+    /// **The hive's refusal reason is shown as text, not parsed as markup** —
+    /// the October 2026 audit's LOW.
+    ///
+    /// `AdwBanner:use-markup` defaults to TRUE, and the title is the hive's
+    /// own sentence. A `<` that does not open a tag GTK knows, or a bare `&`,
+    /// fails the parse, and `GtkLabel` keeps whatever it showed before — for
+    /// a first refusal, nothing: a revealed banner with no words in it.
+    ///
+    /// Read off the banner's own title **label**, not its `title` property:
+    /// the property reads back whatever was set, parsed or not, which is why
+    /// `banner_text` alone never saw this.
+    ///
+    /// Mutation (run this round, red): drop `set_use_markup(false)` in
+    /// `assemble_with_trust` and the rendered-text assertion reds with `[""]`
+    /// where the sentence should be.
+    #[gtk::test]
+    fn a_refusal_reason_is_shown_as_text_not_parsed_as_markup() {
+        let (w, _rx) = window();
+        w.update(Update::State(up(row())));
+        let reason = "policy <deny> says a < b & c";
+        w.update(Update::Refused {
+            request: Request::SetPaused {
+                name: "stray".to_owned(),
+                paused: true,
+            },
+            reason: reason.to_owned(),
+        });
+        let expected = format!("couldn't pause this agent: {reason}");
+        assert_eq!(w.banner_text().as_deref(), Some(expected.as_str()));
+        let rendered = w.banner_rendered();
+        assert!(
+            rendered.contains(&expected),
+            "the banner must show the hive's sentence as written: {rendered:?}"
+        );
     }
 
     /// A button press puts **that verb** on the command lane, scoped to this
@@ -2041,9 +2357,10 @@ mod gtk_tests {
     /// precisely the input `feed.rs:552` exists to suppress on a real hive
     /// (`an_unchanged_hive_sends_one_state_not_one_per_poll`). It now sends
     /// no second update at all: the only thing that can start a second probe
-    /// is the `glib::timeout_add_local_once` the `Err` arm schedules against
-    /// [`Window::retry_load_page`], and the pump below waits on that
-    /// directly.
+    /// is the retry the `Err` arm queues against [`Window::retry_load_page`]
+    /// (since the October 2026 audit's M1, through
+    /// [`Window::schedule_retry`], which the unreachable gateway shares), and
+    /// the pump below waits on that directly.
     #[gtk::test]
     fn a_worker_that_panics_clears_the_latch_and_the_scheduled_retry_starts_a_fresh_probe() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -2053,6 +2370,9 @@ mod gtk_tests {
             panic!("#1274 L1 mutation: the worker dies without a verdict");
         });
         let (w, _rx) = window_with_trust(panics);
+        // The second death queues a third attempt; it must not fire in the
+        // next test.
+        let _quiet = RetryGuard(Rc::clone(&w));
 
         w.update(Update::State(up(row_at(0))));
         assert!(
@@ -2103,6 +2423,136 @@ mod gtk_tests {
         );
     }
 
+    /// **A gateway that did not answer is asked again, and the page mounts
+    /// once it does** — the October 2026 audit's M1.
+    ///
+    /// Before this, the unreachable answer mounted a pinless view and latched
+    /// `page_loaded`, so the second answer below never happened: the window
+    /// was the engine's error page until someone closed it. Three things are
+    /// asserted, in the order the operator meets them:
+    ///
+    /// 1. the answer puts up the unreachable card, not a view, and queues a
+    ///    retry;
+    /// 2. a poll arriving meanwhile — the agent's status moved, which happens
+    ///    every few seconds while it works — does **not** jump the queue: the
+    ///    backoff is the retry's, not the agent's chattiness;
+    /// 3. the queued retry, with nothing fed in, asks again, and that answer
+    ///    mounts the page and latches it exactly as before.
+    ///
+    /// Mutations (run this round, red): drop `finish_probe`'s
+    /// `if trust.unreachable` arm and (1) reds on a mounted view; drop
+    /// `|| self.retry.borrow().is_some()` from `load_page` and (2) reds with
+    /// a probe started by the poll; drop the `schedule_retry` call in that
+    /// arm and (1)'s "next attempt is queued" reds — the card would sit there
+    /// with nothing coming, which is M1 with a better sentence.
+    #[gtk::test]
+    fn an_unreachable_gateway_is_asked_again_and_the_page_mounts_once_it_answers() {
+        let (trust, calls) = scripted_answers(vec![unreachable_answer(), tls::Resolved::default()]);
+        let (w, _rx) = window_with_trust(trust);
+        let _quiet = RetryGuard(Rc::clone(&w));
+
+        w.update(Update::State(up(row_with_page())));
+        assert!(
+            pump_until(Duration::from_secs(10), || !w.probing()),
+            "the probe never answered"
+        );
+        let card = w.page_child().expect("the slot is filled");
+        assert!(
+            webview::is_unreachable(&card),
+            "a gateway that did not answer gets the card that says so, not a view under the \
+             system store"
+        );
+        assert!(w.retrying(), "…and the next attempt is queued");
+
+        w.update(Update::State(up(AgentStatusRow {
+            status_text: Some("still working".to_owned()),
+            ..row_with_page()
+        })));
+        assert!(
+            !w.probing(),
+            "a poll must not start a probe while a retry is queued — the backoff would be \
+             whatever the agent's status line made it"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        assert!(
+            pump_until(Duration::from_secs(10), || w.probing()),
+            "the queued retry never asked again — the window is latched on a gateway that is \
+             down (M1)"
+        );
+        assert!(
+            pump_until(Duration::from_secs(10), || !w.probing()),
+            "the retry's probe never answered"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let mounted = w.page_child().expect("the slot is filled");
+        assert!(
+            webview::view_of(&mounted).is_some(),
+            "the gateway answered, so the page mounts"
+        );
+        assert!(!w.retrying(), "nothing is queued behind a mounted page");
+
+        // …and it latches as it always did.
+        w.update(Update::State(up(row_with_page())));
+        assert_eq!(
+            mounted,
+            w.page_child().expect("the slot is still filled"),
+            "the page mounted after a retry survives a poll like any other"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "…and no third probe ran");
+    }
+
+    /// **"Try again now" asks at once, and takes the queued retry with it.**
+    ///
+    /// The card's button is for the operator who has just restarted the
+    /// gateway: it must start the probe synchronously — not at the end of the
+    /// backoff step — and the step it skipped must not fire as well. A second
+    /// miss queues the next step again.
+    ///
+    /// Mutation (run this round, red): make `retry_now` skip
+    /// `cancel_retry` — the queued source still latches `load_page`, so the
+    /// click starts nothing and the `probing()` assertion reds.
+    #[gtk::test]
+    fn try_again_now_asks_at_once_and_drops_the_queued_retry() {
+        let (trust, calls) = scripted_answers(vec![unreachable_answer()]);
+        let (w, _rx) = window_with_trust(trust);
+        let _quiet = RetryGuard(Rc::clone(&w));
+
+        w.update(Update::State(up(row_with_page())));
+        assert!(
+            pump_until(Duration::from_secs(10), || !w.probing()),
+            "the probe never answered"
+        );
+        assert!(w.retrying(), "a retry is queued behind the card");
+        let button = w
+            .page_child()
+            .and_downcast::<adw::StatusPage>()
+            .and_then(|card| card.child())
+            .and_downcast::<gtk::Button>()
+            .expect("the unreachable card carries its button");
+
+        button.emit_clicked();
+        assert!(
+            w.probing(),
+            "the click must ask the gateway now, not at the end of the backoff step"
+        );
+        assert!(
+            !w.retrying(),
+            "…and the step it skipped is gone, not still waiting to fire"
+        );
+
+        assert!(
+            pump_until(Duration::from_secs(10), || !w.probing()),
+            "the clicked probe never answered"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(
+            webview::is_unreachable(&w.page_child().expect("the slot is filled")),
+            "still down: the card stays up"
+        );
+        assert!(w.retrying(), "…and the next step is queued");
+    }
+
     /// **A slow hive does not freeze the window** — #1246, the whole of it.
     ///
     /// The peer is #1242's review fixture: a legal TLS record header
@@ -2122,7 +2572,12 @@ mod gtk_tests {
     /// then blocks for the whole budget with the loop stopped, `probing()` is
     /// already false when `pump_until` is reached, so **no iteration happens
     /// at all**: the tick count stays at 0 and the verifying assertion reds
-    /// too (the slot holds the page, never the state).
+    /// too (the slot holds the answer, never the state).
+    ///
+    /// The answer itself is the unreachable card, not the page: this peer
+    /// never finishes a handshake, so the probe runs out its budget, and
+    /// since the October 2026 audit's M1 that verdict waits for the gateway
+    /// rather than mounting a view the gateway could never rescue.
     #[gtk::test]
     fn a_slow_hive_paints_the_verifying_state_and_the_main_loop_keeps_running() {
         // The probe's worker and the fixture's server thread are two threads
@@ -2131,6 +2586,7 @@ mod gtk_tests {
         let port = serve_dribbling(Duration::from_secs(12), Duration::from_millis(1500));
         let (trust, runs) = scripted_trust(Duration::from_millis(900));
         let (w, _rx) = window_with_trust(trust);
+        let _quiet = RetryGuard(Rc::clone(&w));
         // `_heartbeat_guard` outlives every assertion below, including a
         // panicking one — it stops the source on drop, at the end of this
         // function's scope, whichever way that scope ends (#1274 N2).
@@ -2165,8 +2621,9 @@ mod gtk_tests {
             ticks.get()
         );
         assert!(
-            webview::view_of(&w.page_child().expect("the slot is filled")).is_some(),
-            "the worker's answer mounts the page"
+            webview::is_unreachable(&w.page_child().expect("the slot is filled")),
+            "the worker's answer replaces the verifying state — here with the card that says the \
+             gateway did not answer"
         );
     }
 
@@ -2192,6 +2649,7 @@ mod gtk_tests {
         let budget = Duration::from_millis(700);
         let (trust, runs) = scripted_trust(budget);
         let (w, _rx) = window_with_trust(trust);
+        let _quiet = RetryGuard(Rc::clone(&w));
 
         let started = Instant::now();
         w.update(Update::State(up(row_at(port))));
@@ -2222,9 +2680,19 @@ mod gtk_tests {
             .expect("the card says what happened");
         assert!(tried.contains("the probe was cancelled after"), "{tried}");
         assert!(
-            webview::view_of(&w.page_child().expect("the slot is filled")).is_some(),
-            "a failed probe still mounts the view, so WebKit's own load can fail into the card"
+            resolved.unreachable,
+            "a probe the deadline cut short never judged a chain — that is reachability, not trust"
         );
+        // Until the October 2026 audit's M1 this asserted the opposite — "a
+        // failed probe still mounts the view, so WebKit's own load can fail
+        // into the card" — and that view, pinless and latched, was what kept
+        // a gateway that came back from ever being asked again.
+        assert!(
+            webview::is_unreachable(&w.page_child().expect("the slot is filled")),
+            "a probe that ran out of time says so and waits to ask again, rather than mounting a \
+             view no later answer could rescue"
+        );
+        assert!(w.retrying(), "…and the next attempt is queued");
     }
 
     /// **One activation, one probe, one connection** — #1246's single
@@ -2262,6 +2730,13 @@ mod gtk_tests {
     /// pinned before any `load_uri` the mount could trigger, with no
     /// wall-clock number to go stale under a slower or faster driver.
     ///
+    /// Since the October 2026 audit's M1 this probe's answer (its budget runs
+    /// out against the dribbler) mounts no view at all — it puts up the
+    /// unreachable card and queues a retry one poll interval out — so the
+    /// next thing to dial this peer is that retry, not `WebKit`. The snapshot
+    /// is pre-answer either way, and the 300 ms wait below sits well inside
+    /// the retry's 2 s.
+    ///
     /// Mutation (run this round, red): drop `|| self.probe.borrow().is_some()`
     /// from `load_page`'s early return — the poll behind the activation starts
     /// a second probe, both are in flight when the pump waits on `probing()`,
@@ -2274,6 +2749,7 @@ mod gtk_tests {
         let (port, accepted) = serve_counting_dribbler(Duration::from_millis(200));
         let (trust, runs) = scripted_trust(Duration::from_millis(900));
         let (w, _rx) = window_with_trust(trust);
+        let _quiet = RetryGuard(Rc::clone(&w));
 
         w.update(Update::State(up(row_at(port))));
         assert!(w.probing(), "the first probe is in flight");
@@ -2320,8 +2796,8 @@ mod gtk_tests {
             "the later activation's --tab survives the probe it did not restart"
         );
         assert!(
-            webview::view_of(&w.page_child().expect("the slot is filled")).is_some(),
-            "and the page still mounts when the one probe answers"
+            webview::is_unreachable(&w.page_child().expect("the slot is filled")),
+            "and the one probe's answer still reaches the slot"
         );
     }
 

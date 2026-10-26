@@ -847,8 +847,24 @@ nothing in that file signs the chain it presented (UNKNOWN_CA)`. That
       verify" is what sent #1224 round in circles.
 - [ ] **(#1234)** **A gateway that is down does not read as a bad
       certificate.** Stop nginx on the hive (leave `host.sock` up, so the
-      header still populates and the window still gets a URL). The card must
-      say `That is a connection problem rather than a certificate one`.
+      header still populates and the window still gets a URL). The window must
+      show _"The hive's gateway did not answer"_, and its first paragraph must
+      say `That is a connection problem rather than a certificate one`. Since
+      the October 2026 audit's M1 that is the window's own card; before it,
+      this answer mounted the page anyway and a refused connection never
+      reached our TLS card, so what showed was `WebKit`'s generic error page.
+- [ ] **(October 2026 audit, M1)** **A gateway that comes back is picked up
+      without touching the window.** With nginx still stopped and the card
+      above showing, watch `journalctl --user -f`: one
+      `the hive's gateway did not answer the certificate check` line per
+      attempt, `retry_in` doubling from the poll interval (2 s, 4 s, 8 s, …)
+      to a minute and staying there — never one line per poll, however busy
+      the agent's status line is. Start nginx again and **do nothing**: within
+      the current step the card must go to the verifying spinner and then to
+      the page, with no close and reopen. Then stop nginx, open a fresh
+      window, let it miss twice, start nginx and press **Try again now**: the
+      spinner must appear at once (not at the end of the step) and the page
+      must load.
 - [ ] **(#1246)** **A slow or dead hive does not freeze the window — it opens
       instantly, on the verifying state.** This is the one to do on glass,
       because it is the half CI cannot reach: stop nginx on the hive and put a
@@ -865,8 +881,8 @@ nothing in that file signs the chain it presented (UNKNOWN_CA)`. That
          to the Settings tab and back, resize it. Nothing may stall. That is
          the check — before #1246 all of this was dead for the whole bound.
       3. After `verify::PROBE_DEADLINE` (8 s) the verifying state is replaced
-         by the failure card, whose first paragraph reads
-         `…the probe was cancelled after 8.0s`.
+         by the unreachable card (_"The hive's gateway did not answer"_),
+         whose first paragraph reads `…the probe was cancelled after 8.0s`.
 
       Then do it again with the hive **up** and confirm the verifying state is
       a blink rather than a state you can read (the probe is a loopback round
@@ -878,9 +894,12 @@ nothing in that file signs the chain it presented (UNKNOWN_CA)`. That
       **Also confirm one probe, not five.** The hive is polled every 2 s and
       the poll is what mounts the page, so a probe that takes 8 s used to have
       four more starting behind it. With the dead gateway up, watch
-      `journalctl --user -f` while the window sits verifying: there must be
-      exactly one `loading the agent's page` line, and `ss -tn state all
-      '( dport = :443 )'` must show one connection, not a growing pile. Then
+      `journalctl --user -f` while the window sits verifying: when the probe
+      gives up there must be exactly one
+      `the hive's gateway did not answer the certificate check` line (the
+      retries after it are one per backoff step — the M1 item above), and
+      `ss -tn state all '( dport = :443 )'` must show one connection, not a
+      growing pile. Then
       run `trollshell-agent-window --agent <name> --tab settings` **while the
       first window is still verifying**: it must move the running window's tab
       and start nothing new.

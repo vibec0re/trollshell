@@ -35,16 +35,46 @@ pub(crate) use types::AgentReply;
 pub use types::{Adapter, Device, PairPrompt, PromptKind};
 
 use agent::{AGENT_ANCHOR_NAME, AGENT_PATH, PairAgent, run_agent};
-use devices::listen;
+use devices::{ListenEnd, listen, wait_for_bluez};
 use futures_signals::signal::{Mutable, Signal};
 use hytte_bus::BusKind;
 use hytte_reactive::{Service, registry, runtime, spawn_supervised};
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::oneshot;
 
 use crate::retry;
+
+/// How long bluetoothd gives our agent to answer one prompt before it gives up
+/// and sends `Cancel`: `REQUEST_TIMEOUT` in `BlueZ`'s `src/agent.c` (60 s).
+/// Copied from the C source for the test that holds [`PAIRING_CALL_TIMEOUT`]
+/// above it.
+#[cfg(test)]
+const BLUEZ_AGENT_REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
+
+/// Deadline for `Device1.Pair` and `Device1.Connect`. It matches the deadline
+/// `BlueZ` puts on its own client's calls.
+///
+/// Both calls block for as long as bluetoothd works on them. `Pair` also blocks
+/// while the user reads a code or types a PIN on our agent's prompt, and
+/// bluetoothd allows that prompt a full minute on its own. `hytte_bus::call`'s
+/// default is 25 s, shorter than one prompt. With that default, a user still
+/// checking the code got a "Couldn't pair: call timeout" toast while bluetoothd
+/// went on pairing. The trust-and-connect follow-up in [`pair_device`] never
+/// ran. The row came back enabled, so a second tap got
+/// `org.bluez.Error.InProgress`.
+///
+/// Five minutes is `METHOD_CALL_TIMEOUT` (300 s) in `BlueZ`'s
+/// `gdbus/client.c`. `bluetoothctl` puts that deadline on every method call
+/// it makes, `pair` and `connect` included. bluetoothd bounds both calls
+/// itself: each agent prompt by `REQUEST_TIMEOUT`, each connection attempt by
+/// the controller's and the kernel's own timeouts. So this deadline is a
+/// backstop for a bluetoothd that has stopped answering. A bluetoothd that
+/// exits does not reach it: the bus answers the pending call with `NoReply`
+/// as soon as the daemon disconnects.
+const PAIRING_CALL_TIMEOUT: Duration = Duration::from_mins(5);
 
 // ── Cross-thread shared handle ────────────────────────────────────────────────
 //
@@ -59,8 +89,8 @@ use crate::retry;
 //     pairing dialog hangs forever on a no-op.
 //   - `PairAgent` iface methods (`request_pin_code`, `request_passkey`,
 //     `request_confirmation`, `request_authorization`, `cancel`) call
-//     `lookup_alias`, `pending_response_arc`, `set_prompt`, `clear_prompt`
-//     — all of which used `registry::with`.
+//     `lookup_alias`, `pending_response_arc` and `await_reply`, which reach
+//     the prompt slot; all of them once used `registry::with`.
 //
 // The cross-thread-safe alternative is `hytte_reactive::shared` (the
 // process-global registry mirror): `Service::start` publishes this bag with
@@ -243,8 +273,11 @@ impl Service for BluetoothService {
                     let outcome = listen(&adapter_mutable, &devices_mutable, &path_store).await;
                     let delay = backoff.delay_after_run(started.elapsed());
                     match outcome {
-                        Ok(()) => {
+                        Ok(ListenEnd::StreamClosed) => {
                             tracing::warn!(?delay, "bluetooth watcher closed, reconnecting");
+                        }
+                        Ok(ListenEnd::DaemonExited) => {
+                            tracing::info!("bluetooth watcher: waiting for bluetoothd to return");
                         }
                         Err(e) => {
                             tracing::warn!(?delay, error = %e, "bluetooth watcher error, reconnecting");
@@ -271,6 +304,14 @@ impl Service for BluetoothService {
                     // Also reset the adapter path store so the next listen()
                     // call starts fresh.
                     set_adapter_path_local("").await;
+                    // Reconnect only to a bluetoothd that is running. The
+                    // next listen() calls org.bluez, and that call would
+                    // D-Bus-activate a stopped one. This applies to every
+                    // exit, not only `DaemonExited`: a dying bluetoothd can
+                    // remove its adapter just before it lets go of the name.
+                    // With bluetoothd up, this returns after one round trip
+                    // to the bus.
+                    wait_for_bluez().await;
                     tokio::time::sleep(delay).await;
                 }
             }
@@ -552,22 +593,90 @@ pub fn pair_device(device_path: &str) {
     let path = device_path.to_string();
     mark_busy(&path);
     runtime::handle().spawn(async move {
-        match do_device_call(&path, "Pair").await {
-            Ok(()) => {
-                if let Err(e) = do_set_device_bool(&path, "Trusted", true).await {
-                    tracing::warn!(error = %e, path, "auto-trust after pair failed");
-                }
-                if let Err(e) = do_device_call(&path, "Connect").await {
-                    tracing::warn!(error = %e, path, "auto-connect after pair failed");
-                }
+        let reply = do_device_call(&path, "Pair").await;
+        match pair_outcome(reply, is_paired_now(&path)) {
+            PairOutcome::Paired => trust_and_connect(&path).await,
+            PairOutcome::PairedDespite(e) => {
+                tracing::info!(
+                    error = %e,
+                    path,
+                    "Pair answered an error but the device is paired; trusting and connecting"
+                );
+                trust_and_connect(&path).await;
             }
-            Err(e) => {
+            PairOutcome::Failed(e) => {
                 tracing::warn!(error = %e, path, "bluetooth pair_device failed");
                 report_action_error(format!("Couldn't pair: {e}"));
             }
         }
         mark_idle(&path);
     });
+}
+
+/// The follow-up to a successful pair: mark the device trusted so it
+/// reconnects by itself next session, then connect it now.
+async fn trust_and_connect(path: &str) {
+    if let Err(e) = do_set_device_bool(path, "Trusted", true).await {
+        tracing::warn!(error = %e, path, "auto-trust after pair failed");
+    }
+    if let Err(e) = do_device_call(path, "Connect").await {
+        tracing::warn!(error = %e, path, "auto-connect after pair failed");
+    }
+}
+
+/// What [`pair_device`] does once its `Pair` call has answered.
+#[derive(Debug)]
+enum PairOutcome {
+    /// `Pair` succeeded: run the follow-up.
+    Paired,
+    /// `Pair` answered an error, but the device is paired anyway: run the
+    /// follow-up and post no toast. The error is kept only for the journal.
+    PairedDespite(hytte_bus::BusError),
+    /// The device is not paired: post this error as a toast.
+    Failed(hytte_bus::BusError),
+}
+
+/// Decide [`PairOutcome`] from the `Pair` reply and from whether the device
+/// shows as paired once that reply is in.
+///
+/// The follow-up depends on the device being paired, not on `Pair` saying
+/// so, because the two can disagree:
+/// - `org.bluez.Error.AlreadyExists` is bluetoothd's own answer for "this
+///   device is already bonded". The usual causes are a stale row, or the
+///   remote side finishing the pairing first. Until now that toasted
+///   "Couldn't pair", and the device stayed untrusted and disconnected.
+/// - A reply that arrives after [`PAIRING_CALL_TIMEOUT`] is lost to us, but
+///   bluetoothd may still finish the pairing. If the device shows as paired by
+///   the time the deadline error comes back, the follow-up runs anyway.
+///
+/// `paired_now` reads the watcher's snapshot. It is never a reason to treat a
+/// *successful* reply as a failure.
+fn pair_outcome(reply: Result<(), hytte_bus::BusError>, paired_now: bool) -> PairOutcome {
+    match reply {
+        Ok(()) => PairOutcome::Paired,
+        Err(e) if paired_now || is_already_exists(&e) => PairOutcome::PairedDespite(e),
+        Err(e) => PairOutcome::Failed(e),
+    }
+}
+
+/// Is this bluetoothd's "already bonded" answer to `Pair`?
+fn is_already_exists(e: &hytte_bus::BusError) -> bool {
+    matches!(
+        e,
+        hytte_bus::BusError::Permanent { dbus_name: Some(name), .. }
+            if name == "org.bluez.Error.AlreadyExists"
+    )
+}
+
+/// Does the watcher's snapshot show `path` as paired? `false` before the
+/// service has started.
+fn is_paired_now(path: &str) -> bool {
+    shared_state().is_some_and(|s| {
+        s.devices
+            .lock_ref()
+            .iter()
+            .any(|d| d.path == path && d.paired)
+    })
 }
 
 /// Fire-and-forget: set the `Trusted` property on a device.
@@ -656,13 +765,22 @@ async fn do_adapter_call(adapter_path: &str, method: &str) -> Result<(), hytte_b
 }
 
 async fn do_device_call(device_path: &str, method: &str) -> Result<(), hytte_bus::BusError> {
-    hytte_bus::call(BusKind::System, "org.bluez")
+    let call = hytte_bus::call(BusKind::System, "org.bluez")
         .at_path(device_path.to_string())
         .iface("org.bluez.Device1")
-        .method(method)
-        .args(())
-        .send::<()>()
-        .await
+        .method(method);
+    let call = match device_call_deadline(method) {
+        Some(deadline) => call.timeout(deadline),
+        None => call,
+    };
+    call.args(()).send::<()>().await
+}
+
+/// The deadline a `Device1` method gets, or `None` for `hytte_bus::call`'s
+/// default. Only `Pair` and `Connect` take longer than that default. See
+/// [`PAIRING_CALL_TIMEOUT`].
+fn device_call_deadline(method: &str) -> Option<Duration> {
+    matches!(method, "Pair" | "Connect").then_some(PAIRING_CALL_TIMEOUT)
 }
 
 async fn do_remove_device(
@@ -686,9 +804,89 @@ async fn do_remove_device(
 
 #[cfg(test)]
 mod tests {
-    use super::{ActionError, set_action_error};
+    use super::{
+        ActionError, BLUEZ_AGENT_REQUEST_TIMEOUT, PairOutcome, device_call_deadline, pair_outcome,
+        set_action_error,
+    };
     use futures_signals::signal::{Mutable, Signal};
+    use hytte_bus::BusError;
     use std::time::Instant;
+
+    /// `Pair` blocks while the user answers our agent's prompt, and
+    /// bluetoothd gives that prompt 60 s. A deadline shorter than that fires
+    /// while pairing is still in progress: a false "Couldn't pair" toast, no
+    /// follow-up, and a re-enabled row that answers `InProgress`. `Connect`
+    /// has the same deadline, because it is also the second half of that
+    /// follow-up.
+    ///
+    /// **Falsification:** make `device_call_deadline` return `None` for
+    /// `Pair` (the 25 s default) and this fails.
+    #[test]
+    fn pair_and_connect_outlast_an_agent_prompt() {
+        for method in ["Pair", "Connect"] {
+            let deadline = device_call_deadline(method);
+            assert!(
+                deadline.is_some_and(|d| d > BLUEZ_AGENT_REQUEST_TIMEOUT),
+                "{method} must wait out a whole agent prompt, got {deadline:?}"
+            );
+        }
+        assert_eq!(
+            device_call_deadline("Disconnect"),
+            None,
+            "a call that waits on nobody keeps the bus default"
+        );
+    }
+
+    fn method_error(name: &str) -> BusError {
+        BusError::Permanent {
+            reason: name.rsplit('.').next().unwrap_or(name).to_owned(),
+            dbus_name: Some(name.to_owned()),
+        }
+    }
+
+    /// What `hytte_bus::call` answers when its own deadline fires.
+    fn deadline_error() -> BusError {
+        BusError::Permanent {
+            reason: "call timeout".to_owned(),
+            dbus_name: None,
+        }
+    }
+
+    /// The trust-and-connect follow-up runs when the device is paired, not
+    /// only when the `Pair` reply says so.
+    #[test]
+    fn the_follow_up_runs_whenever_the_device_is_paired() {
+        assert!(matches!(pair_outcome(Ok(()), false), PairOutcome::Paired));
+
+        // bluetoothd's own "already bonded": the follow-up must still run,
+        // whatever the snapshot shows.
+        assert!(matches!(
+            pair_outcome(Err(method_error("org.bluez.Error.AlreadyExists")), false),
+            PairOutcome::PairedDespite(_)
+        ));
+
+        // The deadline fired, but by the time its error came back the device
+        // showed as paired: the reply was late, the pairing was not lost.
+        assert!(matches!(
+            pair_outcome(Err(deadline_error()), true),
+            PairOutcome::PairedDespite(_)
+        ));
+    }
+
+    /// A pairing that really failed still reaches the toast.
+    #[test]
+    fn a_pairing_that_failed_still_toasts() {
+        for err in [
+            method_error("org.bluez.Error.AuthenticationFailed"),
+            method_error("org.bluez.Error.AuthenticationCanceled"),
+            deadline_error(),
+        ] {
+            assert!(
+                matches!(pair_outcome(Err(err), false), PairOutcome::Failed(_)),
+                "an unpaired device after an error is a failure"
+            );
+        }
+    }
 
     /// The message on the current `action_error`, or `None`.
     fn message(action_error: &Mutable<Option<ActionError>>) -> Option<String> {

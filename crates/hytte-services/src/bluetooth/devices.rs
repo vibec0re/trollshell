@@ -117,7 +117,7 @@ pub(super) async fn listen(
     adapter_mutable: &Mutable<Option<Adapter>>,
     devices_mutable: &Mutable<Vec<Device>>,
     adapter_path_store: &Arc<tokio::sync::RwLock<String>>,
-) -> Result<(), anyhow::Error> {
+) -> Result<ListenEnd, anyhow::Error> {
     let managed = get_managed_objects()
         .await
         .map_err(|e| anyhow::anyhow!("GetManagedObjects: {e}"))?;
@@ -165,7 +165,151 @@ pub(super) async fn listen(
 
     // ── Signal subscriptions ──────────────────────────────────────────────────
 
-    event_loop(&state, &adapter_path, adapter_path_store).await
+    event_loop(&state, &adapter_path).await
+}
+
+/// What a `NameOwnerChanged` for `org.bluez` says about bluetoothd.
+#[derive(Debug, PartialEq, Eq)]
+enum OwnerChange {
+    /// `org.bluez` has no owner any more: bluetoothd exited.
+    Lost,
+    /// `org.bluez` has a new owner: a bluetoothd that started after the one
+    /// our snapshot came from.
+    Appeared,
+}
+
+/// Read one `NameOwnerChanged` body. `None` for any name other than
+/// `org.bluez`, and for a body that does not parse.
+fn bluez_owner_change(body: &zbus::Message) -> Option<OwnerChange> {
+    let (name, _old, new) = body.body().deserialize::<(String, String, String)>().ok()?;
+    if name != "org.bluez" {
+        return None;
+    }
+    Some(if new.is_empty() {
+        OwnerChange::Lost
+    } else {
+        OwnerChange::Appeared
+    })
+}
+
+/// How [`listen`] ended, when it ended without an error.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ListenEnd {
+    /// A signal stream ended. Reconnect on the usual backoff.
+    StreamClosed,
+    /// bluetoothd exited: `org.bluez` lost its owner. Clear the snapshot, then
+    /// [`wait_for_bluez`] before reconnecting.
+    DaemonExited,
+}
+
+/// A subscription to the bus's `NameOwnerChanged`, every name. Filtered in
+/// code by [`bluez_owner_change`]. The pairing agent watches the same signal
+/// the same way (`agent::run_agent`).
+fn name_owner_changed() -> SignalSubscription {
+    hytte_bus::signals(BusKind::System, "org.freedesktop.DBus")
+        .at_path("/org/freedesktop/DBus")
+        .iface("org.freedesktop.DBus")
+        .signal("NameOwnerChanged")
+        .start()
+}
+
+/// React to one `NameOwnerChanged` item for the watcher. `Some` means
+/// [`event_loop`] ends with that.
+///
+/// The state tracker never watched bluetoothd itself; only the pairing
+/// agent did. A bluetoothd that exits does not reliably say goodbye first. A
+/// crash or a `SIGKILL` emits nothing. On `SIGTERM`, `src/main.c` removes the
+/// adapter's objects (`adapter_cleanup`) only after its main loop has
+/// returned, so that `InterfacesRemoved` is nothing to rely on. So after
+/// `systemctl restart bluetooth`, the old daemon's scanned devices,
+/// `Discovering = true` and the rest of the snapshot stayed on screen, and
+/// nothing replaced them.
+///
+/// - **Lost**: end the watch with [`ListenEnd::DaemonExited`]. The
+///   supervised loop in `mod.rs` then does the cleanup it does for a removed
+///   adapter: no adapter, no devices, no in-flight markers, the prompt
+///   rejected. With no daemon, "no adapter" is the honest state. It does
+///   *not* re-sync: a re-sync is a call to `org.bluez`, see [`wait_for_bluez`].
+/// - **Appeared**: arm the coalesced re-sync, which replaces the snapshot
+///   with the new daemon's. That re-sync fails into a full reconnect if the
+///   adapter is gone. This covers a restart whose `Lost` half this
+///   subscription did not see.
+/// - A `Resubscribed`/`Lagged` marker: an owner change may have gone missing,
+///   so re-sync, as for any other subscription in this fold.
+fn on_owner_item(item: SignalItem, wake: &ResyncWake) -> Option<ListenEnd> {
+    let evt = bluetooth_marker_or_event(item, "NameOwnerChanged", wake)?;
+    match bluez_owner_change(&evt.body)? {
+        OwnerChange::Lost => Some(ListenEnd::DaemonExited),
+        OwnerChange::Appeared => {
+            tracing::info!("org.bluez has a new owner; re-syncing devices");
+            arm_resync(wake, "org.bluez new owner");
+            None
+        }
+    }
+}
+
+/// How often [`wait_for_bluez`] asks the bus again without having been woken.
+/// It is a backstop; the wake is the `NameOwnerChanged` for the new owner.
+const BLUEZ_RECHECK: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Wait until `org.bluez` has an owner again, without starting one.
+///
+/// This asks the bus (`NameHasOwner`), never `org.bluez` itself. Any method
+/// call to `org.bluez` D-Bus-activates `bluetooth.service` (`BlueZ` ships an
+/// `org.bluez` activation file, and the `NixOS` module aliases the unit as
+/// `dbus-org.bluez.service`). Reconnecting straight away would therefore
+/// turn a deliberate `systemctl stop bluetooth` into a restart.
+///
+/// It wakes on the `NameOwnerChanged` that announces the new owner. The
+/// [`BLUEZ_RECHECK`] re-ask covers what that wake cannot: the window before
+/// this subscription's match rule is in place, and a `NameHasOwner` that
+/// failed.
+pub(super) async fn wait_for_bluez() {
+    let owner_sub = name_owner_changed();
+    let mut items = owner_sub.items();
+    loop {
+        match bluez_has_owner().await {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(e) => {
+                tracing::debug!(error = %e, "bluetooth: NameHasOwner(org.bluez) failed; asking again");
+            }
+        }
+        let _ = tokio::time::timeout(BLUEZ_RECHECK, next_bluez_owner(&mut items)).await;
+    }
+}
+
+/// Resolve on the next sign that `org.bluez` may have an owner again: the
+/// `NameOwnerChanged` for a new owner, or a marker, since an owner change may
+/// have gone missing. A stream that ends never resolves, so the caller's
+/// timeout paces it instead of letting it spin.
+async fn next_bluez_owner<S>(items: &mut S)
+where
+    S: futures_util::Stream<Item = SignalItem> + Unpin,
+{
+    while let Some(item) = items.next().await {
+        match item {
+            SignalItem::Event(evt) => {
+                if bluez_owner_change(&evt.body) == Some(OwnerChange::Appeared) {
+                    return;
+                }
+            }
+            SignalItem::Resubscribed | SignalItem::Lagged { .. } => return,
+        }
+    }
+    std::future::pending::<()>().await;
+}
+
+/// Ask the bus whether anyone owns `org.bluez`. This is answered by the bus
+/// itself, so it activates nothing.
+async fn bluez_has_owner() -> Result<bool, hytte_bus::BusError> {
+    hytte_bus::call(BusKind::System, "org.freedesktop.DBus")
+        .at_path("/org/freedesktop/DBus")
+        .iface("org.freedesktop.DBus")
+        .method("NameHasOwner")
+        .args(("org.bluez".to_string(),))
+        .send::<bool>()
+        .await
 }
 
 /// One `PropertiesChanged` emission, forwarded from a per-device
@@ -340,11 +484,10 @@ fn bluetooth_marker_or_event(
     }
 }
 
-async fn event_loop(
-    state: &State,
-    adapter_path: &str,
-    adapter_path_store: &Arc<tokio::sync::RwLock<String>>,
-) -> Result<(), anyhow::Error> {
+async fn event_loop(state: &State, adapter_path: &str) -> Result<ListenEnd, anyhow::Error> {
+    // bluetoothd itself: see `on_owner_item`.
+    let owner_sub = name_owner_changed();
+
     // Subscribe to ObjectManager signals on the root path.
     let ifaces_added_sub = hytte_bus::signals(BusKind::System, "org.bluez")
         .at_path("/")
@@ -387,9 +530,18 @@ async fn event_loop(
     let mut ifaces_added_items = ifaces_added_sub.items();
     let mut ifaces_removed_items = ifaces_removed_sub.items();
     let mut adapter_props_items = adapter_props_sub.items();
+    let mut owner_items = owner_sub.items();
 
     loop {
         tokio::select! {
+            item = owner_items.next() => {
+                let Some(item) = item else { break; };
+                if let Some(end) = on_owner_item(item, &resync_tx) {
+                    tracing::info!("bluetoothd exited (org.bluez has no owner)");
+                    return Ok(end);
+                }
+            }
+
             item = ifaces_added_items.next() => {
                 let Some(item) = item else { break; };
                 let evt = bluetooth_marker_or_event(item, "InterfacesAdded", &resync_tx);
@@ -397,7 +549,6 @@ async fn event_loop(
                 let added = handle_ifaces_added(
                     state,
                     adapter_path,
-                    adapter_path_store,
                     evt.body,
                     props_tx.clone(),
                     resync_tx.clone(),
@@ -436,7 +587,7 @@ async fn event_loop(
         }
     }
 
-    Ok(())
+    Ok(ListenEnd::StreamClosed)
 }
 
 /// Subscribe to `PropertiesChanged` on a single device path, forwarding
@@ -529,7 +680,6 @@ where
 async fn handle_ifaces_added(
     state: &State,
     adapter_path: &str,
-    adapter_path_store: &Arc<tokio::sync::RwLock<String>>,
     msg: zbus::Message,
     props_tx: tokio::sync::mpsc::UnboundedSender<DeviceProps>,
     resync_tx: ResyncWake,
@@ -543,13 +693,8 @@ async fn handle_ifaces_added(
     };
 
     let p = path.as_str();
-    if ifaces.contains_key("org.bluez.Adapter1") && adapter_path.is_empty() {
-        // New adapter appeared while we have none (edge case).
-        if let Some(aprops) = ifaces.get("org.bluez.Adapter1") {
-            let a = parse_adapter_props(p, aprops);
-            state.adapter.set(Some(a));
-            set_adapter_path(p, adapter_path_store).await;
-        }
+    if adapter_reappeared(p, &ifaces, adapter_path, &resync_tx) {
+        return false;
     }
 
     if p.starts_with(adapter_path)
@@ -587,6 +732,35 @@ async fn handle_ifaces_added(
     }
 
     false
+}
+
+/// Arm a re-sync if this `InterfacesAdded` announces the tracked adapter
+/// itself, and say whether it did.
+///
+/// The adapter object only appears for one reason while this watcher is
+/// running: a bluetoothd that started after the one our snapshot came from,
+/// re-announcing it at the same path. (A removed adapter ends the loop in
+/// [`handle_ifaces_removed`], so it never gets this far.) The new daemon's
+/// state is not ours, so re-read all of it. This covers a restart even if the
+/// `NameOwnerChanged` for it was missed.
+///
+/// This replaces a branch that could never run. It adopted the adapter only
+/// when `adapter_path` was empty, but [`listen`] returns before this loop
+/// starts if it finds no adapter, so `adapter_path` was never empty here. An
+/// adapter at a *different* path is still ignored: the watcher tracks the
+/// first adapter only, as before.
+fn adapter_reappeared(
+    path: &str,
+    ifaces: &HashMap<String, HashMap<String, OwnedValue>>,
+    adapter_path: &str,
+    wake: &ResyncWake,
+) -> bool {
+    if path != adapter_path || !ifaces.contains_key("org.bluez.Adapter1") {
+        return false;
+    }
+    tracing::info!(path, "bluetooth adapter re-announced; re-syncing devices");
+    arm_resync(wake, "adapter InterfacesAdded");
+    true
 }
 
 /// Returns `true` when the adapter was removed (caller should reconnect).
@@ -721,6 +895,171 @@ mod tests {
         let evt = bluetooth_marker_or_event(SignalItem::Event(signal_event()), "test", &tx);
         assert!(evt.is_some(), "an ordinary event must be forwarded");
         assert!(rx.try_recv().is_err());
+    }
+
+    // ── bluetoothd restarts: NameOwnerChanged + a re-announced adapter ──────
+
+    fn noc_item(name: &str, old: &str, new: &str) -> SignalItem {
+        let body = zbus::Message::signal(
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "NameOwnerChanged",
+        )
+        .expect("signal builder")
+        .build(&(name, old, new))
+        .expect("build NameOwnerChanged");
+        SignalItem::Event(SignalEvent {
+            body,
+            sender: None,
+            timestamp: std::time::SystemTime::now(),
+        })
+    }
+
+    /// bluetoothd exiting ends the watch, so the supervised loop clears the
+    /// snapshot. Before this, nothing in the watcher noticed, and the old
+    /// daemon's devices and `Discovering = true` stayed up.
+    ///
+    /// Falsifiable: make `Lost` return `None` and the `DaemonExited`
+    /// assertion fails.
+    #[test]
+    fn bluetoothd_exiting_ends_the_watch() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(RESYNC_WAKE_QUEUE);
+        assert_eq!(
+            on_owner_item(noc_item("org.bluez", ":1.4", ""), &tx),
+            Some(ListenEnd::DaemonExited),
+            "a lost org.bluez must end the watch"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "and must not re-sync: that is a call to org.bluez, which would start it again"
+        );
+    }
+
+    /// A new bluetoothd arms exactly one re-sync, whether or not this
+    /// subscription saw the old one go.
+    #[test]
+    fn a_new_bluetoothd_arms_one_resync() {
+        for (old, new) in [("", ":1.9"), (":1.4", ":1.9")] {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(RESYNC_WAKE_QUEUE);
+            assert_eq!(on_owner_item(noc_item("org.bluez", old, new), &tx), None);
+            assert!(rx.try_recv().is_ok(), "{old:?} -> {new:?} must re-sync");
+            assert!(rx.try_recv().is_err(), "exactly once");
+        }
+    }
+
+    /// Every other name on the system bus passes through untouched. The
+    /// match rule is unfiltered, so most of what arrives here is someone
+    /// else's.
+    #[test]
+    fn other_names_are_ignored() {
+        for name in ["org.freedesktop.UPower", "org.bluez.obex", ":1.4"] {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(RESYNC_WAKE_QUEUE);
+            assert_eq!(on_owner_item(noc_item(name, ":1.4", ""), &tx), None);
+            assert!(rx.try_recv().is_err(), "{name} must not re-sync bluetooth");
+        }
+    }
+
+    /// A marker on this subscription may hide an owner change, so it
+    /// re-syncs like any other marker in the fold.
+    #[test]
+    fn a_marker_on_the_owner_subscription_resyncs() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(RESYNC_WAKE_QUEUE);
+        assert_eq!(on_owner_item(SignalItem::Resubscribed, &tx), None);
+        assert!(rx.try_recv().is_ok());
+    }
+
+    /// Waiting for bluetoothd wakes on its new owner, and only on that.
+    /// Someone else's name coming or going, and `org.bluez` going away, do
+    /// not count.
+    ///
+    /// Falsifiable: return on any `Event` in `next_bluez_owner` and the
+    /// second half fails, because the wait ends on an unrelated name.
+    #[tokio::test(start_paused = true)]
+    async fn waiting_for_bluez_wakes_on_its_new_owner_only() {
+        let noise = || {
+            futures_util::stream::iter([
+                noc_item("org.freedesktop.UPower", "", ":1.3"),
+                noc_item("org.bluez", ":1.4", ""),
+                noc_item(":1.5", ":1.5", ""),
+            ])
+        };
+
+        let mut items = noise()
+            .chain(futures_util::stream::iter([noc_item(
+                "org.bluez",
+                "",
+                ":1.9",
+            )]))
+            .chain(futures_util::stream::pending());
+        tokio::time::timeout(BLUEZ_RECHECK, next_bluez_owner(&mut items))
+            .await
+            .expect("a new org.bluez owner must end the wait");
+
+        let mut items = noise().chain(futures_util::stream::pending());
+        assert!(
+            tokio::time::timeout(BLUEZ_RECHECK, next_bluez_owner(&mut items))
+                .await
+                .is_err(),
+            "nothing here announces a new bluetoothd"
+        );
+    }
+
+    /// A marker ends the wait so the caller asks the bus again: the owner
+    /// change it may hide could be the one being waited for. A stream that
+    /// ends does not end the wait, so the caller's re-check interval paces
+    /// it instead of a busy loop.
+    #[tokio::test(start_paused = true)]
+    async fn waiting_for_bluez_rechecks_on_a_marker_and_idles_on_a_closed_stream() {
+        let mut items = futures_util::stream::iter([SignalItem::Lagged { skipped: 3 }])
+            .chain(futures_util::stream::pending());
+        tokio::time::timeout(BLUEZ_RECHECK, next_bluez_owner(&mut items))
+            .await
+            .expect("a marker must end the wait");
+
+        let mut items = futures_util::stream::empty::<SignalItem>();
+        assert!(
+            tokio::time::timeout(BLUEZ_RECHECK, next_bluez_owner(&mut items))
+                .await
+                .is_err(),
+            "a closed stream must leave the pacing to the timeout"
+        );
+    }
+
+    /// The tracked adapter being announced again is a new daemon's adapter:
+    /// re-read everything. Before this fix, the branch for it required an
+    /// empty `adapter_path`, which the loop never has, so it never ran.
+    #[test]
+    fn the_adapter_reannounced_at_its_own_path_resyncs() {
+        let ifaces =
+            |iface: &str| HashMap::from([(iface.to_owned(), HashMap::<String, OwnedValue>::new())]);
+        let adapter = "/org/bluez/hci0";
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(RESYNC_WAKE_QUEUE);
+        assert!(adapter_reappeared(
+            adapter,
+            &ifaces("org.bluez.Adapter1"),
+            adapter,
+            &tx
+        ));
+        assert!(
+            rx.try_recv().is_ok(),
+            "the re-announced adapter must re-sync"
+        );
+
+        // A second adapter elsewhere, and an ordinary device, are not it.
+        assert!(!adapter_reappeared(
+            "/org/bluez/hci1",
+            &ifaces("org.bluez.Adapter1"),
+            adapter,
+            &tx
+        ));
+        assert!(!adapter_reappeared(
+            "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF",
+            &ifaces("org.bluez.Device1"),
+            adapter,
+            &tx
+        ));
+        assert!(rx.try_recv().is_err(), "neither may re-sync");
     }
 
     // ── #1201 review M3: one re-read per burst, not one per subscription ────

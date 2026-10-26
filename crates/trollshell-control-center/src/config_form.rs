@@ -1362,7 +1362,7 @@ impl Note {
 
     /// Read it back — what a test asserts on, so it reads the widget rather
     /// than this module's own bookkeeping.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "system-tests"))]
     fn get(&self) -> String {
         match self {
             Self::Subtitle(row) => row.subtitle().map(|s| s.to_string()).unwrap_or_default(),
@@ -2536,13 +2536,16 @@ mod tests {
 
     /// The fixture family, as a [`ShellFamily`] — so its form goes through
     /// the same [`ShellSubsystem`] `core-leds` does.
+    #[cfg(feature = "system-tests")]
     struct Fixture;
 
+    #[cfg(feature = "system-tests")]
     impl ShellFamily for Fixture {
         const FAMILY: &'static Family = &fixture::FAMILY;
     }
 
     /// The fixture's ops, editable.
+    #[cfg(feature = "system-tests")]
     pub(super) fn fixture_ops() -> FamilyOps {
         FamilyOps::of::<ShellSubsystem<Fixture>>(&fixture::FAMILY, RELOAD_LIVE)
     }

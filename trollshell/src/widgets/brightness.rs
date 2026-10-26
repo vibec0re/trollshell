@@ -94,6 +94,20 @@ pub(crate) fn set_from_slider(level: f64) {
     }
 }
 
+/// The level [`LAST_REQUEST`] holds on this thread, for the drawer row's
+/// wiring test (`panels::power::slider_tests`).
+#[cfg(all(test, feature = "system-tests"))]
+pub(crate) fn last_request_level() -> Option<f64> {
+    LAST_REQUEST.with(|last| last.get().map(|(level, _)| level))
+}
+
+/// Forget [`LAST_REQUEST`] on this thread. Every `#[gtk::test]` shares one GTK
+/// thread, so a test that reads the record clears it first.
+#[cfg(all(test, feature = "system-tests"))]
+pub(crate) fn forget_last_request() {
+    LAST_REQUEST.with(|last| last.set(None));
+}
+
 pub fn widget(monitor: &Monitor) -> gtk::Widget {
     let btn =
         crate::components::chip::indicator("ts-brightness", crate::modal::Page::Power, monitor);

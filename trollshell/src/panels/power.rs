@@ -319,7 +319,8 @@ mod markup_tests {
     }
 }
 
-/// The brightness slider under a **real** drag (#1559, from #1495).
+/// The brightness slider under a **real** drag (#1559, from #1495), and the
+/// drawer row's choice of setter.
 ///
 /// What #1495 changed here is GTK-only: the slider binds through
 /// `bind_two_way_drag_safe`, whose grab tracker is a capture-phase controller
@@ -448,6 +449,70 @@ mod slider_tests {
             !writes.borrow().iter().any(|w| close(*w, 0.2)),
             "the reading was written back as a request: {:?}",
             writes.borrow()
+        );
+    }
+
+    /// The first `gtk::Scale` under `widget`, depth first.
+    fn find_scale(widget: &gtk::Widget) -> Option<gtk::Scale> {
+        if let Some(scale) = widget.downcast_ref::<gtk::Scale>() {
+            return Some(scale.clone());
+        }
+        let mut child = widget.first_child();
+        while let Some(c) = child {
+            if let Some(scale) = find_scale(&c) {
+                return Some(scale);
+            }
+            child = c.next_sibling();
+        }
+        None
+    }
+
+    /// The drawer's brightness row writes through
+    /// `widgets::brightness::set_from_slider`, so what the user sets on the
+    /// slider is what the chip's next scroll notch steps from (#1559). The
+    /// `brightness_slider_from` seam takes the setter as a parameter, so this
+    /// pins the one line that picks it, in `build_brightness_row` itself.
+    ///
+    /// The row is built against a registered brightness service whose handles
+    /// are the defaults (no reading), so nothing polls sysfs. The setter's own
+    /// `brightness::set` does start the writer task, but the writer cannot reach
+    /// logind: `do_set` stops at "no backlight device discovered yet", because
+    /// only the service's poll loop ever records a device, and nothing here
+    /// starts it. No pointer is needed: `set_value` emits `value-changed`
+    /// synchronously, insensitive slider or not.
+    ///
+    /// **Mutation:** pass `brightness::set` in `build_brightness_row` → this
+    /// reds with "None".
+    #[gtk::test]
+    fn the_drawer_row_records_the_chips_base() {
+        use hytte::prelude::Service;
+        use hytte::services::brightness::BrightnessHandles;
+
+        struct NoBacklight;
+        impl Service for NoBacklight {
+            type Handles = BrightnessHandles;
+            fn start(self, _rt: &tokio::runtime::Handle) -> BrightnessHandles {
+                BrightnessHandles::default()
+            }
+        }
+
+        adw::init().expect("libadwaita init");
+        if hytte::reactive::registry::with(|r| r.get::<BrightnessHandles>().is_none()) {
+            hytte::reactive::registry::install(
+                Box::new(NoBacklight),
+                hytte::reactive::runtime::handle(),
+            );
+        }
+        crate::widgets::brightness::forget_last_request();
+
+        let row = super::build_brightness_row();
+        let scale = find_scale(row.upcast_ref()).expect("the row holds the slider");
+        scale.set_value(0.3);
+
+        let base = crate::widgets::brightness::last_request_level();
+        assert!(
+            base.is_some_and(|b| close(b, 0.3)),
+            "the drawer slider's write is not the chip's base: {base:?}"
         );
     }
 }

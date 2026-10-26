@@ -2192,20 +2192,47 @@ pub async fn list() -> Vec<systemd::PluginUnit> {
     merge_declared(units, &declared.plugins)
 }
 
-/// Every plugin id `plugins.json` declares, or `None` when a `plugins.json`
-/// exists but cannot be read or parsed — so a caller that prunes by this set
-/// (the host's settings cache, #1415 review L3) can tell "declares nothing"
-/// from "could not tell" and leave things alone on the second.
+/// Every plugin id `plugins.json` declares, or `None` when it cannot tell:
+/// a `plugins.json` that exists but cannot be read or parsed, **or no
+/// `plugins.json` at all** — so a caller that prunes by this set (the host's
+/// settings cache, #1415 review L3) can tell "declares nothing" from "could
+/// not tell" and leave things alone on the second.
+///
+/// A missing file is "could not tell" here, unlike in [`load_declared_from`],
+/// where it means "every declarative plugin was removed" and [`reconcile`]
+/// stops them. A switch can leave the file briefly absent (a home-manager
+/// link swapped, a dangling symlink), and reading that as "declares nothing"
+/// would make the settings cache forget every unconnected plugin's form and
+/// delete its file. The cache keeps its last good reading instead, which on
+/// a first start with no cache is empty — so a missing file still declares
+/// nothing there.
 pub async fn declared_ids() -> Option<BTreeSet<String>> {
     declared_ids_from(&Sources::from_env()).await
 }
 
 /// [`declared_ids`] over explicit [`Sources`], so the `None` contract is
 /// testable against scratch files (#1415 second review B4).
+///
+/// The missing-file check runs after the load and only when it declared
+/// nothing, since that is the one result a missing file produces.
 async fn declared_ids_from(sources: &Sources) -> Option<BTreeSet<String>> {
-    load_declared_from(sources)
-        .await
-        .map(|declared| declared.plugins.into_keys().collect())
+    let declared = load_declared_from(sources).await?;
+    if declared.plugins.is_empty() && !any_exists(&sources.config).await {
+        return None;
+    }
+    Some(declared.plugins.into_keys().collect())
+}
+
+/// Whether any of `paths` exists, following symlinks. One that cannot be
+/// checked counts as absent: the caller's answer for that is "could not
+/// tell".
+async fn any_exists(paths: &[PathBuf]) -> bool {
+    for path in paths {
+        if matches!(tokio::fs::try_exists(path).await, Ok(true)) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Overlay the declared set onto systemd's unit list — see [`list`]. Pure.
@@ -6931,7 +6958,7 @@ mod tests {
 
     /// B4: `declared_ids` tells "declares nothing" from "could not tell", so
     /// the host's settings cache never forgets every id because
-    /// `plugins.json` was briefly unreadable.
+    /// `plugins.json` was briefly unreadable — or briefly missing.
     #[tokio::test]
     async fn declared_ids_are_none_when_plugins_json_cannot_be_read() {
         let (_dir, sources, _toml) = scratch_sources("{ this is not json");
@@ -6943,6 +6970,18 @@ mod tests {
             Some(BTreeSet::from(["pet".to_owned(), "timer".to_owned()]))
         );
 
+        // A file that is there and declares no plugin does declare nothing.
+        let (_empty_dir, empty, _toml) = scratch_sources(r#"{"version":1,"plugins":{}}"#);
+        assert_eq!(
+            declared_ids_from(&empty).await,
+            Some(BTreeSet::new()),
+            "a present file with no plugins declares nothing"
+        );
+
+        // A missing file cannot tell: the caller keeps its last good reading,
+        // which a first start with no cache has empty (so nothing is declared
+        // there either — `plugins::settings`'
+        // `a_missing_plugins_json_keeps_a_known_set_and_declares_nothing_on_first_start`).
         let missing = Sources {
             config: vec![dir.path().join("absent/plugins.json")],
             overrides: None,
@@ -6950,8 +6989,21 @@ mod tests {
         };
         assert_eq!(
             declared_ids_from(&missing).await,
-            Some(BTreeSet::new()),
-            "a missing file does declare nothing"
+            None,
+            "a missing file cannot tell, rather than declaring nothing"
+        );
+        let dangling = dir.path().join("dangling.json");
+        std::os::unix::fs::symlink(dir.path().join("absent/target.json"), &dangling)
+            .expect("symlink");
+        let swapped = Sources {
+            config: vec![dangling],
+            overrides: None,
+            settings: None,
+        };
+        assert_eq!(
+            declared_ids_from(&swapped).await,
+            None,
+            "a dangling link mid-switch is missing too"
         );
     }
 

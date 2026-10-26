@@ -1273,8 +1273,15 @@ fn spend_effect_tokens(
 /// Filter a render frame's effects through the plugin's rate limiter,
 /// dropping (with a warn) any that exceed the cap. All effects in one frame share
 /// a single `now`, so a burst frame depletes the bucket in order.
+///
+/// A provider's [`Effect::DatasourceResult`] answering a query the host parked
+/// for it skips the bucket ([`super::datasource::DatasourceRouter::admit_answer`],
+/// once per query): it is the host's own request coming back, already paid for
+/// from the requester's bucket, and metering it here dropped a busy provider's
+/// answers and timed its requesters out. Any other result is metered.
 fn throttle_effects(
     buckets: &EffectBuckets,
+    datasource: &super::DatasourceRouter,
     plugin_id: &str,
     effects: Vec<Effect>,
     warned: &mut EffectWarnLatch,
@@ -1283,10 +1290,18 @@ fn throttle_effects(
         return effects;
     }
     let now = Instant::now();
-    let verdicts = spend_effect_tokens(buckets, plugin_id, effects.len(), now);
+    let answers: Vec<bool> = effects
+        .iter()
+        .map(|effect| {
+            matches!(effect, Effect::DatasourceResult { request_id, .. }
+                if datasource.admit_answer(*request_id, plugin_id))
+        })
+        .collect();
+    let metered = answers.iter().filter(|answer| !**answer).count();
+    let mut verdicts = spend_effect_tokens(buckets, plugin_id, metered, now).into_iter();
     let mut kept = Vec::with_capacity(effects.len());
-    for (effect, allowed) in effects.into_iter().zip(verdicts) {
-        if allowed {
+    for (effect, answer) in effects.into_iter().zip(answers) {
+        if answer || verdicts.next().unwrap_or(false) {
             kept.push(effect);
         } else {
             // #1165 item 5: latched per connection per effect *kind*, and
@@ -1894,6 +1909,7 @@ pub(super) async fn serve_conn(
                     let requested = effects.len();
                     let kept = throttle_effects(
                         &ctx.effect_buckets,
+                        &ctx.datasource,
                         &plugin_id,
                         enforce_capabilities(
                             &capabilities,

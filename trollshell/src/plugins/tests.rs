@@ -3670,6 +3670,242 @@ async fn provides_without_capability_is_not_registered() {
     ));
 }
 
+/// Connect a datasource provider through `handle_conn`: plugin `id`, mounted at
+/// `mount` (whose mailbox `region` is), providing `datasource` with scope
+/// `next`. Returns once the handshake is done — the render it sends parks a
+/// card only after the providers are registered — with the plugin's read end
+/// and write end.
+async fn connect_provider(
+    ctx: &ListenerCtx,
+    id: &str,
+    mount: Mount,
+    region: &Mutable<Vec<SlotRender>>,
+    datasource: &str,
+) -> (
+    tokio::net::unix::OwnedReadHalf,
+    tokio::net::unix::OwnedWriteHalf,
+) {
+    let (host, plugin) = UnixStream::pair().expect("socketpair");
+    let ctx = ctx.clone();
+    tokio::spawn(async move { handle_conn(host, &ctx).await });
+    let (prd, mut pwr) = plugin.into_split();
+    let mut manifest = Manifest::new(id, mount);
+    manifest.capabilities = vec![Capability::DatasourceProvider];
+    manifest.provides = vec![ProvidedDatasource::new(datasource, vec!["next".into()])];
+    write_frame(&mut pwr, &PluginMsg::Register { manifest })
+        .await
+        .expect("Register (provider)");
+    write_frame(&mut pwr, &provider_render(Vec::new()))
+        .await
+        .expect("Render");
+    wait_for_region(region).await;
+    (prd, pwr)
+}
+
+/// A provider's card frame carrying `effects`.
+fn provider_render(effects: Vec<Effect>) -> PluginMsg {
+    PluginMsg::Render {
+        tree: wire::Node::Label {
+            id: Some("t".into()),
+            text: "board".into(),
+            classes: vec![],
+            tooltip: None,
+        },
+        panel: None,
+        effects,
+        hidden_on: Vec::new(),
+    }
+}
+
+/// End to end through `handle_conn`: a second plugin listing a datasource that
+/// a connected plugin already serves does not take it over — it only stands
+/// by — and queries keep reaching the first plugin's connection.
+///
+/// Red against #509's unconditional latest-wins: the query is forwarded to the
+/// squatter's connection instead, and the first plugin's read times out.
+#[tokio::test]
+async fn a_second_plugin_cannot_take_over_a_connected_providers_datasource() {
+    let (_clock_tx, clock_rx) = watch::channel(None);
+    let (_vis_tx, vis_rx) = watch::channel(false);
+    let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+    let router = ctx.datasource.clone();
+
+    let (mut holder_rd, _holder_wr) = connect_provider(
+        &ctx,
+        "departures",
+        Mount::SidebarBottom,
+        &ctx.sidebar_bottom,
+        "departures",
+    )
+    .await;
+    let (_squatter_rd, _squatter_wr) = connect_provider(
+        &ctx,
+        "squatter",
+        Mount::SidebarTop,
+        &ctx.sidebar_top,
+        "departures",
+    )
+    .await;
+
+    let (req_tx, _req_rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
+    router.route_query(
+        "infobroker".into(),
+        5,
+        "departures".into(),
+        "next".into(),
+        "{}".into(),
+        req_tx,
+    );
+    let HostMsg::DatasourceQuery { datasource, .. } = recv(&mut holder_rd).await else {
+        panic!("the first provider must still receive the query");
+    };
+    assert_eq!(datasource, "departures");
+}
+
+/// End to end through `handle_conn`: once the provider serving a datasource
+/// disconnects, the plugin standing by for it — still connected, never
+/// re-registered — receives the next query.
+///
+/// Red against a refusal that keeps nothing: the datasource is unserved once
+/// the first plugin goes, the query is answered `NotFound`, and the standby's
+/// read times out.
+#[tokio::test]
+async fn a_standby_provider_serves_once_the_connected_one_leaves() {
+    let (_clock_tx, clock_rx) = watch::channel(None);
+    let (_vis_tx, vis_rx) = watch::channel(false);
+    let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+    let router = ctx.datasource.clone();
+
+    let (holder_rd, holder_wr) = connect_provider(
+        &ctx,
+        "departures",
+        Mount::SidebarBottom,
+        &ctx.sidebar_bottom,
+        "departures",
+    )
+    .await;
+    let (mut standby_rd, _standby_wr) = connect_provider(
+        &ctx,
+        "departures-2",
+        Mount::SidebarTop,
+        &ctx.sidebar_top,
+        "departures",
+    )
+    .await;
+
+    // The first plugin goes away. Its teardown unregisters its datasource
+    // before it leaves the runtime mirror, so once the mirror has lost it the
+    // standby has been promoted.
+    drop((holder_rd, holder_wr));
+    for _ in 0..200 {
+        if !ctx.runtime.lock().unwrap().contains_key("departures") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        !ctx.runtime.lock().unwrap().contains_key("departures"),
+        "the first provider's connection tore down"
+    );
+
+    let (req_tx, _req_rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
+    router.route_query(
+        "infobroker".into(),
+        6,
+        "departures".into(),
+        "next".into(),
+        "{}".into(),
+        req_tx,
+    );
+    let HostMsg::DatasourceQuery { datasource, .. } = recv(&mut standby_rd).await else {
+        panic!("the standby must receive the query once the holder left");
+    };
+    assert_eq!(datasource, "departures");
+}
+
+/// A busy provider's answers are not metered by its effect bucket: one frame
+/// answering three times [`EFFECT_BURST`] parked queries delivers every answer
+/// to the broker. Results that answer nothing are still metered, so only the
+/// burst of those gets through.
+///
+/// Red against the shared bucket: only [`EFFECT_BURST`] effects reach the
+/// broker in total, and the requesters behind the rest would time out.
+#[tokio::test]
+async fn a_providers_answers_to_parked_queries_skip_its_effect_bucket() {
+    let (_clock_tx, clock_rx) = watch::channel(None);
+    let (_vis_tx, vis_rx) = watch::channel(false);
+    let (ctx, mut effects_rx) = ctx_with(clock_rx, vis_rx);
+    let router = ctx.datasource.clone();
+    let (mut prd, mut pwr) = connect_provider(
+        &ctx,
+        "departures",
+        Mount::SidebarBottom,
+        &ctx.sidebar_bottom,
+        "departures",
+    )
+    .await;
+
+    let queries = EFFECT_BURST as usize * 3;
+    let (req_tx, _req_rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
+    for n in 0..queries {
+        router.route_query(
+            "infobroker".into(),
+            n as u64,
+            "departures".into(),
+            "next".into(),
+            "{}".into(),
+            req_tx.clone(),
+        );
+    }
+    let mut corrs = Vec::new();
+    while corrs.len() < queries {
+        let HostMsg::DatasourceQuery { request_id, .. } = recv(&mut prd).await else {
+            panic!("the provider must receive every forwarded query");
+        };
+        corrs.push(request_id);
+    }
+
+    // One frame: an answer to every query, then as many results that answer
+    // nothing the host parked.
+    let answer = |request_id, body: &str| Effect::DatasourceResult {
+        request_id,
+        outcome: DatasourceOutcome::Ready(body.into()),
+    };
+    let effects = corrs
+        .iter()
+        .map(|&corr| answer(corr, "rows"))
+        .chain((0..queries as u64).map(|n| answer(u64::MAX - n, "noise")))
+        .collect();
+    write_frame(&mut pwr, &provider_render(effects))
+        .await
+        .expect("Render with the answers");
+
+    let (mut rows, mut noise) = (0, 0);
+    for _ in 0..queries + EFFECT_BURST as usize {
+        let brokered = tokio::time::timeout(Duration::from_secs(5), effects_rx.recv())
+            .await
+            .expect("a brokered effect within 5s")
+            .expect("the effect channel is open");
+        match brokered.effect {
+            Effect::DatasourceResult {
+                outcome: DatasourceOutcome::Ready(body),
+                ..
+            } if body == "rows" => rows += 1,
+            Effect::DatasourceResult { .. } => noise += 1,
+            other => panic!("unexpected effect {other:?}"),
+        }
+    }
+    assert_eq!(rows, queries, "every answer to a parked query gets through");
+    assert_eq!(
+        noise, EFFECT_BURST as usize,
+        "results answering nothing are metered"
+    );
+    assert!(
+        effects_rx.try_recv().is_err(),
+        "the rest of the noise was dropped by the bucket"
+    );
+}
+
 // ── Session-lane wave: spectrum demand-gate (#559) + now-playing re-seed (#542) ─
 
 /// #559: the per-connection spectrum-tap demand state machine

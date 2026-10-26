@@ -1402,3 +1402,6 @@ mod gtk_tests {
         );
     }
 }
+
+#[cfg(all(test, feature = "system-tests"))]
+mod policy_tests;

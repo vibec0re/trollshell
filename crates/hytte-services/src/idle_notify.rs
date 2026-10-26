@@ -7,7 +7,9 @@
 //! reactively via [`state`], and fires the three actions natively at their
 //! thresholds:
 //!
-//! - **dim** — `brightnessctl -s set 10%` (saved level restored on resume),
+//! - **dim** — `brightnessctl -s set 10%` (saved level restored on resume —
+//!   including a resume that lands while the dim is still in flight, which
+//!   the dim then undoes itself; see `DimLatch`),
 //! - **lock** — [`crate::screensaver::lock`] (`loginctl lock-session`),
 //! - **suspend** — `systemctl suspend`,
 //!
@@ -52,8 +54,7 @@ use hytte_reactive::{
 };
 use std::collections::BTreeSet;
 use std::process::Stdio;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::wl_registry::WlRegistry;
@@ -156,8 +157,8 @@ impl Service for IdleNotifyService {
         // objects (dim/lock/suspend). Dropping the old ones cancels them, so
         // there is no double-arming, and the compositor — not this process —
         // owns the idle timer being re-observed. It also re-runs
-        // `reset_after_observer_error`, which is why `dimmed` is created out
-        // here: see `spawn_observer`.
+        // `reset_after_observer_error`, which is why the dim latch is created
+        // out here: see `spawn_observer`.
         spawn_observer(worker_state);
 
         IdleNotifyHandles { state }
@@ -206,22 +207,23 @@ struct IdleClient {
     idled: BTreeSet<u32>,
     /// Rough wall-clock estimate of when this idle cycle began.
     since: Option<DateTime<Local>>,
-    /// `true` while a native dim is in effect (backlight saved + lowered), so
+    /// Whether a native dim is in effect (backlight saved + lowered), so
     /// resume restores exactly what it dimmed and a *skipped* dim (inhibitor
-    /// held) leaves nothing to restore. Shared with the spawned action tasks
-    /// — and owned by the observer's reconnect loop, so it outlives any one
-    /// client incarnation (#431).
-    dimmed: Arc<AtomicBool>,
+    /// held) leaves nothing to restore — plus the resume count that lets a dim
+    /// still in flight see its cycle already ended ([`DimLatch`]). Shared with
+    /// the spawned dim tasks — and owned by the observer's reconnect loop, so
+    /// it outlives any one client incarnation (#431).
+    dim: Arc<DimLatch>,
 }
 
 impl IdleClient {
-    fn new(state: Mutable<IdleState>, dimmed: Arc<AtomicBool>) -> Self {
+    fn new(state: Mutable<IdleState>, dim: Arc<DimLatch>) -> Self {
         Self {
             state,
             notifications: Vec::new(),
             idled: BTreeSet::new(),
             since: None,
-            dimmed,
+            dim,
         }
     }
 
@@ -283,18 +285,27 @@ impl IdleClient {
     /// `sleep` for suspend, so "Keep awake" / a playing video's `idle`
     /// inhibitor holds off suspend too, not just dim/lock (#420). Runs off the
     /// observer thread so the Wayland dispatch loop keeps servicing events.
+    ///
+    /// Only the dim arm checks for a `resumed` that lands while it awaits
+    /// ([`dim_unless_resumed`]), because only the dim has a resume action that
+    /// such a resume could skip. Lock and suspend keep the plain gate-then-act
+    /// shape: a resume inside their gate read costs a lock the user then
+    /// dismisses (the security-safe direction) or a suspend issued just after
+    /// activity resumed — never state left stuck behind an active user.
     fn fire_action(&self, secs: u32) {
-        let dimmed = self.dimmed.clone();
+        let dim = Arc::clone(&self.dim);
+        // The dim's cycle is read **here**, on the observer thread, in event
+        // order. Read inside the task instead, a `resumed` dispatched before
+        // the task's first poll would already be counted, and the task would
+        // take an ended cycle for its own (see `DimLatch::generation`).
+        let generation = dim.generation();
         runtime::handle().spawn(async move {
             match secs {
                 DIM_SECS => {
-                    if inhibitor_blocks(&["idle"]).await {
-                        return;
-                    }
-                    // `brightnessctl -s set 10%` (save current, then dim).
-                    if run_command("brightnessctl", &["-s", "set", "10%"]).await {
-                        dimmed.store(true, Ordering::SeqCst);
-                    }
+                    dim_unless_resumed(&dim, generation, inhibitor_blocks(&["idle"]), |args| {
+                        run_command("brightnessctl", args)
+                    })
+                    .await;
                 }
                 LOCK_SECS => {
                     if inhibitor_blocks(&["idle"]).await {
@@ -322,9 +333,10 @@ impl IdleClient {
 
     /// Undim on resume (`brightnessctl -r`). Only restores when a native dim is
     /// actually in effect (a skipped dim leaves the flag clear), so a stale
-    /// restore never clobbers the saved level.
+    /// restore never clobbers the saved level — and ends the dim's cycle, so a
+    /// dim still in flight undoes itself rather than landing after this.
     fn restore_dim(&self) {
-        restore_dim_if_dimmed(&self.dimmed);
+        restore_dim_if_dimmed(&self.dim);
     }
 }
 
@@ -522,6 +534,177 @@ async fn run_command(program: &'static str, args: &'static [&'static str]) -> bo
     }
 }
 
+// ── The dim against its own resume ──────────────────────────────────────────
+
+/// `brightnessctl` arguments for the dim: `-s` saves the current level first,
+/// which is what [`RESTORE_ARGS`] puts back.
+const DIM_ARGS: &[&str] = &["-s", "set", "10%"];
+
+/// `brightnessctl` arguments for the undim: restore the level `-s` saved.
+const RESTORE_ARGS: &[&str] = &["-r"];
+
+/// The native dim's state, shared by the two sides that race over it: the
+/// observer thread, which dispatches `resumed`, and the dim task
+/// [`IdleClient::fire_action`] spawns, which awaits the logind gate and then
+/// `brightnessctl -s set 10%`.
+///
+/// Before this the shared state was a bare `dimmed` flag the task set only
+/// *after* both awaits. A `resumed` dispatched inside either one read the flag
+/// clear and restored nothing; the dim then landed, set the flag, and nothing
+/// restored it — the screen stayed at 10% under an active user, and the next
+/// cycle's `-s` saved that 10% as the level to restore, so it stayed there
+/// for good. The window is the gate's D-Bus round trip plus the
+/// `brightnessctl` exec: milliseconds normally, and up to `hytte_bus::call`'s
+/// 25 s timeout and its one retry when logind is slow to answer.
+///
+/// Two fields under one lock close it:
+///
+/// - `resumes` counts the dim threshold's resumes. A dim task carries the
+///   count from the moment its `idled` was dispatched
+///   ([`DimLatch::generation`]), so after each await it can tell whether its
+///   own idle cycle already ended.
+/// - `dimmed` is set only by a dim whose cycle is still current
+///   ([`DimLatch::applied`]), and taken — in the same critical section as the
+///   bump — by [`DimLatch::resume`].
+///
+/// Why that is enough: the dim's last step and a resume are each one critical
+/// section on the same lock, so exactly one of them comes first. If the resume
+/// does, the dim sees the count moved, leaves `dimmed` clear and undoes itself
+/// ([`Applied::RestoreNow`]); if the dim does, `dimmed` is set and the resume
+/// takes it and restores. Either way a dim that lands gets exactly one
+/// `brightnessctl -r` and a dim that does not gets none. A resume during the
+/// gate read is caught one step earlier, by [`DimLatch::may_dim`], so the
+/// screen never dips at all. It is a `std` `Mutex` held for a field update and
+/// never across an await, which is what lets the observer thread take it from
+/// inside Wayland dispatch.
+///
+/// The saved-original half: [`DimLatch::may_dim`] also refuses while a dim is
+/// in effect, so `-s` never runs over this module's own 10%, and a dimmed
+/// level cannot become the one `-r` restores.
+///
+/// An observer reset ([`reset_after_observer_error`]) ends the cycle through
+/// [`DimLatch::resume`] too — a reset stands in for a resume nobody saw — so a
+/// dim still in flight from a dead incarnation is undone the same way instead
+/// of landing on a seat the next incarnation's fresh notifications will never
+/// report resumed.
+#[derive(Default)]
+struct DimLatch {
+    state: Mutex<DimState>,
+}
+
+/// What [`DimLatch`] guards.
+#[derive(Default)]
+struct DimState {
+    /// How many times the dim threshold's idle cycle has ended.
+    resumes: u64,
+    /// `true` while a native dim is in effect (backlight saved + lowered).
+    dimmed: bool,
+}
+
+/// What [`DimLatch::applied`] tells the dim task to do once
+/// `brightnessctl -s set 10%` has succeeded.
+#[derive(Debug, PartialEq, Eq)]
+enum Applied {
+    /// The cycle is still current: the dim is now in effect, and the cycle's
+    /// resume restores it.
+    InEffect,
+    /// The cycle resumed while `brightnessctl` ran. That resume found no dim
+    /// in effect and restored nothing, so the dim task owes the `-r` itself.
+    RestoreNow,
+}
+
+impl DimLatch {
+    fn lock(&self) -> MutexGuard<'_, DimState> {
+        // Nothing panics while this is held (field updates only), but a
+        // poisoned latch must not take the dim/restore path down with it.
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The idle cycle a dim fired now belongs to. Read on the observer thread
+    /// while `idled` is dispatched, never inside the spawned task: a `resumed`
+    /// dispatched before the task's first poll would otherwise already be
+    /// counted, and the task would take an ended cycle for its own.
+    fn generation(&self) -> u64 {
+        self.lock().resumes
+    }
+
+    /// May the dim fired in `generation` run `brightnessctl -s set 10%` now?
+    /// Not if its cycle already resumed (the gate read outlasted the idle), and
+    /// not while a dim is in effect — a second `-s` would save the 10% as the
+    /// level `-r` restores.
+    fn may_dim(&self, generation: u64) -> bool {
+        let state = self.lock();
+        state.resumes == generation && !state.dimmed
+    }
+
+    /// Record that the dim fired in `generation` has lowered the backlight, and
+    /// say whether it stays down ([`Applied::InEffect`]) or must be undone now
+    /// because its cycle resumed while `brightnessctl` ran.
+    fn applied(&self, generation: u64) -> Applied {
+        let mut state = self.lock();
+        if state.resumes == generation {
+            state.dimmed = true;
+            Applied::InEffect
+        } else {
+            Applied::RestoreNow
+        }
+    }
+
+    /// The dim threshold resumed (or an observer reset stands in for it): end
+    /// the current cycle and take the dim in effect, if any. `true` means the
+    /// caller owes the backlight one `brightnessctl -r`.
+    fn resume(&self) -> bool {
+        let mut state = self.lock();
+        state.resumes += 1;
+        std::mem::take(&mut state.dimmed)
+    }
+
+    /// Whether a native dim is in effect — what the tests assert on.
+    #[cfg(test)]
+    fn is_dimmed(&self) -> bool {
+        self.lock().dimmed
+    }
+}
+
+/// The dim arm of [`IdleClient::fire_action`]: read the gate, dim, and — if
+/// the cycle resumed while either was awaited — skip the dim or undo it (see
+/// [`DimLatch`] for why each check sits where it does).
+///
+/// `gate` is the logind read ([`inhibitor_blocks`]; `true` = skip) and `run`
+/// one `brightnessctl` invocation (`true` = it exited 0). Both are injected so
+/// the tests can land a resume inside either await with no bus and no
+/// backlight. The `-r` owed by [`Applied::RestoreNow`] runs here, in sequence
+/// after the `-s set`, so the two can never reach `brightnessctl` out of order.
+async fn dim_unless_resumed<F>(
+    dim: &DimLatch,
+    generation: u64,
+    gate: impl Future<Output = bool>,
+    run: impl Fn(&'static [&'static str]) -> F,
+) where
+    F: Future<Output = bool>,
+{
+    if gate.await {
+        return;
+    }
+    if !dim.may_dim(generation) {
+        tracing::info!(
+            target: LOG_TARGET,
+            "native dim dropped — the seat resumed while the inhibitor gate was read (or a dim is already in effect)"
+        );
+        return;
+    }
+    if !run(DIM_ARGS).await {
+        return;
+    }
+    if dim.applied(generation) == Applied::RestoreNow {
+        tracing::info!(
+            target: LOG_TARGET,
+            "the seat resumed while the native dim ran; restoring the backlight now"
+        );
+        run(RESTORE_ARGS).await;
+    }
+}
+
 // ── Observer resilience (#431) ──────────────────────────────────────────────
 
 /// Capped-exponential-backoff schedule for the observer's reconnects (and the
@@ -567,15 +750,17 @@ impl RetryBackoff {
     }
 }
 
-/// Restore the saved backlight level iff a native dim is currently in effect.
-/// The flag is swapped **synchronously** (so callers observe it cleared on
-/// return); only the `brightnessctl -r` itself is fire-and-forget on the
-/// shared runtime. The flag guard is what keeps a stale restore from
-/// clobbering a manually-set brightness.
-fn restore_dim_if_dimmed(dimmed: &Arc<AtomicBool>) {
-    if dimmed.swap(false, Ordering::SeqCst) {
+/// End the dim threshold's idle cycle and restore the saved backlight level
+/// iff a native dim is currently in effect ([`DimLatch::resume`]). The latch
+/// is updated **synchronously** (so callers observe it cleared on return);
+/// only the `brightnessctl -r` itself is fire-and-forget on the shared
+/// runtime. The flag guard is what keeps a stale restore from clobbering a
+/// manually-set brightness; the cycle bump is what makes a dim still in flight
+/// undo itself instead of landing after this returns.
+fn restore_dim_if_dimmed(dim: &DimLatch) {
+    if dim.resume() {
         runtime::handle().spawn(async {
-            run_command("brightnessctl", &["-r"]).await;
+            run_command("brightnessctl", RESTORE_ARGS).await;
         });
     }
 }
@@ -585,36 +770,38 @@ fn restore_dim_if_dimmed(dimmed: &Arc<AtomicBool>) {
 /// last set may otherwise stay frozen forever) and restore a still-in-effect
 /// native dim (the seat may resume while the observer is down, in which case
 /// no `resumed` event ever reaches the *next* incarnation's fresh
-/// notification objects — the backlight would stay stuck at 10%).
-fn reset_after_observer_error(state: &Mutable<IdleState>, dimmed: &Arc<AtomicBool>) {
+/// notification objects — the backlight would stay stuck at 10%). It ends the
+/// dim's cycle as a resume would, so a dim still in flight from the dead
+/// incarnation undoes itself rather than landing after the reset.
+fn reset_after_observer_error(state: &Mutable<IdleState>, dim: &DimLatch) {
     state.set(IdleState::Active);
-    restore_dim_if_dimmed(dimmed);
+    restore_dim_if_dimmed(dim);
 }
 
 /// Start the observer on a supervised blocking thread (#1170).
 ///
-/// `dimmed` is created **here**, outside the supervised closure, so it survives
-/// a restart. That is the one piece of state a panic could otherwise corrupt in
-/// a way a restart would not repair: `run` unwinding between "backlight saved
-/// and lowered" and "resumed event restores it" would leave the screen at 10%
-/// with the next incarnation's fresh `false` flag having nothing to restore —
-/// exactly the stuck-backlight failure `reset_after_observer_error` was added
-/// for on the error path (#431). Every run therefore begins by calling it, so a
-/// panic-restart cleans up precisely as an error-reconnect does. On the first
-/// run it is a no-op (nothing published, nothing dimmed).
+/// The dim latch is created **here**, outside the supervised closure, so it
+/// survives a restart. That is the one piece of state a panic could otherwise
+/// corrupt in a way a restart would not repair: `run` unwinding between
+/// "backlight saved and lowered" and "resumed event restores it" would leave
+/// the screen at 10% with the next incarnation's fresh latch having nothing to
+/// restore — exactly the stuck-backlight failure `reset_after_observer_error`
+/// was added for on the error path (#431). Every run therefore begins by
+/// calling it, so a panic-restart cleans up precisely as an error-reconnect
+/// does. On the first run it is a no-op (nothing published, nothing dimmed).
 ///
 /// Split out from `Service::start` so the test below can supervise a body that
 /// panics without needing a compositor.
 fn spawn_observer(state: Mutable<IdleState>) {
-    let dimmed = Arc::new(AtomicBool::new(false));
-    supervise_observer("idle-notify-observer", state, dimmed, |state, dimmed| {
-        run_observer_with_reconnect(state, dimmed);
+    let dim = Arc::new(DimLatch::default());
+    supervise_observer("idle-notify-observer", state, dim, |state, dim| {
+        run_observer_with_reconnect(state, dim);
     });
 }
 
 /// [`spawn_observer`] with the name and the loop body injected, so the restart
-/// contract — the same `dimmed` across runs, and the reset on every entry — can
-/// be asserted against a body the test controls.
+/// contract — the same dim latch across runs, and the reset on every entry —
+/// can be asserted against a body the test controls.
 ///
 /// Supervised via [`spawn_supervised_blocking_bounded`] (#1196), not the plain
 /// `spawn_supervised_blocking`: `run_observer_with_reconnect`'s doc comment
@@ -623,17 +810,13 @@ fn spawn_observer(state: Mutable<IdleState>) {
 /// the bounded variant exists for — `debug!` and the health row released,
 /// instead of a `warn!` and a permanent `Returned` row on every host without
 /// the protocol.
-fn supervise_observer<F>(
-    name: &'static str,
-    state: Mutable<IdleState>,
-    dimmed: Arc<AtomicBool>,
-    body: F,
-) where
-    F: Fn(&Mutable<IdleState>, &Arc<AtomicBool>) + Send + Sync + 'static,
+fn supervise_observer<F>(name: &'static str, state: Mutable<IdleState>, dim: Arc<DimLatch>, body: F)
+where
+    F: Fn(&Mutable<IdleState>, &Arc<DimLatch>) + Send + Sync + 'static,
 {
     spawn_supervised_blocking_bounded(name, move || {
-        reset_after_observer_error(&state, &dimmed);
-        body(&state, &dimmed);
+        reset_after_observer_error(&state, &dim);
+        body(&state, &dim);
     });
 }
 
@@ -650,14 +833,14 @@ fn supervise_observer<F>(
 /// stays off (already logged inside [`run`]). On such a host the supervisor
 /// stops the task and its health row goes away — a correct absence from the
 /// Stats drawer, not a missing subsystem.
-fn run_observer_with_reconnect(state: &Mutable<IdleState>, dimmed: &Arc<AtomicBool>) {
+fn run_observer_with_reconnect(state: &Mutable<IdleState>, dim: &Arc<DimLatch>) {
     let mut backoff = RetryBackoff::default();
     loop {
         let started = Instant::now();
-        match run(state.clone(), dimmed.clone()) {
+        match run(state.clone(), Arc::clone(dim)) {
             Ok(()) => return,
             Err(err) => {
-                reset_after_observer_error(state, dimmed);
+                reset_after_observer_error(state, dim);
                 let delay = backoff.next_delay(started.elapsed());
                 tracing::error!(
                     target: LOG_TARGET,
@@ -676,7 +859,7 @@ fn run_observer_with_reconnect(state: &Mutable<IdleState>, dimmed: &Arc<AtomicBo
 /// dedicated observer thread; returns only on a fatal Wayland error — which
 /// [`run_observer_with_reconnect`] retries with backoff — or `Ok` when the
 /// compositor advertises no idle-notifier at all.
-fn run(state: Mutable<IdleState>, dimmed: Arc<AtomicBool>) -> Result<()> {
+fn run(state: Mutable<IdleState>, dim: Arc<DimLatch>) -> Result<()> {
     let conn = Connection::connect_to_env()
         .context("connect to the Wayland compositor (is WAYLAND_DISPLAY set?)")?;
     let (globals, mut queue) =
@@ -703,7 +886,7 @@ fn run(state: Mutable<IdleState>, dimmed: Arc<AtomicBool>) -> Result<()> {
         }
     };
 
-    let mut client = IdleClient::new(state, dimmed);
+    let mut client = IdleClient::new(state, dim);
     for &secs in &THRESHOLDS {
         // Protocol timeout is in milliseconds; the notification's user-data is
         // the threshold in seconds so the event handler can identify it.
@@ -793,8 +976,9 @@ impl Dispatch<ExtIdleNotificationV1, u32> for IdleClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-    use std::sync::atomic::AtomicUsize;
+    use futures_executor::block_on;
+    use std::cell::RefCell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// #1170's item 2 for the observer thread: panic a run and the next one
     /// starts — *and* starts clean.
@@ -817,19 +1001,21 @@ mod tests {
         const NAME: &str = "test-idle-observer-restart";
 
         let state = Mutable::new(IdleState::default());
-        let dimmed = Arc::new(AtomicBool::new(false));
+        let dim = Arc::new(DimLatch::default());
         let runs = Arc::new(AtomicUsize::new(0));
         // What run 2 found on entry, so the assertions read a snapshot rather
         // than racing the live handles.
         let second: Arc<Mutex<Option<(bool, IdleState)>>> = Arc::new(Mutex::new(None));
 
-        supervise_observer(NAME, state.clone(), Arc::clone(&dimmed), {
+        supervise_observer(NAME, state.clone(), Arc::clone(&dim), {
             let runs = Arc::clone(&runs);
             let second = Arc::clone(&second);
-            move |state, dimmed| {
+            move |state, dim| {
                 if runs.fetch_add(1, Ordering::SeqCst) == 0 {
                     // Mid-dim, mid-idle — the exact moment #431 cares about.
-                    dimmed.store(true, Ordering::SeqCst);
+                    let generation = dim.generation();
+                    assert!(dim.may_dim(generation));
+                    assert_eq!(dim.applied(generation), Applied::InEffect);
                     state.set(IdleState::Idle {
                         deepest_secs: DIM_SECS,
                         since: Local::now(),
@@ -839,7 +1025,7 @@ mod tests {
                 *second
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Some((dimmed.load(Ordering::SeqCst), state.get_cloned()));
+                    Some((dim.is_dimmed(), state.get_cloned()));
                 // Park so the supervisor stays live and keeps its health row.
                 std::thread::sleep(Duration::from_secs(30));
             }
@@ -904,9 +1090,9 @@ mod tests {
         const NAME: &str = "test-idle-observer-bounded-return";
 
         let state = Mutable::new(IdleState::default());
-        let dimmed = Arc::new(AtomicBool::new(false));
+        let dim = Arc::new(DimLatch::default());
 
-        supervise_observer(NAME, state, dimmed, |_state, _dimmed| {
+        supervise_observer(NAME, state, dim, |_state, _dim| {
             // A brief pause before returning widens the window in which the
             // row is observably present, so the first wait below is not
             // itself a race against an instant return.
@@ -957,7 +1143,7 @@ mod tests {
     fn snapshot_tracks_deepest_active_threshold() {
         let mut client = IdleClient::new(
             Mutable::new(IdleState::default()),
-            Arc::new(AtomicBool::new(false)),
+            Arc::new(DimLatch::default()),
         );
         assert_eq!(client.snapshot(), IdleState::Active);
 
@@ -1155,15 +1341,250 @@ mod tests {
     fn observer_error_reset_publishes_active() {
         // #431: when the observer dies mid-idle-cycle, whatever `Idle { .. }`
         // it last published must not stay frozen across the reconnect gap.
-        // (dimmed = false here so the no-dim path spawns no restore command —
-        // the dimmed = true path would exec a real `brightnessctl -r`.)
+        // (nothing dimmed here so the no-dim path spawns no restore command —
+        // a dim in effect would exec a real `brightnessctl -r`.)
         let state = Mutable::new(IdleState::Idle {
             deepest_secs: LOCK_SECS,
             since: Local::now(),
         });
-        let dimmed = Arc::new(AtomicBool::new(false));
-        reset_after_observer_error(&state, &dimmed);
+        let dim = Arc::new(DimLatch::default());
+        reset_after_observer_error(&state, &dim);
         assert_eq!(state.get_cloned(), IdleState::Active);
-        assert!(!dimmed.load(Ordering::SeqCst));
+        assert!(!dim.is_dimmed());
+    }
+
+    // ── The dim against its own resume ──────────────────────────────────────
+
+    /// The backlight `brightnessctl` drives, as far as the dim can tell: a
+    /// level, the level `-s` saved for `-r`, and every invocation in order.
+    struct FakeBacklight {
+        level: u32,
+        saved: Option<u32>,
+        ran: Vec<&'static [&'static str]>,
+    }
+
+    impl FakeBacklight {
+        fn at(level: u32) -> RefCell<Self> {
+            RefCell::new(Self {
+                level,
+                saved: None,
+                ran: Vec::new(),
+            })
+        }
+
+        /// What `brightnessctl` does with the two argument lists the dim uses.
+        fn run(&mut self, args: &'static [&'static str]) {
+            self.ran.push(args);
+            if args == DIM_ARGS {
+                self.saved = Some(self.level);
+                self.level = 10;
+            } else if args == RESTORE_ARGS {
+                if let Some(saved) = self.saved {
+                    self.level = saved;
+                }
+            } else {
+                panic!("the dim ran an unexpected brightnessctl {args:?}");
+            }
+        }
+    }
+
+    /// Where an idle cycle's `resumed` lands relative to its dim task.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ResumeLands {
+        /// While the task awaits logind's `BlockInhibited`.
+        DuringGate,
+        /// While `brightnessctl -s set 10%` runs — the window the bare
+        /// `dimmed` flag lost a resume in.
+        DuringDim,
+        /// After the task finished — the ordinary cycle.
+        AfterDim,
+    }
+
+    /// One idle cycle of the dim threshold, with its `resumed` landing at
+    /// `when`. `idled` reads the generation on the "observer thread" (here: up
+    /// front, before the task runs) exactly as [`IdleClient::fire_action`]
+    /// does, and the resume is [`restore_dim_if_dimmed`]'s decision —
+    /// [`DimLatch::resume`] — with the restore it owes run against the fake
+    /// instead of spawned. The task itself is the production
+    /// [`dim_unless_resumed`], with no inhibitor held.
+    fn idle_cycle(dim: &DimLatch, backlight: &RefCell<FakeBacklight>, when: ResumeLands) {
+        let resume = || {
+            if dim.resume() {
+                backlight.borrow_mut().run(RESTORE_ARGS);
+            }
+        };
+        let generation = dim.generation();
+        let gate = async {
+            if when == ResumeLands::DuringGate {
+                resume();
+            }
+            false
+        };
+        block_on(dim_unless_resumed(dim, generation, gate, |args| {
+            let resume = &resume;
+            async move {
+                backlight.borrow_mut().run(args);
+                if args == DIM_ARGS && when == ResumeLands::DuringDim {
+                    resume();
+                }
+                true
+            }
+        }));
+        if when == ResumeLands::AfterDim {
+            resume();
+        }
+    }
+
+    /// The bug: a resume dispatched while `brightnessctl -s set 10%` runs used
+    /// to read `dimmed` still clear and restore nothing, and the dim then set
+    /// it — the screen stayed at 10% under an active user. Now the dim sees
+    /// its cycle ended and undoes itself, exactly once.
+    ///
+    /// Falsify by making [`DimLatch::applied`] set `dimmed` unconditionally
+    /// (the old "set it after the await" order): the backlight ends at 10%
+    /// and the latch still thinks a dim is in effect.
+    #[test]
+    fn a_resume_while_the_dim_runs_restores_the_backlight() {
+        let dim = DimLatch::default();
+        let backlight = FakeBacklight::at(80);
+
+        idle_cycle(&dim, &backlight, ResumeLands::DuringDim);
+
+        let backlight = backlight.borrow();
+        assert_eq!(backlight.level, 80, "the resume was lost: still dimmed");
+        assert_eq!(
+            backlight.ran,
+            [DIM_ARGS, RESTORE_ARGS],
+            "one dim, one restore"
+        );
+        assert!(
+            !dim.is_dimmed(),
+            "a dim nobody will restore is still marked in effect"
+        );
+    }
+
+    /// A resume that lands while the gate is read ends the cycle before the
+    /// dim starts: `brightnessctl` never runs, so the screen does not even
+    /// dip. (An observer reset lands here the same way — it is a resume.)
+    ///
+    /// Falsify by dropping the generation check from [`DimLatch::may_dim`]:
+    /// the dim runs after the resume (and, with `applied` intact, undoes
+    /// itself — so the assertion that trips is the empty invocation list).
+    #[test]
+    fn a_resume_while_the_gate_is_read_never_dims() {
+        let dim = DimLatch::default();
+        let backlight = FakeBacklight::at(80);
+
+        idle_cycle(&dim, &backlight, ResumeLands::DuringGate);
+
+        let backlight = backlight.borrow();
+        assert_eq!(backlight.level, 80);
+        assert!(backlight.ran.is_empty(), "dimmed after the cycle resumed");
+        assert!(!dim.is_dimmed());
+    }
+
+    /// The ordinary cycle is unchanged: dim, then the resume restores it.
+    #[test]
+    fn a_resume_after_the_dim_restores_it() {
+        let dim = DimLatch::default();
+        let backlight = FakeBacklight::at(80);
+
+        idle_cycle(&dim, &backlight, ResumeLands::AfterDim);
+
+        let backlight = backlight.borrow();
+        assert_eq!(backlight.level, 80);
+        assert_eq!(backlight.ran, [DIM_ARGS, RESTORE_ARGS]);
+        assert!(!dim.is_dimmed());
+    }
+
+    /// The escalation: once one resume was lost, the next cycle's `-s` saved
+    /// the stuck 10% as the original, so every later restore put the screen
+    /// back to 10%. Run the racing cycle and then ordinary ones: the saved
+    /// level is the user's every time, and the screen ends where it started.
+    #[test]
+    fn a_racing_resume_never_leaves_ten_percent_as_the_saved_level() {
+        let dim = DimLatch::default();
+        let backlight = FakeBacklight::at(80);
+
+        for when in [
+            ResumeLands::DuringDim,
+            ResumeLands::AfterDim,
+            ResumeLands::DuringGate,
+            ResumeLands::DuringDim,
+            ResumeLands::AfterDim,
+        ] {
+            idle_cycle(&dim, &backlight, when);
+            let backlight = backlight.borrow();
+            assert_eq!(backlight.level, 80, "a cycle ended dimmed");
+            assert_ne!(
+                backlight.saved,
+                Some(10),
+                "10% became the level -r restores"
+            );
+        }
+        assert!(!dim.is_dimmed());
+    }
+
+    /// The saved-original guard on its own: a second dim fired while one is in
+    /// effect must not `-s` over the 10%. Two `idled` with no `resumed` between
+    /// them is not something the protocol sends (and a reset ends the cycle),
+    /// so this is the backstop, not the fix.
+    ///
+    /// Falsify by dropping `!state.dimmed` from [`DimLatch::may_dim`]: the
+    /// second `-s` runs, saving 10 as the level the resume then "restores".
+    #[test]
+    fn a_dim_never_saves_over_a_dim_in_effect() {
+        let dim = DimLatch::default();
+        let backlight = FakeBacklight::at(80);
+        let run = |args: &'static [&'static str]| {
+            backlight.borrow_mut().run(args);
+            std::future::ready(true)
+        };
+
+        let generation = dim.generation();
+        block_on(dim_unless_resumed(
+            &dim,
+            generation,
+            std::future::ready(false),
+            run,
+        ));
+        block_on(dim_unless_resumed(
+            &dim,
+            generation,
+            std::future::ready(false),
+            run,
+        ));
+        assert_eq!(
+            backlight.borrow().ran,
+            [DIM_ARGS],
+            "a second -s ran over the dim"
+        );
+
+        if dim.resume() {
+            backlight.borrow_mut().run(RESTORE_ARGS);
+        }
+        assert_eq!(backlight.borrow().level, 80);
+    }
+
+    /// An inhibitor held at the gate still skips the dim entirely, and leaves
+    /// nothing for the resume to restore (#377's "a skipped dim leaves nothing
+    /// to restore").
+    #[test]
+    fn a_held_inhibitor_skips_the_dim_and_its_restore() {
+        let dim = DimLatch::default();
+        let backlight = FakeBacklight::at(80);
+
+        let generation = dim.generation();
+        block_on(dim_unless_resumed(
+            &dim,
+            generation,
+            std::future::ready(true),
+            |args| {
+                backlight.borrow_mut().run(args);
+                std::future::ready(true)
+            },
+        ));
+        assert!(!dim.resume(), "a skipped dim owes a restore");
+        assert!(backlight.borrow().ran.is_empty());
     }
 }

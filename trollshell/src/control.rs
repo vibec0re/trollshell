@@ -29,8 +29,10 @@
 //! session — no tab of its own, it is machine-facing. The **AI Keys** tab
 //! (#392) adds `ListAiKeys` / `SetAiKey` / `ClearAiKey`, which store the
 //! LLM-backed plugins' API keys in the login keyring ([`crate::secrets`]) and
-//! relaunch the plugins that use them so a rotated key takes effect. Each
-//! further tab adds its own methods here, following the same shape.
+//! relaunch the plugins that use them so a rotated key takes effect. Those
+//! three report a keyring failure the same way, as an error reply, so a key the
+//! keyring refused is never shown as stored. Each further tab adds its own
+//! methods here, following the same shape.
 //!
 //! ## Why a *dedicated* bus name, not the app's primary name
 //!
@@ -437,11 +439,17 @@ impl ControlIface {
     /// The provider slots that currently have a stored key — e.g.
     /// `["openrouter"]`. Values are **not** returned, so the control-center's
     /// AI Keys tab can show "key set / not set" per provider without ever
-    /// handling the secret. An unreadable keyring yields an empty list.
-    async fn list_ai_keys(&self) -> Vec<String> {
-        secrets::list().await.unwrap_or_else(|err| {
-            tracing::warn!(%err, "ListAiKeys: reading the keyring failed");
-            Vec::new()
+    /// handling the secret.
+    ///
+    /// # Errors
+    /// A keyring that cannot be opened, unlocked or searched. That used to
+    /// be an empty list, which says no key is stored: the tab then showed
+    /// every provider as "No key set" while their keys sat in a keyring the
+    /// shell could not read. It shows "Unavailable" for an error.
+    async fn list_ai_keys(&self) -> zbus::fdo::Result<Vec<String>> {
+        secrets::list().await.map_err(|err| {
+            tracing::warn!(%err, "ListAiKeys failed");
+            zbus::fdo::Error::Failed(format!("ListAiKeys failed: {err:#}"))
         })
     }
 
@@ -450,36 +458,71 @@ impl ControlIface {
     /// plugins that declare the slot so the new key takes effect (rotation =
     /// relaunch). The relaunch is fired off the D-Bus task so the call returns
     /// promptly; the value is never written to disk/config and never logged.
-    async fn set_ai_key(&self, slot: String, value: String) {
-        if !secrets::is_valid_slot(&slot) {
-            tracing::warn!(%slot, "SetAiKey: invalid slot name; ignored");
-            return;
-        }
-        if let Err(err) = secrets::set(&slot, &value).await {
-            tracing::warn!(%slot, %err, "SetAiKey: storing the key failed");
-            return;
-        }
+    ///
+    /// # Errors
+    /// A slot name [`secrets::is_valid_slot`] refuses, or a keyring that
+    /// cannot be opened, unlocked or written — then nothing is relaunched.
+    /// Both used to be an ordinary empty reply, so the control-center showed
+    /// a key as stored that the keyring had refused: the shape #707 fixed for
+    /// the plugin methods. Neither the reply nor the log line carries the
+    /// value.
+    async fn set_ai_key(&self, slot: String, value: String) -> zbus::fdo::Result<()> {
+        check_slot(&slot, "SetAiKey")?;
+        secrets::set(&slot, &value)
+            .await
+            .map_err(|err| key_fail(&slot, &err, "SetAiKey"))?;
         tracing::info!(%slot, "stored AI key; relaunching affected plugins");
         hytte::reactive::runtime::handle()
             .spawn(async move { plugin_launcher::relaunch_for_secret(&slot).await });
+        Ok(())
     }
 
     /// Delete the stored API key for `slot`, then relaunch the running plugins
     /// that declare it (so they drop back to keyless/fallback). Idempotent —
     /// clearing an unset slot is a no-op.
-    async fn clear_ai_key(&self, slot: String) {
-        if !secrets::is_valid_slot(&slot) {
-            tracing::warn!(%slot, "ClearAiKey: invalid slot name; ignored");
-            return;
-        }
-        if let Err(err) = secrets::clear(&slot).await {
-            tracing::warn!(%slot, %err, "ClearAiKey: clearing the key failed");
-            return;
-        }
+    ///
+    /// # Errors
+    /// A slot name [`secrets::is_valid_slot`] refuses, or a keyring that
+    /// cannot be opened, unlocked or written — then nothing is relaunched,
+    /// and the key is still stored.
+    async fn clear_ai_key(&self, slot: String) -> zbus::fdo::Result<()> {
+        check_slot(&slot, "ClearAiKey")?;
+        secrets::clear(&slot)
+            .await
+            .map_err(|err| key_fail(&slot, &err, "ClearAiKey"))?;
         tracing::info!(%slot, "cleared AI key; relaunching affected plugins");
         hytte::reactive::runtime::handle()
             .spawn(async move { plugin_launcher::relaunch_for_secret(&slot).await });
+        Ok(())
     }
+}
+
+/// Refuse a slot name [`secrets::is_valid_slot`] rejects, before the keyring
+/// is touched, as the same `Failed` reply [`key_fail`] gives.
+///
+/// The name is not echoed into the reply (the caller knows what it sent),
+/// and it is `Debug`-escaped in the log line: it is whatever the caller put
+/// in the message, and failing the check means it is not a bounded
+/// identifier.
+fn check_slot(slot: &str, method: &str) -> zbus::fdo::Result<()> {
+    if secrets::is_valid_slot(slot) {
+        return Ok(());
+    }
+    tracing::warn!(?slot, "{method}: invalid slot name; refused");
+    Err(zbus::fdo::Error::Failed(format!(
+        "{method} failed: not a valid slot name (a lowercase ASCII letter, then lowercase \
+         letters, digits, '-' or '_', at most 64 bytes)"
+    )))
+}
+
+/// [`fail`] for the AI-key methods: the same log line and the same `Failed`
+/// reply carrying the whole `anyhow` chain, naming the keyring slot rather
+/// than a plugin. Only ever called with a slot [`check_slot`] has passed,
+/// and with the keyring's own error, so the value being stored reaches
+/// neither.
+fn key_fail(slot: &str, err: &anyhow::Error, method: &str) -> zbus::fdo::Error {
+    tracing::warn!(%err, %slot, "{method} failed");
+    zbus::fdo::Error::Failed(format!("{method} for slot {slot} failed: {err:#}"))
 }
 
 /// Log a failed plugin control call and map it to the D-Bus error the caller
@@ -542,5 +585,58 @@ mod tests {
     #[test]
     fn label_resolving_when_auto_and_unresolved() {
         assert_eq!(place_label(&PlaceOverride::default(), None), "Resolving…");
+    }
+
+    /// The message of a `Failed` reply, or a panic naming what came back.
+    fn failed_message(reply: zbus::fdo::Result<()>) -> String {
+        match reply {
+            Err(zbus::fdo::Error::Failed(message)) => message,
+            other => panic!("expected a Failed reply, got {other:?}"),
+        }
+    }
+
+    /// An invalid slot is an error reply from both writing methods, not the
+    /// empty reply that told the control-center the key was stored. The
+    /// check runs before the keyring is touched, which is what makes this
+    /// hermetic; the value is in neither the reply nor its log line.
+    #[tokio::test]
+    async fn an_invalid_slot_is_refused_with_an_error_reply() {
+        let (captured, guard) = hytte_config::test_support::capture();
+        let set = ControlIface
+            .set_ai_key("Not A Slot".to_owned(), "sk-do-not-echo".to_owned())
+            .await;
+        let clear = ControlIface.clear_ai_key("../etc".to_owned()).await;
+        drop(guard);
+        let set = failed_message(set);
+        assert!(
+            set.starts_with("SetAiKey failed: not a valid slot name"),
+            "{set}"
+        );
+        assert!(!set.contains("sk-do-not-echo"), "{set}");
+        let clear = failed_message(clear);
+        assert!(
+            clear.starts_with("ClearAiKey failed: not a valid slot name"),
+            "{clear}"
+        );
+        for event in captured.events() {
+            assert!(
+                !format!("{event:?}").contains("sk-do-not-echo"),
+                "the value reached the journal: {event:?}"
+            );
+        }
+    }
+
+    /// A keyring failure travels as a `Failed` reply carrying the method, the
+    /// slot and the whole `anyhow` chain — #707's `fail`, for a slot.
+    #[test]
+    fn a_keyring_failure_names_the_method_the_slot_and_the_cause() {
+        let err = anyhow::anyhow!("the secret service is not running").context("storing the key");
+        let zbus::fdo::Error::Failed(message) = key_fail("openrouter", &err, "SetAiKey") else {
+            panic!("a keyring failure is a Failed reply");
+        };
+        assert_eq!(
+            message,
+            "SetAiKey for slot openrouter failed: storing the key: the secret service is not running"
+        );
     }
 }

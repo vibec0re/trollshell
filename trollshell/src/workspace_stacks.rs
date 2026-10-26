@@ -109,6 +109,29 @@ pub(crate) fn starting() -> impl Signal<Item = BTreeSet<String>> {
     STARTING.signal_cloned()
 }
 
+/// Serializes the **plan-and-name** phase of every Start in this process: from
+/// the housekeeping's first snapshot to the read-back that shows the name
+/// landed ([`start`]'s steps 1–4).
+///
+/// [`plan_start`] decides from a snapshot, and only a name that has landed makes
+/// a workspace unavailable to the next plan. So two Starts of different stacks
+/// clicked a moment apart could both read their snapshot before either batch
+/// landed, both pick the same free workspace, and the second `SetWorkspaceName`
+/// would rename the first stack's workspace (#1559, left open by #1514). Under
+/// this lock the second Start's snapshot is read after the first one's name is
+/// on its workspace, so the planner sees that workspace as taken.
+///
+/// [`STARTING`] cannot do this: it stops a second Start of the **same** stack,
+/// and keeps the housekeeping off an in-flight stack's name, but says nothing
+/// about which workspace either one will take. An autostart run's own Starts
+/// never contend for it, since it awaits each in turn; a click during the run
+/// does.
+///
+/// Async rather than `std::sync`, because it is held across the niri round
+/// trips. It is released before the launches and the grace window, so a Start
+/// waits on another only for a few IPC calls, never for its apps.
+static PLAN_AND_NAME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// The `"<name>#<index>"` keys with a single-app start in flight (#1312) — the
 /// Edit form's own echo of [`STARTING`], scoped to one row rather than the
 /// whole stack: a click on the editor's dim icon runs [`run_app_start`]
@@ -1123,7 +1146,7 @@ pub(crate) trait Ops {
     ///
     /// On the seam rather than called through directly, and that is not a
     /// stylistic choice: [`crate::config::workspaces::save_stack`] resolves its
-    /// own path through `xdg::overlay_path`, so a transaction test that reached
+    /// own path through `xdg::config_layers`, so a transaction test that reached
     /// it would write the **developer's real** `~/.config/trollshell/`. It did,
     /// once, before this moved (#1101 re-review). Behind `Ops` the write is part
     /// of the world like every other side effect here, and a test cannot perform
@@ -1327,7 +1350,9 @@ pub(crate) async fn release_lingering_names(
 
 /// Start one stack, as #1071 §3.4's transaction.
 ///
-/// In order, and every step is a precondition for the next:
+/// In order, and every step is a precondition for the next. Steps 1–4 run
+/// under [`PLAN_AND_NAME`], so no other Start reads a snapshot between this
+/// one's plan and its name landing.
 ///
 /// 1. **Housekeeping.** Release any lingering empty workspace's name, so
 ///    `SetWorkspaceName` below cannot silently no-op.
@@ -1361,26 +1386,10 @@ pub(crate) async fn start(
     stack: &Stack,
     saved: &Workspaces,
 ) -> Result<StartPlan, String> {
-    release_lingering_names(ops, name, &saved.stacks).await?;
-
-    let workspaces = ops.workspaces().await?;
-    let windows = ops.windows().await?;
-    let plan = plan_start(name, stack, &workspaces, &windows, &saved.names_in_order())
-        .map_err(|e| e.to_string())?;
-
-    ops.send_actions(plan.batch.clone()).await?;
-
-    // Step 4. Never skip: a silently-swallowed name looks exactly like a
-    // successful one from the action's own reply.
-    let after = ops.workspaces().await?;
-    if !after
-        .iter()
-        .any(|w| w.id == plan.workspace && w.name.as_deref() == Some(name))
-    {
-        return Err(format!(
-            "niri did not take the name {name:?} — nothing was launched"
-        ));
-    }
+    let (plan, windows) = {
+        let _naming = PLAN_AND_NAME.lock().await;
+        plan_and_name(ops, name, stack, saved).await?
+    };
 
     // The pre-launch snapshot is what tells this Start's windows from the
     // user's in step 6 (#1071 §3.4 step 2). Taken from the *same* `windows`
@@ -1501,6 +1510,39 @@ pub(crate) async fn start(
     }
 
     Ok(plan)
+}
+
+/// [`start`]'s steps 1–4: housekeeping, the plan, its batch and the read-back.
+/// Returns the plan with the window snapshot it was made from.
+///
+/// Its caller holds [`PLAN_AND_NAME`] across all of it.
+async fn plan_and_name(
+    ops: &impl Ops,
+    name: &str,
+    stack: &Stack,
+    saved: &Workspaces,
+) -> Result<(StartPlan, Vec<Window>), String> {
+    release_lingering_names(ops, name, &saved.stacks).await?;
+
+    let workspaces = ops.workspaces().await?;
+    let windows = ops.windows().await?;
+    let plan = plan_start(name, stack, &workspaces, &windows, &saved.names_in_order())
+        .map_err(|e| e.to_string())?;
+
+    ops.send_actions(plan.batch.clone()).await?;
+
+    // Step 4. Never skip: a silently-swallowed name looks exactly like a
+    // successful one from the action's own reply.
+    let after = ops.workspaces().await?;
+    if !after
+        .iter()
+        .any(|w| w.id == plan.workspace && w.name.as_deref() == Some(name))
+    {
+        return Err(format!(
+            "niri did not take the name {name:?} — nothing was launched"
+        ));
+    }
+    Ok((plan, windows))
 }
 
 /// The grace window: move home the windows **this Start opened** that landed
@@ -2096,14 +2138,14 @@ pub(crate) async fn save(
     }
 }
 
-/// Run a Save on the runtime.
-pub(crate) fn spawn_save(ticket: u64, workspace: u64, name: String, stack: Stack) {
+/// Run a Save on the runtime, answering `reply` when it ends.
+pub(crate) fn spawn_save(reply: SaveReply, workspace: u64, name: String, stack: Stack) {
     hytte::reactive::runtime::handle().spawn(async move {
         let result = save(&Live, workspace, &name, &stack).await;
         if result.is_ok() {
             tracing::info!(workspace = name, apps = stack.apps.len(), "workspace saved");
         }
-        finish_save(ticket, &name, result);
+        finish_save(reply, &name, result);
     });
 }
 
@@ -2112,8 +2154,7 @@ pub(crate) fn spawn_save(ticket: u64, workspace: u64, name: String, stack: Stack
 /// A Save is the one action on this page whose failure the user must not have to
 /// discover from a toast *after* the drawer has gone back to the cards and taken
 /// their whole draft with it. The write happens on the runtime, so the result
-/// comes back the way every other cross-thread fact in this shell does: a
-/// process-global `Mutable` the GTK side binds to.
+/// crosses back to the GTK side over the Save's own [`SaveReply`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SaveOutcome {
     /// Which Save this is the answer to — see [`next_save_ticket`].
@@ -2122,34 +2163,65 @@ pub(crate) struct SaveOutcome {
     pub error: Option<String>,
 }
 
-/// The ticket source.
-///
-/// A form must not act on an outcome that is not its own, and it must not act on
-/// a *stale* one either — a `Mutable`'s signal replays on subscribe, so a form
-/// built after some earlier Save would otherwise immediately see that Save's
-/// result and act on it. A monotonic ticket settles both: the form records the
-/// one it is waiting for and ignores every other.
+/// The ticket source: one number per Save, so a form can tell its own outcome
+/// from any other.
 static SAVE_TICKETS: AtomicU64 = AtomicU64::new(1);
 
-/// The outcome of the most recently finished Save.
-static SAVE_OUTCOME: LazyLock<Mutable<Option<SaveOutcome>>> = LazyLock::new(|| Mutable::new(None));
-
-/// Claim a ticket for a Save that is about to be spawned.
+/// Claim a ticket for a Save that is about to be spawned. [`save_reply`] is
+/// the one production caller.
 pub(crate) fn next_save_ticket() -> u64 {
     SAVE_TICKETS.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Subscribe to Save outcomes (review MEDIUM 8).
-pub(crate) fn save_outcome() -> impl Signal<Item = Option<SaveOutcome>> {
-    SAVE_OUTCOME.signal_cloned()
+/// Where **one** Save's outcome goes: to the form that started it, and nowhere
+/// else (#1576 review, LOW 2).
+///
+/// This used to be one process-wide `Mutable<Option<SaveOutcome>>` every form
+/// bound to and filtered by ticket. A `Mutable`'s signal delivers only its
+/// newest value, so two Saves finishing before the GTK loop next ran a form's
+/// binding — two drawers saving one name at once — left the first form seeing
+/// only the second ticket. It ignored that, and sat on "Saving…" with its Save
+/// button disabled until it was closed. A channel per Save cannot lose its one
+/// value to another Save's.
+pub(crate) struct SaveReply {
+    ticket: u64,
+    tx: tokio::sync::oneshot::Sender<SaveOutcome>,
 }
 
-/// Publish one, and report a failure to the journal and the user as before.
+impl SaveReply {
+    /// This Save's ticket.
+    pub(crate) fn ticket(&self) -> u64 {
+        self.ticket
+    }
+}
+
+/// Claim a ticket for a Save that is about to be spawned, and the signal its
+/// outcome will arrive on.
+///
+/// The signal reads `None` until the Save ends, then `Some` once, then ends. A
+/// Save task that stops without answering — a panic drops its [`SaveReply`] —
+/// still arrives, as a failed outcome, so the form is never left waiting on a
+/// write nobody is doing.
+pub(crate) fn save_reply() -> (SaveReply, impl Signal<Item = Option<SaveOutcome>>) {
+    let ticket = next_save_ticket();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let outcome = hytte::futures_signals::signal::from_future(rx).map(move |arrived| {
+        arrived.map(|sent| {
+            sent.unwrap_or_else(|_| SaveOutcome {
+                ticket,
+                error: Some("the Save stopped before it finished; see the journal".to_owned()),
+            })
+        })
+    });
+    (SaveReply { ticket, tx }, outcome)
+}
+
+/// Answer `reply`, and report a failure to the journal and the user as before.
 ///
 /// The toast stays: a form may have been closed, or the drawer retracted, by the
 /// time a niri round trip finishes, and the journal is the durable record either
 /// way. What is new is that the form can *also* see it.
-fn finish_save(ticket: u64, name: &str, result: Result<(), String>) {
+pub(crate) fn finish_save(reply: SaveReply, name: &str, result: Result<(), String>) {
     let error = match result {
         Ok(()) => None,
         Err(e) => {
@@ -2158,7 +2230,9 @@ fn finish_save(ticket: u64, name: &str, result: Result<(), String>) {
             Some(message)
         }
     };
-    SAVE_OUTCOME.set(Some(SaveOutcome { ticket, error }));
+    let SaveReply { ticket, tx } = reply;
+    // The form may be gone by now; then there is nobody left to tell.
+    drop(tx.send(SaveOutcome { ticket, error }));
 }
 
 /// Rewrite the card order, on the runtime — the file half of #1071 §3.6's
@@ -2189,7 +2263,12 @@ pub(crate) fn spawn_set_order(order: Vec<String>) {
 /// (`config::workspaces::save_edit_to`) is tested against a `tempdir`, and
 /// nothing in the suite reaches this function — which is what keeps it from ever
 /// touching the developer's real `~/.config/trollshell`.
-pub(crate) fn spawn_save_edit(ticket: u64, previous: Option<String>, name: String, stack: Stack) {
+pub(crate) fn spawn_save_edit(
+    reply: SaveReply,
+    previous: Option<String>,
+    name: String,
+    stack: Stack,
+) {
     hytte::reactive::runtime::handle().spawn(async move {
         let result = crate::config::workspaces::save_edit(previous.as_deref(), &name, &stack)
             .map_err(|e| e.to_string());
@@ -2200,7 +2279,7 @@ pub(crate) fn spawn_save_edit(ticket: u64, previous: Option<String>, name: Strin
                 "workspace stack saved"
             );
         }
-        finish_save(ticket, &name, result);
+        finish_save(reply, &name, result);
     });
 }
 

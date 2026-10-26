@@ -2,8 +2,9 @@
 //! a `Signal`, and apply each emitted value to a GTK widget on the main
 //! thread — holding the widget only weakly so a torn-down widget frees.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
 
 use futures_signals::signal::Signal;
@@ -356,14 +357,18 @@ fn drag_input(event: &gtk::gdk::Event) -> Option<DragInput> {
 ///
 /// Strong refs to it are held only by the bind's apply-loop (aborted when the
 /// widget is destroyed) and by a delivery timer while one is scheduled. The
-/// handlers wired onto the widget itself hold a [`std::rc::Weak`], so the
-/// widget never owns its own `apply` closure — the same ownership the plain
-/// binds have, where `apply` lives in the loop alone.
+/// loop holds its ref until the signal ends **and** nothing is held — see
+/// [`Self::settled`]. The handlers wired onto the widget itself hold a
+/// [`std::rc::Weak`], so the widget never owns its own `apply` closure — the
+/// same ownership the plain binds have, where `apply` lives in the loop alone.
 struct DragSafe<W: glib::object::ObjectType, V, A> {
     gate: RefCell<DragGate<V>>,
     widget: glib::WeakRef<W>,
     handler_id: glib::SignalHandlerId,
     apply: A,
+    /// The apply-loop, parked in [`Self::settled`] after its signal ended, to
+    /// be woken when the held value is delivered.
+    settle_waker: Cell<Option<Waker>>,
 }
 
 impl<W, V, A> DragSafe<W, V, A>
@@ -418,7 +423,33 @@ where
                 Fired::Rearm(wait) => this.schedule(wait),
                 Fired::Idle => {}
             }
+            // A loop parked in `settled` re-checks; it stays parked unless
+            // this firing was the delivery.
+            if let Some(waker) = this.settle_waker.take() {
+                waker.wake();
+            }
         });
+    }
+
+    /// Resolves once nothing is held — the held value was delivered, or there
+    /// never was one — or the widget is gone.
+    ///
+    /// What the apply-loop awaits after its signal ends. Until a grab ends,
+    /// that loop holds the only strong ref to the binding: no delivery timer
+    /// is armed while a grab is live, and every handler on the widget holds a
+    /// `Weak`. A loop that returned at once would free the binding with a value
+    /// still held for after the drag, and the release would upgrade nothing and
+    /// deliver nothing — so the widget would stay stale for good, the very
+    /// thing the deferral exists to prevent.
+    async fn settled(&self) {
+        std::future::poll_fn(|cx| {
+            if self.gate.borrow().held.is_none() || self.widget.upgrade().is_none() {
+                return Poll::Ready(());
+            }
+            self.settle_waker.set(Some(cx.waker().clone()));
+            Poll::Pending
+        })
+        .await;
     }
 }
 
@@ -437,7 +468,9 @@ where
 /// A held value is **deferred, not dropped**. Only the newest one is kept, and
 /// once nothing holds the widget and the settle window has elapsed it is
 /// applied exactly once, by a one-shot timer — whether or not the signal emits
-/// again. So the widget always ends up showing the signal's latest value, at
+/// again, and even if the signal **ends** mid-drag (the binding then lives on
+/// until that one delivery, and no longer). So the widget always ends up
+/// showing the signal's latest value, at
 /// the latest `DRAG_SETTLE` after the grab ends; it may lag the signal in
 /// between, but never stays stale. That holds for a ticking poller and equally
 /// for a `Mutable` that changes once mid-drag and never again. A value that
@@ -509,6 +542,7 @@ where
         widget: widget.downgrade(),
         handler_id: connect_user(widget),
         apply,
+        settle_waker: Cell::new(None),
     });
 
     let controller = gtk::EventControllerLegacy::new();
@@ -550,6 +584,17 @@ where
             }
             for_loop.offer(value);
         }
+        // The signal ended. A value it sent mid-drag may still be held, and
+        // this task's `for_loop` is then the binding's only strong ref (see
+        // `DragSafe::settled`), so stay until that value is delivered.
+        //
+        // This cannot make the binding outlive its widget. The parked task is
+        // still the one `destroy` aborts below, so destroying the widget drops
+        // it — and the binding — exactly as before. The binding holds the
+        // widget only through a `WeakRef`, so parking never keeps the widget
+        // alive either. And with nothing held this returns at once, so a signal
+        // that ends outside a drag frees the binding as it always did.
+        for_loop.settled().await;
     });
 
     // As `abort_on_destroy`, plus: drop whatever is held, so a delivery timer
@@ -1099,6 +1144,7 @@ mod tests {
     }
 
     type ScaleBinding = Rc<DragSafe<gtk::Scale, f64, fn(&gtk::Scale, f64)>>;
+    type WeakScaleBinding = std::rc::Weak<DragSafe<gtk::Scale, f64, fn(&gtk::Scale, f64)>>;
 
     /// A drag-safe scale over `state`, with its user handler counting into
     /// `user_calls`.
@@ -1192,6 +1238,92 @@ mod tests {
         set_mid_drag(&binding, &state, 0.5);
         scale.set_sensitive(false);
         pump_until("the held value's delivery", || value_is(&scale, 0.5));
+    }
+
+    /// Drive the main context until nothing is ready, so a wake that already
+    /// happened — a `Mutable` dropped, ending its signal — has been handled.
+    fn drain() {
+        let ctx = glib::MainContext::default();
+        while ctx.iteration(false) {}
+    }
+
+    /// `bound_scale`, held the way the production bind holds it: the returned
+    /// `Rc` is dropped, so only the apply-loop and the timers keep it alive,
+    /// and the test sees it through a `Weak` — the same one the widget's
+    /// capture controller upgrades for each press and release.
+    fn weakly_bound_scale(
+        state: &Mutable<f64>,
+        user_calls: &Rc<Cell<u32>>,
+    ) -> (gtk::Scale, WeakScaleBinding) {
+        let (scale, binding) = bound_scale(state, user_calls);
+        let weak = Rc::downgrade(&binding);
+        drop(binding);
+        (scale, weak)
+    }
+
+    /// #1559 item 1: the signal **ends** mid-drag while a value is held.
+    ///
+    /// The apply-loop held the binding's only strong ref, so when its signal
+    /// ended the binding was freed; the release then upgraded nothing, the held
+    /// value was never delivered, and the widget stayed on its pre-drag value.
+    #[gtk::test]
+    fn drag_safe_delivers_a_held_value_after_its_signal_ends() {
+        let state = Mutable::new(0.0_f64);
+        let user_calls = Rc::new(Cell::new(0u32));
+        let (scale, binding) = weakly_bound_scale(&state, &user_calls);
+
+        binding.upgrade().expect("bound").input(DragInput::Press(1));
+        set_mid_drag(&binding.upgrade().expect("bound"), &state, 0.75);
+        drop(state);
+        drain();
+        pump_for(TEST_SETTLE * 2);
+        assert!(value_is(&scale, 0.0), "held while the grab is live");
+
+        let live = binding.upgrade();
+        assert!(
+            live.is_some(),
+            "the binding was freed when its signal ended, with a value still held",
+        );
+        if let Some(binding) = live {
+            binding.input(DragInput::Release(1));
+        }
+        pump_until("the held value's delivery after the signal ended", || {
+            value_is(&scale, 0.75)
+        });
+        assert_eq!(
+            user_calls.get(),
+            0,
+            "the deferred apply blocks the user handler like any other",
+        );
+        pump_until("the binding to be freed once it has delivered", || {
+            binding.upgrade().is_none()
+        });
+    }
+
+    /// The other half of the item above: a binding kept alive past its signal
+    /// for a held value still never pins its widget. Destroying the widget
+    /// aborts the parked loop, so the binding goes with it.
+    #[gtk::test]
+    fn drag_safe_parked_after_its_signal_ends_does_not_pin_the_widget() {
+        let state = Mutable::new(0.0_f64);
+        let user_calls = Rc::new(Cell::new(0u32));
+        let (scale, binding) = weakly_bound_scale(&state, &user_calls);
+        let weak = scale.downgrade();
+
+        binding.upgrade().expect("bound").input(DragInput::Press(1));
+        set_mid_drag(&binding.upgrade().expect("bound"), &state, 0.5);
+        drop(state);
+        drain();
+        assert!(binding.upgrade().is_some(), "parked for the held value");
+
+        drop(scale);
+        assert!(
+            weak.upgrade().is_none(),
+            "the parked binding holds the widget only weakly",
+        );
+        pump_until("the parked binding to be dropped with its widget", || {
+            binding.upgrade().is_none()
+        });
     }
 
     /// A value held when the widget is dropped neither keeps it alive nor gets

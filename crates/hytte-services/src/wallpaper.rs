@@ -516,13 +516,14 @@ fn args_file_body(args: &[String]) -> String {
 /// independently and nothing went red.
 fn load_state() -> WallpaperState {
     if let Some(value) = state::load_if_present(SUBSYSTEM) {
-        return value;
+        return sanitize_loaded(value);
     }
     let json = config_file::read(LEGACY_JSON_FILE);
     let legacy = config_file::read(LEGACY_PATH_FILE);
     let Some(migrated) = state_from_disk(json.as_deref(), legacy.as_deref()) else {
         return WallpaperState::default();
     };
+    let migrated = sanitize_loaded(migrated);
     // Name whichever legacy file's value actually won — mirrors
     // `state_from_disk`'s own precedence (JSON first, else the older
     // single-path file) so the log never claims a source that was actually
@@ -546,6 +547,60 @@ fn load_state() -> WallpaperState {
     }
     state::store(SUBSYSTEM, &migrated);
     migrated
+}
+
+/// Run one loaded path through [`clean`]'s rule. An invalid one is dropped
+/// (`None`) with one warning naming `what` (the field or output), never the
+/// raw path.
+fn clean_loaded(what: &str, path: String) -> Option<String> {
+    if let Some(value) = clean(&path) {
+        return Some(value);
+    }
+    tracing::warn!(
+        field = %what,
+        "wallpaper: dropping an invalid path from the state file; falling back as if it were unset"
+    );
+    None
+}
+
+/// Hold everything a state file supplied to the same rule a fresh pick meets
+/// ([`clean`]): a path written before #1499, or hand-edited, could carry a
+/// newline that [`args_file_body`] would turn into extra `swaybg` arguments.
+/// An invalid entry is dropped, so it falls back the way a missing one does.
+/// Output names are checked too — they are arguments as well.
+fn sanitize_loaded(mut state: WallpaperState) -> WallpaperState {
+    state.default = state
+        .default
+        .take()
+        .and_then(|p| clean_loaded("default", p));
+    state.outputs = std::mem::take(&mut state.outputs)
+        .into_iter()
+        .filter_map(|(name, path)| {
+            if name.is_empty() || name.contains(['\n', '\r', '\0']) {
+                tracing::warn!(
+                    "wallpaper: dropping an output with an invalid name from the state file"
+                );
+                return None;
+            }
+            let value = clean_loaded(&format!("output {name:?}"), path)?;
+            Some((name, value))
+        })
+        .collect();
+    let r = &mut state.rotation;
+    r.morning = r
+        .morning
+        .take()
+        .and_then(|p| clean_loaded("rotation.morning", p));
+    r.day = r.day.take().and_then(|p| clean_loaded("rotation.day", p));
+    r.evening = r
+        .evening
+        .take()
+        .and_then(|p| clean_loaded("rotation.evening", p));
+    r.night = r
+        .night
+        .take()
+        .and_then(|p| clean_loaded("rotation.night", p));
+    state
 }
 
 /// The swaybg args already on disk (one per line), used to seed the render dedup
@@ -680,6 +735,12 @@ impl Default for WallpaperHandles {
 fn render(state: &WallpaperState, last_args: &RefCell<Option<Vec<String>>>) {
     let hour = Local::now().hour();
     let args = swaybg_args(state, hour);
+    // Defence at the sink: no argument may carry a newline or NUL, whatever
+    // the source, since the args file is newline-delimited.
+    if args.iter().any(|a| a.contains(['\n', '\r', '\0'])) {
+        tracing::warn!("wallpaper: refusing to render an argument containing a newline or NUL");
+        return;
+    }
     if last_args.borrow().as_deref() == Some(args.as_slice()) {
         return;
     }
@@ -823,6 +884,10 @@ pub fn clear_default() {
 /// Set a per-output override for connector `name`.
 pub fn set_output(name: &str, path: &str) {
     if let Some(value) = clean(path) {
+        if name.is_empty() || name.contains(['\n', '\r', '\0']) {
+            tracing::warn!("wallpaper: refusing an output name with a newline, NUL or none");
+            return;
+        }
         let name = name.to_string();
         mutate(move |s| {
             s.outputs.insert(name, value);
@@ -1587,6 +1652,88 @@ mod tests {
         scratch_home(|_home| {
             assert_eq!(load_state(), WallpaperState::default());
         });
+    }
+
+    #[test]
+    fn load_state_drops_paths_the_picker_would_have_refused() {
+        // #1553: a state file written before #1499, or hand-edited, must meet
+        // the same rule as a fresh pick. Runs against the scratch home only.
+        scratch_home(|_home| {
+            let state_path = state::path(SUBSYSTEM).unwrap();
+            std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &state_path,
+                "default = \"/a.png\\n-o\\n*\\n-i\\n/etc/x\"\n\
+                 [outputs]\n\
+                 \"DP-1\" = \"/ok.png\"\n\
+                 \"DP-2\" = \"/nul\\u0000.png\"\n\
+                 \"DP-3\" = \"/cr\\r.png\"\n\
+                 [rotation]\n\
+                 enabled = true\n\
+                 morning = \"/m.png\"\n\
+                 night = \"/n\\n.png\"\n",
+            )
+            .unwrap();
+
+            let (captured, _guard) = capture();
+            let got = load_state();
+            assert_eq!(got.default, None);
+            assert_eq!(
+                got.outputs.keys().map(String::as_str).collect::<Vec<_>>(),
+                ["DP-1"]
+            );
+            assert_eq!(got.outputs["DP-1"], "/ok.png");
+            assert_eq!(got.rotation.morning.as_deref(), Some("/m.png"));
+            assert_eq!(got.rotation.night, None);
+
+            // The warnings name the field, never the raw path.
+            let warns: Vec<_> = captured
+                .events()
+                .into_iter()
+                .filter(|e| e.level == tracing::Level::WARN)
+                .collect();
+            assert!(!warns.is_empty());
+            assert!(
+                warns.iter().all(|e| !format!("{e:?}").contains("/etc/x")),
+                "a warning leaked the raw path: {warns:?}"
+            );
+
+            // Whatever was loaded, the args file keeps its intended shape.
+            for hour in [3, 9, 14, 20] {
+                let args = swaybg_args(&got, hour);
+                let body = args_file_body(&args);
+                assert_eq!(body.lines().count(), args.len(), "hour {hour}: {body:?}");
+            }
+        });
+    }
+
+    #[test]
+    fn migrated_legacy_state_is_cleaned_too() {
+        scratch_home(|home| {
+            let legacy = legacy_json_path(home);
+            std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            std::fs::write(
+                &legacy,
+                r#"{"default":"/a\n-i\n/b","outputs":{"DP-1":"/ok.png"}}"#,
+            )
+            .unwrap();
+            let got = load_state();
+            assert_eq!(got.default, None);
+            assert_eq!(got.outputs["DP-1"], "/ok.png");
+        });
+    }
+
+    #[test]
+    fn render_sink_refuses_a_splitting_argument() {
+        // Defence at the sink: a state that bypassed every loader still
+        // cannot reach the args file.
+        let state = WallpaperState {
+            default: Some("/a\n-i\n/b".into()),
+            ..WallpaperState::default()
+        };
+        let last = std::cell::RefCell::new(None);
+        super::render(&state, &last);
+        assert_eq!(*last.borrow(), None, "nothing may be cached or spawned");
     }
 
     #[test]

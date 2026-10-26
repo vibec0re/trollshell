@@ -148,7 +148,11 @@ impl Cfg {
         let key = hytte_ai_providers::load_key("openrouter")
             .or_else(|| non_blank(std::env::var("PET_LLM_API_KEY").ok().as_deref()));
         let model = non_blank(std::env::var("PET_LLM_MODEL").ok().as_deref());
-        let provider = resolve_provider(std::env::var("PET_LLM_URL").ok().as_deref(), key, model);
+        let provider = resolve_provider(
+            url_env(std::env::var("PET_LLM_URL").ok().as_deref()),
+            key,
+            model,
+        );
         let name = non_blank(std::env::var("PET_NAME").ok().as_deref())
             .unwrap_or_else(|| "nisse".to_owned());
         let owner = hytte_ai_providers::owner();
@@ -190,6 +194,15 @@ fn secs_or(raw: Option<&str>, default: Duration) -> Duration {
 fn non_blank(raw: Option<&str>) -> Option<String> {
     let trimmed = raw?.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+/// `$PET_LLM_URL` as [`resolve_provider`] wants it: trimmed, but **not**
+/// blank-as-unset. Unlike the other knobs, an empty value is meaningful here
+/// (`Some("")` explicitly disables the model), so a whitespace-only value, as
+/// a cleared settings field can leave, must read as that same explicit
+/// disable and not reach the URL parser as a bogus endpoint.
+fn url_env(raw: Option<&str>) -> Option<&str> {
+    raw.map(str::trim)
 }
 
 /// Resolve `$PET_PERSONA` into the spliced style clause, or `None` when
@@ -556,6 +569,17 @@ mod tests {
         assert_eq!(non_blank(Some("")), None);
         assert_eq!(non_blank(Some("  	")), None);
         assert_eq!(non_blank(Some(" mjau ")), Some("mjau".to_owned()));
+    }
+
+    /// `$PET_LLM_URL`: unset stays unset, blank stays the explicit disable
+    /// (empty, never unset), a real value is trimmed.
+    #[test]
+    fn url_env_keeps_blank_as_explicit_disable() {
+        assert_eq!(url_env(None), None);
+        assert_eq!(url_env(Some("")), Some(""));
+        assert_eq!(url_env(Some("  ")), Some(""));
+        assert!(resolve_provider(url_env(Some("  ")), Some("k".to_owned()), None).is_none());
+        assert_eq!(url_env(Some(" http://h:1 ")), Some("http://h:1"));
     }
 
     /// #698: `$PET_PERSONA` resolution — unset/empty/whitespace-only all

@@ -83,13 +83,16 @@ struct Terminal {
     /// tracks no keystrokes (v1 has no per-keystroke event), it just re-asserts
     /// `""` after each submit so the widget clears.
     entry: String,
-    /// Flips on every submit and rides the entry as a class. The host only
-    /// clears the entry on a render *answering* the submit, and the SDK drops
-    /// a render identical to the last one — which is exactly what a repeated
-    /// identical line does once the scrollback is full of it. Making the view
-    /// differ by one inert class forces that answering frame out. (The other
-    /// ways to differ — a new entry id, a counter in the text — would rebuild
-    /// the widget or show up on screen.)
+    /// Flips on every submit and rides the entry as a class, purely so the
+    /// view differs from the last one. The host's `activate` handler sets a
+    /// one-shot latch, and the next reconcile that processes this `Entry`
+    /// node re-asserts `set_text` (clearing it) whatever else changed. But
+    /// the SDK drops a render identical to the last one, and a repeated
+    /// identical line on a full scrollback is exactly that, so no frame would
+    /// reach the reconcile that consumes the latch. One inert class difference
+    /// keeps the frame from being dropped. (The other ways to differ, a new
+    /// entry id or a counter in the text, would rebuild the widget or show on
+    /// screen.)
     tick: bool,
 }
 

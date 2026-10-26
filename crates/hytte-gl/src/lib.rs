@@ -1111,7 +1111,7 @@ impl Texture {
     }
 
     /// **Test-only.** Leave the unpack pixel store dirty in exactly the way
-    /// [`reset_unpack_state`] exists to fix, so a live-driver test can prove
+    /// `reset_unpack_state` exists to fix, so a live-driver test can prove
     /// the reset call actually runs rather than merely being present in the
     /// source.
     ///
@@ -1522,7 +1522,7 @@ fn reset_pack_state() {
 }
 
 /// **Test-only.** Leave the pack pixel store dirty in exactly the way
-/// [`reset_pack_state`] exists to fix, so a live-driver test can prove the
+/// `reset_pack_state` exists to fix, so a live-driver test can prove the
 /// reset call actually runs rather than merely being present in the source.
 ///
 /// Gated behind `system-tests` because setting these is the reproduction of

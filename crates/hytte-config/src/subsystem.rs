@@ -2779,7 +2779,12 @@ pub fn save_overlay_locked<S: Subsystem + serde::Serialize>(
 ///   base layer or the built-in default". Deliberately **not** an
 ///   [`merge::UNSET_KEY`] marker: that spelling erases the inherited value
 ///   too, which is what a script or a nix base wants and the opposite of what
-///   a person clicking *reset* means (spec §5).
+///   a person clicking *reset* means (spec §5). A reset also drops the key's
+///   own entry from a same-table `_unset` array (and the `_unset` key itself
+///   if that empties it), since a hand-written `_unset = ["k"]` beside `k`
+///   would otherwise keep erasing the base layer's value after the overlay's
+///   line is gone (#1523). Only the leaf's own table's marker is touched;
+///   see `drop_unset_entry`.
 ///
 /// # A form cannot destroy structure, and cannot write a value the loader will refuse
 ///

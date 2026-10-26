@@ -5324,6 +5324,41 @@ mod tests {
         );
     }
 
+    /// #1590 reads every zoned occurrence through `IcalZone`, which asks
+    /// libical for an offset three times per ordinary occurrence (a sample a
+    /// day either side and the one check), each through a freshly built
+    /// `ICalTime`. That is the new per-occurrence cost on the zoned path, so
+    /// the #1179 shape is pinned on it too: a `TZID=Europe/Berlin`
+    /// `FREQ=MINUTELY` series over the same 43-day window, capped, in order,
+    /// and well inside the same loose bound.
+    #[test]
+    fn a_zoned_minutely_series_expands_in_bounded_work() {
+        use std::time::{Duration, Instant};
+
+        let window_end = JUN_START + 43 * 86_400;
+        let ical = berlin_calendar_of(&["UID:zoned-minutely\r\nDTSTAMP:20260601T090000Z\r\n\
+             DTSTART;TZID=Europe/Berlin:20260601T110000\r\n\
+             DTEND;TZID=Europe/Berlin:20260601T110500\r\n\
+             SUMMARY:Tick\r\nRRULE:FREQ=MINUTELY\r\n"]);
+
+        let started = Instant::now();
+        let inst = super::expand_calendar_for_test(&ical, JUN_START, window_end).unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(inst.len(), super::MAX_OCCURRENCES_PER_COMPONENT);
+        // 11:00 CEST is 09:00Z; one occurrence a minute from there.
+        for (i, e) in inst.iter().enumerate() {
+            let minute = i64::try_from(i).unwrap();
+            assert_eq!(e.start_unix, ANCHOR_0900 + minute * 60, "occurrence {i}");
+        }
+        eprintln!("zoned minutely expansion: {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "zoned expansion took {elapsed:?} for {} occurrences",
+            inst.len()
+        );
+    }
+
     /// The bytes budget, not the count cap, is what binds for a component with
     /// a large body: `EXPANSION_BYTES_BUDGET / ical.len()` occurrences. Pinned
     /// with a VEVENT padded past 419 bytes (4 MiB / 10 000), so a change that

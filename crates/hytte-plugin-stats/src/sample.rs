@@ -353,12 +353,10 @@ pub struct Sampler {
     /// Previous per-device `/proc/diskstats` byte counters, keyed by device
     /// name — `hytte_sensors::compute_disk_io`'s own cache shape.
     ///
-    /// **Not** cleared by [`reset`](Self::reset): unlike the CPU baseline,
-    /// leaving this stale means the first disk-I/O reading after an unpark
-    /// averages over however long the surface was closed rather than over a
-    /// fresh window (the same failure #1277 LOW 4 fixed for CPU load) — a
-    /// known simplification, named rather than silently carried, since the
-    /// rate is one line on a page and not the headline this card leads with.
+    /// Cleared by [`reset`](Self::reset), like the CPU baseline: the counters
+    /// are cumulative, so a baseline from before a park would make the first
+    /// disk-I/O rate after an unpark an average over however long the surface
+    /// was closed (the same failure #1277 LOW 4 fixed for CPU load).
     prev_diskio: HashMap<String, (u64, u64, Instant)>,
 }
 
@@ -532,6 +530,7 @@ impl Sampler {
     /// had this problem — the Nvidia reading didn't exist yet to go stale).
     pub fn reset(&mut self) {
         self.prev_cpu.clear();
+        self.prev_diskio.clear();
         self.gpu.forget_readings();
     }
 }
@@ -1337,6 +1336,20 @@ mod tests {
     fn a_fresh_sampler_has_cold_caches() {
         let s = Sampler::new(Needs::default());
         assert!(format!("{s:?}").contains("prev_cpu: []"));
+    }
+
+    /// An unpark re-baselines every cumulative counter, the disk-I/O one
+    /// included: left over from before the park, it makes the first rate
+    /// afterwards an average over the whole closed period.
+    #[test]
+    fn reset_forgets_the_disk_io_baseline_too() {
+        let mut s = Sampler::new(Needs::default());
+        s.prev_diskio
+            .insert("sda".to_string(), (1, 2, std::time::Instant::now()));
+        s.prev_cpu.push((1, 2));
+        s.reset();
+        assert!(s.prev_diskio.is_empty(), "stale disk-I/O baseline kept");
+        assert!(s.prev_cpu.is_empty());
     }
 
     /// **The needs table**: what a resolved `stats.toml` table asks the sampler

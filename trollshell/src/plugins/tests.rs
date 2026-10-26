@@ -3395,6 +3395,61 @@ async fn a_frame_over_the_value_budget_is_closed_at_warn() {
     assert!(line.fields.contains_key("cap"), "names the cap: {line:?}");
 }
 
+/// A frame whose declared length is past `MAX_FRAME_LEN` is the same host cap
+/// as the value budget, measured in bytes, so it closes the connection at warn
+/// too, naming the plugin, the declared length and the cap. Only the length
+/// prefix is sent: the host refuses on it before reading a body.
+///
+/// **Falsified** by deleting the `ProtoError::FrameTooLarge` arm in
+/// `serve_conn`: the line falls to the catch-all "plugin disconnected" at
+/// info, so no warning is captured.
+#[tokio::test]
+async fn a_frame_over_the_length_cap_is_closed_at_warn() {
+    use tokio::io::AsyncWriteExt;
+    const ID: &str = "too-long";
+    let (captured, _guard) = hytte_config::test_support::capture();
+    let (_clock_tx, clock_rx) = watch::channel(None);
+    let (_vis_tx, vis_rx) = watch::channel(false);
+    let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+    let (host, plugin) = UnixStream::pair().expect("socketpair");
+    let conn = tokio::spawn(async move { handle_conn(host, &ctx).await });
+    let (mut prd, mut pwr) = plugin.into_split();
+    write_frame(
+        &mut pwr,
+        &PluginMsg::Register {
+            manifest: Manifest::new(ID, Mount::BarCenter),
+        },
+    )
+    .await
+    .expect("Register");
+    read_frame::<HostMsg, _>(&mut prd).await.expect("Hello");
+    let declared = hytte_plugin_proto::MAX_FRAME_LEN + 1;
+    let prefix = u32::try_from(declared).expect("fits the u32 prefix");
+    pwr.write_all(&prefix.to_be_bytes()).await.expect("prefix");
+    tokio::time::timeout(Duration::from_secs(5), conn)
+        .await
+        .expect("the connection is dropped")
+        .expect("serve_conn did not panic");
+
+    let events = captured.events();
+    let line = events
+        .iter()
+        .find(|e| e.message.contains("longer than the host reads"))
+        .unwrap_or_else(|| panic!("no refusal line captured: {events:?}"));
+    assert_eq!(line.level, tracing::Level::WARN, "{line:?}");
+    assert_eq!(line.fields.get("plugin").map(String::as_str), Some(ID));
+    assert_eq!(
+        line.fields.get("cap"),
+        Some(&hytte_plugin_proto::MAX_FRAME_LEN.to_string()),
+        "{line:?}",
+    );
+    assert_eq!(
+        line.fields.get("len"),
+        Some(&declared.to_string()),
+        "{line:?}"
+    );
+}
+
 /// A first frame that is not `Register` is logged by its variant name only.
 /// It was `?other`, so a `Render` carrying a large tree became one journal
 /// line of that tree's whole `Debug` text, once per connection attempt.

@@ -17,7 +17,7 @@ use hytte::futures_signals::signal::Mutable;
 use hytte::services::pipewire;
 use hytte_plugin_proto::{
     AudioSpectrum, Capability, ClockState, DatasourceError, DatasourceOutcome, Effect, HostMsg,
-    LogLevel, MAX_BODY_TEXT_BYTES, MAX_DISPLAY_TEXT_BYTES, MAX_FRAME_VALUES, MAX_PLUGIN_ID_BYTES,
+    LogLevel, MAX_BODY_TEXT_BYTES, MAX_DISPLAY_TEXT_BYTES, MAX_FRAME_LEN, MAX_FRAME_VALUES, MAX_PLUGIN_ID_BYTES,
     Manifest, Mount, NowPlaying, PluginMsg, ProtoError, StateKey, StateSnapshot, UpcomingEvent,
     VOCAB, read_frame, wire, write_frame,
 };
@@ -2178,6 +2178,18 @@ pub(super) async fn serve_conn(
                         at_least,
                         cap = MAX_FRAME_VALUES,
                         "plugin frame holds more values than the host decodes; closing the connection",
+                    );
+                    break;
+                }
+                // The same cap measured in bytes: a declared length past
+                // `MAX_FRAME_LEN` is refused before the body is read, and it
+                // is no more an ordinary disconnect than the arm above.
+                Err(ProtoError::FrameTooLarge { len }) => {
+                    tracing::warn!(
+                        plugin = %plugin_id,
+                        len,
+                        cap = MAX_FRAME_LEN,
+                        "plugin frame is longer than the host reads; closing the connection",
                     );
                     break;
                 }

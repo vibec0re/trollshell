@@ -17,7 +17,8 @@ use hytte::futures_signals::signal::Mutable;
 use hytte::services::pipewire;
 use hytte_plugin_proto::{
     AudioSpectrum, Capability, ClockState, DatasourceError, DatasourceOutcome, Effect, HostMsg,
-    LogLevel, MAX_BODY_TEXT_BYTES, MAX_DISPLAY_TEXT_BYTES, MAX_PLUGIN_ID_BYTES, Manifest, Mount,
+    LogLevel, MAX_BODY_TEXT_BYTES, MAX_DISPLAY_TEXT_BYTES, MAX_FRAME_VALUES, MAX_PLUGIN_ID_BYTES,
+    Manifest, Mount,
     NowPlaying, PluginMsg, ProtoError, StateKey, StateSnapshot, UpcomingEvent, VOCAB, read_frame,
     wire, write_frame,
 };
@@ -1310,8 +1311,9 @@ fn throttle_effects(
             // effect it is over with carries the very payloads the other caps
             // in this file exist to bound — so the unlatched `?effect` line was
             // a per-frame journal write of arbitrary plugin-supplied bytes,
-            // which is the flood it was reporting. The audit log below still
-            // records every dropped effect: that is the per-occurrence record,
+            // which is the flood it was reporting. The audit log below keeps
+            // a line per dropped effect up to its drop budget, then a count of
+            // the rest: that is the per-occurrence record,
             // and it is rotated and bounded.
             if warned.insert(std::mem::discriminant(&effect)) {
                 tracing::warn!(
@@ -1320,8 +1322,8 @@ fn throttle_effects(
                     burst = EFFECT_BURST,
                     per_sec = EFFECT_REFILL_PER_SEC,
                     "plugin effect rate cap exceeded; dropped (further drops of this effect \
-                     kind on this connection are silenced — the audit log still records each \
-                     one)",
+                     kind on this connection are silenced — the audit log keeps a line each up to \
+                     the drop budget, then a count)",
                 );
             }
             super::effects::record_audit(
@@ -1489,7 +1491,8 @@ pub(super) fn enforce_capabilities(
                         ?cap,
                         "plugin effect requires a capability it didn't declare; dropped. Add it \
                          to the manifest's capabilities (further drops of this effect kind on \
-                         this connection are silenced — the audit log still records each one)",
+                         this connection are silenced — the audit log keeps a line each up to the drop \
+                         budget, then a count)",
                     );
                 }
                 // Budgeted per plugin inside `record_audit`, so a frame of
@@ -1509,9 +1512,9 @@ pub(super) fn enforce_capabilities(
         .collect()
 }
 
-/// The most entries a manifest's `subscribes` or `capabilities` may list.
+/// The most entries a manifest's `subscribes`, `capabilities` or `provides` may list.
 ///
-/// Both are lists of unit variants: 8 state keys and 15 capabilities today. A
+/// The first two are lists of unit variants: 8 state keys and 15 capabilities today. A
 /// plugin built against a newer vocabulary than this host fails to decode
 /// before it gets here, so 64 is four times the larger vocabulary with every
 /// entry listed, and duplicates are still accepted.
@@ -1519,7 +1522,9 @@ pub(super) fn enforce_capabilities(
 /// The cap matters for two reasons. `enforce_capabilities` runs `contains`
 /// over the capability list once per effect, so a 100 000-entry list made each
 /// frame's capability check cost its effect count times that. And the
-/// "plugin registered" line prints both lists.
+/// "plugin registered" line prints both lists. `provides` is bounded because the
+/// registrar loops over every entry, so an unbounded list was an unbounded
+/// number of datasource ids registered from one frame (#1555).
 pub(super) const MAX_MANIFEST_LIST_ENTRIES: usize = 64;
 
 /// The longest plugin-influenced error text the host writes into one of its
@@ -1723,13 +1728,16 @@ pub(super) async fn serve_conn(
     // so a long one is a malformed manifest rather than a big plugin.
     if manifest.subscribes.len() > MAX_MANIFEST_LIST_ENTRIES
         || manifest.capabilities.len() > MAX_MANIFEST_LIST_ENTRIES
+        || manifest.provides.len() > MAX_MANIFEST_LIST_ENTRIES
     {
         tracing::warn!(
             plugin = %plugin_id,
             subscribes = manifest.subscribes.len(),
             capabilities = manifest.capabilities.len(),
+            provides = manifest.provides.len(),
             cap = MAX_MANIFEST_LIST_ENTRIES,
-            "plugin manifest lists more subscriptions or capabilities than the host accepts; \
+            "plugin manifest lists more subscriptions, capabilities or provided datasources \
+             than the host accepts; \
              dropping the connection",
         );
         return;
@@ -2158,6 +2166,19 @@ pub(super) async fn serve_conn(
                         plugin = %plugin_id,
                         error = %bounded_error(&e),
                         "plugin frame failed to decode (schema skew? a plugin built against a newer wire vocabulary than this host); closing the connection",
+                    );
+                    break;
+                }
+                // A frame whose bytes fit but whose decoded size would not
+                // (`MAX_FRAME_VALUES`) is refused before anything is decoded. It
+                // is the host's own cap firing on a peer's frame, not an ordinary
+                // disconnect, so it warns and names the cap (#1555).
+                Err(ProtoError::TooManyValues { at_least }) => {
+                    tracing::warn!(
+                        plugin = %plugin_id,
+                        at_least,
+                        cap = MAX_FRAME_VALUES,
+                        "plugin frame holds more values than the host decodes; closing the connection",
                     );
                     break;
                 }

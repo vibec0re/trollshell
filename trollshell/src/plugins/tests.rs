@@ -3315,6 +3315,86 @@ async fn a_manifest_listing_too_many_entries_is_rejected() {
     );
 }
 
+/// `provides` is bounded by the same cap as the other two lists: the registrar
+/// loops over every entry, so an over-cap list would register an unbounded
+/// number of datasource ids from one frame. Exactly at the cap is accepted.
+///
+/// **Falsified** by deleting the `manifest.provides.len()` clause in
+/// `serve_conn`: the over-cap manifest is accepted.
+#[tokio::test]
+async fn a_manifest_providing_too_many_datasources_is_rejected() {
+    let cap = super::session::MAX_MANIFEST_LIST_ENTRIES;
+    let provides = |n: usize| -> Vec<ProvidedDatasource> {
+        (0..n)
+            .map(|i| ProvidedDatasource::new(format!("ds{i}"), vec!["next".into()]))
+            .collect()
+    };
+
+    let mut over = Manifest::new("many-provides", Mount::BarCenter);
+    over.provides = provides(cap + 1);
+    assert!(
+        register_is_dropped(over).await,
+        "provides over the cap is refused"
+    );
+
+    let mut at_cap = Manifest::new("enough-provides", Mount::BarCenter);
+    at_cap.provides = provides(cap);
+    assert!(
+        !register_is_dropped(at_cap).await,
+        "exactly at the cap is accepted"
+    );
+}
+
+/// A frame past the host's value budget closes the connection at warn, naming
+/// the plugin and the cap, not as an ordinary info-level disconnect.
+///
+/// **Falsified** by deleting the `ProtoError::TooManyValues` arm in
+/// `serve_conn`: the line falls to the catch-all and is logged at info, so no
+/// warning is captured.
+#[tokio::test]
+async fn a_frame_over_the_value_budget_is_closed_at_warn() {
+    const ID: &str = "too-many-values";
+    let (captured, _guard) = hytte_config::test_support::capture();
+    let (_clock_tx, clock_rx) = watch::channel(None);
+    let (_vis_tx, vis_rx) = watch::channel(false);
+    let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+    let (host, plugin) = UnixStream::pair().expect("socketpair");
+    let conn = tokio::spawn(async move { handle_conn(host, &ctx).await });
+    let (mut prd, mut pwr) = plugin.into_split();
+    write_frame(
+        &mut pwr,
+        &PluginMsg::Register {
+            manifest: Manifest::new(ID, Mount::BarCenter),
+        },
+    )
+    .await
+    .expect("Register");
+    // The accepted connection's first frame is `Hello`; read it so the
+    // oversized frame is the session loop's, not the handshake's.
+    read_frame::<HostMsg, _>(&mut prd).await.expect("Hello");
+    // A flat array of nils: a few hundred KiB on the wire, one more value
+    // than the budget. It is refused before anything is decoded.
+    write_frame(
+        &mut pwr,
+        &vec![(); hytte_plugin_proto::MAX_FRAME_VALUES + 1],
+    )
+    .await
+    .expect("an over-budget frame");
+    tokio::time::timeout(Duration::from_secs(5), conn)
+        .await
+        .expect("the connection is dropped")
+        .expect("serve_conn did not panic");
+
+    let events = captured.events();
+    let line = events
+        .iter()
+        .find(|e| e.message.contains("more values than the host decodes"))
+        .unwrap_or_else(|| panic!("no refusal line captured: {events:?}"));
+    assert_eq!(line.level, tracing::Level::WARN, "{line:?}");
+    assert_eq!(line.fields.get("plugin").map(String::as_str), Some(ID));
+    assert!(line.fields.contains_key("cap"), "names the cap: {line:?}");
+}
+
 /// A first frame that is not `Register` is logged by its variant name only.
 /// It was `?other`, so a `Render` carrying a large tree became one journal
 /// line of that tree's whole `Debug` text, once per connection attempt.

@@ -450,6 +450,44 @@ fn unknown_app_keys(value: &toml::Value) -> Vec<String> {
 
 // ── Saving (the drawer's Edit → Save, #1071 §3.7) ────────────────────────────
 
+/// Serializes every read-modify-write of `workspaces.toml` in this process.
+///
+/// Each writer below loads the overlay, changes its part and writes the whole
+/// value back. Two of them in flight at once both load the same file, and
+/// whichever writes second puts back the value the other one changed, so that
+/// change is gone. That is an ordinary path, not a corner case. A card dropped
+/// onto another monitor's column *and* before another card is two writes:
+/// `panels::workspaces::perform_drop` spawns [`set_order`] and
+/// [`set_stack_monitor`] as two tasks on the multi-thread runtime. The page's
+/// poll then snaps the card back to whichever change survived.
+///
+/// This mirrors `hytte_services::places`' `EDIT_LOCK`. The critical section is
+/// a read, a patch and one small atomic write with no `.await` inside, so a
+/// plain `Mutex` is safe and cheap. It is taken inside each `*_to` writer,
+/// because that is where the read-modify-write is, so every caller is covered:
+/// the four process-environment wrappers and the tests' explicit paths alike.
+///
+/// The **guard reads** stay outside it: [`save_stack`]'s taken-name check and
+/// [`save_edit`]'s [`EditContext`] run before the writer takes the lock. So two
+/// Saves *of the same name* could both pass their check, and the second would
+/// then replace the first. Both writes still land whole, which is the lost update
+/// this lock exists for. A form keeps one Save in flight, so that needs two
+/// drawers saving one name at the same moment.
+///
+/// It covers this process only, which is every writer there is. The
+/// control-center renders `workspaces` read-only, and a hand edit is outside any
+/// lock.
+static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Hold [`WRITE_LOCK`]. A poisoned lock is taken anyway, as `places` does: the
+/// `()` behind it carries no state a panicking writer could have left torn, and
+/// the file itself is only ever replaced atomically.
+fn serialized() -> std::sync::MutexGuard<'static, ()> {
+    WRITE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Add the stack `name` to the **overlay**, keeping everything else in the file
 /// as written.
 ///
@@ -500,6 +538,7 @@ pub fn save_stack(name: &str, stack: &Stack) -> Result<(), ConfigError> {
 /// # Errors
 /// As [`save_stack`], minus the already-taken case.
 pub fn save_stack_to(path: &std::path::Path, name: &str, stack: &Stack) -> Result<(), ConfigError> {
+    let _serialized = serialized();
     let existing = hytte_config::subsystem::load_from::<WorkspacesConfig>(&[path.to_path_buf()])?;
     let mut table = existing
         .config
@@ -625,6 +664,7 @@ pub fn save_edit_to(
         })
         .transpose()?;
 
+    let _serialized = serialized();
     let existing = hytte_config::subsystem::load_from::<WorkspacesConfig>(&[path.to_path_buf()])?;
     let mut table = workspace_table(&existing)?;
     let mut order = existing.config.order.clone();
@@ -747,6 +787,7 @@ pub fn set_order(names: &[String]) -> Result<(), ConfigError> {
 /// # Errors
 /// Whatever the reader and the format-preserving writer report.
 pub fn set_order_to(path: &std::path::Path, names: &[String]) -> Result<(), ConfigError> {
+    let _serialized = serialized();
     let existing = hytte_config::subsystem::load_from::<WorkspacesConfig>(&[path.to_path_buf()])?;
     let order = toml::Value::Array(names.iter().map(|n| n.clone().into()).collect());
     let next = WorkspacesConfig {
@@ -845,6 +886,7 @@ pub fn set_stack_monitor_to(
 ) -> Result<(), ConfigError> {
     let name = normalize_workspace_name(name)
         .ok_or_else(|| ConfigError::Invalid(format!("invalid workspace name: {name:?}")))?;
+    let _serialized = serialized();
     let existing = hytte_config::subsystem::load_from::<WorkspacesConfig>(&[path.to_path_buf()])?;
     // Absent is fine — that is a first save. **Present but not a table** is a
     // hand-edit slip (`workspace = "chat"`), and an `unwrap_or_default()` there
@@ -994,7 +1036,7 @@ mod tests {
     };
     use hytte_config::schema::{self, Kind};
     use hytte_config::subsystem::{self, Subsystem};
-    use hytte_config::test_support::capture;
+    use hytte_config::test_support::{Overlay, capture};
     use hytte_config_families::workspaces::SCHEMA;
     use std::collections::BTreeSet;
     use std::path::PathBuf;
@@ -2136,6 +2178,72 @@ apps = [
             body,
             "the order rewrite is not reversible, so it touched something else"
         );
+    }
+
+    /// Writers in flight at once must **all** land.
+    ///
+    /// Each one loads the overlay, changes its part and writes the whole value
+    /// back. Without `WRITE_LOCK` the later write puts back what an earlier one
+    /// changed. The ordinary trigger is a drop that is both a reorder and a
+    /// screen change: `panels::workspaces::perform_drop` spawns `set_order` and
+    /// `set_stack_monitor` as two tasks on the multi-thread runtime.
+    ///
+    /// Eight monitor rewrites (one per stack) plus an order rewrite, released
+    /// together from one barrier. All nine changes must survive, along with the
+    /// stacks' own `apps`.
+    ///
+    /// **Mutation:** make `serialized()` not take the lock and this reds.
+    #[test]
+    fn concurrent_writes_to_one_overlay_all_land() {
+        let names: Vec<String> = (0..8).map(|i| format!("s{i}")).collect();
+        let body = names
+            .iter()
+            .map(|name| format!("[workspace.{name}]\napps = [{{ id = \"app-{name}\" }}]\n"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut overlay = Overlay::new(WorkspacesConfig::NAME);
+        overlay.write(&body);
+        let path = overlay.path();
+        let reversed: Vec<String> = names.iter().rev().cloned().collect();
+
+        let gate = std::sync::Barrier::new(names.len() + 1);
+        std::thread::scope(|s| {
+            for name in &names {
+                let gate = &gate;
+                s.spawn(move || {
+                    gate.wait();
+                    set_stack_monitor_to(path, name, &format!("OUT-{name}")).expect("writes");
+                });
+            }
+            s.spawn(|| {
+                gate.wait();
+                set_order_to(path, &reversed).expect("writes");
+            });
+        });
+
+        let loaded = subsystem::load_from::<WorkspacesConfig>(&overlay.layers())
+            .expect("loads")
+            .config
+            .parsed()
+            .0;
+        for name in &names {
+            let stack = loaded.stacks.get(name).expect("every stack survives");
+            assert_eq!(
+                stack.monitor.as_deref(),
+                Some(format!("OUT-{name}").as_str()),
+                "{name}'s monitor rewrite was lost: {}",
+                std::fs::read_to_string(path).expect("reads back")
+            );
+            assert_eq!(
+                stack.apps,
+                [StackApp {
+                    id: format!("app-{name}"),
+                    exec: None
+                }],
+                "{name}'s apps were not carried through"
+            );
+        }
+        assert_eq!(loaded.order, reversed, "the order rewrite was lost");
     }
 
     /// An ephemeral card's Save creates the entry and still invents no `order`

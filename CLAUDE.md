@@ -323,6 +323,8 @@ inline in `flake.nix` as one-liners.
   the same `mesa`/`xvfb-run` the GL tests already pulled in.
   Since #1413 the closure also carries `xdotool`, with `TROLLSHELL_REQUIRE_XDOTOOL=1` failing rather than skipping the four real-pointer press-tracker tests in `trollshell/src/plugins/region.rs` (XTest clicks into the `xvfb-run` display), and `preCheck` exports `TROLLSHELL_DATA_DIR` at the `trollshell-assets` derivation plus `TROLLSHELL_REQUIRE_SHELL_CSS=1`, so #1414's render test reads the shipped stylesheet the crane filter otherwise strips.
 
+  Since #1595, `checks.workspace-tests` and `system-tests` export `TZDIR` at nixpkgs' `tzdata` (`${pkgs.tzdata}/share/zoneinfo`) in their `preCheck`: the build sandbox has no system zoneinfo, so any test needing libical's builtin zones (`/freeassociation.sourceforge.net/<IANA>`) or a named zone through the real `Local` used to skip in CI and only run on a dev machine. Both also export `TROLLSHELL_REQUIRE_TZDATA=1`, the fail-instead-of-skip switch on the `TROLLSHELL_REQUIRE_GL` precedent: a tzdata-needing test's skip helper must check it and fail with a message naming `TZDIR` rather than skip. No such helper is on main yet (#1594 adds the hytte-ecal rows that need one), so today the switch is exported and documented but read by nothing.
+
 Since #1231 the workflow (`.github/workflows/nix-flake-check.yml`) no longer
 runs those checks as one `nix flake check` on one runner. Five of them are
 each a full workspace compile (`packages.trollshell`'s release build off the bin-only

@@ -728,6 +728,16 @@
               preCheck = ''
                 export XDG_DATA_DIRS="${pkgs.adwaita-icon-theme}/share''${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
                 export TROLLSHELL_REQUIRE_ICON_THEME=1
+                # #1595: a build sandbox has no system zoneinfo, so a test that
+                # needs libical's builtin zones (`/freeassociation.sourceforge.net/<IANA>`)
+                # or a named zone through the real `Local` skips here and only
+                # ever ran on a dev machine. `TZDIR` points libical and glibc at
+                # nixpkgs' `tzdata`; `TROLLSHELL_REQUIRE_TZDATA=1` is the
+                # fail-instead-of-skip switch on the `REQUIRE_ICON_THEME`
+                # precedent above (read by a tzdata-needing test's skip helper,
+                # if it has one). `system-tests` carries its own copy.
+                export TZDIR="${pkgs.tzdata}/share/zoneinfo"
+                export TROLLSHELL_REQUIRE_TZDATA=1
               '';
               # Leaf/terminal check: nothing consumes its target dir. Same
               # `doInstallCargoArtifacts = false` reasoning as `system-tests`

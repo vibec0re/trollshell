@@ -240,9 +240,9 @@ pub fn resolve_route_within(route: &Route, url: &str, budget: std::time::Duratio
 
     match route {
         Route::SystemStore => Resolved::system_store(None),
-        Route::PinLeaf { pem, source } => pin_from_file(pem, &source.describe(), host, port),
+        Route::PinLeaf { pem, source } => pin_from_file(pem, &source.describe(), &host, port),
         Route::VerifyAgainstBundle { bundle, source } => {
-            verify_then_pin(bundle, &source.describe(), host, port, budget)
+            verify_then_pin(bundle, &source.describe(), &host, port, budget)
         }
     }
 }
@@ -480,28 +480,64 @@ pub fn failure_description(host: &str, tried: Option<&str>) -> String {
 /// function is the single source all three derive from; none of them takes its
 /// output unchanged.
 ///
-/// Hand-rolled rather than a `url` crate dependency: this is the only URL
-/// parsing in the window, it runs on one string the hive produced, and a
-/// resolved package for it would be the crate's fifth.
-///
 /// It is also what [`crate::page::navigable_in_place`] compares, so read that
 /// function's docs for what the port-stripping means for the origin rule.
+///
+/// # A real parser, and one rule on top of it
+///
+/// The URL is read by `GLib`'s `GUri` (`authority_of`) rather than split by
+/// hand. The hand split this replaced cut the authority at `/ ? #` and took
+/// what followed the last `@`, which was right only because `WebKit` hands
+/// the policy handlers canonical URLs; `GUri` is RFC 3986, rejects what it
+/// cannot parse (a bad port, an invalid escape, a relative reference), and
+/// adds no package — `glib` is already linked, and a `url` crate would have
+/// been the window's fifth resolved dependency for one string.
+///
+/// RFC 3986 is still not what `WebKit` speaks, though. `WebKit` parses WHATWG
+/// URLs, and the one disagreement found that turns a refusal into a match is
+/// the **backslash**: WHATWG ends an `http(s)` authority at one, RFC 3986
+/// does not. `https://evil.example\@hive.local/` is `evil.example` to the
+/// engine and `hive.local` to `GUri` (measured, glib 2.88). So a backslash
+/// anywhere in the authority answers `None` — the URL has no host this
+/// window will vouch for. The other differences measured (`a@b@host`, `%2f`,
+/// spaces, tabs, IPv4 shorthand, upper case) all go the safe way: `GUri`'s
+/// reading can only equal the hive's name where `WebKit`'s does too, so a
+/// comparison against it refuses on its own.
+///
+/// Nothing is normalised on the way out: no lower-casing and no trailing-dot
+/// stripping, so another spelling of a host compares unequal and fails
+/// closed rather than being guessed into a match.
 #[must_use]
-pub fn host_of(url: &str) -> Option<&str> {
-    let rest = url.trim().split_once("://")?.1;
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()
-        .filter(|a| !a.is_empty())?;
-    // userinfo@host — take what follows the LAST '@', since userinfo may
-    // contain one.
-    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    if let Some(end) = host.find(']') {
-        // [::1]:443 — the bracketed literal is the host.
-        return Some(&host[..=end]);
+pub fn host_of(url: &str) -> Option<String> {
+    let uri = authority_of(url)?;
+    let host = uri.host()?;
+    if host.is_empty() || host.contains('\\') {
+        return None;
     }
-    let host = host.split_once(':').map_or(host, |(h, _)| h);
-    if host.is_empty() { None } else { Some(host) }
+    // `GUri` hands an IPv6 literal back without the brackets the URL spelled
+    // it in; this function's contract is the bracketed form.
+    Some(if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    })
+}
+
+/// `url` parsed by `GUri`, if it parses and its authority is one this window
+/// will read a host or port out of — the one parse [`host_of`] and
+/// [`port_of`] share, so the two cannot disagree about where the authority
+/// ends.
+///
+/// Surrounding whitespace is trimmed first, as every reader of the hive's
+/// URL does. A userinfo carrying a backslash is refused here rather than in
+/// [`host_of`], because that is where WHATWG would have ended the authority
+/// and RFC 3986 did not — see [`host_of`]'s docs.
+fn authority_of(url: &str) -> Option<glib::Uri> {
+    let uri = glib::Uri::parse(url.trim(), glib::UriFlags::NONE).ok()?;
+    if uri.userinfo().is_some_and(|info| info.contains('\\')) {
+        return None;
+    }
+    Some(uri)
 }
 
 /// The same host **without** its brackets — what `GNetworkAddress` wants, and
@@ -541,31 +577,23 @@ pub fn identity_host(host: &str) -> &str {
 ///
 /// Only the probe uses this; `WebKit`'s own exception is per **host**, not per
 /// host-and-port, which is why [`host_of`] drops it.
+///
+/// Read by the same `GUri` parse as [`host_of`] (`authority_of`), which
+/// already knows that `[::1]:8443`'s port follows the bracket and not a colon
+/// inside the literal. A URL it refuses — an unparseable or out-of-range port
+/// among them — gets the scheme's default, as does an explicit `:0`.
 #[must_use]
 pub fn port_of(url: &str) -> u16 {
     const HTTPS: u16 = 443;
     const HTTP: u16 = 80;
-    let trimmed = url.trim();
-    let default = if trimmed.starts_with("http://") {
+    let default = if url.trim().starts_with("http://") {
         HTTP
     } else {
         HTTPS
     };
-    let Some(rest) = trimmed.split_once("://").map(|(_, r)| r) else {
-        return default;
-    };
-    let Some(authority) = rest.split(['/', '?', '#']).next() else {
-        return default;
-    };
-    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    // `[::1]:8443` — the port is what follows the **bracket**, never a colon
-    // inside the literal; `hive.local:8443` has no bracket, so it is what
-    // follows the last colon.
-    let port = match authority.rfind(']') {
-        Some(end) => authority[end + 1..].strip_prefix(':'),
-        None => authority.rsplit_once(':').map(|(_, p)| p),
-    };
-    port.and_then(|p| p.parse::<u16>().ok())
+    authority_of(url)
+        // `-1` is `GUri`'s "no port given", which `try_from` refuses too.
+        .and_then(|uri| u16::try_from(uri.port()).ok())
         .filter(|p| *p != 0)
         .unwrap_or(default)
 }
@@ -875,23 +903,101 @@ mod tests {
 
     #[test]
     fn the_host_is_read_without_its_port_or_userinfo() {
-        assert_eq!(host_of("https://hive.local/agent/x/"), Some("hive.local"));
-        assert_eq!(host_of("https://hive.local:8443/x"), Some("hive.local"));
-        assert_eq!(host_of("https://user:pw@hive.local/x"), Some("hive.local"));
-        assert_eq!(host_of("https://hive.local"), Some("hive.local"));
-        assert_eq!(host_of("https://hive.local?a=1"), Some("hive.local"));
-        assert_eq!(host_of("https://[::1]:8443/x"), Some("[::1]"));
-        assert_eq!(host_of("  https://hive.local/x  "), Some("hive.local"));
+        for (url, host) in [
+            ("https://hive.local/agent/x/", "hive.local"),
+            ("https://hive.local:8443/x", "hive.local"),
+            ("https://user:pw@hive.local/x", "hive.local"),
+            ("https://hive.local", "hive.local"),
+            ("https://hive.local?a=1", "hive.local"),
+            ("https://hive.local#a", "hive.local"),
+            ("https://[::1]:8443/x", "[::1]"),
+            ("https://[fd00::1]/x", "[fd00::1]"),
+            ("  https://hive.local/x  ", "hive.local"),
+        ] {
+            assert_eq!(host_of(url).as_deref(), Some(host), "{url}");
+        }
         assert_eq!(host_of("hive.local/x"), None, "no scheme, no authority");
+    }
+
+    /// **The host is read by a parser, and what it cannot read has none.**
+    ///
+    /// The hand split this replaced answered `Some` for the first three rows
+    /// — it took whatever sat between `://` and the next `/ ? #`, so a bad
+    /// port or an invalid escape still produced a host. `GUri` refuses them,
+    /// and a refused URL is an unscoped one: [`resolve_route`] degrades it to
+    /// the system store and `navigable_in_place` loads nothing for it. The
+    /// rest had no host under either parser, and are here so the swap cannot
+    /// have handed them one.
+    ///
+    /// The backslash rows are the one place RFC 3986 and `WebKit`'s WHATWG
+    /// parser disagree in the direction that matters — `GUri` reads
+    /// `hive.local` out of `https://evil.example\@hive.local/`, the engine
+    /// reads `evil.example` — so the rule on top of `GUri` answers `None`.
+    ///
+    /// Mutation (run this round, red): drop the userinfo backslash test in
+    /// `authority_of` and the first backslash row reds with
+    /// `Some("hive.local")`, the host the engine would never have gone to —
+    /// as does `page::tests::an_uncanonical_spelling_of_the_hive_is_not_the_hive`,
+    /// which then loads that URL in place.
+    #[test]
+    fn a_url_the_parser_refuses_has_no_host() {
+        for refused in [
+            "https://hive.local:nope/x",
+            "https://hive.local:99999/x",
+            "https://hive.local%00.evil/",
+            "https://",
+            "https:///hive.local/",
+            "https:hive.local/",
+            "file:///tmp/x",
+            "about:blank",
+            "",
+        ] {
+            assert_eq!(host_of(refused), None, "{refused:?} has no host");
+        }
+        for differential in [
+            "https://evil.example\\@hive.local/",
+            "https://evil.example\\.hive.local/",
+        ] {
+            assert_eq!(
+                host_of(differential),
+                None,
+                "{differential:?}: WHATWG ends the authority at the backslash, RFC 3986 does not"
+            );
+        }
+    }
+
+    /// Nothing is normalised: another spelling of a host is another host, so
+    /// every comparison built on [`host_of`] fails **closed** for it.
+    ///
+    /// Upper case and a trailing dot both come back as written — never
+    /// folded into `hive.local`, which is what keeps
+    /// `page::navigable_in_place` from admitting them — and the RFC 3986
+    /// readings of shapes WHATWG reads differently (`a@b@host`, `%2f`) come
+    /// back as hosts no clean name can equal.
+    #[test]
+    fn another_spelling_of_a_host_is_another_host() {
+        for (url, read) in [
+            ("https://HIVE.Local/agent/x/", "HIVE.Local"),
+            ("https://hive.local./agent/x/", "hive.local."),
+            ("https://a@b@hive.local/", "b@hive.local"),
+            ("https://hive.local%2fevil/", "hive.local/evil"),
+        ] {
+            assert_eq!(host_of(url).as_deref(), Some(read), "{url}");
+            assert_ne!(host_of(url).as_deref(), Some("hive.local"), "{url}");
+        }
     }
 
     /// The probe connects to the port the URL names, or the scheme's default —
     /// and the URL's bracketed IPv6 host becomes the bare literal both
     /// `GNetworkAddress` and `WebKit`'s pin lookup want.
     ///
-    /// Mutation (re-run this round, red): take the **first** colon in the
-    /// authority as the port separator and the `[::1]` rows red with a parse
-    /// failure that silently becomes 443.
+    /// The `[::1]` rows used to pin the hand split's "the port follows the
+    /// bracket, not the first colon" rule; since the port is read by `GUri`
+    /// that rule is the parser's, and the rows pin that it still holds.
+    ///
+    /// Mutation (run this round, red): drop `port_of`'s `!= 0` filter and
+    /// the `:0` row reds with `0` — a port `GUri` parses happily and nothing
+    /// can connect to.
     #[test]
     fn the_probe_port_follows_the_url_and_the_scheme() {
         assert_eq!(port_of("https://hive.local/agent/x/"), 443);

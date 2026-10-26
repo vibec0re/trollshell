@@ -76,6 +76,7 @@ use futures_signals::signal::Mutable;
 
 use super::env::Deprecations;
 use super::{Subsystem, initial_load, load_layer};
+use crate::xdg::Layers;
 
 /// How often a running shell re-checks its config layers, absent a
 /// battery-aware [`CadenceSource`] (i.e. what [`constant`] gives back). Each
@@ -197,7 +198,7 @@ pub fn stamps_of(paths: &[PathBuf]) -> Vec<Stamp> {
 /// save keeps: the shell goes on rendering the last good config rather than
 /// snapping back to the built-in default the moment a hand edit is mid-word.
 pub struct Watcher<S: Subsystem> {
-    paths: Vec<PathBuf>,
+    layers: Layers,
     stamps: Vec<Stamp>,
     last_good: S::Resolved,
     /// `fn() -> S` rather than `S`, so the watcher is `Send`/`Sync` on the
@@ -213,7 +214,7 @@ pub struct Watcher<S: Subsystem> {
 impl<S: Subsystem> Clone for Watcher<S> {
     fn clone(&self) -> Self {
         Self {
-            paths: self.paths.clone(),
+            layers: self.layers.clone(),
             stamps: self.stamps.clone(),
             last_good: self.last_good.clone(),
             _subsystem: PhantomData,
@@ -222,7 +223,7 @@ impl<S: Subsystem> Clone for Watcher<S> {
 }
 
 impl<S: Subsystem> Watcher<S> {
-    /// **Stamp `paths`, then read them with `load`** — in that order, which is
+    /// **Stamp `layers`, then read them with `load`** — in that order, which is
     /// the entire contract of this constructor.
     ///
     /// The one load is `load`'s, and it is a parameter rather than a call to
@@ -239,14 +240,20 @@ impl<S: Subsystem> Watcher<S> {
     ///
     /// See the module doc for why the order is the difference between an edit
     /// that is one tick late and an edit that is lost forever.
+    ///
+    /// `layers` is a [`Layers`] or a bare list read positionally, as
+    /// [`crate::subsystem::load_from`] takes it, and `load` is handed the
+    /// [`Layers`] — the overlay slot by name, so a search path that has none
+    /// cannot have its top base read as one.
     pub fn stamping_before(
-        paths: Vec<PathBuf>,
-        load: impl FnOnce(&[PathBuf]) -> S::Resolved,
+        layers: impl Into<Layers>,
+        load: impl FnOnce(&Layers) -> S::Resolved,
     ) -> Self {
-        let stamps = stamps_of(&paths);
-        let last_good = load(&paths);
+        let layers = layers.into();
+        let stamps = stamps_of(&layers.paths());
+        let last_good = load(&layers);
         Self {
-            paths,
+            layers,
             stamps,
             last_good,
             _subsystem: PhantomData,
@@ -298,14 +305,14 @@ impl<S: Subsystem> Watcher<S> {
         current: &S::Resolved,
         lookup: &dyn Fn(&str) -> Option<String>,
     ) -> Option<S::Resolved> {
-        let now = stamps_of(&self.paths);
+        let now = stamps_of(&self.layers.paths());
         if now == self.stamps {
             return None;
         }
         // Unconditional, and before the load: this is what makes a malformed
         // file warn once per save rather than once per tick (#1040 T2).
         self.stamps = now;
-        match load_layer::<S>(&self.paths) {
+        match load_layer::<S>(&self.layers) {
             Ok(config) => self.last_good = config,
             Err(e) => tracing::warn!(
                 subsystem = S::NAME,
@@ -333,14 +340,14 @@ impl<S: Subsystem> Watcher<S> {
 /// harmless in that direction.
 ///
 /// This is the only place in production that passes
-/// [`Deprecations::Announce`], and it takes `paths`/`lookup` rather than
+/// [`Deprecations::Announce`], and it takes `layers`/`lookup` rather than
 /// reaching for the process so the real call site is drivable in a test (#1040
 /// F3/V3).
 pub fn boot<S: Subsystem>(
-    paths: &[PathBuf],
+    layers: impl Into<Layers>,
     lookup: &dyn Fn(&str) -> Option<String>,
 ) -> (S::Resolved, Watcher<S>) {
-    let watcher = Watcher::<S>::stamping_before(paths.to_vec(), initial_load::<S>);
+    let watcher = Watcher::<S>::stamping_before(layers, |layers| initial_load::<S>(layers));
     let resolved = S::resolve(watcher.last_good.clone(), lookup, Deprecations::Announce);
     (resolved, watcher)
 }
@@ -354,7 +361,7 @@ pub fn boot<S: Subsystem>(
 /// `Clone`, which is what lets this ride a supervisor's `Fn` factory — a
 /// restart resumes from the same baseline instead of re-stamping.
 ///
-/// `lookup` and `cadence` are parameters for the same reason `paths` is one:
+/// `lookup` and `cadence` are parameters for the same reason `layers` is one:
 /// the loop is then drivable in a test at a cadence a test can wait for, and
 /// the subsystem's `Service` is the single place production values are chosen.
 ///

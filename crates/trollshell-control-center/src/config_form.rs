@@ -193,8 +193,8 @@ pub(crate) struct FamilyOps {
     /// here needs the plugin restarting — which the switch at the top of this
     /// very page does.
     reload: &'static str,
-    /// [`subsystem::load_raw`] for this family's `S`.
-    load: fn(&[PathBuf]) -> Result<Raw, ConfigError>,
+    /// [`subsystem::load_raw`] for this family's `S` — through `load_raw_of`.
+    load: fn(&xdg::Layers) -> Result<Raw, ConfigError>,
     /// [`subsystem::save_leaf_to_locked`] for this family's `S`.
     save: SaveLeaf,
     /// [`subsystem::save_leaf_to_locked_unchecked`] for this family's `S` —
@@ -232,12 +232,22 @@ impl FamilyOps {
         Self {
             family,
             reload,
-            load: subsystem::load_raw::<S>,
+            load: load_raw_of::<S>,
             save: subsystem::save_leaf_to_locked::<S>,
             save_unchecked: subsystem::save_leaf_to_locked_unchecked::<S>,
             remove_entry: subsystem::remove_entry_to_locked::<S>,
         }
     }
+}
+
+/// [`subsystem::load_raw`] at one `S`, as a plain `fn` for [`FamilyOps::load`].
+///
+/// `load_raw` takes `impl Into<xdg::Layers>` since the overlay-slot fix (a
+/// bare list or the environment's [`xdg::Layers`], whose overlay slot is named
+/// rather than read off the end), and a function with a generic argument does
+/// not coerce to a function pointer — so the pointer is to this.
+fn load_raw_of<S: Subsystem>(layers: &xdg::Layers) -> Result<Raw, ConfigError> {
+    subsystem::load_raw::<S>(layers)
 }
 
 /// [`FamilyOps::reload`] for a file the **shell** re-reads on its own poll.
@@ -351,10 +361,11 @@ struct FormInner {
     /// `~/.config/trollshell` in a test (#1101) with no `Env` threaded
     /// through five page constructors.
     env: Rc<xdg::Env>,
-    /// The search path, lowest precedence first. Resolved once: the process
-    /// environment cannot change under a running process (the Plugins tab's
-    /// `search_path` argument, #1270).
-    layers: Vec<PathBuf>,
+    /// The search path — the bases lowest precedence first, and the overlay
+    /// slot by name. Resolved once: the process environment cannot change
+    /// under a running process (the Plugins tab's `search_path` argument,
+    /// #1270).
+    layers: xdg::Layers,
     /// `$XDG_CONFIG_HOME/trollshell/<family>.toml` — the one file this app
     /// may write. `None` when neither `$XDG_CONFIG_HOME` nor `$HOME` is set.
     overlay: Option<PathBuf>,

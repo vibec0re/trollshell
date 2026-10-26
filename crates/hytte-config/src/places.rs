@@ -1690,11 +1690,12 @@ fn layered_fallback() -> Vec<Place> {
 /// tempdir instead of the user's real config.
 ///
 /// The existing file is the document being edited (see [`render_places`]), so
-/// everything the edit doesn't touch survives it. When there is no file yet —
-/// or it can't be read — the *shipped default* stands in as that document, so
-/// a config this API creates is as self-documenting as the one first run
-/// writes: it keeps the whole documented preamble, and the first place lands in
-/// the default's commented `[[place]]` scaffold rather than in a bare table.
+/// everything the edit doesn't touch survives it. When there is no file yet the
+/// *shipped default* stands in as that document, so a config this API creates
+/// is as self-documenting as the one first run writes: it keeps the whole
+/// documented preamble, and the first place lands in the default's commented
+/// `[[place]]` scaffold rather than in a bare table. A file that is there but
+/// cannot be read is **not** "no file yet" — see `existing_or_seed`.
 ///
 /// The write itself is [`config_file::write_atomic`] — the crate's one copy of
 /// the scratch-file + `fsync` + `rename(2)` algorithm (#739), which is also
@@ -1706,12 +1707,13 @@ fn layered_fallback() -> Vec<Place> {
 /// which is what [`PlacesError::Write`] needs to carry.
 ///
 /// # Errors
-/// [`PlacesError::Encode`] when the file that is there doesn't parse — a patch
-/// has nothing to patch, and replacing bytes we can't account for is precisely
-/// what [`check_base`] exists to prevent. Reaching this through [`save_to`] is
-/// impossible (it refuses first, with the more specific
-/// [`PlacesError::Unreadable`]). [`PlacesError::Write`] when the atomic write
-/// itself fails; the previous config is then untouched.
+/// [`PlacesError::Unreadable`] when a file is there but cannot be read
+/// (permissions, non-UTF-8, …), and [`PlacesError::Encode`] when the file that
+/// is there doesn't parse — either way a patch has nothing to patch, and
+/// replacing bytes we can't account for is precisely what [`check_base`]
+/// exists to prevent. Reaching either through [`save_to`] is impossible (it
+/// refuses first, with [`PlacesError::Unreadable`]). [`PlacesError::Write`]
+/// when the atomic write itself fails; the previous config is then untouched.
 pub fn persist_to(path: &Path, places: &[Place]) -> Result<(), PlacesError> {
     persist_to_seeded(path, places, DEFAULT_CONFIG)
 }
@@ -1726,10 +1728,44 @@ pub fn persist_to(path: &Path, places: &[Place]) -> Result<(), PlacesError> {
 /// meaning what they meant. [`save`] passes [`seed_for`]'s filtered document;
 /// everyone else passes [`DEFAULT_CONFIG`] whole.
 fn persist_to_seeded(path: &Path, places: &[Place], seed: &str) -> Result<(), PlacesError> {
-    let existing = std::fs::read_to_string(path).unwrap_or_else(|_| seed.to_owned());
+    let existing = existing_or_seed(path, seed)?;
     let body = render_places(&existing, places)?;
     config_file::write_atomic(path, &body, config_file::Durability::FsyncParent)
         .map_err(|e| PlacesError::Write(e.to_string()))
+}
+
+/// The document a writer patches: `path`'s current bytes, or `seed` when there
+/// is no file yet — and **only** then.
+///
+/// `NotFound` is the one read error that means "nothing here to lose". Every
+/// other one — permission denied, non-UTF-8, a directory where the file should
+/// be — means a file is there whose bytes this writer cannot see, and seeding
+/// over it would replace them: [`config_file::write_atomic`] renames a fresh
+/// file into place, which succeeds whenever the *directory* is writable,
+/// whatever the old file's own mode. Both writers used to take any read error
+/// for "absent" (`unwrap_or_else(|_| seed)`). [`save`] and [`save_to`] never
+/// reached that, because [`check_base`] refuses an unreadable file first;
+/// [`save_departures_endpoint`] has no such guard (it needs none against
+/// *drift*, as its own doc argues), so a `chmod 000` or one stray Latin-1 byte
+/// in `places.toml` cost the operator the whole file on one click of the
+/// control center's Endpoint row — replaced by the seed plus one `endpoint`
+/// line, atomically and with no backup.
+///
+/// The same rule [`load_places`] and [`load_layered`] already keep on the read
+/// side ("use the layers below but DON'T overwrite"), now kept by the writers
+/// too.
+///
+/// # Errors
+/// [`PlacesError::Unreadable`] for any read error but `NotFound`.
+fn existing_or_seed(path: &Path, seed: &str) -> Result<String, PlacesError> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(seed.to_owned()),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "places: refusing to write over a config we can't read back");
+            Err(PlacesError::Unreadable(e.to_string()))
+        }
+    }
 }
 
 /// Establish that `path` still holds `base` — i.e. that an edit computed
@@ -2041,11 +2077,15 @@ pub fn render_departures_endpoint(
 }
 
 /// Patch + atomically write the departures endpoint to `path`. The
-/// endpoint-only counterpart to [`persist_to`].
+/// endpoint-only counterpart to [`persist_to`], seeding the same way: only a
+/// file that is not there is replaced by the shipped default
+/// (`existing_or_seed`).
 ///
 /// # Errors
-/// As [`render_departures_endpoint`], plus [`PlacesError::Write`] if the
-/// atomic write fails; the previous config is then untouched.
+/// As [`render_departures_endpoint`], plus [`PlacesError::Unreadable`] when a
+/// file is there but cannot be read — it is left exactly as it was — and
+/// [`PlacesError::Write`] if the atomic write fails; the previous config is
+/// then untouched.
 pub fn persist_departures_endpoint_to(
     path: &Path,
     endpoint: Option<&str>,
@@ -2061,7 +2101,7 @@ fn persist_departures_endpoint_seeded(
     endpoint: Option<&str>,
     seed: &str,
 ) -> Result<(), PlacesError> {
-    let existing = std::fs::read_to_string(path).unwrap_or_else(|_| seed.to_owned());
+    let existing = existing_or_seed(path, seed)?;
     let body = render_departures_endpoint(&existing, endpoint)?;
     config_file::write_atomic(path, &body, config_file::Durability::FsyncParent)
         .map_err(|e| PlacesError::Write(e.to_string()))
@@ -2071,7 +2111,9 @@ fn persist_departures_endpoint_seeded(
 /// `~/.config/trollshell/places.toml`. No `check_base` counterpart here (as
 /// [`save_to`] has for places): the key is a single scalar with no set of
 /// things that could have drifted from underneath an edit the way
-/// `[[place]]` can.
+/// `[[place]]` can. The *other* half of `check_base` — never write over a file
+/// that is there but unreadable — is not about drift, and this writer keeps it
+/// in `existing_or_seed`.
 ///
 /// # Errors
 /// [`PlacesError::NoConfigPath`] when `$HOME` is unset,
@@ -3445,6 +3487,97 @@ mine = true
         let cleared = std::fs::read_to_string(&path).expect("read back");
         assert_eq!(parse_departures_endpoint(&cleared).unwrap(), None);
         assert!(!cleared.contains("[departures]"));
+    }
+
+    /// A `places.toml` that is there but cannot be read as text — one Latin-1
+    /// byte, the shape a hand edit in the wrong encoding leaves. Valid TOML
+    /// otherwise, so the only thing standing between it and being replaced is
+    /// the read.
+    const NOT_UTF8: &[u8] = b"[[place]]\nname = \"Caf\xe9\"\nlat = 52.5\nlon = 13.4\n";
+
+    /// The data-loss case: an endpoint save over a file it cannot read must
+    /// refuse and leave every byte where it was — not seed the shipped default
+    /// over it plus one `endpoint` line.
+    ///
+    /// Non-UTF-8 rather than `chmod 000` because the read error is what
+    /// matters, not which one: every error but `NotFound` takes the same arm,
+    /// and a permission bit is no error at all to a test running as root.
+    ///
+    /// Red if `persist_departures_endpoint_seeded` goes back to
+    /// `unwrap_or_else(|_| seed)`: the save succeeds, and the file is the seed.
+    #[test]
+    fn persist_departures_endpoint_to_refuses_a_file_it_cannot_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("places.toml");
+        std::fs::write(&path, NOT_UTF8).expect("seed");
+
+        for endpoint in [Some("vbb"), None] {
+            assert!(
+                matches!(
+                    persist_departures_endpoint_to(&path, endpoint),
+                    Err(PlacesError::Unreadable(_))
+                ),
+                "{endpoint:?}"
+            );
+            assert_eq!(
+                std::fs::read(&path).expect("still there"),
+                NOT_UTF8,
+                "{endpoint:?}: the operator's bytes are untouched"
+            );
+        }
+    }
+
+    /// [`persist_to`]'s twin of the test above. Not reachable through
+    /// [`save_to`] — [`check_base`] refuses the same file first — but `pub`,
+    /// and `hytte_services::places::edit` composes it by hand, so the writer
+    /// holds the rule itself rather than relying on every caller to.
+    #[test]
+    fn persist_to_refuses_a_file_it_cannot_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("places.toml");
+        std::fs::write(&path, NOT_UTF8).expect("seed");
+
+        assert!(matches!(
+            persist_to(&path, &[full_place("Home")]),
+            Err(PlacesError::Unreadable(_))
+        ));
+        assert_eq!(std::fs::read(&path).expect("still there"), NOT_UTF8);
+    }
+
+    /// The control for the two tests above: `NotFound` — and only that — is
+    /// "no file yet", which still seeds the shipped default.
+    #[test]
+    fn a_missing_file_still_seeds_the_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("places.toml");
+
+        persist_departures_endpoint_to(&path, Some("vbb")).expect("persists");
+
+        let saved = std::fs::read_to_string(&path).expect("created");
+        assert!(saved.starts_with(DEFAULT_CONFIG.lines().next().expect("a header")));
+        assert_eq!(
+            parse_departures_endpoint(&saved).expect("valid TOML"),
+            Some("vbb".to_owned())
+        );
+    }
+
+    /// The real entry point the control center's Endpoint row calls, against a
+    /// scratch `$HOME` with no base layer: refused, file intact.
+    #[test]
+    fn save_departures_endpoint_refuses_an_unreadable_overlay() {
+        let home = tempfile::tempdir().expect("tempdir");
+
+        with_layers(home.path(), &[], || {
+            let path = config_path().expect("$HOME");
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("config dir");
+            std::fs::write(&path, NOT_UTF8).expect("seed");
+
+            assert!(matches!(
+                save_departures_endpoint(Some("vbb")),
+                Err(PlacesError::Unreadable(_))
+            ));
+            assert_eq!(std::fs::read(&path).expect("still there"), NOT_UTF8);
+        });
     }
 
     #[test]

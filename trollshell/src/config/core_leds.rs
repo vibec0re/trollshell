@@ -79,7 +79,6 @@
 //! subsystem's battery split rides — everything below is this subsystem's own
 //! half: mapping "on battery or not" to a `Duration`.
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use hytte::futures_signals::signal::{Mutable, Signal};
@@ -593,15 +592,15 @@ pub struct CoreLedsHandles {
 /// the announcing resolution entirely, left the suite green. Nobody would ever
 /// have heard a deprecation line again and CI would not have noticed.
 ///
-/// Holding `paths`, `lookup` and `on_battery` as fields means a test
+/// Holding `layers`, `lookup` and `on_battery` as fields means a test
 /// constructs this over a scratch overlay and a fake environment and then
 /// calls the **real** `start`. What is left unpinned is [`service`]'s three
 /// argument expressions — deliberately, and that is as thin as this can get
 /// without `set_var`: they are `xdg::config_layers`, `env::process_env` and
 /// `self::on_battery`, each covered on its own elsewhere.
 pub struct CoreLedsService {
-    /// Layer paths, lowest precedence first.
-    paths: Vec<PathBuf>,
+    /// The layers — bases lowest precedence first, the overlay slot by name.
+    layers: xdg::Layers,
     /// How a retired variable is checked for presence (#1041 step 3 — its
     /// value, if any, is never read).
     lookup: EnvLookup,
@@ -620,7 +619,7 @@ impl Service for CoreLedsService {
         // One stamp, one load, one announcing resolution — all inside `boot`,
         // in that order. Nothing here chooses a `Deprecations` or a stamp
         // ordering, so this call site cannot get either wrong.
-        let (resolved, watcher) = watch::boot::<CoreLedsConfig>(&self.paths, &*self.lookup);
+        let (resolved, watcher) = watch::boot::<CoreLedsConfig>(&self.layers, &*self.lookup);
         let leds = Mutable::new(resolved);
         let Self {
             lookup, on_battery, ..
@@ -643,7 +642,7 @@ impl Service for CoreLedsService {
 
 pub fn service() -> CoreLedsService {
     CoreLedsService {
-        paths: xdg::config_layers(CoreLedsConfig::NAME),
+        layers: xdg::config_layers(CoreLedsConfig::NAME),
         lookup: std::sync::Arc::new(env::process_env),
         on_battery: std::sync::Arc::new(on_battery),
     }
@@ -815,8 +814,8 @@ mod tests {
     }
 
     /// [`subsystem::initial_load`] at this subsystem.
-    fn initial_load(paths: &[PathBuf]) -> CoreLeds {
-        subsystem::initial_load::<CoreLedsConfig>(paths)
+    fn initial_load(layers: impl Into<hytte_config::xdg::Layers>) -> CoreLeds {
+        subsystem::initial_load::<CoreLedsConfig>(layers)
     }
 
     /// [`Subsystem::resolve`] at this subsystem — the environment layered over
@@ -1260,7 +1259,7 @@ mod tests {
         overlay.write("style = \"crt\"\ncolor = \"rainbow\"\nrows = \"many\"\n");
 
         let (captured, _guard) = capture();
-        let leds = initial_load(&overlay.layers());
+        let leds = initial_load(overlay.layers());
 
         assert_eq!(leds.style, DisplayStyle::Crt, "the good keys apply");
         assert_eq!(leds.color, ColorMap::Rainbow, "…all of them");
@@ -1914,7 +1913,7 @@ mod tests {
         on_battery: impl Fn() -> bool + Send + Sync + 'static,
     ) -> CoreLedsService {
         CoreLedsService {
-            paths,
+            layers: paths.into(),
             lookup: std::sync::Arc::new(lookup),
             on_battery: std::sync::Arc::new(on_battery),
         }

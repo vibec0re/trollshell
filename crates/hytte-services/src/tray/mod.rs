@@ -1527,6 +1527,38 @@ mod tests {
         assert_eq!(reads, 1);
     }
 
+    /// The retry waits the grace delay before it reads again. That delay is
+    /// the whole point of the retry: an item that has not exported yet fails
+    /// a second read made at once just as it failed the first. `drive` passes
+    /// a zero delay, so nothing else here sees the wait (#1574 review).
+    ///
+    /// The paused clock is never stepped by hand: `read_with_retry`'s own
+    /// `sleep` auto-advances it, and nothing runs under `spawn_blocking`, so
+    /// the gap measured is exactly the delay slept, in debug and release.
+    ///
+    /// Falsifiable: delete the `sleep` in `read_with_retry` and the gap is 0.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn the_retry_reads_again_only_after_the_grace_delay() {
+        use super::INITIAL_READ_RETRY_DELAY;
+        let start = tokio::time::Instant::now();
+        let at = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = at.clone();
+        let mut script: VecDeque<Result<u8, &'static str>> = vec![Err("early"), Ok(7)].into();
+        let out = read_with_retry(
+            move || {
+                log.lock().unwrap().push(start.elapsed());
+                std::future::ready(script.pop_front().unwrap_or(Err("exhausted")))
+            },
+            || std::future::ready(Some(true)),
+            INITIAL_READ_RETRY_DELAY,
+        )
+        .await;
+        assert_eq!(out, Ok(7));
+        let at = at.lock().unwrap();
+        assert_eq!(at.len(), 2);
+        assert_eq!(at[1].checked_sub(at[0]), Some(INITIAL_READ_RETRY_DELAY));
+    }
+
     // ── Ghost rows: the identity check and the owner check ──────────────────
 
     use super::{Identity, LivenessEnd, ProxyState, watch_liveness};

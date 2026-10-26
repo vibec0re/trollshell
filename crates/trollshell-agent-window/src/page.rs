@@ -504,8 +504,8 @@ mod tests {
     /// (`xn--bcher-kva` is RFC 3492's own worked example for `bücher`, so the
     /// literal is the standard's, not a recomputation). The first row is the
     /// window's own first `load_uri`; the others say the conversion composes
-    /// with the M2 case fold, with a port, and with a trailing dot, which
-    /// `WebKit` keeps and so must the hive's side.
+    /// with the M2 case fold, with a port, and with a trailing dot, which the
+    /// URL Standard keeps and so must the hive's side.
     ///
     /// Mutations (run this round, red): parse with `UriFlags::NON_DNS` in
     /// `tls::authority_of` and the first row reds — the hive's host stays
@@ -559,14 +559,17 @@ mod tests {
     /// downgrade — plus the converse, an ASCII hive refusing its IDN
     /// look-alike.
     ///
-    /// Mutation (run this round, red): the issue's other suggested fix,
-    /// "IDNA-encode both sides" — run the candidate's host through
-    /// `glib::hostname_to_ascii` as well — and the `xn--bcher-kva.example.`
-    /// row reds: the conversion drops the dot, so a second origin by
-    /// `WebKit`'s reckoning compares equal. (It also folds the candidate's
-    /// case, which `a_candidate_not_in_webkits_spelling_is_still_refused`
-    /// catches.) Converting only the hive's side, to the spelling `WebKit`
-    /// already uses, is what keeps the rule one origin wide.
+    /// Mutations (run this round, red): strip a trailing dot from both hosts
+    /// before comparing — the "normalisation" a reader might add next to an
+    /// IDNA one — and the `xn--bcher-kva.example.` row reds, a second origin
+    /// by `WebKit`'s reckoning compared equal; match the hive's host as a
+    /// suffix and the `www.` row reds. The issue's other suggested fix,
+    /// running the candidate's host through `glib::hostname_to_ascii` as
+    /// well, leaves this test green — `g_hostname_to_ascii` keeps the dot on
+    /// an A-label and changes nothing else here — and reds
+    /// `a_candidate_not_in_webkits_spelling_is_still_refused` instead, because
+    /// it folds the candidate's case. Converting only the hive's side, to the
+    /// spelling `WebKit` already uses, is what keeps the rule one-sided.
     #[test]
     fn another_idn_host_is_still_another_host() {
         let page = "https://bücher.example/agent/stray/?hide=header";

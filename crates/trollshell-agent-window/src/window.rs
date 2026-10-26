@@ -3425,7 +3425,8 @@ mod gtk_tests {
     /// whatever `presented` says — the retry as it shipped — and the second
     /// probe runs while hidden (`calls` reds at 2); drop the
     /// `presentation_changed` call from `follow_presentation`'s loop and the
-    /// edge back runs nothing (`probing()` reds).
+    /// window never learns it was hidden, so the same assertion reds the same
+    /// way.
     #[gtk::test]
     fn a_retry_due_while_hidden_parks_and_runs_when_shown_again() {
         let (trust, calls) = scripted_answers(vec![unreachable_answer()]);
@@ -3446,10 +3447,12 @@ mod gtk_tests {
         );
 
         shown.send(false).expect("the window follows the watch");
+        // The timer coming due shows either way: parked, or — the bug —
+        // a second probe.
         assert!(
-            pump_until(Duration::from_secs(10), || w
-                .waiting()
-                .is_some_and(|(_, parked)| parked)),
+            pump_until(Duration::from_secs(10), || {
+                calls.load(Ordering::SeqCst) > 1 || w.waiting().is_some_and(|(_, parked)| parked)
+            }),
             "the retry's timer never came due"
         );
         assert_eq!(
@@ -3457,6 +3460,7 @@ mod gtk_tests {
             1,
             "a hidden window's retry dials nothing — it parks"
         );
+        assert_eq!(w.waiting(), Some((super::Attempt::Probe, true)), "parked");
         assert!(!w.probing());
         // Parked still holds `load_page`'s latch, so a poll arriving meanwhile
         // (the feed parks too, but a command's reconciling poll does not) does

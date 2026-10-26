@@ -547,11 +547,14 @@ pub fn failure_description(host: &str, tried: Option<&str>) -> String {
 /// would have quietly broken all three;
 /// `an_idn_host_comes_back_in_the_a_label_spelling` pins it now.
 ///
-/// `g_hostname_to_ascii` drops a trailing dot as it converts, and WHATWG
-/// keeps one (`xn--bcher-kva.example.` is its own origin to `WebKit`, as
-/// `hive.local.` is). So that one dot is put back from the host as written
+/// `g_hostname_to_ascii` drops a trailing dot as it converts (measured), and
+/// the URL Standard keeps one: `WebKit` serialises `hive.local.` with its
+/// dot, as its own origin (`URLParser.cpp` strips nothing from an ASCII
+/// host), and its IDNA step runs with the empty-label error tolerated. So
+/// that one dot is put back from the host as written
 /// (`written_with_a_trailing_dot`), and an IDN host keeps its dot exactly as
-/// an ASCII one does.
+/// an ASCII one does. If `WebKit` ever did drop it for an IDN host, the
+/// hive's own page would be refused — closed, not open.
 #[must_use]
 pub fn host_of(url: &str) -> Option<String> {
     let uri = authority_of(url)?;

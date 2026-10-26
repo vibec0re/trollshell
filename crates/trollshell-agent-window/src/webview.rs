@@ -601,6 +601,16 @@ pub fn is_verifying(widget: &gtk::Widget) -> bool {
 ///
 /// Escaped, like every other description in this file: `tried` carries a path
 /// and the GIO error's own words, and neither is markup.
+///
+/// # The same card for a mounted page (#1557 item 2)
+///
+/// On the routes with no probe there is no verdict to wait for, so the page
+/// mounts and `WebKit`'s own load is what finds the gateway down. The window
+/// puts this card in front of the view then too ([`show_unanswered`]), with
+/// `tried` naming the URI that got no answer and the engine's own words for
+/// it, and its button skips the backoff of the queued reload instead of a
+/// queued probe. One card for one condition — the gateway did not answer —
+/// whichever step found it out.
 #[must_use]
 pub fn unreachable(
     tried: Option<&str>,

@@ -365,7 +365,7 @@ impl Plugin for NiriLayouts {
                 // pool rather than stalling the SDK's current-thread runtime
                 // (which is also servicing the host socket).
                 let outcome = hytte_plugin::tokio::task::spawn_blocking(move || {
-                    apply_and_report(&mut SocketTransport, layout, output.as_deref())
+                    apply_and_report(&mut SocketTransport::new(), layout, output.as_deref())
                 })
                 .await;
                 let report = match outcome {

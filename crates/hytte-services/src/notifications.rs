@@ -65,8 +65,11 @@ struct NotificationsShared {
     /// (D-Bus `Notify`) notifications never populate this map, so this
     /// field has zero effect on their behaviour. A plain `std::sync::Mutex`
     /// is fine here for the same reason as `POST_LOCAL_SEEN`: every
-    /// critical section is non-async map surgery.
-    local_actions: Mutex<LocalActionMap>,
+    /// critical section is non-async map surgery. The **same** `Arc` the
+    /// D-Bus `Notify` handler (`NotificationsIface::local_actions`) clears a
+    /// replaced id's callbacks from, so that handler needs no registry lookup
+    /// and a test can drive it hermetically.
+    local_actions: Arc<Mutex<LocalActionMap>>,
     /// Hover-pausable per-id expiry timers (#567). Keyed by notification id,
     /// each entry pairs the pure [`TimerState`] bookkeeping with the live
     /// `sleep → dismiss` task's abort handle. One entry per **live**
@@ -208,10 +211,12 @@ impl Service for NotificationsService {
         let active = Mutable::new(Vec::new());
         let next_id = Arc::new(AtomicU32::new(1));
         let history = Mutable::new(Vec::new());
+        let local_actions = Arc::new(Mutex::new(HashMap::new()));
 
         let iface = NotificationsIface {
             active: active.clone(),
             next_id: next_id.clone(),
+            local_actions: local_actions.clone(),
         };
 
         // Own the well-known name + mount the interface. The bus layer handles
@@ -235,7 +240,7 @@ impl Service for NotificationsService {
             history: history.clone(),
             next_id: next_id.clone(),
             ownership: ownership.clone(),
-            local_actions: Mutex::new(HashMap::new()),
+            local_actions,
             timers: Mutex::new(HashMap::new()),
         });
 
@@ -1163,8 +1168,10 @@ pub fn post_local_with_actions(
 
 /// The mounted `org.freedesktop.Notifications` object. Closing goes through
 /// [`dismiss`] and the shared registry, like every other close path, so the
-/// interface holds only what `Notify` writes: the live list and the id
-/// counter. (It used to carry the history too, for a `close_notification` that
+/// interface holds only what `Notify` writes: the live list, the id counter,
+/// and the shell-local callback map a replace retires an id's entries from
+/// (the `Arc` `NotificationsShared::local_actions` also holds). (It used to
+/// carry the history too, for a `close_notification` that
 /// pulled the notification out itself before calling `dismiss` — which is
 /// what left `dismiss` emitting `NotificationClosed` for ids it had not
 /// removed, since from there it could not tell a close it was finishing from
@@ -1173,6 +1180,7 @@ pub fn post_local_with_actions(
 struct NotificationsIface {
     active: Mutable<Vec<Notification>>,
     next_id: Arc<AtomicU32>,
+    local_actions: Arc<Mutex<LocalActionMap>>,
 }
 
 // zbus's `#[interface]` macro requires every method to be `async fn` even
@@ -1262,6 +1270,12 @@ impl NotificationsIface {
         // `close` uses for its arming check, so the pair cannot invert.
         let id = {
             let mut list = self.active.lock_mut();
+            // A replace of a live id keeps the id, so it must also drop any
+            // shell-local callback registered under it. Lock order is
+            // `active` -> `local_actions`; nothing takes them the other way.
+            if let Ok(mut map) = self.local_actions.lock() {
+                forget_replaced_local_actions(&mut map, &list, replaces_id);
+            }
             let id = notify_id(&list, replaces_id, &self.next_id);
             crate::notifications::set_expiry(id, timeout);
             let notification = Notification {
@@ -1358,10 +1372,33 @@ impl NotificationsIface {
 /// one. Must be called under the `active` write guard the result is written
 /// back under: the answer is only as current as `live`.
 fn notify_id(live: &[Notification], replaces_id: u32, next_id: &AtomicU32) -> u32 {
-    if replaces_id != 0 && live.iter().any(|n| n.id == replaces_id) {
+    if replaces_live(live, replaces_id) {
         replaces_id
     } else {
         next_id.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+/// Whether `replaces_id` names a notification that is live in `live`, i.e. a
+/// `Notify` carrying it lands as a replace and keeps the id.
+fn replaces_live(live: &[Notification], replaces_id: u32) -> bool {
+    replaces_id != 0 && live.iter().any(|n| n.id == replaces_id)
+}
+
+/// A replace lands on a live id: forget any shell-local callbacks registered
+/// for it. A D-Bus client can name one of the shell's own `post_local` toasts
+/// in `replaces_id`; the replacement's actions are the client's, so a click on
+/// a key the shell also registered (`open`, `copy`) must broadcast
+/// `ActionInvoked`, not run the shell's callback. Close clears these too (see
+/// `dismiss`); a replace never closes. Pure map mutation, so it is
+/// unit-testable without the process-global registry.
+fn forget_replaced_local_actions(
+    map: &mut LocalActionMap,
+    live: &[Notification],
+    replaces_id: u32,
+) {
+    if replaces_live(live, replaces_id) {
+        clear_local_actions(map, replaces_id);
     }
 }
 
@@ -1427,15 +1464,16 @@ fn parse_actions(raw: &[String]) -> Vec<Action> {
 /// Before this, `image_data` was not read at all — a 1.1 client's image was
 /// silently dropped — and `icon_data` outranked both `image-path` and
 /// `app_icon`. A hint that is present but unusable (a malformed raw image, an
-/// empty or non-string path) falls through to the next one.
+/// empty or non-string path) falls through to the next one. Spec 1.2 lets
+/// `image-path` name a themed icon as well as a file, so it takes the same
+/// path-or-icon-name rule as `app_icon` ([`app_icon_image`]).
 fn parse_image(hints: &HashMap<String, OwnedValue>, app_icon: &str) -> Option<NotificationImage> {
     let raw = |key: &str| hints.get(key).and_then(decode_image_data);
     let path = |key: &str| {
         hints
             .get(key)
             .and_then(|v| String::try_from(v.try_clone().ok()?).ok())
-            .filter(|p| !p.is_empty())
-            .map(NotificationImage::Path)
+            .and_then(|p| app_icon_image(&p))
     };
     raw("image-data")
         .or_else(|| raw("image_data"))
@@ -1659,12 +1697,12 @@ mod tests {
         DEFAULT_TIMEOUT, HashMap, LocalActionMap, MIN_RESUME, Mutable, Notification,
         NotificationImage, NotificationsIface, OwnedValue, RateLimitMap, TimerAction, TimerEntry,
         TimerMap, TimerState, Urgency, apply_expiry, apply_pause, clear_local_actions, clear_timer,
-        closable, image_data_consistent, notify_id, parse_image, rate_limit_check,
-        register_local_action, resolve_timeout, strip_markup, take_local_action,
+        closable, forget_replaced_local_actions, image_data_consistent, notify_id, parse_image,
+        rate_limit_check, register_local_action, resolve_timeout, strip_markup, take_local_action,
     };
     use std::cell::Cell;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
     use zbus::zvariant::{Str, Structure, Value};
 
@@ -1709,6 +1747,21 @@ mod tests {
         assert_eq!(picked(&h, "firefox"), "raw 2");
         let h = hints(&[("image_path", str_hint("/tmp/b.png"))]);
         assert_eq!(picked(&h, "firefox"), "path /tmp/b.png");
+    }
+
+    #[test]
+    fn image_path_hint_may_name_a_themed_icon() {
+        // Spec 1.2: `image-path` is "a URI or a name in an icon theme", the
+        // same as `app_icon`. A bare name is an icon, a `/` path or
+        // `file://` URI stays a file.
+        for key in ["image-path", "image_path"] {
+            let h = hints(&[(key, str_hint("mail-unread"))]);
+            assert_eq!(picked(&h, "firefox"), "icon mail-unread");
+            let h = hints(&[(key, str_hint("file:///tmp/a.png"))]);
+            assert_eq!(picked(&h, "firefox"), "path file:///tmp/a.png");
+            let h = hints(&[(key, str_hint("/tmp/a.png"))]);
+            assert_eq!(picked(&h, "firefox"), "path /tmp/a.png");
+        }
     }
 
     #[test]
@@ -1887,6 +1940,7 @@ mod tests {
         let iface = NotificationsIface {
             active: Mutable::new(Vec::new()),
             next_id: Arc::new(AtomicU32::new(1)),
+            local_actions: Arc::new(Mutex::new(LocalActionMap::new())),
         };
         let caps = iface.get_capabilities();
         assert!(caps.iter().any(|c| c == "body"), "{caps:?}");
@@ -2164,6 +2218,77 @@ mod tests {
 
         assert_eq!(map.len(), 1);
         assert!(map.contains_key(&(2, "open".to_string())));
+    }
+
+    #[test]
+    fn replace_of_a_live_id_forgets_its_local_actions() {
+        let mut map = LocalActionMap::new();
+        register_local_action(&mut map, 1, "open".to_string(), Box::new(|| {}));
+        register_local_action(&mut map, 1, "copy".to_string(), Box::new(|| {}));
+        register_local_action(&mut map, 2, "open".to_string(), Box::new(|| {}));
+
+        forget_replaced_local_actions(&mut map, &[live(1), live(2)], 1);
+
+        // id 1's callbacks are gone, so a click broadcasts `ActionInvoked`;
+        // id 2's stay.
+        assert!(take_local_action(&mut map, 1, "open").is_none());
+        assert!(take_local_action(&mut map, 1, "copy").is_none());
+        assert!(map.contains_key(&(2, "open".to_string())));
+    }
+
+    #[test]
+    fn replace_of_a_non_live_or_zero_id_keeps_local_actions() {
+        let mut map = LocalActionMap::new();
+        register_local_action(&mut map, 1, "open".to_string(), Box::new(|| {}));
+
+        // 0 = replace nothing; 5 is not live: neither touches id 1.
+        forget_replaced_local_actions(&mut map, &[live(1)], 0);
+        forget_replaced_local_actions(&mut map, &[live(1)], 5);
+
+        assert!(map.contains_key(&(1, "open".to_string())));
+    }
+
+    /// The `Notify` handler itself, not just the helper: a client's
+    /// `replaces_id` naming a live shell-local toast retires that toast's
+    /// callbacks, so the replacement's `open` broadcasts `ActionInvoked`
+    /// instead of running the shell's. Driven through the real `notify`
+    /// (#1572 review): with no `NotificationsShared` registered, its only
+    /// other side effect, `set_expiry`, is a no-op.
+    #[test]
+    fn notify_replacing_a_live_local_toast_forgets_its_callbacks() {
+        let local_actions = Arc::new(Mutex::new(LocalActionMap::new()));
+        {
+            let mut map = local_actions.lock().expect("fresh mutex");
+            register_local_action(&mut map, 1, "open".to_string(), Box::new(|| {}));
+            register_local_action(&mut map, 2, "open".to_string(), Box::new(|| {}));
+        }
+        let iface = NotificationsIface {
+            active: Mutable::new(vec![live(1), live(2)]),
+            next_id: Arc::new(AtomicU32::new(3)),
+            local_actions: Arc::clone(&local_actions),
+        };
+
+        let id = futures_executor::block_on(iface.notify(
+            "client",
+            1,
+            "",
+            "replaced",
+            "",
+            vec!["open".to_string(), "Open".to_string()],
+            HashMap::new(),
+            -1,
+        ));
+
+        assert_eq!(id, 1, "a replace of a live id keeps the id");
+        let mut map = local_actions.lock().expect("not poisoned");
+        assert!(
+            take_local_action(&mut map, 1, "open").is_none(),
+            "the replaced shell toast's callback must not run on the client's click"
+        );
+        assert!(
+            map.contains_key(&(2, "open".to_string())),
+            "another toast's callback is untouched"
+        );
     }
 
     #[test]

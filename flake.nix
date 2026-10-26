@@ -1026,6 +1026,15 @@
                         enable = true;
                         package = stubLlamaCpp;
                         model = "/var/empty/brain.gguf";
+                        # A `%` and a `$` in an argument: systemd expands both inside
+                        # single quotes, so they must reach ExecStart doubled (and the
+                        # arg double-quoted) or llama-server gets a rewritten argv.
+                        extraArgs = [
+                          "--ctx-size"
+                          "1024"
+                          "--alias"
+                          "100%$x y"
+                        ];
                       };
                       # plugins (#350/#355, attrsOf keyed by id): `demo` is
                       # declared enabled; `off` must render declared-but-off.
@@ -1182,9 +1191,9 @@
                   let
                     exec = builtins.toString units.trollshell-pet-brain.Service.ExecStart;
                   in
-                  pkgs.lib.hasInfix "--model /var/empty/brain.gguf" exec
+                  pkgs.lib.hasInfix "--model \"/var/empty/brain.gguf\"" exec
                   && pkgs.lib.hasInfix "--port 8080" exec
-                  && pkgs.lib.hasSuffix "--ctx-size 1024 --threads 4" exec;
+                  && pkgs.lib.hasSuffix "\"--ctx-size\" \"1024\" \"--alias\" \"100%%$$x y\"" exec;
                 builtins.deepSeq {
                   userUnits = units;
                   sessionVars = cfg.home.sessionVariables;
@@ -1785,6 +1794,48 @@
                 builtins.deepSeq { inherit falsePredicates; } "ok";
             in
             pkgs.runCommand "trollshell-nixos-module-nightlight-check" { inherit probe; } ''
+              echo "$probe" >/dev/null
+              touch $out
+            '';
+
+          # geoclue2's `appConfig.trollshell` is set by the module as
+          # `mkDefault` like the rest of the recommended-services block, so a
+          # user's explicit `isAllowed = false` must evaluate (a plain
+          # definition on the module's side made it a "conflicting definition
+          # values" error) and win.
+          nixos-module-geoclue-override =
+            let
+              nixos = nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.default
+                  {
+                    programs.trollshell = {
+                      enable = true;
+                      package = stubPackage;
+                      weather.fallbackCity = "Berlin";
+                    };
+                    services.geoclue2.appConfig.trollshell = {
+                      isAllowed = false;
+                      isSystem = true;
+                    };
+                    boot.loader.grub.enable = false;
+                    fileSystems."/" = {
+                      device = "/dev/sda1";
+                      fsType = "ext4";
+                    };
+                    system.stateVersion = "24.11";
+                  }
+                ];
+              };
+              app = nixos.config.services.geoclue2.appConfig.trollshell;
+              probe =
+                assert nixos.config.services.geoclue2.enable;
+                assert !app.isAllowed;
+                assert app.isSystem;
+                "ok";
+            in
+            pkgs.runCommand "trollshell-nixos-module-geoclue-override-check" { inherit probe; } ''
               echo "$probe" >/dev/null
               touch $out
             '';

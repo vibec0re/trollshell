@@ -239,6 +239,15 @@ let
   cb = cfg.claudeBridge;
   pb = cfg.petBrain;
 
+  # Quote one argument for a systemd `Exec*=` line. `lib.escapeShellArg` is the
+  # wrong tool: systemd is not a shell, and still expands `%` specifiers and
+  # `$VAR` inside single quotes, so `/data/100%/brain.gguf` was rewritten. Same
+  # rule as nixpkgs' NixOS-only `utils.escapeSystemdExecArg` (which
+  # home-manager cannot reach): a JSON string is a valid systemd double-quoted
+  # string, and `%` and `$` are doubled.
+  escapeSystemdExecArg =
+    arg: lib.replaceStrings [ "%" "$" ] [ "%%" "$$" ] (builtins.toJSON (toString arg));
+
   # Where the pet brain's GGUF lives. Resolved here rather than as the option's
   # own default because module-common.nix is shared with the NixOS module, where
   # `config.home` does not exist to point at.
@@ -1033,7 +1042,7 @@ in
           Service = {
             Type = "simple";
             # `getExe'` by binary name, not `getExe`: llama-cpp's mainProgram is
-            # the CLI, not the server. The model path is shell-escaped because
+            # the CLI, not the server. The model path is systemd-escaped because
             # systemd splits ExecStart on whitespace and it is the one component
             # a user can point at a directory with a space in it; the store path
             # and the numbers cannot contain one.
@@ -1041,14 +1050,14 @@ in
               [
                 (lib.getExe' pb.package "llama-server")
                 "--model"
-                (lib.escapeShellArg pbModel)
+                (escapeSystemdExecArg pbModel)
                 "--port"
                 (toString pb.port)
               ]
               # One list entry is one argv token — escaped, so an entry with a
               # space stays a single argument instead of being re-split by
               # systemd into two.
-              ++ map lib.escapeShellArg pb.extraArgs
+              ++ map escapeSystemdExecArg pb.extraArgs
             );
             Restart = "on-failure";
             RestartSec = 5;

@@ -395,6 +395,7 @@ jobs:
             .#checks.x86_64-linux.nixos-module-core-leds \
             .#checks.x86_64-linux.nixos-module-core-leds-unknown-key \
             .#checks.x86_64-linux.nixos-module-nightlight \
+            .#checks.x86_64-linux.nixos-module-geoclue-override \
             .#checks.x86_64-linux.nixos-module-places-fixture \
             .#checks.x86_64-linux.nixos-module-plugin-id \
             .#checks.x86_64-linux.nixos-module-plugin-id-conflict \

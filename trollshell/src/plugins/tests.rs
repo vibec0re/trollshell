@@ -3391,7 +3391,10 @@ async fn a_provided_datasource_with_an_unusable_id_is_refused() {
     let events = captured.events();
     let refusals = events
         .iter()
-        .filter(|e| e.message.contains("provides a datasource the host does not accept"))
+        .filter(|e| {
+            e.message
+                .contains("provides a datasource the host does not accept")
+        })
         .count();
     assert_eq!(refusals, bad.len(), "one refusal line each: {events:?}");
     for event in &events {

@@ -42,7 +42,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use hytte_config::places::{self, Place};
-use hytte_plugin::{CmdReceiver, poll};
+use hytte_plugin::CmdReceiver;
+use hytte_plugin::poll::{Gate, Wake};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
@@ -198,16 +199,34 @@ fn into_row(row: ApiDeparture, now_unix: i64) -> Option<Row> {
     // Integer division truncates toward zero; sub-minute precision isn't shown.
     let delay_minutes = row.delay.unwrap_or(0) / 60;
 
+    let direction = row.direction.unwrap_or_default();
+    // HAFAS normally supplies a stable `tripId`; an empty one would make every
+    // such row share the `arm:` node id (arming one arms all). Synthesise a
+    // stable id from the row's own identity rather than drop a real train.
+    let trip_id = if row.trip_id.is_empty() {
+        synthetic_trip_id(&line_name, &direction, planned_raw)
+    } else {
+        row.trip_id
+    };
+
     Some(Row {
         line: line_name,
-        direction: row.direction.unwrap_or_default(),
+        direction,
         hhmm: actual.format("%H:%M").to_string(),
         actual_unix,
         delay_minutes,
         cancelled: row.cancelled,
-        trip_id: row.trip_id,
+        trip_id,
         walk_minutes: 0,
     })
+}
+
+/// A stable stand-in `trip_id` for a wire row that has none: line, direction and
+/// planned time identify a train across refreshes (the same row re-derives the
+/// same id, so an armed train survives a refresh) and differ between the rows
+/// of one board.
+fn synthetic_trip_id(line: &str, direction: &str, planned: &str) -> String {
+    format!("synth:{line}|{direction}|{planned}")
 }
 
 /// Parse a raw response body into rows, filtering as [`into_row`] describes.
@@ -432,8 +451,19 @@ fn fetch_departures(
 /// here (`"can't reach <label>: …"`, #1124) rather than left for the view
 /// layer to guess at — this is the one place that knows which backend was
 /// actually dialled.
-fn fetch_once() -> Result<Vec<Row>, String> {
-    let cfg = load_station_config()?;
+///
+/// Returns the resolved backend label alongside the result (`None` when the
+/// config itself failed to load) so the board's empty-state text can name the
+/// backend actually configured.
+fn fetch_once() -> (Option<String>, Result<Vec<Row>, String>) {
+    match load_station_config() {
+        Ok(cfg) => (Some(cfg.backend_label.clone()), fetch_with(&cfg)),
+        Err(e) => (None, Err(e)),
+    }
+}
+
+/// The fetch half of [`fetch_once`], against an already-resolved config.
+fn fetch_with(cfg: &StationConfig) -> Result<Vec<Row>, String> {
     let agent = http_agent();
     let all = fetch_departures(&agent, &cfg.base_url, &cfg.station)
         .map_err(|e| format!("can't reach {}: {e}", cfg.backend_label))?;
@@ -453,9 +483,12 @@ fn fetch_once() -> Result<Vec<Row>, String> {
 
 /// Run a `spawn_blocking` fetch and forward the result as a [`BoardMsg`].
 async fn fetch_and_send(msg_tx: &mpsc::UnboundedSender<BoardMsg>) {
-    let result = tokio::task::spawn_blocking(fetch_once)
+    let (label, result) = tokio::task::spawn_blocking(fetch_once)
         .await
-        .unwrap_or_else(|e| Err(format!("join: {e}")));
+        .unwrap_or_else(|e| (None, Err(format!("join: {e}"))));
+    if let Some(label) = label {
+        let _ = msg_tx.send(BoardMsg::Backend(label));
+    }
     if let Err(ref e) = result {
         eprintln!("[departures] fetch failed: {e}");
     }
@@ -472,15 +505,22 @@ async fn fetch_and_send(msg_tx: &mpsc::UnboundedSender<BoardMsg>) {
 /// down to the comments on the `biased;` and the `, if visible` guard. What
 /// each of those buys is documented on the helper.
 pub(crate) async fn poll_task(cmds: CmdReceiver<Cmd>, msg_tx: mpsc::UnboundedSender<BoardMsg>) {
-    // An irrefutable pattern on purpose: a second `Cmd` variant would fail to
-    // compile here rather than being silently read as a visibility flip.
-    poll::gated(
-        cmds,
-        REFRESH_WHILE_OPEN,
-        |&Cmd::SetVisible(visible)| visible,
-        || fetch_and_send(&msg_tx),
-    )
-    .await;
+    // Driven through `Gate` directly: the lane carries more than the
+    // visibility flip. `Cmd::Refresh` is a datasource query waking one fetch
+    // through this same machinery, even while parked (no second HTTP path).
+    // The match is exhaustive on purpose: a new `Cmd` variant fails to compile
+    // here rather than being silently read as a visibility flip.
+    let mut gate = Gate::new(cmds, REFRESH_WHILE_OPEN, |cmd: &Cmd| match cmd {
+        Cmd::SetVisible(visible) => Some(*visible),
+        Cmd::Refresh => None,
+    });
+    while let Some(wake) = gate.next().await {
+        match wake {
+            Wake::Refresh | Wake::Cmd(Cmd::Refresh) => fetch_and_send(&msg_tx).await,
+            // Unreachable: the classifier absorbs every `SetVisible`.
+            Wake::Cmd(Cmd::SetVisible(_)) => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -564,6 +604,31 @@ mod tests {
     #[test]
     fn into_row_drops_already_departed() {
         assert!(into_row(nth_wire_row(0), now_after()).is_none());
+    }
+
+    #[test]
+    fn empty_trip_id_gets_a_stable_unique_synthetic_id() {
+        let mut a = nth_wire_row(0);
+        a.trip_id.clear();
+        let mut b = nth_wire_row(1);
+        b.trip_id.clear();
+        let a2 = {
+            let mut x = nth_wire_row(0);
+            x.trip_id.clear();
+            x
+        };
+        let ra = into_row(a, now_before()).expect("row");
+        let rb = into_row(b, now_before()).expect("row");
+        let ra2 = into_row(a2, now_before()).expect("row");
+        assert!(!ra.trip_id.is_empty());
+        assert_ne!(ra.trip_id, rb.trip_id, "distinct trains, distinct arm ids");
+        assert_eq!(ra.trip_id, ra2.trip_id, "stable across refreshes");
+    }
+
+    #[test]
+    fn a_real_trip_id_is_kept() {
+        let r = into_row(nth_wire_row(0), now_before()).expect("row");
+        assert_eq!(r.trip_id, "trip-1-ontime");
     }
 
     // ── parse_response ────────────────────────────────────────────────────────

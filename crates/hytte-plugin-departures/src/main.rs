@@ -79,6 +79,25 @@ const DEPARTED_GRACE_SECS: i64 = 30;
 /// After this much elapses since the last good fetch, a continuing error drops
 /// `Stale` → `Err`. Native `STALE_DROP_AFTER` (30 min).
 const STALE_DROP_AFTER_SECS: i64 = 30 * 60;
+/// How old the board's last good fetch may be before the `departures`
+/// datasource refuses to answer from it. The poller refreshes every
+/// [`feed::REFRESH_WHILE_OPEN`] (30 s) while the sidebar is open and parks while
+/// it is hidden, so a held list ages without bound; four refresh periods
+/// (two minutes) tolerates three consecutive missed polls (a slow link, a
+/// retry) yet bounds how long a requester can see a delay or cancellation that
+/// has since changed. Past it the answer is a failure, never a frozen list. A
+/// test pins this to `4 * REFRESH_WHILE_OPEN`.
+const DATASOURCE_MAX_AGE_SECS: i64 = 4 * 30;
+/// A query that finds the list older than that wakes a fetch (see
+/// [`Board::on_query`]); a woken fetch is not repeated within this many seconds,
+/// so a chatty consumer gets at most one HTTP round trip per floor, however
+/// often it asks.
+const KICK_FLOOR_SECS: i64 = 15;
+/// A parked query is answered from what is on hand after this long. The host
+/// drops an unanswered query at 10 s (`plugins/datasource.rs` `QUERY_TIMEOUT`),
+/// and the clock tick that checks this lands once a second, so 8 s leaves
+/// slack for the tick and the wire.
+const QUERY_DEADLINE_SECS: i64 = 8;
 /// Ellipsis/wrap cap on the destination cell. Native `set_max_width_chars(22)`.
 const DIRECTION_MAX_CHARS: i32 = 22;
 
@@ -100,6 +119,9 @@ const LEAVE_BY_ICON: &str = "appointment-soon-symbolic";
 pub(crate) enum BoardMsg {
     /// One completed fetch (or its error) to fold into [`BoardState`].
     Fetched(Result<Vec<Row>, String>),
+    /// The display label of the backend the latest fetch resolved from config
+    /// (`BVG`, `VBB`, a custom URL…), for the empty-board text.
+    Backend(String),
 }
 
 /// A command from [`update`](Board::update) to the [`feed::poll_task`] over the
@@ -111,6 +133,9 @@ pub(crate) enum Cmd {
     /// parks its poller while hidden and does an immediate refresh on the
     /// hidden→visible edge.
     SetVisible(bool),
+    /// Fetch once now, even while parked: a datasource query found the held
+    /// list stale. The task answers it with a normal `Fetched`.
+    Refresh,
 }
 
 // ── State ────────────────────────────────────────────────────────────────────
@@ -309,6 +334,22 @@ fn hhmm(iso: &str) -> String {
     iso.get(11..16).unwrap_or("--:--").to_owned()
 }
 
+/// The wall clock as `(unix seconds, RFC 3339 local)` — the stand-in for the
+/// host's `Clock` push before its first one has arrived.
+fn wall_clock() -> (i64, String) {
+    let now = chrono::Local::now();
+    (now.timestamp(), now.to_rfc3339())
+}
+
+/// The empty-board line, naming the backend the board was configured with
+/// (`None` until the first fetch has resolved one).
+fn empty_text(backend_label: Option<&str>) -> String {
+    match backend_label {
+        Some(label) => format!("no matching S-Bahn departures right now ({label})"),
+        None => "no matching S-Bahn departures right now".to_owned(),
+    }
+}
+
 /// Sanitize a line name into a CSS-class-safe token so a stray non-alphanumeric
 /// from the API (e.g. `"SEV S9"`) can't trip the host's `add_css_class`
 /// assertion. Native `safe_line`.
@@ -347,6 +388,8 @@ struct Board {
     /// Latest clock as its RFC 3339 string — sliced to stamp the last-good time
     /// (`at_hhmm`) on a successful fetch, tz-correct without re-deriving one.
     now_iso: String,
+    /// Display label of the configured backend, learned from the fetches.
+    backend_label: Option<String>,
     /// The command lane to the [`feed::poll_task`]: `update` forwards each
     /// visibility change as a [`Cmd::SetVisible`] here.
     cmd_tx: CmdSender<Cmd>,
@@ -359,6 +402,21 @@ struct Board {
     /// leave-by threshold latching (fire once per 3-min / now crossing). Seeded
     /// on arm, cleared on disarm; mirrors the OSD battery prev/curr diff.
     armed_prev_slack: Option<i64>,
+    /// Datasource queries parked until a fetch lands (coalesced: all of them
+    /// ride one fetch).
+    pending: Vec<PendingQuery>,
+    /// A `Cmd::Refresh` has been sent and no fetch has landed since.
+    refresh_inflight: bool,
+    /// When the last query-woken fetch was requested, for the per-query floor.
+    last_kick_unix: Option<i64>,
+}
+
+/// A datasource query waiting on a woken fetch.
+#[derive(Debug)]
+struct PendingQuery {
+    request_id: u64,
+    params: String,
+    queued_at: i64,
 }
 
 impl Plugin for Board {
@@ -396,9 +454,13 @@ impl Plugin for Board {
             state: BoardState::Loading,
             now_unix: 0,
             now_iso: String::new(),
+            backend_label: None,
             cmd_tx: cmds,
             armed: None,
             armed_prev_slack: None,
+            pending: Vec::new(),
+            refresh_inflight: false,
+            last_kick_unix: None,
         }
     }
 
@@ -423,18 +485,31 @@ impl Plugin for Board {
                     self.now_unix = clock.unix;
                     self.now_iso = clock.iso;
                 }
-                self.tick_armed()
+                // Queries that outlived their deadline are answered from what
+                // is on hand, before the host's own timeout fires.
+                let (now_unix, _) = self.clock_or(wall_clock);
+                let mut fx = self.expire_pending(now_unix);
+                fx.extend(self.tick_armed());
+                fx
             }
             // A fetch landed: fold it through the transition machine, stamping
             // the last-good time from the current clock.
             Input::App(BoardMsg::Fetched(result)) => {
-                let now_hhmm = hhmm(&self.now_iso);
-                self.state = next_state(
-                    std::mem::take(&mut self.state),
-                    result,
-                    self.now_unix,
-                    &now_hhmm,
-                );
+                let (now_unix, now_iso) = self.clock_or(wall_clock);
+                let now_hhmm = hhmm(&now_iso);
+                self.state =
+                    next_state(std::mem::take(&mut self.state), result, now_unix, &now_hhmm);
+                // Every parked query is answered by this fetch, success or not
+                // (a failure answers `stale`/the error through the same path).
+                self.refresh_inflight = false;
+                let pending = std::mem::take(&mut self.pending);
+                pending
+                    .into_iter()
+                    .map(|q| self.answer_query_at(q.request_id, &q.params, now_unix))
+                    .collect()
+            }
+            Input::App(BoardMsg::Backend(label)) => {
+                self.backend_label = Some(label);
                 Vec::new()
             }
             // The visibility gate: forward down the command lane so the poll
@@ -455,14 +530,13 @@ impl Plugin for Board {
                 }
                 Vec::new()
             }
-            // A datasource query (#509): answer the `departures` datasource from the
-            // board's current rows. The board keeps them live off its poller, so the
-            // answer is served straight from the model — no extra fetch.
+            // A datasource query (#509): answered from the board's rows when
+            // they are fresh; otherwise it wakes one fetch (even while the
+            // sidebar is hidden and the poller parked) and is answered when
+            // that lands — see `on_query`.
             Input::DatasourceQuery {
                 request_id, params, ..
-            } => {
-                vec![self.answer_query(request_id, &params)]
-            }
+            } => self.on_query(request_id, params),
             // Additive `Input` variants — today `EffectResult`/`DatasourceResult`
             // (this board issues no `RunCommand` and no query of its own), plus any
             // future kind. A wildcard keeps new variants from breaking the build.
@@ -482,7 +556,7 @@ impl Plugin for Board {
                 let mut kids = Vec::new();
                 if items.is_empty() {
                     kids.push(status_text(
-                        "no matching S-Bahn departures right now (BVG Berlin)",
+                        &empty_text(self.backend_label.as_deref()),
                         "ts-departures-empty",
                     ));
                 } else {
@@ -541,24 +615,118 @@ struct QueryParams {
 }
 
 impl Board {
-    /// Answer a `departures` datasource query (#509) from the board's current rows.
-    /// The rows are live off the poller, so this serves the model — Loading/Err
-    /// surface as a provider-sourced failure the requester can relay.
-    fn answer_query(&self, request_id: u64, params: &str) -> Effect {
+    /// The board's clock as `(unix, iso)`: the host's last `Clock` push, or —
+    /// before the first one has arrived — `wall()`. Without this a fetch
+    /// landing first would stamp `at_unix = 0` / `--:--`, and a later failure
+    /// would see a 30-minute-old list and drop straight to `Err`.
+    fn clock_or(&self, wall: impl FnOnce() -> (i64, String)) -> (i64, String) {
+        if self.now_iso.is_empty() {
+            wall()
+        } else {
+            (self.now_unix, self.now_iso.clone())
+        }
+    }
+
+    /// Whether the held list is too old (or absent) to answer a query from.
+    fn needs_refresh(&self, now_unix: i64) -> bool {
+        match &self.state {
+            BoardState::Ok { at_unix, .. } | BoardState::Stale { at_unix, .. } => {
+                now_unix - at_unix > DATASOURCE_MAX_AGE_SECS
+            }
+            BoardState::Loading | BoardState::Err { .. } => true,
+        }
+    }
+
+    /// A datasource query arrives. Fresh data answers at once. Stale or absent
+    /// data parks the query and wakes one fetch through the poll task (even
+    /// while the sidebar is hidden): all queries parked meanwhile coalesce onto
+    /// it, and the answer goes out when it lands
+    /// ([`BoardMsg::Fetched`]) or at [`QUERY_DEADLINE_SECS`]. A fetch kicked
+    /// less than [`KICK_FLOOR_SECS`] ago is not repeated: the query is answered
+    /// from what is on hand (so a chatty consumer cannot turn this into
+    /// polling).
+    fn on_query(&mut self, request_id: u64, params: String) -> Vec<Effect> {
+        let (now_unix, _) = self.clock_or(wall_clock);
+        if !self.needs_refresh(now_unix) {
+            return vec![self.answer_query_at(request_id, &params, now_unix)];
+        }
+        if !self.refresh_inflight {
+            let floored = self
+                .last_kick_unix
+                .is_some_and(|t| now_unix - t < KICK_FLOOR_SECS);
+            if floored || self.cmd_tx.send(Cmd::Refresh).is_err() {
+                return vec![self.answer_query_at(request_id, &params, now_unix)];
+            }
+            self.refresh_inflight = true;
+            self.last_kick_unix = Some(now_unix);
+        }
+        self.pending.push(PendingQuery {
+            request_id,
+            params,
+            queued_at: now_unix,
+        });
+        Vec::new()
+    }
+
+    /// Answer (from what is on hand) every parked query older than
+    /// [`QUERY_DEADLINE_SECS`], so none outlives the host's own timeout.
+    ///
+    /// Also forgets a woken fetch that has gone unanswered for that long, so a
+    /// `Cmd::Refresh` that never produced a `Fetched` cannot leave
+    /// `refresh_inflight` stuck (every later query would park, time out, and
+    /// bypass the floor).
+    ///
+    /// A periodic fetch landing while a woken `Refresh` is still queued costs
+    /// one redundant fetch: the lane gives the poll task no way to peek or
+    /// retract a queued command, and the floor bounds it to one per 15 s.
+    fn expire_pending(&mut self, now_unix: i64) -> Vec<Effect> {
+        if self.refresh_inflight
+            && self
+                .last_kick_unix
+                .is_some_and(|t| now_unix - t > QUERY_DEADLINE_SECS)
+        {
+            self.refresh_inflight = false;
+        }
+        let (expired, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending)
+            .into_iter()
+            .partition(|q| now_unix - q.queued_at >= QUERY_DEADLINE_SECS);
+        self.pending = keep;
+        expired
+            .into_iter()
+            .map(|q| self.answer_query_at(q.request_id, &q.params, now_unix))
+            .collect()
+    }
+
+    /// Answer a `departures` datasource query (#509) from the board's current
+    /// rows, as of `now_unix`. Loading/Err surface as a provider-sourced failure
+    /// the requester can relay.
+    ///
+    /// Like the board view, it drops rows that have already departed. It also
+    /// refuses to answer from a list older than [`DATASOURCE_MAX_AGE_SECS`]:
+    /// the poller parks while the sidebar is hidden, so the held rows can be
+    /// hours old, and a requester must never read them as "now".
+    fn answer_query_at(&self, request_id: u64, params: &str, now_unix: i64) -> Effect {
         let limit = serde_json::from_str::<QueryParams>(params)
             .unwrap_or_default()
             .limit;
         let outcome = match &self.state {
+            BoardState::Ok { at_unix, .. } | BoardState::Stale { at_unix, .. }
+                if now_unix - at_unix > DATASOURCE_MAX_AGE_SECS =>
+            {
+                DatasourceOutcome::Failed {
+                    error: DatasourceError::Provider,
+                    message: "stale".to_owned(),
+                }
+            }
             BoardState::Ok { items, .. } | BoardState::Stale { items, .. } => {
-                let take = limit.unwrap_or(items.len());
-                let rows: Vec<DepartureJson> = items
-                    .iter()
-                    .take(take)
+                let live = items.iter().filter(|r| !departed(now_unix, r.actual_unix));
+                let rows: Vec<DepartureJson> = live
+                    .take(limit.unwrap_or(usize::MAX))
                     .map(|r| DepartureJson {
                         line: &r.line,
                         direction: &r.direction,
                         hhmm: &r.hhmm,
-                        in_minutes: ((r.actual_unix - self.now_unix).max(0)) / 60,
+                        in_minutes: ((r.actual_unix - now_unix).max(0)) / 60,
                         delay_minutes: r.delay_minutes,
                         cancelled: r.cancelled,
                     })
@@ -1445,5 +1613,293 @@ mod tests {
     #[test]
     fn reference_now_precedes_the_sample_departures() {
         assert!(now() < ts("2030-01-01T16:05:00+01:00"));
+    }
+
+    // ── datasource staleness, backend label, pre-clock stamping ──────────────
+
+    fn answer(board: &Board, at: i64, params: &str) -> DatasourceOutcome {
+        let Effect::DatasourceResult { outcome, .. } = board.answer_query_at(1, params, at) else {
+            panic!("a DatasourceResult");
+        };
+        outcome
+    }
+
+    fn ok_board(rows: Vec<Row>, at_unix: i64) -> Board {
+        let (mut board, _rx) = fresh();
+        board.state = BoardState::Ok {
+            at_unix,
+            at_hhmm: "16:00".to_owned(),
+            items: rows,
+        };
+        board
+    }
+
+    // ── a query wakes one fetch ──────────────────────────────────────────────
+
+    fn query(board: &mut Board, id: u64) -> Vec<Effect> {
+        board.update(Input::DatasourceQuery {
+            request_id: id,
+            datasource: PLUGIN_ID.to_owned(),
+            scope: SCOPE_NEXT.to_owned(),
+            params: "{}".to_owned(),
+        })
+    }
+
+    fn outcome_of(fx: &Effect) -> (&u64, &DatasourceOutcome) {
+        let Effect::DatasourceResult {
+            request_id,
+            outcome,
+        } = fx
+        else {
+            panic!("a DatasourceResult");
+        };
+        (request_id, outcome)
+    }
+
+    /// A board with a clock at `now()` whose last good fetch is an hour old.
+    fn hour_old_board() -> (Board, CmdReceiver<Cmd>) {
+        let (mut board, rx) = fresh();
+        board.update(snapshot_at("2030-01-01T16:00:00+01:00"));
+        board.state = BoardState::Ok {
+            at_unix: now() - 3600,
+            at_hhmm: "15:00".to_owned(),
+            items: vec![sample_row("S9", "X", "2030-01-01T16:05:00+01:00", 0)],
+        };
+        (board, rx)
+    }
+
+    #[test]
+    fn a_stale_query_parks_and_wakes_exactly_one_fetch() {
+        let (mut board, mut rx) = hour_old_board();
+        assert!(query(&mut board, 1).is_empty(), "parked, not answered");
+        assert!(query(&mut board, 2).is_empty(), "coalesced onto the fetch");
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Refresh)));
+        assert!(rx.try_recv().is_err(), "one fetch for both queries");
+    }
+
+    #[test]
+    fn the_landing_fetch_answers_every_parked_query() {
+        let (mut board, _rx) = hour_old_board();
+        query(&mut board, 1);
+        query(&mut board, 2);
+        let fx = board.update(Input::App(BoardMsg::Fetched(Ok(vec![sample_row(
+            "S9",
+            "X",
+            "2030-01-01T16:05:00+01:00",
+            0,
+        )]))));
+        assert_eq!(fx.len(), 2);
+        for (fx, id) in fx.iter().zip([1, 2]) {
+            let (rid, outcome) = outcome_of(fx);
+            assert_eq!(*rid, id);
+            assert!(matches!(outcome, DatasourceOutcome::Ready(_)));
+        }
+        assert!(board.pending.is_empty() && !board.refresh_inflight);
+    }
+
+    #[test]
+    fn a_failed_wake_answers_stale() {
+        let (mut board, _rx) = hour_old_board();
+        query(&mut board, 1);
+        let fx = board.update(Input::App(BoardMsg::Fetched(Err("down".to_owned()))));
+        let (_, outcome) = outcome_of(&fx[0]);
+        assert!(matches!(outcome, DatasourceOutcome::Failed { message, .. } if message == "stale"));
+    }
+
+    #[test]
+    fn fresh_data_answers_at_once_without_a_fetch() {
+        let (mut board, mut rx) = hour_old_board();
+        board.state = BoardState::Ok {
+            at_unix: now() - 10,
+            at_hhmm: "15:59".to_owned(),
+            items: vec![sample_row("S9", "X", "2030-01-01T16:05:00+01:00", 0)],
+        };
+        let fx = query(&mut board, 1);
+        assert!(matches!(outcome_of(&fx[0]).1, DatasourceOutcome::Ready(_)));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn the_floor_stops_a_chatty_consumer_from_polling() {
+        let (mut board, mut rx) = hour_old_board();
+        query(&mut board, 1);
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Refresh)));
+        board.update(Input::App(BoardMsg::Fetched(Err("down".to_owned()))));
+        // Inside the floor: answered on the spot, no second fetch.
+        board.update(snapshot_at("2030-01-01T16:00:05+01:00"));
+        let fx = query(&mut board, 2);
+        assert_eq!(fx.len(), 1, "answered immediately");
+        assert!(rx.try_recv().is_err(), "no wake inside the floor");
+        // Past the floor: wakes again.
+        board.update(snapshot_at("2030-01-01T16:00:16+01:00"));
+        assert!(query(&mut board, 3).is_empty());
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Refresh)));
+    }
+
+    #[test]
+    fn a_parked_query_is_answered_before_the_host_times_out() {
+        let (mut board, _rx) = hour_old_board();
+        query(&mut board, 1);
+        let early = board.update(snapshot_at("2030-01-01T16:00:07+01:00"));
+        assert!(early.is_empty(), "still inside the deadline");
+        let fx = board.update(snapshot_at("2030-01-01T16:00:08+01:00"));
+        assert_eq!(fx.len(), 1);
+        assert!(matches!(
+            outcome_of(&fx[0]).1,
+            DatasourceOutcome::Failed { message, .. } if message == "stale"
+        ));
+        assert!(board.pending.is_empty());
+    }
+
+    #[test]
+    fn an_unanswered_wake_does_not_stick_the_inflight_flag() {
+        let (mut board, mut rx) = hour_old_board();
+        query(&mut board, 1);
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Refresh)));
+        // The refresh is never answered. Past the deadline the query is
+        // answered `stale` and the flag clears.
+        board.update(snapshot_at("2030-01-01T16:00:09+01:00"));
+        assert!(!board.refresh_inflight);
+        // Past the floor too, the next query wakes a fresh fetch rather than
+        // parking behind a ghost.
+        board.update(snapshot_at("2030-01-01T16:00:16+01:00"));
+        assert!(query(&mut board, 2).is_empty());
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Refresh)));
+    }
+
+    #[test]
+    fn a_loading_board_wakes_a_fetch_too() {
+        let (mut board, mut rx) = fresh();
+        board.update(snapshot_at("2030-01-01T16:00:00+01:00"));
+        assert!(query(&mut board, 1).is_empty());
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Refresh)));
+    }
+
+    #[test]
+    fn datasource_bound_is_four_refresh_periods() {
+        assert_eq!(
+            u64::try_from(DATASOURCE_MAX_AGE_SECS).unwrap(),
+            4 * feed::REFRESH_WHILE_OPEN.as_secs()
+        );
+    }
+
+    #[test]
+    fn datasource_prunes_departed_rows() {
+        let board = ok_board(
+            vec![
+                sample_row("S9", "Gone", "2030-01-01T15:59:00+01:00", 0),
+                sample_row("S46", "Soon", "2030-01-01T16:05:00+01:00", 0),
+            ],
+            now(),
+        );
+        let DatasourceOutcome::Ready(json) = answer(&board, now(), "{}") else {
+            panic!("ready");
+        };
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 1);
+        assert_eq!(v[0]["line"], "S46");
+        assert_eq!(v[0]["in_minutes"], 5);
+    }
+
+    #[test]
+    fn datasource_limit_applies_after_the_prune() {
+        let board = ok_board(
+            vec![
+                sample_row("S9", "Gone", "2030-01-01T15:59:00+01:00", 0),
+                sample_row("S46", "A", "2030-01-01T16:05:00+01:00", 0),
+                sample_row("S8", "B", "2030-01-01T16:06:00+01:00", 0),
+            ],
+            now(),
+        );
+        let DatasourceOutcome::Ready(json) = answer(&board, now(), r#"{"limit":1}"#) else {
+            panic!("ready");
+        };
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 1);
+        assert_eq!(v[0]["line"], "S46");
+    }
+
+    #[test]
+    fn datasource_refuses_a_board_older_than_the_bound() {
+        let rows = vec![sample_row("S9", "X", "2030-01-01T17:30:00+01:00", 0)];
+        let board = ok_board(rows, now());
+        // Exactly at the bound still answers; one second past fails.
+        assert!(matches!(
+            answer(&board, now() + DATASOURCE_MAX_AGE_SECS, "{}"),
+            DatasourceOutcome::Ready(_)
+        ));
+        let DatasourceOutcome::Failed { message, .. } =
+            answer(&board, now() + DATASOURCE_MAX_AGE_SECS + 1, "{}")
+        else {
+            panic!("stale must fail");
+        };
+        assert_eq!(message, "stale");
+    }
+
+    #[test]
+    fn datasource_refuses_a_stale_state_too() {
+        let (mut board, _rx) = fresh();
+        board.state = BoardState::Stale {
+            at_unix: now(),
+            at_hhmm: "16:00".to_owned(),
+            items: vec![sample_row("S9", "X", "2030-01-01T17:30:00+01:00", 0)],
+            err: "down".to_owned(),
+        };
+        assert!(matches!(
+            answer(&board, now() + 3600, "{}"),
+            DatasourceOutcome::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn empty_text_names_the_configured_backend() {
+        assert_eq!(
+            empty_text(Some("VBB")),
+            "no matching S-Bahn departures right now (VBB)"
+        );
+        assert!(!empty_text(None).contains('('));
+    }
+
+    #[test]
+    fn view_empty_text_uses_the_backend_label() {
+        let (mut board, _rx) = fresh();
+        board.update(Input::App(BoardMsg::Backend("DB".to_owned())));
+        board.update(Input::App(BoardMsg::Fetched(Ok(Vec::new()))));
+        let kids = root_children(&board);
+        let Node::Text { text, .. } = &kids[0] else {
+            panic!("a Text");
+        };
+        assert!(text.contains("(DB)") && !text.contains("BVG"), "{text}");
+    }
+
+    #[test]
+    fn clock_or_uses_wall_time_only_before_the_first_push() {
+        let (mut board, _rx) = fresh();
+        assert_eq!(
+            board.clock_or(|| (99, "2031-02-03T04:05:06+00:00".to_owned())),
+            (99, "2031-02-03T04:05:06+00:00".to_owned())
+        );
+        board.update(snapshot_at("2030-01-01T16:00:00+01:00"));
+        assert_eq!(
+            board.clock_or(|| panic!("the host clock wins once pushed")),
+            (now(), "2030-01-01T16:00:00+01:00".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_fetch_before_the_first_clock_push_is_stamped_with_real_time() {
+        let (mut board, _rx) = fresh();
+        board.update(Input::App(BoardMsg::Fetched(Ok(Vec::new()))));
+        let BoardState::Ok {
+            at_unix, at_hhmm, ..
+        } = &board.state
+        else {
+            panic!("Ok");
+        };
+        assert!(*at_unix > 1_700_000_000, "a real, non-zero timestamp");
+        assert_ne!(at_hhmm, "--:--");
+        // A failure right after is Stale, not dropped to Err.
+        board.update(Input::App(BoardMsg::Fetched(Err("down".to_owned()))));
+        assert!(matches!(board.state, BoardState::Stale { .. }));
     }
 }

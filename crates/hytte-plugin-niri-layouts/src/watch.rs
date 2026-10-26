@@ -531,7 +531,8 @@ pub(crate) enum Incoming {
     Ended(String),
     /// A **known** state-bearing event failed to decode, so the window model
     /// can no longer be trusted for the rest of this connection: [`drive`]
-    /// logs the line and hides the chip via [`Watch::poison`].
+    /// hides the chip via [`Watch::poison`] on every one, and logs the line
+    /// only for the first of the connection.
     Poisoned(String),
 }
 
@@ -677,7 +678,16 @@ fn stream_once<B: Backend>(watch: &mut Watch, backend: &mut B) -> Stopped {
             Incoming::Idle => {}
             Incoming::Ended(why) => return Stopped::StreamEnded(why),
             Incoming::Poisoned(why) => {
-                backend.log(&why);
+                // One line per connection, on the move into poisoned. Every
+                // failure poisons, but a skewed niri can fail a state event on
+                // each window-title change (`WindowOpenedOrChanged`), and a
+                // line for each would flood the journal until niri restarts.
+                // Deduped here rather than on the source's `fresh`, which is
+                // always false past `MAX_REPORTED_SHAPES` and would make a
+                // poison that arrives there silent.
+                if !watch.poisoned {
+                    backend.log(&why);
+                }
                 if let Some(verdict) = watch.poison()
                     && !backend.emit(verdict)
                 {
@@ -985,10 +995,11 @@ impl EventSource for SocketEvents {
                         let fresh = self.reported.len() < MAX_REPORTED_SHAPES
                             && self.reported.insert(shape.clone());
                         if STATE_EVENTS.contains(&shape.as_str()) {
-                            // Poison on EVERY such failure: `fresh` only
-                            // dedupes the log line, never the decision (past
-                            // `MAX_REPORTED_SHAPES` it is always false, and a
-                            // skipped state event would drift the model).
+                            // Poison on EVERY such failure, whatever `fresh`
+                            // says: past `MAX_REPORTED_SHAPES` it is always
+                            // false, and a skipped state event would drift the
+                            // model. `fresh` plays no part here; `stream_once`
+                            // logs one line per connection instead.
                             return Incoming::Poisoned(skip_message(
                                 "a known niri event no longer decodes; the window \
                                  model cannot be trusted, hiding the chip until \
@@ -2057,6 +2068,27 @@ mod tests {
             vec![up()],
             "the chip goes up once and stays up across the reconnect"
         );
+    }
+
+    /// A state event that keeps failing is logged once per connection, not
+    /// once per event: `WindowOpenedOrChanged` fires on every title change, so
+    /// a line each would flood the journal for the rest of the niri session.
+    #[test]
+    fn a_repeating_poison_is_logged_once_per_connection() {
+        let poison = || Incoming::Poisoned("poisoned: WindowOpenedOrChanged".to_owned());
+        let mut first = opening_snapshot(1, 10, 20);
+        first.extend([poison(), poison(), poison()]);
+        let mut script = Script::of(vec![Ok(first), Ok(vec![poison()])]);
+
+        drive("test", &mut script);
+
+        let lines = script
+            .logs
+            .iter()
+            .filter(|l| l.starts_with("poisoned"))
+            .count();
+        assert_eq!(lines, 2, "one per connection: {:?}", script.logs);
+        assert_eq!(script.emitted, vec![up(), Verdict::default()]);
     }
 
     /// The backoff policy `drive` owns: absence grows the delay, a stream that

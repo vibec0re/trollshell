@@ -1172,8 +1172,9 @@ mod gtk_tests {
     ///
     /// Mutations (run this round, red): make the `load-failed` handler return
     /// `false` without reporting — no general handler, the bug as it stood —
-    /// and `heard` stays empty; drop the `load-changed` flip and the card
-    /// stays up over a page that answered.
+    /// and the first assertion reds, the failure going on to `WebKit`'s own
+    /// error page with nothing reported; drop the `load-changed` flip and the
+    /// card stays up over a page that answered.
     #[gtk::test]
     fn a_hive_page_nothing_answered_is_reported_and_its_card_lifts_on_commit() {
         let url = "https://hive.local/agent/stray/?hide=header";

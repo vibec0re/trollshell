@@ -1049,7 +1049,7 @@ mod tests {
     ///
     /// Mutations (run this round, red): parse with `UriFlags::NON_DNS` in
     /// `authority_of` — the "host as written" a reader might reach for — and
-    /// the first three rows red with the Unicode name; drop the
+    /// the first row reds with the Unicode name; drop the
     /// `written_with_a_trailing_dot` re-append and the trailing-dot row reds
     /// without its dot.
     #[test]

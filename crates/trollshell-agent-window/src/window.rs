@@ -1372,7 +1372,7 @@ mod tests {
     /// edge with nothing waiting does nothing at all.
     ///
     /// Mutations (run this round, red): answer `RunNow` without asking
-    /// `resume_acts_now` (no flap guard) and the two flap rows red; answer
+    /// `resume_acts_now` (no flap guard) and the armed-flap row reds; answer
     /// `Leave` for a parked flap (no re-arm) and the parked-flap row reds
     /// — that attempt would have no timer and no edge to run it, which is
     /// the M1 latch again.
@@ -3551,7 +3551,7 @@ mod gtk_tests {
     ///
     /// Mutations (run this round, red): drop `on_gateway`'s
     /// `schedule_retry` and nothing is queued (the `waiting` assertion reds);
-    /// drop its `unanswered.set(0)` on `Answered` and the backoff reds at 1;
+    /// drop its `unanswered.set(0)` on `Answered` and the backoff reds at 2;
     /// drop its `cancel_retry` there and a reload stays queued behind a page
     /// that came back.
     #[gtk::test]

@@ -278,7 +278,7 @@ fn map_page(
 ) -> SubPage {
     let title = humanise(leaf_of(&key));
     let group = adw::PreferencesGroup::builder()
-        .title(title.clone())
+        .title(crate::markup::escape(&title))
         .description(field.doc)
         .build();
     let banner = adw::Banner::new("");
@@ -841,7 +841,7 @@ fn list_page(
 ) -> SubPage {
     let title = humanise(leaf_of(&key));
     let group = adw::PreferencesGroup::builder()
-        .title(title.clone())
+        .title(crate::markup::escape(&title))
         .description(format!(
             "{} Arrays replace rather than merge, so this list is saved whole: your own file \
              states all of it, or none of it. Changing one item therefore copies the items a \
@@ -1099,7 +1099,7 @@ fn records_page(
 ) -> SubPage {
     let title = humanise(leaf_of(&key));
     let group = adw::PreferencesGroup::builder()
-        .title(title.clone())
+        .title(crate::markup::escape(&title))
         .description(format!(
             "{} In order. Arrays replace rather than merge, so an edit here saves the whole \
              list.",

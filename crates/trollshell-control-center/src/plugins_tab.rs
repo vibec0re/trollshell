@@ -1334,8 +1334,12 @@ fn build_detail(env: &Rc<hytte_config::xdg::Env>) -> (PluginDetail, Vec<crate::c
     let controls = adw::PreferencesGroup::new();
     controls.add(&switch);
 
-    let unit_row = adw::ActionRow::builder().title("Unit").build();
-    let conn_row = adw::ActionRow::builder().title("Host connection").build();
+    let unit_row = adw::ActionRow::new();
+    crate::markup::plain_text(&unit_row);
+    unit_row.set_title("Unit");
+    let conn_row = adw::ActionRow::new();
+    crate::markup::plain_text(&conn_row);
+    conn_row.set_title("Host connection");
     let conn_badge = gtk::Image::new();
     conn_badge.set_valign(gtk::Align::Center);
     conn_row.add_prefix(&conn_badge);
@@ -3221,11 +3225,12 @@ fn set_placeholder(state: &PluginsState, view: PluginsView, title: &str, subtitl
     state.snapshot.borrow_mut().clear();
     clear_selection(state);
     let row = adw::ActionRow::builder()
-        .title(title)
-        .subtitle(subtitle)
         .activatable(false)
         .selectable(false)
         .build();
+    crate::markup::plain_text(&row);
+    row.set_title(title);
+    row.set_subtitle(subtitle);
     state.list.append(&row);
     state.rows.borrow_mut().push(row.upcast());
     state.view.set(view);
@@ -3245,10 +3250,9 @@ fn build_plugin_row(
     enabled: bool,
     rt: Option<&PluginRuntime>,
 ) -> PluginRow {
-    let row = adw::ActionRow::builder()
-        .title(id)
-        .activatable(true)
-        .build();
+    let row = adw::ActionRow::builder().activatable(true).build();
+    crate::markup::plain_text(&row);
+    row.set_title(id);
 
     let badge = gtk::Image::new();
     badge.set_valign(gtk::Align::Center);

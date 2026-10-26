@@ -1447,7 +1447,7 @@ fn open_agent_page(state: &AgentsState) {
 /// over the tab that launched it, and the tab is built (and tested) without a
 /// window at all.
 fn toast(state: &AgentsState, text: &str) {
-    state.toasts.add_toast(adw::Toast::new(text));
+    state.toasts.add_toast(crate::markup::toast(text));
 }
 
 /// How the tab reaches the world outside this process — injected so a GTK test

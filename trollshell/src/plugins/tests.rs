@@ -3677,14 +3677,13 @@ async fn a_frame_over_the_value_budget_is_closed_at_warn() {
     // The accepted connection's first frame is `Hello`; read it so the
     // oversized frame is the session loop's, not the handshake's.
     read_frame::<HostMsg, _>(&mut prd).await.expect("Hello");
-    // A flat array of nils: a few hundred KiB on the wire, one more value
-    // than the budget. It is refused before anything is decoded.
-    write_frame(
-        &mut pwr,
-        &vec![(); hytte_plugin_proto::MAX_FRAME_VALUES + 1],
-    )
-    .await
-    .expect("an over-budget frame");
+    // A flat array of nils, about 512 KiB on the wire. The array header is a
+    // value too, so `MAX_FRAME_VALUES` nils are `MAX_FRAME_VALUES + 1` values:
+    // exactly one over the budget. It is refused at the header, before any
+    // element is read.
+    write_frame(&mut pwr, &vec![(); hytte_plugin_proto::MAX_FRAME_VALUES])
+        .await
+        .expect("an over-budget frame");
     tokio::time::timeout(Duration::from_secs(5), conn)
         .await
         .expect("the connection is dropped")
@@ -3697,7 +3696,16 @@ async fn a_frame_over_the_value_budget_is_closed_at_warn() {
         .unwrap_or_else(|| panic!("no refusal line captured: {events:?}"));
     assert_eq!(line.level, tracing::Level::WARN, "{line:?}");
     assert_eq!(line.fields.get("plugin").map(String::as_str), Some(ID));
-    assert!(line.fields.contains_key("cap"), "names the cap: {line:?}");
+    assert_eq!(
+        line.fields.get("cap"),
+        Some(&hytte_plugin_proto::MAX_FRAME_VALUES.to_string()),
+        "names the value budget: {line:?}",
+    );
+    assert_eq!(
+        line.fields.get("at_least"),
+        Some(&(hytte_plugin_proto::MAX_FRAME_VALUES + 1).to_string()),
+        "the header's own count, one over the budget: {line:?}",
+    );
 }
 
 /// A frame whose declared length is past `MAX_FRAME_LEN` is the same host cap

@@ -3286,8 +3286,10 @@ mod gtk_tests {
     /// connection is not a second probe — the resolver ran exactly once,
     /// asserted below — it is the embedded view's own `load_uri` reaching
     /// `WebKitGTK`'s **network** process, which is a different process from
-    /// the web process that dies under xvfb (see `webview.rs`'s `gtk_tests`
-    /// module doc, which now carries this same correction).
+    /// the web process that dies under a bare `xvfb-run` (see `webview.rs`'s
+    /// `gtk_tests` module doc, which carries this same correction, and which
+    /// since #1584 also records that the web process runs under
+    /// `checks.system-tests`).
     ///
     /// Previously documented as "within ~300 ms", measured under a mutation
     /// at 50–75 ms — a real cross-process race with the read as the
@@ -3565,7 +3567,8 @@ mod gtk_tests {
     /// load is real where `checks.system-tests` runs**: that derivation exports
     /// llvmpipe's EGL vendor for the GL tests, which gets `WebKit`'s web process
     /// past the `EGL_BAD_PARAMETER` abort it dies of under a bare `xvfb-run`
-    /// (the only setting `webview.rs`'s `gtk_tests` module doc measured). There
+    /// (until #1584, the only setting `webview.rs`'s `gtk_tests` module doc
+    /// had measured; it now records both). There
     /// the load fails on the hive's name and reports a second, real
     /// [`webview::Gateway::Unanswered`] while this test pumps for its timer —
     /// and the window does what it should with a newer failure: the page's own

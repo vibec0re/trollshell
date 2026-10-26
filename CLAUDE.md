@@ -67,9 +67,16 @@ xvfb-run cargo test --features system-tests -p hytte-ui   # display tests headle
   (`bwrap: Can't mount proc…`, SIGABRT) rather than failing a test — so both
   `nix/devshell.nix` and `nix/checks/system-tests.nix` export
   `WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1`, each with the comment saying
-  why. Nothing that ships sets it. It buys a constructible widget, not a
-  working web process (one still crashes in both), which is why the
-  navigation-policy assertion is a live-verify item and not a test — see
+  why. Nothing that ships sets it. It buys a constructible widget; whether the
+  web process then starts depends on EGL. Under a bare devShell `xvfb-run` it
+  aborts at once (`EGL_BAD_PARAMETER`), so nothing loads. Under
+  `checks.system-tests`, whose llvmpipe exports (below) give it an EGL vendor,
+  it runs, loads pages and dispatches `decide-policy` (#1584). That is where
+  `webview.rs`'s `policy_tests` pin the navigation policy end to end, against
+  loopback HTTPS servers and real `xdotool` clicks; they skip under a bare
+  `xvfb-run` unless `TROLLSHELL_REQUIRE_GL=1`. It also means a display test
+  that pumps the main context races its page's own real load in CI: give it a
+  gateway that hears nothing and a `.invalid` host (#1578). See
   `crates/trollshell-agent-window/src/webview.rs`'s `gtk_tests` module doc.
 - Both of those also export `GIO_EXTRA_MODULES` at `glib-networking`'s
   `lib/gio/modules` (#1234). GIO's TLS backend is a **loadable module**, not
@@ -80,8 +87,9 @@ xvfb-run cargo test --features system-tests -p hytte-ui   # display tests headle
   #1130. It buys `verify.rs`'s `tls_tests`: a real `GTlsServerConnection` on a
   loopback port and the window's own `probe` against it, over checked-in
   fixtures (`crates/trollshell-agent-window/tests/fixtures/tls/`, minted by the
-  `generate.sh` beside them). Still **no page is loaded** there — the web
-  process dies either way; everything #1234 added runs before WebKit.
+  `generate.sh` beside them). `verify.rs` itself loads no page, since
+  everything #1234 added runs before WebKit; `policy_tests` serves real pages
+  over TLS from the same fixtures (#1584).
 - `hytte-services`'s gated test round-trips the NetworkManager secret agent
   (`wifi::nm_agent`'s `GetSecrets`) against a real `dbus-daemon` too.
 - The hermetic internals suite (`cargo test --workspace`, deliberately

@@ -796,9 +796,9 @@ fn a_scripted_window_open_opens_nothing() {
 
 /// Whether this run can send real pointer input: `xdotool` on `PATH` and GTK
 /// on an X11 display. Without either it skips, unless
-/// `TROLLSHELL_REQUIRE_XDOTOOL=1` (exported by `checks.system-tests`, for
-/// `trollshell`'s `plugins/region.rs`, the precedent this follows) makes that
-/// a failure.
+/// `TROLLSHELL_REQUIRE_XDOTOOL=1` (exported by `checks.system-tests` for
+/// `trollshell`'s real-pointer tests; this is their `real_pointer_or_skip`)
+/// makes that a failure.
 fn real_pointer_or_skip(test: &str) -> bool {
     let xdotool = std::process::Command::new("xdotool")
         .arg("version")
@@ -857,7 +857,7 @@ fn x_window(title: &str) -> String {
 /// Click button 1 on the view, `fraction` of the way across it and halfway
 /// down, in the X window `xid` — the window's own coordinates, offset by
 /// wherever GTK put the window widget inside its surface and scaled to device
-/// pixels (`trollshell`'s `plugins/region.rs` `centre_of`, the same sum).
+/// pixels (the same sum as `trollshell`'s real-pointer `centre_of`).
 #[allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,

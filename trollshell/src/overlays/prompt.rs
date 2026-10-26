@@ -476,3 +476,123 @@ mod tests {
         assert_eq!(field_label(""), "");
     }
 }
+
+/// [`is_up`] answers for what is on screen: every way a secret prompt leaves —
+/// Cancel, `Esc`, and the daemon clearing `active_prompt` once it has the
+/// secret — runs [`close_prompt`], the one place [`PROMPT_WINDOW`] is emptied,
+/// so a plugin dialog may raise again afterwards. (`overlays::consent` had the
+/// opposite shape — its card's own resolution closed the window but left the
+/// slot full — which is why these pin it here too.)
+///
+/// Real [`show_prompt`] under `xvfb-run`; see `overlays::consent::gtk_tests`
+/// for why that builds. `wifi::cancel_prompt` is a no-op with no service
+/// registered, which is all Cancel and `Esc` reach beyond this module.
+#[cfg(all(test, feature = "system-tests"))]
+mod gtk_tests {
+    use super::{PROMPT_WINDOW, close_all, close_prompt, is_up, show_prompt};
+    use crate::overlays::consent::gtk_tests::test_monitor;
+    use crate::overlays::{consent, dialog};
+    use hytte::gtk::glib::translate::IntoGlib;
+    use hytte::gtk::{self, gdk, prelude::*};
+    use hytte::services::wifi;
+
+    /// Takes any prompt down on drop, failing assertion included.
+    struct Cleanup;
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            close_all();
+        }
+    }
+
+    fn raise(id: u64) -> gtk::Window {
+        show_prompt(
+            &test_monitor(),
+            wifi::PromptRequest {
+                id,
+                network_path: "/net/test".to_owned(),
+                ssid: "Cafe & Co".to_owned(),
+                security: "psk".to_owned(),
+                kind: wifi::PromptKind::WifiPassphrase,
+                secret_keys: vec!["psk".to_owned()],
+                prior_failure: false,
+            },
+        );
+        PROMPT_WINDOW
+            .with(|w| w.borrow().clone())
+            .expect("show_prompt must have put its window in the slot")
+    }
+
+    fn cancel_button(window: &gtk::Window) -> gtk::Button {
+        let mut stack: Vec<gtk::Widget> = vec![window.clone().upcast()];
+        while let Some(w) = stack.pop() {
+            if let Some(btn) = w.downcast_ref::<gtk::Button>()
+                && btn.label().as_deref() == Some("Cancel")
+            {
+                return btn.clone();
+            }
+            let mut child = w.first_child();
+            while let Some(c) = child {
+                child = c.next_sibling();
+                stack.push(c);
+            }
+        }
+        panic!("no Cancel button on the prompt");
+    }
+
+    fn a_dialog_may_raise() -> bool {
+        dialog::may_raise(consent::is_up(), is_up())
+    }
+
+    #[gtk::test]
+    fn a_cancelled_prompt_releases_its_slot() {
+        let _cleanup = Cleanup;
+        let window = raise(1);
+        assert!(is_up());
+        assert!(
+            !a_dialog_may_raise(),
+            "sanity: a live prompt refuses a dialog"
+        );
+
+        cancel_button(&window).emit_clicked();
+
+        assert!(!is_up());
+        assert!(a_dialog_may_raise());
+    }
+
+    #[gtk::test]
+    fn an_escaped_prompt_releases_its_slot() {
+        let _cleanup = Cleanup;
+        let window = raise(2);
+        let controller = window
+            .observe_controllers()
+            .into_iter()
+            .filter_map(Result::ok)
+            .find_map(|c| c.downcast::<gtk::EventControllerKey>().ok())
+            .expect("the prompt has a key controller");
+        controller.emit_by_name::<bool>(
+            "key-pressed",
+            &[
+                &gdk::Key::Escape.into_glib(),
+                &0u32,
+                &gdk::ModifierType::empty(),
+            ],
+        );
+
+        assert!(!is_up());
+        assert!(a_dialog_may_raise());
+    }
+
+    /// The daemon side: `active_prompt` going `None` (the secret was taken,
+    /// or `CancelGetSecrets`) is `install`'s `close_prompt()` arm.
+    #[gtk::test]
+    fn a_prompt_the_daemon_withdraws_releases_its_slot() {
+        let _cleanup = Cleanup;
+        let _window = raise(3);
+
+        close_prompt();
+
+        assert!(!is_up());
+        assert!(a_dialog_may_raise());
+    }
+}

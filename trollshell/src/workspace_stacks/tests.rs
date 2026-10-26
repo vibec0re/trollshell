@@ -780,6 +780,168 @@ fn a_second_start_during_the_first_ones_grace_window_takes_a_new_workspace() {
     );
 }
 
+/// A niri whose workspace list **changes** as actions land, and that gives the
+/// executor a turn on every niri call (#1559 item 7).
+///
+/// [`Script`] answers from a queue of snapshots scripted in advance, which suits
+/// one transaction and cannot show two: what a second Start must see is what
+/// the first one's batch did to niri. And a world whose every call completes on
+/// its first poll runs one `join!`ed Start to the end before the other begins,
+/// so they would never overlap. This is the smallest world that shows it: the
+/// three actions a Start's naming sends, applied to a list, behind calls that
+/// yield. Everything else answers as an empty session would.
+struct Compositor(RefCell<Vec<Workspace>>);
+
+impl Compositor {
+    fn with(workspaces: Vec<Workspace>) -> Self {
+        Self(RefCell::new(workspaces))
+    }
+
+    /// The name on workspace `id` right now.
+    fn name_of(&self, id: u64) -> Option<String> {
+        self.0
+            .borrow()
+            .iter()
+            .find(|w| w.id == id)
+            .and_then(|w| w.name.clone())
+    }
+}
+
+impl Ops for Compositor {
+    async fn send_actions(&self, actions: Vec<WorkspaceAction>) -> Result<(), String> {
+        tokio::task::yield_now().await;
+        let mut workspaces = self.0.borrow_mut();
+        for action in actions {
+            match action {
+                // As niri does: a name some other workspace holds is a silent
+                // no-op, and one on a named workspace *renames* it.
+                WorkspaceAction::SetName { workspace, name } => {
+                    let taken = workspaces.iter().any(|w| {
+                        w.id != workspace
+                            && w.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(&name))
+                    });
+                    if let Some(w) = workspaces.iter_mut().find(|w| w.id == workspace)
+                        && !taken
+                    {
+                        w.name = Some(name);
+                    }
+                }
+                WorkspaceAction::UnsetName { workspace } => {
+                    if let Some(w) = workspaces.iter_mut().find(|w| w.id == workspace) {
+                        w.name = None;
+                    }
+                }
+                WorkspaceAction::Focus { workspace } => {
+                    for w in &mut *workspaces {
+                        w.is_focused = w.id == workspace;
+                        w.is_active = w.is_focused;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    async fn workspaces(&self) -> Result<Vec<Workspace>, String> {
+        tokio::task::yield_now().await;
+        Ok(self.0.borrow().clone())
+    }
+
+    async fn windows(&self) -> Result<Vec<Window>, String> {
+        tokio::task::yield_now().await;
+        Ok(Vec::new())
+    }
+
+    async fn launch(&self, _launch: &Launch) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn save_stack(&self, _name: &str, _stack: &Stack) -> Result<(), String> {
+        Err("this world has no workspaces.toml".to_owned())
+    }
+
+    async fn set_monitor(&self, _name: &str, _monitor: &str) -> Result<(), String> {
+        Err("this world has no workspaces.toml".to_owned())
+    }
+
+    async fn desktop_entry(&self, _id: &str) -> Option<Launchable> {
+        None
+    }
+
+    async fn activate(&self, _id: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn unit_for_pid(&self, _pid: u32) -> Option<String> {
+        None
+    }
+
+    async fn stop_unit(&self, _unit: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn stop_slice(&self, _name: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn slice_is_up(&self, _name: &str) -> bool {
+        false
+    }
+
+    async fn sleep(&self, _duration: Duration) {}
+
+    async fn apply_layout(&self, _layout: Layout) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// **#1559 item 7.** Two Starts clicked a moment apart take **two** workspaces.
+///
+/// #1514 stopped a Start adopting a workspace another stack had already named.
+/// It left the moment before that name lands: both Starts read their snapshot
+/// first, both plan to adopt the one free focused workspace, and the second
+/// `SetName` renames the first stack's. Under `PLAN_AND_NAME` the second Start
+/// plans from a niri where the first one's name is already on that workspace,
+/// so it sees it as taken and takes the spare.
+///
+/// Both `STARTING` marks are held, as `spawn_start` holds them, so neither
+/// Start's housekeeping may release the other's new name.
+///
+/// **Mutation:** drop the lock from `start` and this reds — the first Start's
+/// read-back finds its workspace renamed.
+#[test]
+fn two_overlapping_starts_take_two_workspaces() {
+    let first = "overlapfirst";
+    let second = "overlapsecond";
+    let _first_mark = StartingMark::hold(first);
+    let _second_mark = StartingMark::hold(second);
+    let saved = stacked(&[(first, Stack::default()), (second, Stack::default())]);
+    let niri = Compositor::with(vec![
+        ws_focused(1, 1, LEFT, None),
+        ws(2, 2, LEFT, None, false),
+    ]);
+
+    let empty = Stack::default();
+    let (a, b) = run(async {
+        tokio::join!(
+            start(&niri, first, &empty, &saved),
+            start(&niri, second, &empty, &saved),
+        )
+    });
+
+    let a = a.expect("the first Start");
+    let b = b.expect("the second Start");
+    assert_ne!(a.workspace, b.workspace, "both Starts took one workspace");
+    assert_eq!(niri.name_of(a.workspace).as_deref(), Some(first));
+    assert_eq!(niri.name_of(b.workspace).as_deref(), Some(second));
+    // Whichever planned second saw the focused workspace named, and took the
+    // spare rather than adopting it.
+    let (adopter, other) = if a.adopted { (&a, &b) } else { (&b, &a) };
+    assert!(adopter.adopted && adopter.workspace == 1, "{a:?} {b:?}");
+    assert!(!other.adopted && other.workspace == 2, "{a:?} {b:?}");
+}
+
 /// **MEDIUM-1.** The *fallback* leg takes an **empty** workspace too, not just
 /// any unnamed one.
 ///

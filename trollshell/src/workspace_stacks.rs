@@ -109,6 +109,29 @@ pub(crate) fn starting() -> impl Signal<Item = BTreeSet<String>> {
     STARTING.signal_cloned()
 }
 
+/// Serializes the **plan-and-name** phase of every Start in this process: from
+/// the housekeeping's first snapshot to the read-back that shows the name
+/// landed ([`start`]'s steps 1–4).
+///
+/// [`plan_start`] decides from a snapshot, and only a name that has landed makes
+/// a workspace unavailable to the next plan. So two Starts of different stacks
+/// clicked a moment apart could both read their snapshot before either batch
+/// landed, both pick the same free workspace, and the second `SetWorkspaceName`
+/// would rename the first stack's workspace (#1559, left open by #1514). Under
+/// this lock the second Start's snapshot is read after the first one's name is
+/// on its workspace, so the planner sees that workspace as taken.
+///
+/// [`STARTING`] cannot do this: it stops a second Start of the **same** stack,
+/// and keeps the housekeeping off an in-flight stack's name, but says nothing
+/// about which workspace either one will take. An autostart run's own Starts
+/// never contend for it, since it awaits each in turn; a click during the run
+/// does.
+///
+/// Async rather than `std::sync`, because it is held across the niri round
+/// trips. It is released before the launches and the grace window, so a Start
+/// waits on another only for a few IPC calls, never for its apps.
+static PLAN_AND_NAME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// The `"<name>#<index>"` keys with a single-app start in flight (#1312) — the
 /// Edit form's own echo of [`STARTING`], scoped to one row rather than the
 /// whole stack: a click on the editor's dim icon runs [`run_app_start`]
@@ -1123,7 +1146,7 @@ pub(crate) trait Ops {
     ///
     /// On the seam rather than called through directly, and that is not a
     /// stylistic choice: [`crate::config::workspaces::save_stack`] resolves its
-    /// own path through `xdg::overlay_path`, so a transaction test that reached
+    /// own path through `xdg::config_layers`, so a transaction test that reached
     /// it would write the **developer's real** `~/.config/trollshell/`. It did,
     /// once, before this moved (#1101 re-review). Behind `Ops` the write is part
     /// of the world like every other side effect here, and a test cannot perform
@@ -1327,7 +1350,9 @@ pub(crate) async fn release_lingering_names(
 
 /// Start one stack, as #1071 §3.4's transaction.
 ///
-/// In order, and every step is a precondition for the next:
+/// In order, and every step is a precondition for the next. Steps 1–4 run
+/// under [`PLAN_AND_NAME`], so no other Start reads a snapshot between this
+/// one's plan and its name landing.
 ///
 /// 1. **Housekeeping.** Release any lingering empty workspace's name, so
 ///    `SetWorkspaceName` below cannot silently no-op.
@@ -1361,26 +1386,10 @@ pub(crate) async fn start(
     stack: &Stack,
     saved: &Workspaces,
 ) -> Result<StartPlan, String> {
-    release_lingering_names(ops, name, &saved.stacks).await?;
-
-    let workspaces = ops.workspaces().await?;
-    let windows = ops.windows().await?;
-    let plan = plan_start(name, stack, &workspaces, &windows, &saved.names_in_order())
-        .map_err(|e| e.to_string())?;
-
-    ops.send_actions(plan.batch.clone()).await?;
-
-    // Step 4. Never skip: a silently-swallowed name looks exactly like a
-    // successful one from the action's own reply.
-    let after = ops.workspaces().await?;
-    if !after
-        .iter()
-        .any(|w| w.id == plan.workspace && w.name.as_deref() == Some(name))
-    {
-        return Err(format!(
-            "niri did not take the name {name:?} — nothing was launched"
-        ));
-    }
+    let (plan, windows) = {
+        let _naming = PLAN_AND_NAME.lock().await;
+        plan_and_name(ops, name, stack, saved).await?
+    };
 
     // The pre-launch snapshot is what tells this Start's windows from the
     // user's in step 6 (#1071 §3.4 step 2). Taken from the *same* `windows`
@@ -1501,6 +1510,39 @@ pub(crate) async fn start(
     }
 
     Ok(plan)
+}
+
+/// [`start`]'s steps 1–4: housekeeping, the plan, its batch and the read-back.
+/// Returns the plan with the window snapshot it was made from.
+///
+/// Its caller holds [`PLAN_AND_NAME`] across all of it.
+async fn plan_and_name(
+    ops: &impl Ops,
+    name: &str,
+    stack: &Stack,
+    saved: &Workspaces,
+) -> Result<(StartPlan, Vec<Window>), String> {
+    release_lingering_names(ops, name, &saved.stacks).await?;
+
+    let workspaces = ops.workspaces().await?;
+    let windows = ops.windows().await?;
+    let plan = plan_start(name, stack, &workspaces, &windows, &saved.names_in_order())
+        .map_err(|e| e.to_string())?;
+
+    ops.send_actions(plan.batch.clone()).await?;
+
+    // Step 4. Never skip: a silently-swallowed name looks exactly like a
+    // successful one from the action's own reply.
+    let after = ops.workspaces().await?;
+    if !after
+        .iter()
+        .any(|w| w.id == plan.workspace && w.name.as_deref() == Some(name))
+    {
+        return Err(format!(
+            "niri did not take the name {name:?} — nothing was launched"
+        ));
+    }
+    Ok((plan, windows))
 }
 
 /// The grace window: move home the windows **this Start opened** that landed

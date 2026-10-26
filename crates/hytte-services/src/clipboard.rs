@@ -333,8 +333,9 @@ enum DecodeVerdict {
     /// overflowing.
     Failed,
     /// Output went past the cap ([`DECODE_MAX_BYTES`]); it is truncated, so do
-    /// not copy. Whatever the decoder's exit status says: the paste path kills a
-    /// decoder that overflows, so its status is then the kill's.
+    /// not copy. Whatever the decoder's exit status says: the paste path stops
+    /// reading and kills a decoder that overflows, so its status is then a
+    /// signal of ours, not a failure of its own.
     TooLarge,
 }
 
@@ -343,11 +344,12 @@ enum DecodeVerdict {
 /// `cliphist decode` exit non-zero with empty stdout, and `wl-copy` on
 /// empty stdin would replace the user's live clipboard with nothing.
 ///
-/// Overflow is checked **before** the exit status. A decoder that writes past
-/// `max_bytes` is killed by [`run_decode_to_wlcopy_with`], so its status is a
-/// `SIGKILL`, not a verdict of its own. Checked after it, that overflow was
-/// reported as "exited" (`Failed`), and `TooLarge` was reachable only by a
-/// decoder that finished before the kill landed (#1559).
+/// Overflow is checked **before** the exit status. Once a decoder writes past
+/// `max_bytes`, [`run_decode_to_wlcopy_with`] stops reading (closing the pipe)
+/// and kills it, so its status is a `SIGPIPE` or a `SIGKILL` of ours, not a
+/// verdict of its own. Checked after it, that overflow was reported as
+/// "exited" (`Failed`), and `TooLarge` was reachable only by a decoder that
+/// had finished before either landed (#1559).
 fn decode_verdict(success: bool, output_len: usize, max_bytes: u64) -> DecodeVerdict {
     if output_len as u64 > max_bytes {
         DecodeVerdict::TooLarge
@@ -696,14 +698,15 @@ mod tests {
         assert_eq!(stand.copied(), None, "wl-copy ran for an empty decode");
     }
 
-    /// A decoder that writes past the cap is killed, and the paste says it
+    /// A decoder that writes past the cap is stopped, and the paste says it
     /// was **too large**, not that the decoder "exited" (#1559). The decoder
-    /// never stops writing on its own, so the kill is what ends it and its
-    /// status is always a signal.
+    /// never stops writing on its own, so what ends it is ours — `SIGPIPE`
+    /// once the read side closes, or the kill — and its status is always a
+    /// signal.
     ///
     /// **Mutation:** check the exit status before the size in
     /// `decode_verdict` (the old order) → this reds, the message reading
-    /// `cliphist decode exited ExitStatus(unix_wait_status(9))`.
+    /// `cliphist decode exited ExitStatus(unix_wait_status(13))`.
     #[test]
     fn a_decode_past_the_cap_is_killed_and_reported_too_large() {
         let stand = Stand::copying("while :; do printf '%s' 0123456789abcdef; done");

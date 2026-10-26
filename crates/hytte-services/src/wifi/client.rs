@@ -270,15 +270,40 @@ pub(super) async fn register_iwd_agent(agent_path: &str) -> Result<(), hytte_bus
         .await
 }
 
+/// Is this iwd's answer that our connection already has an agent registered?
+///
+/// iwd keys agents by the caller's unique name and refuses a second
+/// `RegisterAgent` from the same one with `net.connman.iwd.AlreadyExists`
+/// (`agent_register` in iwd 3.12's `src/agent.c`). The watcher re-registers
+/// after any hole in its owner subscription, and when iwd itself is fine that
+/// is the answer it gets. For the watcher it means "registered", not a
+/// failure to retry.
+pub(super) fn is_already_registered(e: &hytte_bus::BusError) -> bool {
+    matches!(
+        e,
+        hytte_bus::BusError::Permanent { dbus_name: Some(name), .. }
+            if name == "net.connman.iwd.AlreadyExists"
+    )
+}
+
 // ── Discovery ─────────────────────────────────────────────────────────────────
 
+/// Read iwd's object tree and find its `Station`. `None` when iwd did not
+/// answer or has no station yet.
+///
+/// This **calls `net.connman.iwd`**, and iwd is D-Bus-activatable
+/// (`SystemdService=iwd.service` in its activation file), so on a bus where
+/// iwd has no owner this call starts it. The watcher therefore asks
+/// [`iwd_has_owner`] first on every discovery but its first (#1551), and
+/// paces a retry itself. This used to sleep 5 s and return, and the watcher
+/// called it again, so an iwd that was stopped cleanly (its station removed,
+/// its name released) was restarted by the next attempt.
 pub(super) async fn discover_station() -> Option<(ManagedObjects, zbus::zvariant::OwnedObjectPath)>
 {
     let managed = match get_managed_objects().await {
         Ok(m) => m,
         Err(e) => {
             tracing::debug!(error = %e, "iwd GetManagedObjects failed (iwd not running?)");
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             return None;
         }
     };
@@ -289,16 +314,57 @@ pub(super) async fn discover_station() -> Option<(ManagedObjects, zbus::zvariant
             .then(|| path.clone())
     }) else {
         tracing::debug!("iwd has no Station object yet");
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         return None;
     };
 
     Some((managed, station_path))
 }
 
+/// Ask the bus whether anyone owns iwd's name. The bus answers this itself,
+/// so unlike any call to `net.connman.iwd` it starts nothing.
+pub(super) async fn iwd_has_owner() -> Result<bool, hytte_bus::BusError> {
+    hytte_bus::call(BusKind::System, "org.freedesktop.DBus")
+        .at_path("/org/freedesktop/DBus")
+        .iface("org.freedesktop.DBus")
+        .method("NameHasOwner")
+        .args((crate::wifi_backend::IWD_BUS_NAME.to_string(),))
+        .send::<bool>()
+        .await
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{IWD_AGENT_INPUT_TIMEOUT, network_call_deadline};
+    use super::{IWD_AGENT_INPUT_TIMEOUT, is_already_registered, network_call_deadline};
+    use hytte_bus::BusError;
+
+    /// Only iwd's own `AlreadyExists` reads as "registered". Any other
+    /// refusal, and a failure with no D-Bus error name, is still a failure to
+    /// retry.
+    ///
+    /// **Falsification:** match any `net.connman.iwd.*` error and the
+    /// `InvalidArgs` row passes as registered.
+    #[test]
+    fn only_already_exists_reads_as_registered() {
+        let named = |name: &str| BusError::Permanent {
+            reason: "x".to_owned(),
+            dbus_name: Some(name.to_owned()),
+        };
+        assert!(is_already_registered(&named(
+            "net.connman.iwd.AlreadyExists"
+        )));
+        for name in [
+            "net.connman.iwd.InvalidArgs",
+            "net.connman.iwd.Failed",
+            "org.freedesktop.DBus.Error.UnknownObject",
+            "org.bluez.Error.AlreadyExists",
+        ] {
+            assert!(!is_already_registered(&named(name)), "{name}");
+        }
+        assert!(!is_already_registered(&BusError::Permanent {
+            reason: "net.connman.iwd.AlreadyExists".to_owned(),
+            dbus_name: None,
+        }));
+    }
 
     /// `Network.Connect` blocks while the user types the passphrase on our
     /// agent's prompt, and iwd waits two minutes for that. A deadline shorter

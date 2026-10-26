@@ -65,8 +65,11 @@ struct NotificationsShared {
     /// (D-Bus `Notify`) notifications never populate this map, so this
     /// field has zero effect on their behaviour. A plain `std::sync::Mutex`
     /// is fine here for the same reason as `POST_LOCAL_SEEN`: every
-    /// critical section is non-async map surgery.
-    local_actions: Mutex<LocalActionMap>,
+    /// critical section is non-async map surgery. The **same** `Arc` the
+    /// D-Bus `Notify` handler (`NotificationsIface::local_actions`) clears a
+    /// replaced id's callbacks from, so that handler needs no registry lookup
+    /// and a test can drive it hermetically.
+    local_actions: Arc<Mutex<LocalActionMap>>,
     /// Hover-pausable per-id expiry timers (#567). Keyed by notification id,
     /// each entry pairs the pure [`TimerState`] bookkeeping with the live
     /// `sleep → dismiss` task's abort handle. One entry per **live**
@@ -208,10 +211,12 @@ impl Service for NotificationsService {
         let active = Mutable::new(Vec::new());
         let next_id = Arc::new(AtomicU32::new(1));
         let history = Mutable::new(Vec::new());
+        let local_actions = Arc::new(Mutex::new(HashMap::new()));
 
         let iface = NotificationsIface {
             active: active.clone(),
             next_id: next_id.clone(),
+            local_actions: local_actions.clone(),
         };
 
         // Own the well-known name + mount the interface. The bus layer handles
@@ -235,7 +240,7 @@ impl Service for NotificationsService {
             history: history.clone(),
             next_id: next_id.clone(),
             ownership: ownership.clone(),
-            local_actions: Mutex::new(HashMap::new()),
+            local_actions,
             timers: Mutex::new(HashMap::new()),
         });
 
@@ -1163,8 +1168,10 @@ pub fn post_local_with_actions(
 
 /// The mounted `org.freedesktop.Notifications` object. Closing goes through
 /// [`dismiss`] and the shared registry, like every other close path, so the
-/// interface holds only what `Notify` writes: the live list and the id
-/// counter. (It used to carry the history too, for a `close_notification` that
+/// interface holds only what `Notify` writes: the live list, the id counter,
+/// and the shell-local callback map a replace retires an id's entries from
+/// (the `Arc` `NotificationsShared::local_actions` also holds). (It used to
+/// carry the history too, for a `close_notification` that
 /// pulled the notification out itself before calling `dismiss` — which is
 /// what left `dismiss` emitting `NotificationClosed` for ids it had not
 /// removed, since from there it could not tell a close it was finishing from
@@ -1173,6 +1180,7 @@ pub fn post_local_with_actions(
 struct NotificationsIface {
     active: Mutable<Vec<Notification>>,
     next_id: Arc<AtomicU32>,
+    local_actions: Arc<Mutex<LocalActionMap>>,
 }
 
 // zbus's `#[interface]` macro requires every method to be `async fn` even
@@ -1265,9 +1273,7 @@ impl NotificationsIface {
             // A replace of a live id keeps the id, so it must also drop any
             // shell-local callback registered under it. Lock order is
             // `active` -> `local_actions`; nothing takes them the other way.
-            if let Some(shared) = shared::get::<NotificationsShared>()
-                && let Ok(mut map) = shared.local_actions.lock()
-            {
+            if let Ok(mut map) = self.local_actions.lock() {
                 forget_replaced_local_actions(&mut map, &list, replaces_id);
             }
             let id = notify_id(&list, replaces_id, &self.next_id);
@@ -1695,8 +1701,8 @@ mod tests {
         rate_limit_check, register_local_action, resolve_timeout, strip_markup, take_local_action,
     };
     use std::cell::Cell;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
     use zbus::zvariant::{Str, Structure, Value};
 
@@ -1934,6 +1940,7 @@ mod tests {
         let iface = NotificationsIface {
             active: Mutable::new(Vec::new()),
             next_id: Arc::new(AtomicU32::new(1)),
+            local_actions: Arc::new(Mutex::new(LocalActionMap::new())),
         };
         let caps = iface.get_capabilities();
         assert!(caps.iter().any(|c| c == "body"), "{caps:?}");
@@ -2239,6 +2246,49 @@ mod tests {
         forget_replaced_local_actions(&mut map, &[live(1)], 5);
 
         assert!(map.contains_key(&(1, "open".to_string())));
+    }
+
+    /// The `Notify` handler itself, not just the helper: a client's
+    /// `replaces_id` naming a live shell-local toast retires that toast's
+    /// callbacks, so the replacement's `open` broadcasts `ActionInvoked`
+    /// instead of running the shell's. Driven through the real `notify`
+    /// (#1572 review): with no `NotificationsShared` registered, its only
+    /// other side effect, `set_expiry`, is a no-op.
+    #[test]
+    fn notify_replacing_a_live_local_toast_forgets_its_callbacks() {
+        let local_actions = Arc::new(Mutex::new(LocalActionMap::new()));
+        {
+            let mut map = local_actions.lock().expect("fresh mutex");
+            register_local_action(&mut map, 1, "open".to_string(), Box::new(|| {}));
+            register_local_action(&mut map, 2, "open".to_string(), Box::new(|| {}));
+        }
+        let iface = NotificationsIface {
+            active: Mutable::new(vec![live(1), live(2)]),
+            next_id: Arc::new(AtomicU32::new(3)),
+            local_actions: Arc::clone(&local_actions),
+        };
+
+        let id = futures_executor::block_on(iface.notify(
+            "client",
+            1,
+            "",
+            "replaced",
+            "",
+            vec!["open".to_string(), "Open".to_string()],
+            HashMap::new(),
+            -1,
+        ));
+
+        assert_eq!(id, 1, "a replace of a live id keeps the id");
+        let mut map = local_actions.lock().expect("not poisoned");
+        assert!(
+            take_local_action(&mut map, 1, "open").is_none(),
+            "the replaced shell toast's callback must not run on the client's click"
+        );
+        assert!(
+            map.contains_key(&(2, "open".to_string())),
+            "another toast's callback is untouched"
+        );
     }
 
     #[test]

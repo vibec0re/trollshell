@@ -49,7 +49,7 @@
 use std::io::{Read as _, Write as _};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use ureq::Error;
@@ -146,6 +146,16 @@ pub(crate) fn resolve_socket_path(
     if trimmed.is_empty() {
         return Err(format!(
             "{UNIX_SCHEME} URL names no socket path; use {BRIDGE_BASE_URL}"
+        ));
+    }
+    // A `..` would let `$XDG_RUNTIME_DIR/../../tmp/x.sock` (or an absolute
+    // path) climb out of the directory the same-uid boundary is anchored on.
+    if Path::new(trimmed)
+        .components()
+        .any(|c| c == Component::ParentDir)
+    {
+        return Err(format!(
+            "{UNIX_SCHEME} socket path must not contain `..`, got {raw}"
         ));
     }
     for token in RUNTIME_DIR_TOKENS {
@@ -328,6 +338,33 @@ mod tests {
         resolve_socket_path, socket_target,
     };
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn parent_dir_components_are_rejected() {
+        let runtime = Path::new("/run/user/1000");
+        for raw in [
+            "$XDG_RUNTIME_DIR/../../tmp/x.sock",
+            "${XDG_RUNTIME_DIR}/trollshell/../../x.sock",
+            "/run/user/1000/../../tmp/x.sock",
+        ] {
+            let err = resolve_socket_path(raw, Some(runtime)).expect_err(raw);
+            assert!(err.contains(".."), "{err}");
+        }
+    }
+
+    #[test]
+    fn ordinary_and_dotted_names_still_resolve() {
+        let runtime = Path::new("/run/user/1000");
+        assert_eq!(
+            resolve_socket_path("$XDG_RUNTIME_DIR/trollshell/a..b.sock", Some(runtime))
+                .expect("resolves"),
+            PathBuf::from("/run/user/1000/trollshell/a..b.sock")
+        );
+        assert_eq!(
+            resolve_socket_path("/tmp/x.sock", None).expect("resolves"),
+            PathBuf::from("/tmp/x.sock")
+        );
+    }
 
     /// The canonical env value every deployment carries must resolve to the
     /// exact path `hytte-claude-bridge` binds. These are the two ends of one

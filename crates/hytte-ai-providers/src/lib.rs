@@ -76,7 +76,7 @@ pub const ROUTE: &str = "/v1/chat/completions";
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// An OpenAI-compatible chat provider: where to POST and how to authenticate.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Provider {
     /// Base URL of the endpoint; `/v1/chat/completions` is appended (a trailing
     /// slash is tolerated — `llama-server` 404s on `//v1/...`).
@@ -104,6 +104,20 @@ pub struct Provider {
     /// natural choice (unique, and it survives a restart). Leaving it `None`
     /// keeps the pre-#704 behaviour exactly.
     pub user: Option<String>,
+}
+
+/// Hand-written so a `{:?}` of a [`Provider`] (or of anything holding one)
+/// can never write the bearer token into a log: the key prints as
+/// `Some("<redacted>")` or `None`, every other field as the derive would.
+impl std::fmt::Debug for Provider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Provider")
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("model", &self.model)
+            .field("user", &self.user)
+            .finish()
+    }
 }
 
 impl Provider {
@@ -427,6 +441,24 @@ pub fn owner_or(raw: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_debug_redacts_the_api_key() {
+        let p = Provider {
+            base_url: "https://example.test".to_owned(),
+            api_key: Some("sk-secret-123".to_owned()),
+            model: Some("m".to_owned()),
+            user: None,
+        };
+        let shown = format!("{p:?}");
+        assert!(!shown.contains("sk-secret-123"), "{shown}");
+        assert!(shown.contains("api_key: Some(\"<redacted>\")"), "{shown}");
+        assert!(shown.contains("https://example.test"), "{shown}");
+        let nested = format!("{:?}", Some(p));
+        assert!(!nested.contains("sk-secret-123"), "{nested}");
+        let none = format!("{:?}", Provider::llama("http://x"));
+        assert!(none.contains("api_key: None"), "{none}");
+    }
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::path::{Path, PathBuf};

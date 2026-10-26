@@ -13,16 +13,18 @@
 //! `WarningLevel` additionally drives a self-toast: `spawn_warning_level_watcher`
 //! watches for a rising severity edge (entering `Low` or `Critical`/`Action`)
 //! and posts via [`crate::notifications::post_local`] — see `warning_toast`
-//! for the crossing/dedup rules (#237). [`is_critical`] exposes that same
-//! `Critical`/`Action` severity split so other `WarningLevel` consumers (the
-//! `trollshell` battery chip's emergency pulse) agree with the toast instead
-//! of carrying their own threshold (#656).
+//! for the crossing/dedup rules (#237), and `WarningWatch` for why it reads
+//! the raw property states rather than [`Battery`]. [`is_critical`] exposes
+//! that same `Critical`/`Action` severity split so other `WarningLevel`
+//! consumers (the `trollshell` battery chip's emergency pulse) agree with the
+//! toast instead of carrying their own threshold (#656).
 //!
 //! [`on_battery`] tracks a separate property — `OnBattery` on the *manager*
 //! object (`/org/freedesktop/UPower`, `org.freedesktop.UPower`), not the
 //! device — since it's correct even on desktops with no battery (#230).
 
 use crate::notifications::Urgency;
+use futures_signals::map_ref;
 use futures_signals::signal::{Mutable, Signal, SignalExt};
 use hytte_bus::{BusKind, PropState, PropertySignal, property};
 use hytte_reactive::{Service, registry, shared, spawn_supervised};
@@ -150,12 +152,17 @@ impl Service for UpowerService {
         let handles = UpowerHandles::default();
         let writer = handles.battery.clone();
 
-        bind_prop_field(
-            display_device_prop::<f64>("Percentage"),
-            0.0,
-            writer.clone(),
-            |b, v| b.percentage = v,
-        );
+        // Two of these subscriptions are also read raw by the warning watcher
+        // below, which needs to tell "not loaded yet" from a loaded value —
+        // something the folded `Battery` (whose `Loading` arm writes the field's
+        // default) cannot say. Cloning a `PropertySignal` shares one tracking
+        // task; it does not open a second subscription.
+        let percentage = display_device_prop::<f64>("Percentage");
+        let warning_level = display_device_prop::<u32>("WarningLevel");
+
+        bind_prop_field(percentage.clone(), 0.0, writer.clone(), |b, v| {
+            b.percentage = v;
+        });
         bind_prop_field(
             display_device_prop::<u32>("State"),
             0,
@@ -180,14 +187,11 @@ impl Service for UpowerService {
             writer.clone(),
             |b, v| b.icon_name = v,
         );
-        bind_prop_field(
-            display_device_prop::<u32>("WarningLevel"),
-            0,
-            writer.clone(),
-            |b, v| b.warning_level = WarningLevel::from_u32(v),
-        );
+        bind_prop_field(warning_level.clone(), 0, writer, |b, v| {
+            b.warning_level = WarningLevel::from_u32(v);
+        });
 
-        spawn_warning_level_watcher(writer);
+        spawn_warning_level_watcher(warning_level, percentage);
 
         bind_on_battery(
             manager_prop::<bool>("OnBattery"),
@@ -331,8 +335,10 @@ pub fn is_critical(level: WarningLevel) -> bool {
 /// a state the user is already living with (see #237 triage: naively
 /// toasting on "any transition into Low/Critical" would re-fire on every
 /// restart, since the property emits its current value as the first
-/// `Loaded`). Otherwise only a **rising** edge — climbing to a higher
-/// severity tier — toasts; falling back (charger plugged in) or sitting at
+/// `Loaded`). That only holds if `None` is what the first *loaded* value
+/// meets, which is [`WarningWatch`]'s job: it is the only caller, and it
+/// does not count `PropState::Loading` as an observation. Otherwise only a
+/// **rising** edge — climbing to a higher severity tier — toasts; falling back (charger plugged in) or sitting at
 /// the same tier stays silent. A fast drain that skips a tier (jumping
 /// straight from "fine" to `Critical`/`Action`) still fires the
 /// higher-severity toast once.
@@ -349,36 +355,126 @@ fn warning_toast(baseline: Option<WarningLevel>, next: WarningLevel) -> Option<U
     }
 }
 
-/// Watch `battery`'s `warning_level` for rising edges and self-post a toast
-/// via [`crate::notifications::post_local`] (normal-urgency entering `Low`,
-/// critical-urgency entering `Critical`/`Action`) — see [`warning_toast`] for
-/// the dedup/baseline rules.
+/// One low-battery toast, as [`WarningWatch::observe`] decided it.
+#[derive(Debug, PartialEq)]
+struct WarningToast {
+    summary: &'static str,
+    /// `"N% remaining"`, or empty when `Percentage` has not loaded yet — the
+    /// toast renders a summary-only card rather than claiming `0%`.
+    body: String,
+    urgency: Urgency,
+}
+
+/// The edge detector behind the low-battery toast, fed the **raw** property
+/// states rather than the folded [`Battery`].
+///
+/// That is the whole fix for the toast re-firing on every shell restart.
+/// `Battery` folds `PropState::Loading` into each field's default, so its
+/// `warning_level` starts out as `WarningLevel::Unknown` before `UPower` has
+/// answered anything — and the watcher that used to read it took that
+/// placeholder as its first observation, seeded the baseline at tier 0, and
+/// then saw the first real `Loaded(Low)` as a rising edge. The "a restart
+/// while Low doesn't re-announce" rule on [`warning_toast`] was therefore
+/// never in force for the one path that runs in production. Here `Loading`
+/// is not an observation at all, so the baseline is seeded by the first
+/// value `UPower` actually reported.
+///
+/// `Stale(v)` *is* an observation: `hytte_bus` only produces it after a
+/// `Loaded` (a bus reconnect keeps the last value), so it carries the same
+/// level the baseline already holds and is silent by [`warning_toast`]'s own
+/// rule, while a level that moved during the outage is judged on its own
+/// edge when the reconnect delivers it.
+#[derive(Debug, Default)]
+struct WarningWatch {
+    /// The last level `UPower` reported; `None` until it has reported one.
+    baseline: Option<WarningLevel>,
+}
+
+impl WarningWatch {
+    /// Feed one combined emission; returns the toast to post, if any.
+    ///
+    /// `percentage` only shapes the body. It is read as its own state rather
+    /// than off `Battery` for the same reason as `level`: `WarningLevel` can
+    /// land before `Percentage` does, and `Battery.percentage` is `0.0` until
+    /// then — which used to put "0% remaining" on a `Low` toast.
+    fn observe(
+        &mut self,
+        level: &PropState<u32>,
+        percentage: &PropState<f64>,
+    ) -> Option<WarningToast> {
+        let (PropState::Loaded(raw) | PropState::Stale(raw)) = level else {
+            return None;
+        };
+        let level = WarningLevel::from_u32(*raw);
+        let urgency = warning_toast(self.baseline, level);
+        self.baseline = Some(level);
+        let urgency = urgency?;
+        let summary = match level {
+            WarningLevel::Critical | WarningLevel::Action => "Battery critical",
+            _ => "Battery low",
+        };
+        let body = match percentage {
+            PropState::Loaded(p) | PropState::Stale(p) => format!("{p:.0}% remaining"),
+            PropState::Loading => String::new(),
+        };
+        Some(WarningToast {
+            summary,
+            body,
+            urgency,
+        })
+    }
+}
+
+/// Drive a [`WarningWatch`] off the two property signals and hand each toast
+/// it decides on to `post`. Returns when either signal ends.
+///
+/// The signals and the sink are injected so the tests run the production
+/// fold — the combination, the ordering, the seed — without a bus or the
+/// notifications daemon.
+async fn run_warning_watch<L, P, Post>(level: L, percentage: P, mut post: Post)
+where
+    L: Signal<Item = PropState<u32>>,
+    P: Signal<Item = PropState<f64>>,
+    Post: FnMut(WarningToast),
+{
+    let mut watch = WarningWatch::default();
+    map_ref! {
+        let level = level,
+        let percentage = percentage => (level.clone(), percentage.clone())
+    }
+    .for_each(move |(level, percentage)| {
+        if let Some(toast) = watch.observe(&level, &percentage) {
+            post(toast);
+        }
+        std::future::ready(())
+    })
+    .await;
+}
+
+/// Watch `UPower`'s `WarningLevel` for rising edges and self-post a toast via
+/// [`crate::notifications::post_local`] (normal-urgency entering `Low`,
+/// critical-urgency entering `Critical`/`Action`) — see [`WarningWatch`] for
+/// the seed and [`warning_toast`] for the edge rules.
 ///
 /// Runs on the hytte-tokio runtime, not the GTK thread; `post_local` is
 /// cross-thread-safe (reaches the notifications daemon's `SHARED` handle),
-/// so this is safe regardless of service registration order.
-fn spawn_warning_level_watcher(battery: Mutable<Battery>) {
+/// so this is safe regardless of service registration order. A supervisor
+/// restart builds a fresh [`WarningWatch`], which re-seeds silently from the
+/// current value — the same rule as a shell restart.
+fn spawn_warning_level_watcher(level: PropertySignal<u32>, percentage: PropertySignal<f64>) {
     spawn_supervised("upower-warning", move || {
-        let battery = battery.clone();
+        let level = level.clone();
+        let percentage = percentage.clone();
         async move {
-            let mut baseline: Option<WarningLevel> = None;
-            battery
-                .signal_ref(|b| b.warning_level)
-                .dedupe()
-                .for_each(move |level| {
-                    if let Some(urgency) = warning_toast(baseline, level) {
-                        let percentage = battery.lock_ref().percentage;
-                        let summary = match level {
-                            WarningLevel::Critical | WarningLevel::Action => "Battery critical",
-                            _ => "Battery low",
-                        };
-                        let body = format!("{percentage:.0}% remaining");
-                        crate::notifications::post_local("Battery", summary, &body, urgency);
-                    }
-                    baseline = Some(level);
-                    std::future::ready(())
-                })
-                .await;
+            run_warning_watch(level.signal(), percentage.signal(), |toast| {
+                crate::notifications::post_local(
+                    "Battery",
+                    toast.summary,
+                    &toast.body,
+                    toast.urgency,
+                );
+            })
+            .await;
         }
     });
 }
@@ -467,11 +563,14 @@ pub fn on_battery_now() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        UpowerShared, Urgency, WarningLevel, is_critical, on_battery_snapshot, warning_toast,
+        UpowerShared, Urgency, WarningLevel, WarningToast, WarningWatch, is_critical,
+        on_battery_snapshot, run_warning_watch, warning_toast,
     };
     use futures_signals::signal::Mutable;
+    use hytte_bus::PropState;
     use hytte_reactive::test_lock::TEST_LOCK;
     use hytte_reactive::{registry, shared};
+    use std::sync::{Arc, Mutex};
 
     /// Everything about the battery-aware cadence snapshot (#505), in **one**
     /// test on purpose: `hytte_reactive::shared` is a process-global map, so
@@ -646,6 +745,150 @@ mod tests {
         assert_eq!(
             warning_toast(Some(after_charge), WarningLevel::Low),
             Some(Urgency::Normal)
+        );
+    }
+
+    // ── The production path: raw property states into `WarningWatch` ──────
+    //
+    // The tests above drive `warning_toast` with a hand-picked baseline. The
+    // one that matters — `None`, i.e. a shell that just started — was never
+    // what production fed it: the old watcher read `Battery`, whose
+    // `warning_level` is `Unknown` before UPower answers, so the baseline was
+    // always seeded `Some(Unknown)` and a restart while Low re-announced.
+    // These go through the same `observe` the spawned watcher calls.
+
+    /// `UPower`'s raw `WarningLevel` values (`org.freedesktop.UPower.Device`).
+    const NONE: u32 = 1;
+    const LOW: u32 = 3;
+    const CRITICAL: u32 = 4;
+
+    /// A restart while already Low: the property is `Loading` until the first
+    /// `Get` answers, then `Loaded(Low)`. Nothing may toast.
+    ///
+    /// Falsifiable: treating `Loading` as an observation (seeding the
+    /// baseline from it, as reading `Battery`'s defaulted field did) turns
+    /// the second `observe` into a rising edge and posts "Battery low".
+    #[test]
+    fn a_restart_while_low_seeds_from_the_first_loaded_value() {
+        let mut watch = WarningWatch::default();
+        assert_eq!(
+            watch.observe(&PropState::Loading, &PropState::Loading),
+            None
+        );
+        assert_eq!(watch.baseline, None, "Loading must not seed the baseline");
+        assert_eq!(
+            watch.observe(&PropState::Loaded(LOW), &PropState::Loaded(12.0)),
+            None,
+            "the first loaded level seeds silently, even when it is Low"
+        );
+        // …and the seed is live: the next real rise still toasts.
+        assert_eq!(
+            watch
+                .observe(&PropState::Loaded(CRITICAL), &PropState::Loaded(4.0))
+                .map(|t| t.urgency),
+            Some(Urgency::Critical)
+        );
+    }
+
+    /// A bus reconnect keeps the last value as `Stale`, then reloads it. Same
+    /// level both times: no re-toast.
+    #[test]
+    fn a_reconnect_at_the_same_level_does_not_retoast() {
+        let mut watch = WarningWatch::default();
+        let pct = PropState::Loaded(9.0);
+        assert_eq!(watch.observe(&PropState::Loaded(NONE), &pct), None);
+        assert!(watch.observe(&PropState::Loaded(LOW), &pct).is_some());
+        assert_eq!(watch.observe(&PropState::Stale(LOW), &pct), None);
+        assert_eq!(watch.observe(&PropState::Loaded(LOW), &pct), None);
+    }
+
+    /// `WarningLevel` can land before `Percentage`; the body must not then
+    /// claim `0% remaining` off the unloaded default.
+    #[test]
+    fn the_body_omits_a_percentage_that_has_not_loaded() {
+        let mut watch = WarningWatch::default();
+        assert_eq!(
+            watch.observe(&PropState::Loaded(NONE), &PropState::Loading),
+            None
+        );
+        assert_eq!(
+            watch.observe(&PropState::Loaded(LOW), &PropState::Loading),
+            Some(WarningToast {
+                summary: "Battery low",
+                body: String::new(),
+                urgency: Urgency::Normal,
+            })
+        );
+
+        let mut watch = WarningWatch::default();
+        assert_eq!(
+            watch.observe(&PropState::Loaded(NONE), &PropState::Loaded(9.6)),
+            None
+        );
+        assert_eq!(
+            watch
+                .observe(&PropState::Loaded(CRITICAL), &PropState::Stale(9.6))
+                .map(|t| (t.summary, t.body)),
+            Some(("Battery critical", "10% remaining".to_string()))
+        );
+    }
+
+    /// The spawned watcher's own fold, end to end: two signals combined, the
+    /// seed, the edge, the sink. Each `set` is followed by a yield so the
+    /// watcher sees every intermediate state (a `Mutable` signal only reports
+    /// the latest value it was polled at).
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_warning_watch_posts_only_a_real_rising_edge() {
+        let level = Mutable::new(PropState::<u32>::Loading);
+        let pct = Mutable::new(PropState::<f64>::Loading);
+        let posted: Arc<Mutex<Vec<WarningToast>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let task = {
+            let posted = posted.clone();
+            tokio::spawn(run_warning_watch(
+                level.signal_cloned(),
+                pct.signal_cloned(),
+                move |toast| posted.lock().unwrap().push(toast),
+            ))
+        };
+        let settle = || async {
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+        };
+
+        settle().await;
+        // Startup while already Low: silent.
+        level.set(PropState::Loaded(LOW));
+        settle().await;
+        pct.set(PropState::Loaded(14.0));
+        settle().await;
+        assert!(
+            posted.lock().unwrap().is_empty(),
+            "a shell (re)start while Low must not announce it"
+        );
+
+        // Charger in, then out again: one fresh rising edge, with the body
+        // read from the loaded percentage.
+        level.set(PropState::Loaded(NONE));
+        settle().await;
+        pct.set(PropState::Loaded(13.0));
+        settle().await;
+        level.set(PropState::Loaded(LOW));
+        settle().await;
+
+        // Dropping both writers ends both signals, so the fold returns.
+        drop(level);
+        drop(pct);
+        task.await.expect("watcher task panicked");
+
+        assert_eq!(
+            *posted.lock().unwrap(),
+            vec![WarningToast {
+                summary: "Battery low",
+                body: "13% remaining".to_string(),
+                urgency: Urgency::Normal,
+            }]
         );
     }
 }

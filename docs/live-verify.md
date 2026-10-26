@@ -177,7 +177,9 @@ range above is a floor, not a ceiling.
       binary / non-zero exit / a command running past 10s all still return
       `ok: false` (no hang), with a warn in `RUST_LOG=trollshell=info`.
       `~/.local/state/trollshell/effects-audit.log` accrues one line per
-      brokered/dropped effect and rotates to `.log.1` past the 256 KiB cap.
+      brokered effect, and one per dropped effect up to a per-plugin budget
+      (16, then one every ten seconds, each ending `suppressed=<n>`), and
+      rotates to `.log.1` past the 256 KiB cap.
 - [ ] **(#953)** The **detached** spawn mode (`Effect::RunCommand` with
       `detached: true`, i.e. `Effect::launch(...)`): click a sidebar/panel row
       on a plugin that launches a terminal that way → the terminal opens, and

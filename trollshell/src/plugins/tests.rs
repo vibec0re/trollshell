@@ -3233,6 +3233,271 @@ async fn granted_effect_reaches_the_broker() {
     assert!(matches!(got.effect, Effect::OpenPage(Page::PowerMenu)));
 }
 
+// ── Register hygiene and bounded logging ─────────────────────────────────────
+
+/// Drive one `Register` and report whether the host dropped the connection
+/// (EOF within 5 s) — the harness the empty-id and over-cap-id tests use.
+async fn register_is_dropped(manifest: Manifest) -> bool {
+    let (_clock_tx, clock_rx) = watch::channel(None);
+    let (_vis_tx, vis_rx) = watch::channel(false);
+    let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+    let (host, plugin) = UnixStream::pair().expect("socketpair");
+    tokio::spawn(async move { handle_conn(host, &ctx).await });
+    let (mut prd, mut pwr) = plugin.into_split();
+    write_frame(&mut pwr, &PluginMsg::Register { manifest })
+        .await
+        .expect("Register");
+    // `Manifest::new` negotiates the vocabulary, so an accepted connection's
+    // first frame is `Hello`; a refused one reads EOF.
+    tokio::time::timeout(Duration::from_secs(5), read_frame::<HostMsg, _>(&mut prd))
+        .await
+        .expect("the host answers or drops the connection within 5s")
+        .is_err()
+}
+
+/// An id outside the launcher's charset is refused at `Register`, like an
+/// empty or over-cap one. The id is in every journal line that names the
+/// plugin, a notification's app name and the control-center's Plugins tab, so
+/// a newline or a terminal escape in it forged journal records and reached the
+/// screen raw. The launcher, the session bus and the SDK's `HYTTE_PLUGIN_ID`
+/// already refuse such ids, so no plugin the shell can start has one.
+///
+/// **Falsified** by deleting the `systemd::is_valid_plugin_id` branch in
+/// `session::register_id`: the four bad ids are accepted.
+#[tokio::test]
+async fn a_plugin_id_outside_the_launcher_charset_is_rejected() {
+    for bad in ["has space", "new\nline", "ansi\u{1b}[31m", "dot.ted"] {
+        assert!(
+            register_is_dropped(Manifest::new(bad, Mount::BarCenter)).await,
+            "{bad:?} must be refused at Register",
+        );
+    }
+    for good in ["clock-demo", "audio_widget", "Stats2"] {
+        assert!(
+            !register_is_dropped(Manifest::new(good, Mount::BarCenter)).await,
+            "{good:?} is a launcher-valid id and must be accepted",
+        );
+    }
+}
+
+/// A manifest listing more than `MAX_MANIFEST_LIST_ENTRIES` subscriptions or
+/// capabilities is refused: both are lists of a small vocabulary's unit
+/// variants, every frame runs `contains` over the capability list once per
+/// effect, and the "plugin registered" line prints them. Exactly at the cap is
+/// accepted.
+///
+/// **Falsified** by deleting the list check in `serve_conn`: the two over-cap
+/// manifests are accepted.
+#[tokio::test]
+async fn a_manifest_listing_too_many_entries_is_rejected() {
+    let cap = super::session::MAX_MANIFEST_LIST_ENTRIES;
+
+    let mut over_caps = Manifest::new("many-caps", Mount::BarCenter);
+    over_caps.capabilities = vec![Capability::OpenPage; cap + 1];
+    assert!(
+        register_is_dropped(over_caps).await,
+        "capabilities over the cap"
+    );
+
+    let mut over_subs = Manifest::new("many-subs", Mount::BarCenter);
+    over_subs.subscribes = vec![StateKey::Accent; cap + 1];
+    assert!(
+        register_is_dropped(over_subs).await,
+        "subscribes over the cap"
+    );
+
+    let mut at_cap = Manifest::new("enough-caps", Mount::BarCenter);
+    at_cap.capabilities = vec![Capability::OpenPage; cap];
+    assert!(
+        !register_is_dropped(at_cap).await,
+        "exactly at the cap is accepted"
+    );
+}
+
+/// A first frame that is not `Register` is logged by its variant name only.
+/// It was `?other`, so a `Render` carrying a large tree became one journal
+/// line of that tree's whole `Debug` text, once per connection attempt.
+///
+/// **Falsified** by logging `?other` again: the captured line carries the
+/// label's 64 KiB of text.
+#[tokio::test]
+async fn a_non_register_first_frame_is_logged_by_its_variant_only() {
+    let (captured, _guard) = hytte_config::test_support::capture();
+    let (_clock_tx, clock_rx) = watch::channel(None);
+    let (_vis_tx, vis_rx) = watch::channel(false);
+    let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+    let (host, plugin) = UnixStream::pair().expect("socketpair");
+    let conn = tokio::spawn(async move { handle_conn(host, &ctx).await });
+    let (_prd, mut pwr) = plugin.into_split();
+    write_frame(
+        &mut pwr,
+        &PluginMsg::Render {
+            tree: wire::Node::Label {
+                id: None,
+                text: "x".repeat(64 * 1024),
+                classes: vec![],
+                tooltip: None,
+            },
+            panel: None,
+            hidden_on: Vec::new(),
+            effects: Vec::new(),
+        },
+    )
+    .await
+    .expect("a Render as the first frame");
+    tokio::time::timeout(Duration::from_secs(5), conn)
+        .await
+        .expect("the connection is dropped")
+        .expect("serve_conn did not panic");
+
+    let events = captured.events();
+    let refusal = events
+        .iter()
+        .find(|e| e.message.contains("first frame was not Register"))
+        .unwrap_or_else(|| panic!("no refusal line captured: {events:?}"));
+    assert_eq!(
+        refusal.fields.get("frame").map(String::as_str),
+        Some("Render")
+    );
+    let longest = events
+        .iter()
+        .map(|e| e.message.len() + e.fields.values().map(String::len).sum::<usize>())
+        .max()
+        .unwrap_or(0);
+    assert!(
+        longest < 1024,
+        "no captured line carries the frame: {longest} bytes"
+    );
+}
+
+/// A frame that fails to decode is reported with a bounded error text. serde
+/// quotes the value it refused, so an unknown variant name of 64 KiB was a
+/// 64 KiB `error=` field in the handshake's warn line.
+///
+/// **Falsified** by logging `%e` instead of `%bounded_error(&e)` in the
+/// handshake arm: the captured `error` field is over 64 KiB.
+#[tokio::test]
+async fn a_frame_that_fails_to_decode_is_reported_with_a_bounded_error() {
+    let (captured, _guard) = hytte_config::test_support::capture();
+    let (_clock_tx, clock_rx) = watch::channel(None);
+    let (_vis_tx, vis_rx) = watch::channel(false);
+    let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+    let (host, plugin) = UnixStream::pair().expect("socketpair");
+    let conn = tokio::spawn(async move { handle_conn(host, &ctx).await });
+    let (_prd, mut pwr) = plugin.into_split();
+    // A one-entry map is how an externally tagged enum arrives; this one
+    // names a variant `PluginMsg` does not have.
+    let bogus = std::collections::BTreeMap::from([("V".repeat(64 * 1024), 0u8)]);
+    write_frame(&mut pwr, &bogus).await.expect("a bogus frame");
+    tokio::time::timeout(Duration::from_secs(5), conn)
+        .await
+        .expect("the connection is dropped")
+        .expect("serve_conn did not panic");
+
+    let events = captured.events();
+    let failure = events
+        .iter()
+        .find(|e| e.message.contains("handshake read failed"))
+        .unwrap_or_else(|| panic!("no handshake failure captured: {events:?}"));
+    let error = failure.fields.get("error").expect("an error field");
+    assert!(error.len() <= 260, "bounded: {} bytes", error.len());
+    assert!(error.ends_with('…'), "the cut is visible: {error}");
+}
+
+/// `bounded_error` puts the text on one line and cuts it with a visible `…`;
+/// a short single-line error passes through unchanged.
+#[test]
+fn bounded_error_is_one_line_and_capped() {
+    let long = format!("unknown variant `{}`\nforged: line", "v".repeat(10_000));
+    let bounded = super::session::bounded_error(&long);
+    assert!(!bounded.contains('\n'), "{bounded:?}");
+    assert!(
+        bounded.len() <= 256 + '…'.len_utf8(),
+        "{} bytes",
+        bounded.len()
+    );
+    assert!(bounded.ends_with('…'));
+    assert_eq!(
+        super::session::bounded_error(&"io error: broken pipe"),
+        "io error: broken pipe"
+    );
+}
+
+/// A plugin's `Log` text reaches the journal on one line: a newline cannot
+/// start a forged record and an escape cannot reach a terminal.
+///
+/// **Falsified** by logging `msg` raw in `log_plugin`: the captured message
+/// keeps the newline and the ESC.
+#[test]
+fn a_plugin_log_line_cannot_forge_a_second_record() {
+    let (captured, _guard) = hytte_config::test_support::capture();
+    super::session::log_plugin(
+        "logger",
+        hytte_plugin_proto::LogLevel::Warn,
+        "fetch failed\ntrollshell: plugin registered\u{1b}[31m",
+    );
+    let warnings = captured.warnings();
+    assert_eq!(
+        warnings,
+        ["fetch failed trollshell: plugin registered[31m"],
+        "one line, no escape",
+    );
+}
+
+/// The audit's closing count is written when the connection tears down: a
+/// frame of 100 ungranted effects writes the drop budget's burst, and the
+/// other 84 are a count the teardown flushes, so a flood that ends with its
+/// connection still reaches the file at its full size.
+///
+/// **Falsified** by deleting the `effects::flush_drop_audit` call in
+/// `serve_conn`'s teardown: the entry still owes `Some(84)`.
+#[tokio::test]
+async fn teardown_flushes_the_suppressed_drop_count() {
+    const ID: &str = "audit-teardown-flush";
+    let (_clock_tx, clock_rx) = watch::channel(None);
+    let (_vis_tx, vis_rx) = watch::channel(false);
+    let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+    let (host, plugin) = UnixStream::pair().expect("socketpair");
+    let conn = tokio::spawn(async move { handle_conn(host, &ctx).await });
+    let (prd, mut pwr) = plugin.into_split();
+    write_frame(
+        &mut pwr,
+        &PluginMsg::Register {
+            manifest: Manifest::new(ID, Mount::BarCenter),
+        },
+    )
+    .await
+    .expect("Register (no caps)");
+    write_frame(
+        &mut pwr,
+        &PluginMsg::Render {
+            tree: wire::Node::Label {
+                id: None,
+                text: "hi".into(),
+                classes: vec![],
+                tooltip: None,
+            },
+            panel: None,
+            hidden_on: Vec::new(),
+            effects: vec![Effect::OpenPage(Page::PowerMenu); 100],
+        },
+    )
+    .await
+    .expect("Render with 100 ungranted effects");
+    drop(pwr);
+    drop(prd);
+    tokio::time::timeout(Duration::from_secs(5), conn)
+        .await
+        .expect("the connection tears down on EOF")
+        .expect("serve_conn did not panic");
+
+    assert_eq!(
+        super::effects::pending_drop_audit(ID),
+        Some(0),
+        "teardown wrote the closing count and kept the spent budget",
+    );
+}
+
 // ── Datasource query routing (#509) ──────────────────────────────────────────
 
 /// Read one host→plugin frame off an outbound mpsc queue (the requester/provider

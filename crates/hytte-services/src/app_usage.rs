@@ -184,8 +184,7 @@ async fn poll_loop(usage: Mutable<(Vec<ProcSample>, Vec<ProcSample>)>, active: M
     // actually contended (one loop, calls never overlap), the `Mutex` is only
     // what lets an owned, `'static` future leave and return through a plain
     // `FnMut`.
-    let jiffy_state =
-        std::sync::Arc::new(std::sync::Mutex::new((HashMap::<u32, u64>::new(), 0u64)));
+    let jiffy_state = std::sync::Arc::new(std::sync::Mutex::new((HashMap::new(), 0u64)));
 
     gated_poll(
         active,

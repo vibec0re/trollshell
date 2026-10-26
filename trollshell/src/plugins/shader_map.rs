@@ -22,8 +22,9 @@
 //! So what lives here is a capability check, one "does this session run plugin
 //! shaders at all" check — the context-failure latch; #978's
 //! `TROLLSHELL_PREEM_RENDERER=cpu` kill switch was the second until #1157
-//! retired it along with the CPU renderer it named — and five cheap shape
-//! checks, the fifth being #977's per-axis grid extent. There
+//! retired it along with the CPU renderer it named — and six cheap shape
+//! checks, the fifth being #977's per-axis grid extent and the sixth the
+//! same bound on the drawn size. There
 //! is **no source validator**, and that is a measured absence rather than a
 //! todo: naga — the one Rust GLSL frontend in reach — cannot parse the ES
 //! profile at all (`#version 300/310/320 es` each come back `InvalidVersion` +
@@ -54,6 +55,7 @@ use hytte_plugin_proto::{Capability, Manifest};
 use hytte_preem as kit;
 
 use super::preem_render::{self, Scope, Warned};
+use super::wire_map::MAX_PIXELS_SCALED_DIM;
 
 /// What a plugin's connection is allowed to render, as far as the mapping pass
 /// is concerned.
@@ -177,6 +179,19 @@ pub(super) enum Refusal {
         /// The grid that was claimed, in texels.
         size: (u32, u32),
     },
+    /// The drawn size has a side over
+    /// [`MAX_PIXELS_SCALED_DIM`],
+    /// before `scale`.
+    ///
+    /// A `Pixels` node cannot ask for a big surface without sending the bytes
+    /// for it, but a shader's `width` and `height` are two free numbers: the
+    /// buffer is a separate grid. The `scale` clamp held the *scaled* size to
+    /// the cap only for a side already under it, so `width = u32::MAX` reached
+    /// `ShaderSurface` as is and asked GTK for an `i32::MAX` natural width.
+    SizeTooLarge {
+        /// The size that was claimed, in logical pixels.
+        size: (u32, u32),
+    },
     /// GL has been abandoned for this process — a context failed to create, and
     /// `hytte-ui` latched it.
     ///
@@ -243,10 +258,11 @@ impl Refusal {
     ///
     /// - [`Warned::ShaderDenied`] — the manifest. One refusal.
     /// - [`Warned::ShaderCap`] — the plugin's rendering code. Classifies all
-    ///   five shape refusals — "the node I sent is malformed" — but as of
+    ///   six shape refusals — "the node I sent is malformed" — but as of
     ///   #1023 item 2 only **four** of them (`SourceTooLarge`, `DataTooLarge`,
     ///   `MalformedData`, `EmptyGrid`) actually *claim* it in [`warn`]; see
-    ///   the section below for the fifth. Splitting the four further would
+    ///   the section below for the fifth, and `SizeTooLarge` takes its own
+    ///   latch on the same terms. Splitting the four further would
     ///   spend more of [`Warned`]'s eight bits on
     ///   one node kind.
     /// - [`Warned::ShaderNoGpu`] — the session, i.e. a shell restart. Two
@@ -285,7 +301,8 @@ impl Refusal {
             | Self::DataTooLarge { .. }
             | Self::MalformedData { .. }
             | Self::EmptyGrid
-            | Self::GridTooLarge { .. } => Warned::ShaderCap,
+            | Self::GridTooLarge { .. }
+            | Self::SizeTooLarge { .. } => Warned::ShaderCap,
             Self::NoGl => Warned::ShaderNoGpu,
         }
     }
@@ -316,7 +333,8 @@ impl Refusal {
 ///    this shell run should not have its buffer measured and reported — there
 ///    is nothing to read the buffer *with*;
 /// 3. the shape checks, cheapest and most fundamental first — the length
-///    invariant, then a zero side, then the per-axis extent. A grid whose
+///    invariant, then a zero side, then the per-axis extent of the grid and
+///    then of the drawn size. A grid whose
 ///    length does not match it is a more basic mistake than a grid that is
 ///    merely too big, and reporting the basic one first sends the author to
 ///    the right place.
@@ -355,6 +373,11 @@ pub(super) fn refusal(
     if node.data_size.0 > MAX_SHADER_DATA_EXTENT || node.data_size.1 > MAX_SHADER_DATA_EXTENT {
         return Some(Refusal::GridTooLarge {
             size: node.data_size,
+        });
+    }
+    if node.width.max(node.height) > MAX_PIXELS_SCALED_DIM {
+        return Some(Refusal::SizeTooLarge {
+            size: (node.width, node.height),
         });
     }
     None
@@ -609,6 +632,12 @@ thread_local! {
     /// touched by `forget_scope` here, matching `preem_render::forget_scope`
     /// not touching `WARNED`.
     static WARNED_GRID_TOO_LARGE: RefCell<HashSet<Scope>> = RefCell::new(HashSet::new());
+
+    /// Per-scope latch for [`Refusal::SizeTooLarge`], on
+    /// [`WARNED_GRID_TOO_LARGE`]'s terms and for its reason: `Warned` has no
+    /// ninth bit, and sharing a latch with another shape refusal would let one
+    /// mistake swallow the other's line (#1020 review LOW 1).
+    static WARNED_SIZE_TOO_LARGE: RefCell<HashSet<Scope>> = RefCell::new(HashSet::new());
 }
 
 /// Claim the [`Refusal::GridTooLarge`] latch for `scope`: `true` the first
@@ -625,7 +654,17 @@ thread_local! {
 /// `HashSet<(Scope, Warned)>` for for the same reason (#901): "the map
 /// clones the `Scope` only on the insert that actually latches something."
 fn warn_once_grid_too_large(scope: &Scope) -> bool {
-    WARNED_GRID_TOO_LARGE.with_borrow_mut(|warned| {
+    claim_latch(&WARNED_GRID_TOO_LARGE, scope)
+}
+
+/// Claim `latch` for `scope`, borrow-only on a hit as
+/// [`warn_once_grid_too_large`] describes. Shared by the two per-scope latches
+/// so the clone-only-on-insert rule is written once.
+fn claim_latch(
+    latch: &'static std::thread::LocalKey<RefCell<HashSet<Scope>>>,
+    scope: &Scope,
+) -> bool {
+    latch.with_borrow_mut(|warned| {
         if warned.contains(scope) {
             return false;
         }
@@ -641,14 +680,15 @@ fn warn_once_grid_too_large(scope: &Scope) -> bool {
 /// and neither does a 20 KiB source), so an unlatched warning would be one line
 /// per frame per monitor.
 ///
-/// [`Refusal::GridTooLarge`] is the one exception: it claims
-/// [`WARNED_GRID_TOO_LARGE`] instead of [`Warned`]'s shared shape slot
+/// [`Refusal::GridTooLarge`] and [`Refusal::SizeTooLarge`] are the
+/// exceptions: each claims a latch of its own ([`WARNED_GRID_TOO_LARGE`],
+/// [`WARNED_SIZE_TOO_LARGE`]) instead of [`Warned`]'s shared shape slot
 /// (#1023 item 2) — see there for why.
 fn warn(scope: &Scope, node: &ShaderNode<'_>, refused: Refusal) {
-    let claimed = if let Refusal::GridTooLarge { .. } = refused {
-        warn_once_grid_too_large(scope)
-    } else {
-        preem_render::warn_once(scope, refused.slot())
+    let claimed = match refused {
+        Refusal::GridTooLarge { .. } => warn_once_grid_too_large(scope),
+        Refusal::SizeTooLarge { .. } => claim_latch(&WARNED_SIZE_TOO_LARGE, scope),
+        _ => preem_render::warn_once(scope, refused.slot()),
     };
     if !claimed {
         return;
@@ -715,6 +755,17 @@ fn warn(scope: &Scope, node: &ShaderNode<'_>, refused: Refusal) {
              32 KiB — and a grid this wide is refused by many drivers' GL_MAX_TEXTURE_SIZE, \
              which would blank the widget silently instead. Reshape the buffer (a 1-D grid \
              folds into rows) (further occurrences in this tree are silenced)",
+        ),
+        Refusal::SizeTooLarge { size } => tracing::warn!(
+            plugin = scope.plugin_id(),
+            tree = ?scope.role(),
+            node = ?node.id,
+            width = size.0,
+            height = size.1,
+            cap = MAX_PIXELS_SCALED_DIM,
+            "plugin Shader asks for a surface with a side over the host's cap; rendering the \
+             placeholder. `width`/`height` are the natural size in logical pixels before \
+             `scale`, not the data grid (further occurrences in this tree are silenced)",
         ),
         Refusal::NoGl => tracing::warn!(
             plugin = scope.plugin_id(),
@@ -812,6 +863,7 @@ mod tests {
     };
     use crate::plugins::preem_render::{self, Scope};
     use crate::plugins::tests::{preem_ink_lock, role_ink_reset};
+    use crate::plugins::wire_map::MAX_PIXELS_SCALED_DIM;
     use hytte::ui::Node as UiNode;
 
     /// A well-formed node: a 4-texel `R8` strip on a 144×48 surface.
@@ -1985,6 +2037,102 @@ mod tests {
             "a shape refusal already claimed must not swallow a later GridTooLarge — that is \
              #1023 item 2",
         );
+    }
+
+    /// **The drawn size is capped like the grid.** A shader's `width` and
+    /// `height` are free numbers (the buffer is a separate grid), so before
+    /// this refusal `width = u32::MAX` mapped to a `UiNode::Shader` of that
+    /// width and asked GTK for an `i32::MAX` natural width. Both axes at the
+    /// boundary, for the transpose reason `a_grid_side_over_the_extent_cap_is_refused`
+    /// gives.
+    ///
+    /// **Falsified** by deleting the `node.width.max(node.height) >
+    /// MAX_PIXELS_SCALED_DIM` guard: the over-cap assertions become `None` and
+    /// the mapped node is a `Shader` with `width == u32::MAX`. Falsified the
+    /// other way by writing it `>=`: the at-cap assertions go red.
+    #[test]
+    fn a_drawn_side_over_the_size_cap_is_refused() {
+        let data = [0u8; 4];
+        let mut node = ok_node("void main() {}", &data);
+        node.width = MAX_PIXELS_SCALED_DIM;
+        assert_eq!(
+            refusal(granted(), GlAvailability::Available, &node),
+            None,
+            "exactly at the cap draws",
+        );
+        node.width = 1;
+        node.height = MAX_PIXELS_SCALED_DIM;
+        assert_eq!(
+            refusal(granted(), GlAvailability::Available, &node),
+            None,
+            "…on either axis",
+        );
+
+        node.width = MAX_PIXELS_SCALED_DIM + 1;
+        node.height = 1;
+        assert_eq!(
+            refusal(granted(), GlAvailability::Available, &node),
+            Some(Refusal::SizeTooLarge {
+                size: (MAX_PIXELS_SCALED_DIM + 1, 1)
+            }),
+            "one pixel over the width is refused",
+        );
+        node.width = 1;
+        node.height = MAX_PIXELS_SCALED_DIM + 1;
+        assert_eq!(
+            refusal(granted(), GlAvailability::Available, &node),
+            Some(Refusal::SizeTooLarge {
+                size: (1, MAX_PIXELS_SCALED_DIM + 1)
+            }),
+            "…and so is the height",
+        );
+
+        // The reported input, end to end through the mapping: the placeholder,
+        // never a `Shader` node carrying the size.
+        node.width = u32::MAX;
+        node.height = 48;
+        let scope = Scope::detached("shader-size-too-large");
+        begin_pass(&scope);
+        let mapped = map_shader(&scope, granted(), FitAxis::Width, &node);
+        end_pass(&scope);
+        assert!(
+            matches!(
+                mapped,
+                UiNode::Pixels {
+                    width: 0,
+                    height: 0,
+                    ..
+                }
+            ),
+            "an over-cap size draws the broken-widget placeholder: {mapped:?}",
+        );
+        assert_eq!(
+            Refusal::SizeTooLarge { size: (1, 1) }.slot(),
+            Warned::ShaderCap,
+            "classified as a shape refusal, like the grid's",
+        );
+    }
+
+    /// `SizeTooLarge` claims its own latch, so an earlier shape refusal in the
+    /// same tree cannot swallow its line (the #1023 item 2 shape, for the new
+    /// refusal).
+    ///
+    /// **Falsified** by routing `Refusal::SizeTooLarge` through
+    /// `preem_render::warn_once(scope, refused.slot())` in [`warn`]: the count
+    /// drops from 2 to 1.
+    #[test]
+    fn a_size_too_large_refusal_is_not_swallowed_by_an_earlier_shape_refusal() {
+        let over_source = "x".repeat(MAX_SHADER_SOURCE_BYTES + 1);
+        let small = [0u8; 4];
+        let source_too_large = ok_node(&over_source, &small);
+        let mut size_too_large = ok_node("void main() {}", &small);
+        size_too_large.width = u32::MAX;
+
+        let emitted = counting_events("shader-size-too-large-not-swallowed", |scope| {
+            let _ = map_shader(scope, granted(), FitAxis::Width, &source_too_large);
+            let _ = map_shader(scope, granted(), FitAxis::Width, &size_too_large);
+        });
+        assert_eq!(emitted, 2, "the size refusal gets its own line");
     }
 
     /// **PR #1031 review M1.** Repeated probes of an already-latched scope

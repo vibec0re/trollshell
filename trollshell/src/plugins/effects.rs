@@ -2453,9 +2453,17 @@ fn truncate_uri_for_log(uri: &str) -> String {
 // or the rate cap (#435) — is appended to a bounded, rotating log file under XDG
 // state (`$XDG_STATE_HOME/trollshell/effects-audit.log`), so the host's
 // allow/deny decisions are reviewable after the fact rather than only visible in
-// live `tracing` output. Writes are handed to a single background writer over an
-// unbounded channel, so neither the GTK broker thread nor the tokio reader
-// threads block on file IO.
+// live `tracing` output. Writes are handed to one dedicated writer thread over a
+// **bounded** queue ([`AuditSink`]), so neither the GTK broker thread nor the
+// tokio reader threads block on file IO, and a flood cannot grow the queue.
+//
+// Dropped effects are the one record a plugin can produce at will — a frame of
+// ungranted effects costs it nothing — so they go through a per-plugin budget
+// and a global one ([`DropBudgets`]) before they are even formatted, and their
+// lines may not use the queue slots kept for `allowed` ones
+// ([`AUDIT_ALLOWED_RESERVE`]). That is what stops a drop flood from rotating
+// the `allowed` records (the ones the audit exists for) out of both files, or
+// from crowding one out of the queue.
 
 /// Total-bytes cap per audit file before rotation (#510). Two files are kept —
 /// the live `effects-audit.log` and one rotated `effects-audit.log.1` — so the
@@ -2463,6 +2471,82 @@ fn truncate_uri_for_log(uri: &str) -> String {
 /// rate-capped write volume.
 #[cfg(not(test))]
 const MAX_AUDIT_BYTES: u64 = 256 * 1024;
+
+/// How many lines the audit writer's queue holds before a new line is counted
+/// as lost instead of queued.
+///
+/// The queue only fills if the writer thread stalls on the disk, because
+/// everything that feeds it is already rate-limited: `allowed` records by the
+/// effect rate cap, and every drop-related line by [`AUDIT_DROP_GLOBAL_BURST`]
+/// / [`AUDIT_DROP_GLOBAL_PER_SEC`]. 1024 lines is about 130 KiB, under one
+/// rotation's worth.
+#[cfg(not(test))]
+const AUDIT_QUEUE_LINES: usize = 1024;
+
+/// How many of [`AUDIT_QUEUE_LINES`] only an `allowed` line may take.
+///
+/// A drop-related line is queued only while fewer than
+/// `AUDIT_QUEUE_LINES - AUDIT_ALLOWED_RESERVE` lines are waiting, so drop
+/// lines never hold more than 768 slots and an `allowed` line is lost only
+/// when 256 or more `allowed` lines are already waiting for the writer, i.e.
+/// when the writer has stalled on the disk. No drop flood can take its slot.
+#[cfg(not(test))]
+const AUDIT_ALLOWED_RESERVE: usize = 256;
+
+/// How many dropped-effect records one plugin can have written back to back
+/// before [`AUDIT_DROP_PER_SEC`] applies.
+///
+/// This is the "first N" of a flood frame: a frame of 10 000 ungranted effects
+/// writes this many lines, and the next line that plugin gets carries the
+/// count of the rest. 16 covers a buggy plugin's honest burst (a few clicks on
+/// a control whose capability it forgot) line for line.
+const AUDIT_DROP_BURST: u32 = 16;
+
+/// Dropped-effect records per second, per plugin, once the burst is spent: one
+/// line every ten seconds.
+///
+/// A drop line is about 110 bytes, so that is about 40 KiB an hour per
+/// flooding plugin, and one flooding plugin needs about half a day to push an
+/// `allowed` record out of the live file and the rotated `.1` together. Before
+/// this budget each dropped effect wrote a line, and one 16 MiB frame of
+/// ungranted effects could rotate both files many times over.
+///
+/// Nothing is lost by the slow rate: every line carries the count of the drops
+/// it stands in for, and the warn latches in `session` already name each
+/// mistake once in the journal.
+const AUDIT_DROP_PER_SEC: f64 = 0.1;
+
+/// How many drop-related lines, across **every** plugin id together, can be
+/// written back to back before [`AUDIT_DROP_GLOBAL_PER_SEC`] applies.
+///
+/// The per-id budget alone is per *name*, and a name costs nothing: any
+/// same-uid client can `Register` as `x1`, `x2`, … and each new id came with a
+/// fresh [`AUDIT_DROP_BURST`]. Across [`MAX_TRACKED_DROP_AUDITS`] ids that is
+/// about 1.8 MB of lines per refill window, which rotates both audit files and
+/// takes the `allowed` records with them. This bucket sits in front of the
+/// per-id ones, so cycling names buys nothing.
+///
+/// 64 is four plugins' whole per-id bursts at once, so a few plugins making
+/// the same manifest mistake at startup are still written line for line.
+const AUDIT_DROP_GLOBAL_BURST: u32 = 64;
+
+/// Drop-related lines per second across every plugin id once
+/// [`AUDIT_DROP_GLOBAL_BURST`] is spent: one line every five seconds, which is
+/// two plugins each at its own [`AUDIT_DROP_PER_SEC`].
+///
+/// At about 110 bytes a line that is about 80 KiB an hour whatever the number
+/// of ids, so any drop flood needs over six hours to push an `allowed` record
+/// out of the live file and the rotated `.1` together.
+const AUDIT_DROP_GLOBAL_PER_SEC: f64 = 0.2;
+
+/// How many plugin ids the per-id budgets track at once.
+///
+/// An entry is kept only while its bucket is partly spent (the same sweep rule
+/// as the effect buckets, see [`TokenBucket::is_full`]), so this binds only if
+/// that many ids flood at the same time. A drop from a new id beyond it has no
+/// per-id budget to count on, so it joins the global count
+/// ([`DropBudgets::global_suppressed`]).
+const MAX_TRACKED_DROP_AUDITS: usize = 1024;
 
 /// The host's allow/deny decision on one effect, recorded in the audit log
 /// (#510). `Allowed` effects reach the broker; the two `Dropped*` decisions are
@@ -2522,7 +2606,8 @@ pub(super) fn effect_kind(effect: &Effect) -> &'static str {
 /// decision=<decision>`, plus — for the effects that carry one — the
 /// correlation `id=`, an `OpenUri`'s destination as `uri=` (#1060), and for a
 /// detached launch the `unit=` and `slice=` it started (#953 M1). Pure
-/// (timestamp injected) so the format is unit-testable.
+/// (timestamp injected) so the format is unit-testable. A dropped record can
+/// also end in ` suppressed=<n>`, which [`record_audit`] appends.
 ///
 /// The audit name `RunCommand(detached)` exists so a reviewer can reconcile the
 /// log against `systemctl --user list-units 'trollshell-launch-*'` — which the
@@ -2581,11 +2666,39 @@ fn sanitize_field(s: &str) -> String {
         .collect()
 }
 
+/// A drop-count line: `<rfc3339> plugin=<id> effect=* decision=dropped
+/// suppressed=<n>`, or `plugin=*` for the global count. `effect=*` because the
+/// `n` drops can be of any kind and for either drop reason.
+///
+/// A per-id one closes a run at connection teardown ([`flush_drop_audit`]) or
+/// when the sweep retires an entry that still owed one. The `plugin=*` one
+/// carries the drops [`DropBudgets::global`] refused, whatever their ids.
+fn format_drop_summary(ts: &str, plugin_id: Option<&str>, suppressed: u64) -> String {
+    let id = plugin_id.map_or_else(|| "*".to_owned(), sanitize_field);
+    format!("{ts} plugin={id} effect=* decision=dropped suppressed={suppressed}")
+}
+
+/// The line the writer thread adds when lines were lost before reaching the
+/// file: `<rfc3339> plugin=* effect=* decision=lost count=<n>`. "Lost" means
+/// there was no room in the queue for them ([`AuditSink::offer`]).
+fn format_lost_line(ts: &str, count: u64) -> String {
+    format!("{ts} plugin=* effect=* decision=lost count={count}")
+}
+
 /// Append one effect decision to the persisted audit log (#510). Non-blocking:
-/// formats the line and hands it to the background writer over an unbounded
-/// channel (which serializes the file IO + rotation off both the GTK broker
-/// thread and the tokio reader threads). A no-op if the audit path can't be
-/// resolved (no `$HOME`/`$XDG_STATE_HOME`).
+/// formats the line and offers it to the writer thread's bounded queue
+/// ([`AuditSink`]), which keeps the file IO and rotation off both the GTK
+/// broker thread and the tokio reader threads. A no-op if the audit path can't
+/// be resolved (no `$HOME`/`$XDG_STATE_HOME`).
+///
+/// A **dropped** decision goes through the drop budgets first
+/// ([`DropBudgets::admit`]). Past them the record is counted, not formatted:
+/// the next drop line its plugin gets ends in ` suppressed=<n>`, or, when the
+/// global budget refused it, the next `plugin=*` count line carries it. An
+/// `allowed` record is never budgeted, and it may use the queue slots no drop
+/// line can (`AUDIT_ALLOWED_RESERVE`). It is already behind the effect rate
+/// cap, and it is the record the log exists for.
+///
 /// `unit` is the transient unit a detached [`Effect::RunCommand`] is about to
 /// start (#953 M1) — `None` for every other effect, and for the drop sites,
 /// which never reach a launch.
@@ -2595,6 +2708,37 @@ pub(super) fn record_audit(
     decision: AuditDecision,
     unit: Option<&str>,
 ) {
+    record_audit_at(plugin_id, effect, decision, unit, Instant::now());
+}
+
+/// [`record_audit`] with the drop budgets' clock injected, so a test can step
+/// past a refill without sleeping.
+fn record_audit_at(
+    plugin_id: &str,
+    effect: &Effect,
+    decision: AuditDecision,
+    unit: Option<&str>,
+    now: Instant,
+) {
+    let (suppressed, priority) = match decision {
+        AuditDecision::Allowed => (0, AuditPriority::Allowed),
+        AuditDecision::DroppedUngranted | AuditDecision::DroppedRateCap => {
+            let mut own = None;
+            for line in with_drop_budgets(|budgets| budgets.admit(plugin_id, now)) {
+                match line {
+                    DropLine::Record { suppressed } => own = Some(suppressed),
+                    DropLine::Count { plugin, suppressed } => emit_audit_line(
+                        format_drop_summary(&now_rfc3339(), plugin.as_deref(), suppressed),
+                        AuditPriority::Drop,
+                    ),
+                }
+            }
+            let Some(suppressed) = own else {
+                return;
+            };
+            (suppressed, AuditPriority::Drop)
+        }
+    };
     // #964 item 1: in `#[cfg(test)]` builds `audit_sink()` is hard-wired to
     // `None` (see its doc — tests touch no filesystem), which meant the audit
     // line was never even *formatted* under test, let alone inspectable. The
@@ -2604,7 +2748,7 @@ pub(super) fn record_audit(
     // — in particular, that a detached launch's `unit=` is the same string
     // the launcher was handed (see `tests::LAST_DETACHED_DISPATCH_UNIT`).
     let uri = audit_effect_uri(effect);
-    let line = format_audit_line(
+    let mut line = format_audit_line(
         &now_rfc3339(),
         plugin_id,
         effect_kind(effect),
@@ -2613,11 +2757,257 @@ pub(super) fn record_audit(
         uri.as_deref(),
         unit,
     );
+    if suppressed > 0 {
+        let _ = write!(line, " suppressed={suppressed}");
+    }
     #[cfg(test)]
     tests::LAST_AUDIT_LINE.with(|cell| *cell.borrow_mut() = Some(line.clone()));
-    if let Some(tx) = audit_sink() {
-        let _ = tx.send(line);
+    emit_audit_line(line, priority);
+}
+
+/// Which share of the writer's queue a line may use ([`AuditSink::offer`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuditPriority {
+    /// An `allowed` record: the whole queue, the reserve included.
+    Allowed,
+    /// A drop record or a drop-count line: everything but the reserve.
+    Drop,
+}
+
+/// Hand one finished line to the writer. The single exit every audit line
+/// takes, so the test capture sees exactly what the file would.
+fn emit_audit_line(line: String, priority: AuditPriority) {
+    #[cfg(test)]
+    tests::AUDIT_CAPTURE.with_borrow_mut(|capture| {
+        if let Some(lines) = capture.as_mut() {
+            lines.push(line.clone());
+        }
+    });
+    if let Some(sink) = audit_sink() {
+        sink.offer(line, priority);
     }
+}
+
+/// One plugin's budget for dropped-effect audit lines.
+struct DropAudit {
+    /// [`AUDIT_DROP_BURST`] lines, refilled at [`AUDIT_DROP_PER_SEC`].
+    bucket: TokenBucket,
+    /// Drop records refused by `bucket` since the last line that was written.
+    suppressed: u64,
+}
+
+/// One drop-related line the budgets let through, for the caller to format.
+#[derive(Debug, PartialEq, Eq)]
+enum DropLine {
+    /// The record's own line. `suppressed` is how many of its plugin's earlier
+    /// drop records it stands in for (` suppressed=<n>` when non-zero).
+    Record {
+        /// Earlier drops of this plugin that got no line.
+        suppressed: u64,
+    },
+    /// A [`format_drop_summary`] line: `plugin: None` is the global count.
+    Count {
+        /// The id the count belongs to, or `None` for `plugin=*`.
+        plugin: Option<String>,
+        /// How many drop records the line stands for.
+        suppressed: u64,
+    },
+}
+
+/// Every budget a dropped-effect audit line passes: one global bucket in front
+/// of one bucket per plugin id.
+///
+/// Every drop record ends up in exactly one place: in a written line (a record
+/// line counts itself plus its `suppressed=`, a count line its `suppressed=`),
+/// in its id's pending [`DropAudit::suppressed`], or in
+/// [`global_suppressed`](Self::global_suppressed). So the file plus the two
+/// pending counters always add up to every drop, and the line count is bounded
+/// by the global bucket whatever the number of ids.
+struct DropBudgets {
+    /// [`AUDIT_DROP_GLOBAL_BURST`] lines, refilled at
+    /// [`AUDIT_DROP_GLOBAL_PER_SEC`]. Every drop-related line spends one,
+    /// record and count lines alike, whichever plugin it is for.
+    global: TokenBucket,
+    /// Drop records with no line yet, counted here because the global bucket
+    /// refused the line that would have carried them, or because the per-id
+    /// table was full. The next line the global bucket admits is a `plugin=*`
+    /// count carrying them (and the records that line was for).
+    global_suppressed: u64,
+    /// The per-id budgets.
+    per_id: std::collections::BTreeMap<String, DropAudit>,
+}
+
+impl DropBudgets {
+    fn new_at(now: Instant) -> Self {
+        Self {
+            global: TokenBucket::new_at(now, AUDIT_DROP_GLOBAL_BURST, AUDIT_DROP_GLOBAL_PER_SEC),
+            global_suppressed: 0,
+            per_id: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Decide what one dropped-effect record of `plugin_id` writes: its own
+    /// line, a count line in its place, or nothing (it is counted instead).
+    /// Also returns the closing count of any per-id entry the sweep retired.
+    ///
+    /// This is the whole flood bound. A frame of 10 000 ungranted effects
+    /// writes [`AUDIT_DROP_BURST`] lines, then one every ten seconds while the
+    /// plugin keeps dropping, each carrying the count it stands in for. Every
+    /// one of those spends a global token too, so a flood spread over many ids
+    /// writes [`AUDIT_DROP_GLOBAL_BURST`] lines, then one every five seconds.
+    /// The connection's end writes whatever its id still owes
+    /// ([`flush_drop_audit`]). Both `session` drop sites reach this through
+    /// [`record_audit`], so neither needs a per-frame counter of its own.
+    fn admit(&mut self, plugin_id: &str, now: Instant) -> Vec<DropLine> {
+        let mut lines = Vec::new();
+        if !self.per_id.contains_key(plugin_id) {
+            // A new id is the one moment the table can grow, so it is the
+            // moment to retire the entries that have refilled (#1165 item 4's
+            // sweep rule).
+            for (id, owed) in sweep_drop_audits(&mut self.per_id, now) {
+                let count = DropLine::Count {
+                    plugin: Some(id),
+                    suppressed: owed,
+                };
+                lines.extend(self.through_global(count, owed, now));
+            }
+            if self.per_id.len() < MAX_TRACKED_DROP_AUDITS {
+                self.per_id.insert(
+                    plugin_id.to_owned(),
+                    DropAudit {
+                        bucket: TokenBucket::new_at(now, AUDIT_DROP_BURST, AUDIT_DROP_PER_SEC),
+                        suppressed: 0,
+                    },
+                );
+            }
+        }
+        let Some(audit) = self.per_id.get_mut(plugin_id) else {
+            // The table is full: no per-id budget to count on.
+            self.global_suppressed = self.global_suppressed.saturating_add(1);
+            return lines;
+        };
+        if !audit.bucket.allow(now) {
+            audit.suppressed = audit.suppressed.saturating_add(1);
+            return lines;
+        }
+        let earlier = std::mem::take(&mut audit.suppressed);
+        let record = DropLine::Record {
+            suppressed: earlier,
+        };
+        lines.extend(self.through_global(record, earlier.saturating_add(1), now));
+        lines
+    }
+
+    /// `plugin_id`'s closing count, if it owes one, through the global bucket.
+    /// The per-id budget itself is kept, so a reconnect gets no fresh burst.
+    fn flush(&mut self, plugin_id: &str, now: Instant) -> Option<DropLine> {
+        let owed = self
+            .per_id
+            .get_mut(plugin_id)
+            .map(|audit| std::mem::take(&mut audit.suppressed))
+            .filter(|&owed| owed > 0)?;
+        let count = DropLine::Count {
+            plugin: Some(plugin_id.to_owned()),
+            suppressed: owed,
+        };
+        self.through_global(count, owed, now)
+    }
+
+    /// Spend one global token on `line`, which stands for `records` drop
+    /// records. Refused: the records join the global count and nothing is
+    /// written. Admitted while the global count is owed: the line becomes the
+    /// `plugin=*` count, carrying both.
+    fn through_global(&mut self, line: DropLine, records: u64, now: Instant) -> Option<DropLine> {
+        if !self.global.allow(now) {
+            self.global_suppressed = self.global_suppressed.saturating_add(records);
+            return None;
+        }
+        if self.global_suppressed == 0 {
+            return Some(line);
+        }
+        let owed = std::mem::take(&mut self.global_suppressed);
+        Some(DropLine::Count {
+            plugin: None,
+            suppressed: owed.saturating_add(records),
+        })
+    }
+}
+
+/// Run `f` on the process's [`DropBudgets`].
+///
+/// Process-wide and keyed by id rather than per connection, on the effect
+/// buckets' reasoning (#1165 item 4): a plugin that reconnects must not get a
+/// fresh burst of lines. Shared by both drop sites in `session` (one per
+/// tokio reader thread) and the broker's launch-budget drop on the GTK thread,
+/// hence the `Mutex`, held for arithmetic only: no line is formatted or sent
+/// while it is held. A poisoned lock is used as is: the state is counters, and
+/// [`flush_drop_audit`] runs from a drop guard, where a second panic would
+/// abort the process.
+///
+/// **Per thread under `cfg(test)`**, so parallel tests do not share the global
+/// bucket and each can assert exact line counts. Every test that drives the
+/// audit runs that work on its own thread (`#[test]`, or `#[tokio::test]`'s
+/// current-thread runtime, which runs spawned tasks on the test's thread).
+fn with_drop_budgets<R>(f: impl FnOnce(&mut DropBudgets) -> R) -> R {
+    #[cfg(not(test))]
+    {
+        static BUDGETS: std::sync::LazyLock<Mutex<DropBudgets>> =
+            std::sync::LazyLock::new(|| Mutex::new(DropBudgets::new_at(Instant::now())));
+        f(&mut BUDGETS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
+    }
+    #[cfg(test)]
+    {
+        thread_local! {
+            static BUDGETS: RefCell<DropBudgets> = RefCell::new(DropBudgets::new_at(Instant::now()));
+        }
+        BUDGETS.with_borrow_mut(f)
+    }
+}
+
+/// Remove every entry whose bucket has refilled — a full bucket changes no
+/// decision, see [`TokenBucket::is_full`] — and return the id and pending count
+/// of any that still owed one. Pure over the map so the rule is testable on
+/// its own.
+fn sweep_drop_audits(
+    audits: &mut std::collections::BTreeMap<String, DropAudit>,
+    now: Instant,
+) -> Vec<(String, u64)> {
+    let mut owed = Vec::new();
+    audits.retain(|plugin_id, audit| {
+        if !audit.bucket.is_full(now) {
+            return true;
+        }
+        if audit.suppressed > 0 {
+            owed.push((plugin_id.clone(), audit.suppressed));
+        }
+        false
+    });
+    owed
+}
+
+/// Write the closing count of `plugin_id`'s suppressed drop records, if it owes
+/// one and the global budget has room (else the count joins the global one).
+/// Called when a connection goes away, from a drop guard in `session`, so a
+/// flood that ends with its connection still leaves its size in the file.
+pub(super) fn flush_drop_audit(plugin_id: &str) {
+    let now = Instant::now();
+    if let Some(DropLine::Count { plugin, suppressed }) =
+        with_drop_budgets(|budgets| budgets.flush(plugin_id, now))
+    {
+        emit_audit_line(
+            format_drop_summary(&now_rfc3339(), plugin.as_deref(), suppressed),
+            AuditPriority::Drop,
+        );
+    }
+}
+
+/// `plugin_id`'s current suppressed count, or `None` with no table entry. For
+/// the end-to-end tests that a connection's end flushes it.
+#[cfg(test)]
+pub(super) fn pending_drop_audit(plugin_id: &str) -> Option<u64> {
+    with_drop_budgets(|budgets| budgets.per_id.get(plugin_id).map(|audit| audit.suppressed))
 }
 
 /// The plugin's own correlation token for the effects that carry one (#953 M1),
@@ -2655,43 +3045,151 @@ fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
+/// The producer end of the audit writer's queue.
+///
+/// **Bounded**, at `capacity` lines (`AUDIT_QUEUE_LINES` in production). It
+/// was an unbounded channel, so a flood of drop records queued a line each for
+/// as long as the writer lagged. A line with no room is counted in `lost`
+/// instead, and the writer reports the count in one line once it has made room
+/// ([`run_audit_writer`]).
+///
+/// The last `reserve` slots (`AUDIT_ALLOWED_RESERVE`) are for `allowed` lines
+/// only ([`AuditPriority`]): a drop-related line is queued only while fewer
+/// than `capacity - reserve` lines are waiting. So drop lines never hold more
+/// than that, and an `allowed` line is lost only when `reserve` or more
+/// `allowed` lines are already waiting, i.e. when the writer has stalled.
+struct AuditSink {
+    tx: std::sync::mpsc::SyncSender<String>,
+    capacity: usize,
+    reserve: usize,
+    /// Lines claimed and not yet taken by the writer. Claimed before the send
+    /// and released after the receive, so it is never below what the channel
+    /// holds, and a claim under `capacity` always finds room.
+    queued: Arc<std::sync::atomic::AtomicUsize>,
+    lost: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// The writer's end of [`AuditSink`]'s queue.
+struct AuditQueue {
+    rx: std::sync::mpsc::Receiver<String>,
+    queued: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl AuditQueue {
+    /// The next line, blocking; `None` once every sender is gone.
+    fn recv(&self) -> Option<String> {
+        let line = self.rx.recv().ok()?;
+        self.queued
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        Some(line)
+    }
+}
+
+impl AuditSink {
+    /// A sink with room for `capacity` lines, the last `reserve` of them for
+    /// `allowed` lines only, and the queue the writer drains.
+    fn new(capacity: usize, reserve: usize) -> (Self, AuditQueue) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(capacity);
+        let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink = Self {
+            tx,
+            capacity,
+            reserve: reserve.min(capacity),
+            queued: Arc::clone(&queued),
+            lost: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        (sink, AuditQueue { rx, queued })
+    }
+
+    /// Queue `line` without blocking, within `priority`'s share of the queue,
+    /// or count it as lost. A gone writer (its thread exited) counts the same
+    /// way: the line is not on disk either way.
+    fn offer(&self, line: String, priority: AuditPriority) {
+        use std::sync::atomic::Ordering;
+        let limit = match priority {
+            AuditPriority::Allowed => self.capacity,
+            AuditPriority::Drop => self.capacity - self.reserve,
+        };
+        // Claim the slot first: two producers racing for the last slot of a
+        // share can't both get it.
+        if self.queued.fetch_add(1, Ordering::AcqRel) >= limit {
+            self.queued.fetch_sub(1, Ordering::AcqRel);
+            self.note_lost();
+            return;
+        }
+        if self.tx.try_send(line).is_err() {
+            self.queued.fetch_sub(1, Ordering::AcqRel);
+            self.note_lost();
+        }
+    }
+
+    fn note_lost(&self) {
+        self.lost.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The writer thread's whole loop: append each queued line, and after each one
+/// write a single [`format_lost_line`] for whatever was lost since the last.
+/// Returns when every sender is gone.
+///
+/// A plain thread blocking on the queue, not a tokio task. The file IO here is
+/// blocking `std::fs` (`create_dir_all`, `metadata`, `rename`, `open`, write)
+/// per line, which inside a task pinned a runtime worker for as long as a flood
+/// lasted.
+fn run_audit_writer(queue: &AuditQueue, log: &AuditLog, lost: &std::sync::atomic::AtomicU64) {
+    let append = |line: &str| {
+        if let Err(e) = log.append(line) {
+            tracing::debug!(error = %e, "effect audit write failed");
+        }
+    };
+    while let Some(line) = queue.recv() {
+        append(&line);
+        let count = lost.swap(0, std::sync::atomic::Ordering::Relaxed);
+        if count > 0 {
+            append(&format_lost_line(&now_rfc3339(), count));
+        }
+    }
+}
+
 /// The process-wide audit writer sink, initialized once on first use: resolves
-/// the log path and spawns the background writer task. `None` if the path can't
-/// be resolved (audit then no-ops).
+/// the log path and starts the writer thread. `None` if the path can't be
+/// resolved or the thread can't start (audit then no-ops).
 #[cfg(not(test))]
-fn audit_sink() -> Option<&'static mpsc::UnboundedSender<String>> {
-    static SINK: std::sync::OnceLock<Option<mpsc::UnboundedSender<String>>> =
-        std::sync::OnceLock::new();
+fn audit_sink() -> Option<&'static AuditSink> {
+    static SINK: std::sync::OnceLock<Option<AuditSink>> = std::sync::OnceLock::new();
     SINK.get_or_init(spawn_audit_writer).as_ref()
 }
 
 /// Hermetic in unit tests: never resolves a real path or spawns a writer, so the
 /// per-connection tests that exercise `enforce_capabilities` / `throttle_effects`
 /// touch no filesystem. The audit machinery itself is covered directly below
-/// ([`AuditLog`] rotation, [`format_audit_line`]).
+/// ([`AuditLog`] rotation, [`format_audit_line`], [`run_audit_writer`] over a
+/// scratch file), and `tests::AUDIT_CAPTURE` sees every line that would have
+/// been offered here.
 #[cfg(test)]
-fn audit_sink() -> Option<&'static mpsc::UnboundedSender<String>> {
+fn audit_sink() -> Option<&'static AuditSink> {
     None
 }
 
 #[cfg(not(test))]
-fn spawn_audit_writer() -> Option<mpsc::UnboundedSender<String>> {
+fn spawn_audit_writer() -> Option<AuditSink> {
     let path = audit_log_path()?;
     let path_str = path.display().to_string();
-    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let (sink, queue) = AuditSink::new(AUDIT_QUEUE_LINES, AUDIT_ALLOWED_RESERVE);
+    let lost = Arc::clone(&sink.lost);
     let log = AuditLog {
         path,
         max_bytes: MAX_AUDIT_BYTES,
     };
-    hytte::reactive::runtime::handle().spawn(async move {
-        while let Some(line) = rx.recv().await {
-            if let Err(e) = log.append(&line) {
-                tracing::debug!(error = %e, "effect audit write failed");
-            }
-        }
-    });
+    let spawned = std::thread::Builder::new()
+        .name("effects-audit".into())
+        .spawn(move || run_audit_writer(&queue, &log, &lost));
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "could not start the effect audit writer; audit log off");
+        return None;
+    }
     tracing::info!(path = %path_str, "effect audit log active");
-    Some(tx)
+    Some(sink)
 }
 
 /// `$XDG_STATE_HOME/trollshell/effects-audit.log`, falling back to
@@ -2756,6 +3254,10 @@ impl AuditLog {
 mod tests {
     use super::DatasourceRouter;
     use super::{
+        AUDIT_DROP_BURST, AUDIT_DROP_GLOBAL_BURST, AuditPriority, AuditSink, DropAudit,
+        flush_drop_audit, record_audit_at, run_audit_writer, sweep_drop_audits, with_drop_budgets,
+    };
+    use super::{
         AuditDecision, AuditLog, CLICK_ORIGIN_WINDOW, EffectOutcome, FORWARDED_ENV, LaunchReport,
         MAX_URI_BYTES, MAX_VOLUME, MIN_VOLUME, PageSurface, RUN_COMMAND_MAX_OUTPUT, UriRefusal,
         anchors_to_click, audit_effect_id, audit_effect_uri, broker_effect, broker_open_page_with,
@@ -2764,6 +3266,7 @@ mod tests {
         open_uri_with, page_output, page_surface, start_detached_with, truncate_on_char_boundary,
         truncate_uri_for_log,
     };
+    use crate::plugins::session::TokenBucket;
     use hytte_plugin_proto::{
         AudioAction, ConsentChoices, ConsentDecision, Effect, HostMsg, MediaAction, Mount,
         NiriAction, Page,
@@ -2798,6 +3301,9 @@ mod tests {
         pub(super) static LAST_AUDIT_LINE: RefCell<Option<String>> = const { RefCell::new(None) };
         pub(super) static LAST_DETACHED_DISPATCH_UNIT: RefCell<Option<String>> =
             const { RefCell::new(None) };
+        /// Every line `emit_audit_line` would have offered the writer, while a
+        /// test holds it `Some` (see [`capture_audit`]); `None` collects nothing.
+        pub(super) static AUDIT_CAPTURE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
     }
 
     /// Clear both #964 capture cells. Every test that reads them starts by
@@ -3134,6 +3640,358 @@ mod tests {
         log.append("first").expect("append creates parents");
         let contents = std::fs::read_to_string(&path).expect("read");
         assert_eq!(contents, "first\n");
+    }
+
+    // ── Dropped effects can't flood the audit log ────────────────────────────
+
+    /// Run `f` with [`AUDIT_CAPTURE`] on, returning its result and every line
+    /// the audit path emitted on this thread meanwhile.
+    fn capture_audit<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
+        AUDIT_CAPTURE.with_borrow_mut(|capture| *capture = Some(Vec::new()));
+        let result = f();
+        let lines = AUDIT_CAPTURE
+            .with_borrow_mut(Option::take)
+            .unwrap_or_default();
+        (result, lines)
+    }
+
+    /// **The flood frame.** One render frame carrying 10 000 effects the plugin
+    /// never declared the capability for wrote 10 000 audit lines — enough, at
+    /// 16 MiB a frame, to rotate both audit files many times over and take every
+    /// `allowed` record with them. Now it writes [`AUDIT_DROP_BURST`] lines, and
+    /// the connection's teardown writes one more carrying the count of the rest.
+    ///
+    /// The budgets are per thread under `cfg(test)` (`with_drop_budgets`), so
+    /// every test here starts with a full global bucket and can count exactly.
+    ///
+    /// **Falsified** by making `record_audit_at` skip the budgets
+    /// (`let suppressed = 0;`): the frame writes 10 000 lines.
+    #[test]
+    fn a_frame_of_ten_thousand_ungranted_effects_writes_a_bounded_audit() {
+        const ID: &str = "audit-flood-frame";
+        let effects = vec![Effect::OpenPage(Page::PowerMenu); 10_000];
+        let mut warned = crate::plugins::session::EffectWarnLatch::new();
+        let (kept, lines) = capture_audit(|| {
+            crate::plugins::session::enforce_capabilities(&[], ID, effects, &mut warned)
+        });
+        assert!(
+            kept.is_empty(),
+            "every effect was ungranted, so none is kept"
+        );
+        assert_eq!(
+            lines.len(),
+            AUDIT_DROP_BURST as usize,
+            "the frame writes the budget's burst and no more: {:?}",
+            lines.last(),
+        );
+        assert!(
+            lines.iter().all(|line| line.contains(&format!(
+                "plugin={ID} effect=OpenPage decision=dropped(ungranted-capability)"
+            )) && !line.contains("suppressed=")),
+            "the burst lines are ordinary drop records: {lines:?}",
+        );
+
+        let ((), closing) = capture_audit(|| flush_drop_audit(ID));
+        let suppressed = 10_000 - u64::from(AUDIT_DROP_BURST);
+        assert_eq!(
+            closing.len(),
+            1,
+            "teardown writes one closing line: {closing:?}"
+        );
+        assert!(
+            closing[0].ends_with(&format!(
+                " plugin={ID} effect=* decision=dropped suppressed={suppressed}"
+            )),
+            "it carries the count of every drop the burst did not write: {}",
+            closing[0],
+        );
+        let ((), again) = capture_audit(|| flush_drop_audit(ID));
+        assert!(
+            again.is_empty(),
+            "the count is written once, not on every flush"
+        );
+    }
+
+    /// The count is never lost while the plugin keeps dropping: the next drop
+    /// line the budget admits carries ` suppressed=<n>` for the ones before it.
+    /// And the budget survives a teardown flush, so a reconnect gets no fresh
+    /// burst.
+    ///
+    /// **Falsified** by dropping the `" suppressed={suppressed}"` append in
+    /// `record_audit_at`: the admitted line has no count. Or by removing the
+    /// entry in `DropBudgets::flush`: the post-flush record is written.
+    #[test]
+    fn the_next_admitted_drop_line_carries_the_suppressed_count() {
+        const ID: &str = "audit-suppressed-count";
+        let effect = Effect::OpenPage(Page::PowerMenu);
+        let t0 = Instant::now();
+        let ((), lines) = capture_audit(|| {
+            for _ in 0..u64::from(AUDIT_DROP_BURST) + 5 {
+                record_audit_at(ID, &effect, AuditDecision::DroppedRateCap, None, t0);
+            }
+        });
+        assert_eq!(lines.len(), AUDIT_DROP_BURST as usize);
+
+        // Ten seconds on, one token has come back.
+        let ((), lines) = capture_audit(|| {
+            record_audit_at(
+                ID,
+                &effect,
+                AuditDecision::DroppedRateCap,
+                None,
+                t0 + Duration::from_secs(10),
+            );
+        });
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].ends_with(" effect=OpenPage decision=dropped(rate-cap) suppressed=5"),
+            "the admitted line stands in for the five before it: {}",
+            lines[0],
+        );
+
+        flush_drop_audit(ID);
+        assert_eq!(
+            with_drop_budgets(|budgets| budgets.admit(ID, t0 + Duration::from_secs(10))),
+            [],
+            "a teardown flush keeps the spent budget, so a reconnect gets no fresh burst",
+        );
+    }
+
+    /// How many drop records one captured audit line stands for: a record line
+    /// is itself plus its `suppressed=`, a count line (`effect=*`) just its
+    /// `suppressed=`.
+    fn records_in(line: &str) -> u64 {
+        let suppressed = line
+            .rsplit_once(" suppressed=")
+            .map_or(0, |(_, n)| n.parse().expect("a numeric count"));
+        if line.contains(" effect=* ") {
+            suppressed
+        } else {
+            1 + suppressed
+        }
+    }
+
+    /// **Cycling ids buys nothing.** The per-id budget alone came fresh with
+    /// every new name, and names cost nothing: 1000 made-up ids dropping 20
+    /// effects each wrote 16 000 lines, about 1.8 MB, enough to rotate both
+    /// files and take the `allowed` records with them. The global bucket in
+    /// front holds them to [`AUDIT_DROP_GLOBAL_BURST`] lines, and nothing goes
+    /// uncounted: the lines plus the two pending counters add up to every drop.
+    /// Once the global bucket refills, the next drop line is the `plugin=*`
+    /// count that carries what it refused.
+    ///
+    /// **Falsified** by having `through_global` return `Some(line)` without
+    /// spending a token: the flood writes 16 000 lines.
+    #[test]
+    fn cycling_ids_cannot_write_past_the_global_drop_budget() {
+        const IDS: u64 = 1000;
+        const PER_ID: u64 = 20;
+        let effect = Effect::OpenPage(Page::PowerMenu);
+        let t0 = Instant::now();
+        let ((), lines) = capture_audit(|| {
+            for n in 0..IDS {
+                let id = format!("cycle-{n}");
+                for _ in 0..PER_ID {
+                    record_audit_at(&id, &effect, AuditDecision::DroppedUngranted, None, t0);
+                }
+            }
+        });
+        assert_eq!(
+            lines.len(),
+            AUDIT_DROP_GLOBAL_BURST as usize,
+            "a thousand fresh per-id bursts write one global burst",
+        );
+        let pending = || {
+            with_drop_budgets(|budgets| {
+                budgets.global_suppressed
+                    + budgets
+                        .per_id
+                        .values()
+                        .map(|audit| audit.suppressed)
+                        .sum::<u64>()
+            })
+        };
+        let written: u64 = lines.iter().map(|line| records_in(line)).sum();
+        assert_eq!(
+            written + pending(),
+            IDS * PER_ID,
+            "every drop is in a line or a pending count",
+        );
+        let global = with_drop_budgets(|budgets| budgets.global_suppressed);
+        assert!(global > 0, "the flood was refused by the global bucket");
+
+        // Ten seconds on: two global tokens and one of `cycle-0`'s own. Its
+        // next drop is admitted by both, and becomes the global count line.
+        let ((), lines) = capture_audit(|| {
+            record_audit_at(
+                "cycle-0",
+                &effect,
+                AuditDecision::DroppedUngranted,
+                None,
+                t0 + Duration::from_secs(10),
+            );
+        });
+        let carried = global + 1 + (PER_ID - u64::from(AUDIT_DROP_BURST));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].ends_with(&format!(
+                " plugin=* effect=* decision=dropped suppressed={carried}"
+            )),
+            "the global count, this record and cycle-0's own four: {}",
+            lines[0],
+        );
+        assert_eq!(with_drop_budgets(|budgets| budgets.global_suppressed), 0);
+        assert_eq!(
+            written + records_in(&lines[0]) + pending(),
+            IDS * PER_ID + 1,
+            "still every drop accounted for",
+        );
+    }
+
+    /// `allowed` records are never budgeted: they are what the audit log is
+    /// for, and they are already behind the effect rate cap.
+    ///
+    /// **Falsified** by budgeting every decision in `record_audit_at`: the
+    /// count stops at the burst.
+    #[test]
+    fn allowed_records_are_never_budgeted() {
+        let effect = Effect::OpenPage(Page::PowerMenu);
+        let now = Instant::now();
+        let ((), lines) = capture_audit(|| {
+            for _ in 0..100 {
+                record_audit_at(
+                    "audit-allowed-unbudgeted",
+                    &effect,
+                    AuditDecision::Allowed,
+                    None,
+                    now,
+                );
+            }
+        });
+        assert_eq!(lines.len(), 100);
+        assert!(lines.iter().all(|line| line.ends_with("decision=allowed")));
+    }
+
+    /// The table sweep forgets an entry only once its bucket has refilled (a
+    /// full bucket changes no decision), and hands back the count of one that
+    /// still owed it, so a flood whose connection never tore down cleanly is
+    /// still counted.
+    ///
+    /// **Falsified** by sweeping partly-spent entries too (the `is_full`
+    /// check): the busy entry disappears. Or by dropping the push: the
+    /// returned list is empty.
+    #[test]
+    fn the_drop_audit_sweep_keeps_spent_budgets_and_closes_refilled_ones() {
+        let t0 = Instant::now();
+        let mut audits = std::collections::BTreeMap::new();
+        let mut busy = DropAudit {
+            bucket: TokenBucket::new_at(t0, AUDIT_DROP_BURST, super::AUDIT_DROP_PER_SEC),
+            suppressed: 3,
+        };
+        assert!(busy.bucket.allow(t0), "spend one token");
+        audits.insert("busy".to_owned(), busy);
+        audits.insert(
+            "idle-owing".to_owned(),
+            DropAudit {
+                bucket: TokenBucket::new_at(t0, AUDIT_DROP_BURST, super::AUDIT_DROP_PER_SEC),
+                suppressed: 7,
+            },
+        );
+        audits.insert(
+            "idle".to_owned(),
+            DropAudit {
+                bucket: TokenBucket::new_at(t0, AUDIT_DROP_BURST, super::AUDIT_DROP_PER_SEC),
+                suppressed: 0,
+            },
+        );
+        let owed = sweep_drop_audits(&mut audits, t0);
+        assert_eq!(
+            audits.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["busy"],
+            "only the partly-spent entry is kept",
+        );
+        assert_eq!(owed, [("idle-owing".to_owned(), 7)]);
+    }
+
+    /// **The bounded queue.** A line that meets a full queue is counted, not
+    /// queued, and the writer reports the count in one `decision=lost` line
+    /// right after the next line it drains, when there is room again. Before,
+    /// the channel was unbounded and a flood queued a line each in memory for
+    /// as long as the writer lagged.
+    ///
+    /// **Falsified** by making `offer` block or queue unboundedly (the overflow
+    /// count stays 0 and all five lines land), or by dropping the writer's
+    /// `lost` report (the middle line is missing).
+    #[test]
+    fn a_full_audit_queue_counts_its_overflow_and_reports_it_once_room_returns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("effects-audit.log");
+        let log = AuditLog {
+            path: path.clone(),
+            max_bytes: 1024 * 1024,
+        };
+        let (sink, queue) = AuditSink::new(2, 0);
+        for line in ["a", "b", "c", "d", "e"] {
+            sink.offer(line.to_owned(), AuditPriority::Drop);
+        }
+        let lost = std::sync::Arc::clone(&sink.lost);
+        assert_eq!(lost.load(std::sync::atomic::Ordering::Relaxed), 3);
+        // Every sender gone, so the writer drains what was queued and returns.
+        drop(sink);
+        run_audit_writer(&queue, &log, &lost);
+
+        let contents = std::fs::read_to_string(&path).expect("read");
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(lines[0], "a");
+        assert!(
+            lines[1].ends_with(" plugin=* effect=* decision=lost count=3"),
+            "the overflow is reported once, after the first line drained: {lines:?}",
+        );
+        assert_eq!(lines[2], "b");
+        assert_eq!(
+            lost.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the reported count is reset",
+        );
+    }
+
+    /// **The reserve.** Drop lines stop at `capacity - reserve`, so however
+    /// many arrive, `allowed` lines still find room: here eight of ten drop
+    /// lines are lost and both `allowed` lines are queued. The guarantee is
+    /// exactly that much and no more: once `reserve` `allowed` lines are
+    /// waiting, the next one is lost too, which takes a writer stalled on the
+    /// disk rather than a flood.
+    ///
+    /// **Falsified** by giving `AuditPriority::Drop` the whole queue in
+    /// `offer`: the drop lines fill it and both `allowed` lines are lost.
+    #[test]
+    fn a_drop_flood_cannot_take_the_queue_slots_kept_for_allowed_lines() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("effects-audit.log");
+        let log = AuditLog {
+            path: path.clone(),
+            max_bytes: 1024 * 1024,
+        };
+        let (sink, queue) = AuditSink::new(4, 2);
+        for n in 0..10 {
+            sink.offer(format!("drop {n}"), AuditPriority::Drop);
+        }
+        sink.offer("allowed 0".to_owned(), AuditPriority::Allowed);
+        sink.offer("allowed 1".to_owned(), AuditPriority::Allowed);
+        // The queue is full now, with `reserve` allowed lines waiting.
+        sink.offer("allowed 2".to_owned(), AuditPriority::Allowed);
+        let lost = std::sync::Arc::clone(&sink.lost);
+        assert_eq!(lost.load(std::sync::atomic::Ordering::Relaxed), 9);
+        drop(sink);
+        run_audit_writer(&queue, &log, &lost);
+
+        let contents = std::fs::read_to_string(&path).expect("read");
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 5, "{lines:?}");
+        assert_eq!(lines[0], "drop 0");
+        assert!(lines[1].ends_with(" decision=lost count=9"), "{lines:?}");
+        assert_eq!(&lines[2..], ["drop 1", "allowed 0", "allowed 1"]);
     }
 
     // ── #964: four detached-launch mechanisms PR #960's review found unpinned ──

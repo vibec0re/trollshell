@@ -1480,7 +1480,8 @@ pub(super) fn enforce_capabilities(
                 // frame for the life of the connection — the unlatched form
                 // wrote the plugin's whole (arbitrary-length, plugin-supplied)
                 // effect payload to the journal at the plugin's frame rate. The
-                // audit log keeps the per-occurrence record.
+                // audit log keeps the per-occurrence count: a line each up to
+                // the plugin's drop budget, then a `suppressed=` count.
                 if warned.insert(std::mem::discriminant(effect)) {
                     tracing::warn!(
                         plugin = %plugin_id,
@@ -1491,6 +1492,9 @@ pub(super) fn enforce_capabilities(
                          this connection are silenced — the audit log still records each one)",
                     );
                 }
+                // Budgeted per plugin inside `record_audit`, so a frame of
+                // thousands of these writes a few lines and a count, not a
+                // line each.
                 super::effects::record_audit(
                     plugin_id,
                     effect,
@@ -1503,6 +1507,119 @@ pub(super) fn enforce_capabilities(
             }
         })
         .collect()
+}
+
+/// The most entries a manifest's `subscribes` or `capabilities` may list.
+///
+/// Both are lists of unit variants: 8 state keys and 15 capabilities today. A
+/// plugin built against a newer vocabulary than this host fails to decode
+/// before it gets here, so 64 is four times the larger vocabulary with every
+/// entry listed, and duplicates are still accepted.
+///
+/// The cap matters for two reasons. `enforce_capabilities` runs `contains`
+/// over the capability list once per effect, so a 100 000-entry list made each
+/// frame's capability check cost its effect count times that. And the
+/// "plugin registered" line prints both lists.
+pub(super) const MAX_MANIFEST_LIST_ENTRIES: usize = 64;
+
+/// The longest plugin-influenced error text the host writes into one of its
+/// own journal fields.
+const MAX_LOGGED_ERROR_BYTES: usize = 256;
+
+/// `error`'s `Display`, made safe for one journal field: on one line
+/// ([`version::single_line`](super::version::single_line)) and cut to
+/// [`MAX_LOGGED_ERROR_BYTES`], ending in `…` when cut.
+///
+/// For a decode error, whose text can carry the plugin's own bytes: serde's
+/// messages quote the value they refused (an unknown variant's name, a string
+/// where a number belongs), so a frame that fails to decode could put up
+/// to `MAX_FRAME_LEN` of whatever the peer sent into the line that reports it.
+pub(super) fn bounded_error(error: &impl std::fmt::Display) -> String {
+    let text = super::version::single_line(&error.to_string());
+    let cut = super::effects::truncate_on_char_boundary(&text, MAX_LOGGED_ERROR_BYTES);
+    if cut.len() < text.len() {
+        format!("{cut}…")
+    } else {
+        cut
+    }
+}
+
+/// The name of a [`PluginMsg`] variant, for a line that must not print the
+/// frame. Exhaustive, so a new variant is a compile error here.
+pub(super) fn plugin_msg_kind(msg: &PluginMsg) -> &'static str {
+    match msg {
+        PluginMsg::Register { .. } => "Register",
+        PluginMsg::Render { .. } => "Render",
+        PluginMsg::Log { .. } => "Log",
+        PluginMsg::Pong { .. } => "Pong",
+    }
+}
+
+/// The id a `Register` frame names, if the host accepts it as a key, or `None`
+/// after one warn.
+///
+/// An id is a key, not display text. It names the region mailbox, `live_ids`,
+/// the audit log and the per-id effect and launch budgets, and it is shown raw
+/// as a notification's app name and in the control-center's Plugins tab. So
+/// every refusal here drops the connection instead of repairing the id: a
+/// truncated or cleaned-up id would silently be a *different* plugin,
+/// colliding with whatever already holds that name.
+///
+/// Three rules, checked in this order so the warn names the first one broken:
+///
+/// - **non-empty** (#436): an empty id can't key a card.
+/// - **at most [`MAX_PLUGIN_ID_BYTES`] bytes** (#1165 review round 2 HIGH-1):
+///   bounds both per-id tables' keys, and keeps a megabyte id away from
+///   `gtk::Label::new` (`effects.rs`'s `Effect::Notify` arm).
+/// - **ASCII alphanumerics, `-` and `_`**: the launcher's rule,
+///   [`is_valid_plugin_id`](hytte::services::systemd::is_valid_plugin_id),
+///   which already refuses any other id in `plugins.json` and on the session
+///   bus, and which the SDK applies to `HYTTE_PLUGIN_ID`. A plugin with another id could never have been
+///   started or stopped by the shell, and every bundled plugin's id fits.
+///   What the rule adds here is that the id can't carry a newline or a
+///   terminal escape into every journal line that names the plugin
+///   (`plugin = %id`), or into the notification and the Plugins tab.
+fn register_id(manifest: &Manifest) -> Option<String> {
+    let id = &manifest.id;
+    if id.is_empty() {
+        tracing::warn!("plugin Register carried an empty id; dropping the connection");
+        return None;
+    }
+    if id.len() > MAX_PLUGIN_ID_BYTES {
+        tracing::warn!(
+            bytes = id.len(),
+            cap = MAX_PLUGIN_ID_BYTES,
+            "plugin Register carried an id over the host's cap; dropping the connection",
+        );
+        return None;
+    }
+    if !hytte::services::systemd::is_valid_plugin_id(id) {
+        // `?id`: at most 64 bytes by now, and `Debug` escapes the very
+        // characters this refuses.
+        tracing::warn!(
+            id = ?id,
+            "plugin Register carried an id with a character outside ASCII letters, digits, \
+             `-` and `_`; dropping the connection",
+        );
+        return None;
+    }
+    Some(id.clone())
+}
+
+/// Writes a connection's closing drop-audit count
+/// ([`flush_drop_audit`](super::effects::flush_drop_audit)) when the
+/// connection goes away, however it goes.
+///
+/// A guard rather than a call in `serve_conn`'s teardown: that teardown runs
+/// only when the reader or the liveness ping returns. A panic in the reader
+/// unwinds past it, and an aborted task never reaches it. Either way the count
+/// of a flood that ended there was never written.
+struct DropAuditFlush(String);
+
+impl Drop for DropAuditFlush {
+    fn drop(&mut self) {
+        super::effects::flush_drop_audit(&self.0);
+    }
 }
 
 /// [`serve_conn`] with no unregistered-connection permit — one connection driven
@@ -1546,7 +1663,10 @@ pub(super) async fn serve_conn(
         match tokio::time::timeout(REGISTER_TIMEOUT, read_frame::<PluginMsg, _>(&mut rd)).await {
             Ok(Ok(msg)) => msg,
             Ok(Err(e)) => {
-                tracing::warn!(error = %e, "plugin handshake read failed; dropping");
+                tracing::warn!(
+                    error = %bounded_error(&e),
+                    "plugin handshake read failed; dropping",
+                );
                 return;
             }
             Err(_elapsed) => {
@@ -1560,12 +1680,23 @@ pub(super) async fn serve_conn(
     let manifest = match first {
         PluginMsg::Register { manifest } => manifest,
         other => {
-            tracing::warn!(?other, "plugin's first frame was not Register; dropping");
+            // The variant's name, never `?other`: a first frame is whatever
+            // the peer sent, and a `Render` of a large tree `Debug`-printed
+            // into one journal line was megabytes per connection attempt.
+            tracing::warn!(
+                frame = plugin_msg_kind(&other),
+                "plugin's first frame was not Register; dropping",
+            );
             return;
         }
     };
+    // The id is checked before anything else logs it: every line from here on
+    // names the plugin by it, so it has to be a short, plain token first.
+    let Some(plugin_id) = register_id(&manifest) else {
+        return;
+    };
     if let Err(e) = manifest.check_proto() {
-        tracing::warn!(plugin = %manifest.id, error = %e, "plugin proto mismatch; dropping");
+        tracing::warn!(plugin = %plugin_id, error = %e, "plugin proto mismatch; dropping");
         return;
     }
     // #437: reject a plugin built against a NEWER wire vocabulary than this host —
@@ -1578,7 +1709,7 @@ pub(super) async fn serve_conn(
     // older plugin that predates the field decodes to `vocab = 0` and always passes.
     if let Err(e) = manifest.check_vocab() {
         tracing::warn!(
-            plugin = %manifest.id,
+            plugin = %plugin_id,
             plugin_vocab = manifest.vocab,
             host_vocab = VOCAB,
             error = %e,
@@ -1586,28 +1717,20 @@ pub(super) async fn serve_conn(
         );
         return;
     }
-    let plugin_id = manifest.id.clone();
-    // #436: an empty id can't key a region card or the audit log — reject it
-    // outright (the connection is dropped, nothing is mounted).
-    if plugin_id.is_empty() {
-        tracing::warn!("plugin Register carried an empty id; dropping the connection");
-        return;
-    }
-    // #1165 review round 2 HIGH-1: an id is a *key* (it names the region
-    // mailbox, `live_ids`, the audit log, and — since this same round —
-    // `EffectBuckets`/`LAUNCH_BUDGETS`), so an over-cap one is refused
-    // outright here, on the same terms as the empty-id check above, rather
-    // than truncated like a display string. A truncated id would silently
-    // become a *different* plugin colliding with (or shadowing) whatever
-    // already holds that prefix. This is also what stops an unbounded id from
-    // ever reaching `gtk::Label::new` as a notification's app name
-    // (`effects.rs`'s `Effect::Notify` arm) or costing the two per-id host
-    // tables an unbounded key.
-    if plugin_id.len() > MAX_PLUGIN_ID_BYTES {
+    // Two lists every frame consults (`enforce_capabilities` runs `contains`
+    // over `capabilities` once per effect) and the "plugin registered" line
+    // below prints. Both are lists of unit variants from a small vocabulary,
+    // so a long one is a malformed manifest rather than a big plugin.
+    if manifest.subscribes.len() > MAX_MANIFEST_LIST_ENTRIES
+        || manifest.capabilities.len() > MAX_MANIFEST_LIST_ENTRIES
+    {
         tracing::warn!(
-            bytes = plugin_id.len(),
-            cap = MAX_PLUGIN_ID_BYTES,
-            "plugin Register carried an id over the host's cap; dropping the connection",
+            plugin = %plugin_id,
+            subscribes = manifest.subscribes.len(),
+            capabilities = manifest.capabilities.len(),
+            cap = MAX_MANIFEST_LIST_ENTRIES,
+            "plugin manifest lists more subscriptions or capabilities than the host accepts; \
+             dropping the connection",
         );
         return;
     }
@@ -1627,6 +1750,11 @@ pub(super) async fn serve_conn(
         );
         return;
     };
+    // The audit log's closing drop count for this id, written however this
+    // connection ends: the teardown below, a panic, or the task being
+    // aborted. Declared after `_id_guard`, so it runs while the id is still
+    // this connection's.
+    let _drop_audit = DropAuditFlush(plugin_id.clone());
     // #1165 item 6: **registered**, so the listener's gate permit is released
     // here rather than at teardown. What the gate bounds is *unregistered*
     // connections — a peer that dials and says nothing — and a registered
@@ -2028,7 +2156,7 @@ pub(super) async fn serve_conn(
                 Err(ProtoError::Decode(e)) => {
                     tracing::warn!(
                         plugin = %plugin_id,
-                        error = %e,
+                        error = %bounded_error(&e),
                         "plugin frame failed to decode (schema skew? a plugin built against a newer wire vocabulary than this host); closing the connection",
                     );
                     break;
@@ -2495,7 +2623,16 @@ async fn now_playing_task(now_playing_rx: watch::Receiver<NowPlaying>, out: mpsc
 }
 
 /// Surface a plugin's `Log` frame at the matching host `tracing` level.
-fn log_plugin(plugin_id: &str, level: LogLevel, msg: &str) {
+///
+/// The message is put on one line first
+/// ([`version::single_line`](super::version::single_line)). It was logged raw,
+/// so a plugin could end its text with a newline and a fake
+/// `trollshell: …` record, or carry terminal escapes into whoever reads the
+/// journal on a terminal. [`LogGate`] has already capped its length and rate.
+/// The id needs nothing here: [`register_id`] refused any id outside
+/// `[A-Za-z0-9_-]` at `Register`.
+pub(super) fn log_plugin(plugin_id: &str, level: LogLevel, msg: &str) {
+    let msg = super::version::single_line(msg);
     match level {
         LogLevel::Error => tracing::error!(plugin = %plugin_id, "{msg}"),
         LogLevel::Warn => tracing::warn!(plugin = %plugin_id, "{msg}"),

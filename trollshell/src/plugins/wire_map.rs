@@ -1046,7 +1046,13 @@ pub(super) fn pixels_len_ok(width: u32, height: u32, data_len: usize) -> bool {
 /// (`max(width, height) * scale`), so a hostile/buggy `scale` can't request a
 /// monster widget. 16384 px is a common max-texture edge and far beyond any
 /// sane sidebar surface.
-const MAX_PIXELS_SCALED_DIM: u32 = 16_384;
+///
+/// A `Shader` node's unscaled size is refused past it too
+/// (`shader_map`'s `Refusal::SizeTooLarge`). A `Pixels` size is bounded by its
+/// buffer's length, but a shader's `width`/`height` are free numbers, so
+/// without that refusal `width = u32::MAX` asked GTK for an `i32::MAX`
+/// natural width.
+pub(super) const MAX_PIXELS_SCALED_DIM: u32 = 16_384;
 
 /// Clamp a [`wire::Node::Pixels`] `scale` hint to something the host will
 /// honor: at least `1` (the wire contract treats `0`/absent as `1`), and small

@@ -43,8 +43,9 @@ use super::region::{clear_region_if_owned, upsert_region};
 use super::session::{
     EFFECT_BURST, EffectBuckets, EffectRateLimiter, EffectWarnLatch, HiddenOnViolation, IdGuard,
     MAX_HIDDEN_ON_ENTRIES, MAX_HIDDEN_ON_NAME_BYTES, MAX_MISSED_PONGS, OUTBOUND_CAPACITY,
-    PING_INTERVAL, PageEdge, Push, REGISTER_TIMEOUT, capped_hidden_on, enforce_capabilities,
-    handle_conn, page_task, push_gate, push_state, state_key_capability,
+    PING_INTERVAL, PageEdge, Push, REGISTER_TIMEOUT, RENDER_BURST, RENDER_REFILL_PER_SEC,
+    RenderAdmission, RenderGate, capped_hidden_on, enforce_capabilities, handle_conn, page_task,
+    parked_renders, push_gate, push_latest, push_state, state_key_capability, visibility_task,
 };
 use super::shader_map::{self, Grants};
 use super::wire_map::{
@@ -11899,7 +11900,7 @@ mod kind_enumeration {
 
 // ── #1159: Mount → mailbox routing, all nine arms ────────────────────────────
 //
-// `route_render`'s `match` is the host's entire placement decision, and until
+// `mount_mailbox`'s `match` is the host's entire placement decision, and until
 // #1159 **nothing pinned it**. `bar_mount_render_reaches_bar_region` (#349)
 // covers one arm; the other five were free to be swapped, deleted or aliased
 // without a single test noticing — which is why the epic (#1158) asked for this
@@ -11913,7 +11914,7 @@ mod sidebar_right_routing {
     /// The nine mounts paired with the [`ListenerCtx`] mailbox each must land in.
     ///
     /// The `match` is deliberately written out here rather than reusing anything
-    /// from `route_render`: an oracle that shared the production mapping would
+    /// from `mount_mailbox`: an oracle that shared the production mapping would
     /// agree with a swapped pair by construction. This is the second, independent
     /// statement of the same table, and the test is the two of them meeting.
     fn mailbox_for(ctx: &ListenerCtx, mount: Mount) -> Mutable<Vec<SlotRender>> {
@@ -11949,7 +11950,7 @@ mod sidebar_right_routing {
     /// `Register` frame, and the hop from that frame to the routing decision is
     /// part of what this pins.
     ///
-    /// **Falsified** by swapping any two arms of `route_render`'s `match` —
+    /// **Falsified** by swapping any two arms of `mount_mailbox`'s `match` —
     /// verified for `SidebarRightTop` ⇄ `BarCenter` and for
     /// `SidebarLead` ⇄ `SidebarRightLead`, which is the swap the old six-arm
     /// match could not have produced and the one the left/right families make
@@ -12524,10 +12525,12 @@ async fn enforce_before_throttle_ungranted_flood_spends_no_tokens() {
 ///
 /// Also carries #1166 finding 4 (review round on #1239): `Err(Closed(_)) =>
 /// Push::Stop` is `push_state`'s *only* `Stop`-producing arm — the only thing
-/// that ever stops a producer task (`accent_task`/`calendar_task`/
-/// `locked_task`/`now_playing_task`/`visibility_task`/`snapshot_task` would
-/// each spin forever on a closed channel without it) — and was untested
-/// until now. **Falsified** by mapping that arm to `Push::Continue` too.
+/// that stops `spectrum_task`, the one producer still on this lossy push (it
+/// would spin forever on a closed channel without it; the level-state pushes
+/// moved to `push_latest`, whose closed-queue exit is `reserve`'s own error and
+/// is pinned by `a_level_push_ends_with_its_queue_or_its_source`) — and was
+/// untested until then. **Falsified** by mapping that arm to `Push::Continue`
+/// too.
 #[tokio::test]
 async fn push_state_stops_the_queue_at_capacity_and_resumes_after_a_drain() {
     const OVERFLOW: usize = 5;
@@ -12599,5 +12602,662 @@ async fn push_state_stops_the_queue_at_capacity_and_resumes_after_a_drain() {
     assert!(
         matches!(push_state(&out_tx, HostMsg::Ping { seq: 0 }), Push::Stop),
         "a push to a closed queue must report Stop",
+    );
+}
+
+// ── Level-state pushes converge across a full queue ───────────────────────────
+//
+// Every push task but the spectrum stream used to go through the lossy
+// `push_state`, whose doc promised that "the next change re-sends the latest
+// value" — true for a stream, false for level and edge state: the next change of
+// `SlotVisibility` is the next *toggle*, so a close that met a full queue was
+// gone until the sidebar opened again. Driven on the tasks directly with a
+// one-slot queue, for the reason the `push_state` test above gives: a real
+// socket's kernel buffer would have to fill first.
+
+/// A one-slot queue already holding a frame — a plugin that stopped reading,
+/// in the state a fast stream (the spectrum) leaves its queue in.
+fn full_queue() -> (mpsc::Sender<HostMsg>, mpsc::Receiver<HostMsg>) {
+    let (out_tx, out_rx) = mpsc::channel::<HostMsg>(1);
+    out_tx
+        .try_send(HostMsg::Ping { seq: 1 })
+        .expect("the one slot is free");
+    (out_tx, out_rx)
+}
+
+/// The next frame on `rx`, failing rather than hanging.
+async fn next_frame(rx: &mut mpsc::Receiver<HostMsg>, why: &str) -> HostMsg {
+    tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap_or_else(|_| panic!("{why}: no frame within 5s"))
+        .expect("the queue is open")
+}
+
+/// Nothing more arrives on `rx` for a while.
+async fn assert_quiet(rx: &mut mpsc::Receiver<HostMsg>, why: &str) {
+    let got = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await;
+    assert!(got.is_err(), "{why}: unexpected {got:?}");
+}
+
+/// **The headline case: a sidebar close that meets a full queue still reaches
+/// the plugin**, once the plugin drains a frame and with nothing else changing
+/// afterwards. Before, the close was dropped on the full queue and the plugin —
+/// told only `visible: true` — kept sampling and painting a closed sidebar
+/// until the next toggle.
+///
+/// **Falsification (run):** revert `visibility_task` to the
+/// `push_state(&out, HostMsg::SlotVisibility { visible })` loop → the close is
+/// dropped and the `next_frame` after the `Ping` times out.
+#[tokio::test]
+async fn a_sidebar_close_that_meets_a_full_queue_still_reaches_the_plugin() {
+    let (vis_tx, vis_rx) = watch::channel(true);
+    let (out_tx, mut out_rx) = mpsc::channel::<HostMsg>(1);
+    let task = tokio::spawn(visibility_task(vis_rx, None, out_tx.clone()));
+    assert!(matches!(
+        next_frame(&mut out_rx, "seed").await,
+        HostMsg::SlotVisibility { visible: true }
+    ));
+
+    // The plugin stalls: its queue is full when the sidebar closes.
+    out_tx
+        .try_send(HostMsg::Ping { seq: 1 })
+        .expect("the one slot is free");
+    vis_tx.send_replace(false);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // The plugin catches up. Nothing on screen changes after this.
+    assert!(matches!(
+        next_frame(&mut out_rx, "the stalled frame").await,
+        HostMsg::Ping { seq: 1 }
+    ));
+    let close = next_frame(&mut out_rx, "the close must still reach the plugin").await;
+    assert!(
+        matches!(close, HostMsg::SlotVisibility { visible: false }),
+        "{close:?}",
+    );
+    task.abort();
+}
+
+/// **The #542 re-seed still follows the open**, when the open is what met the
+/// full queue: once there is room the plugin is told `visible: true` and then,
+/// behind it on the same queue, the current track.
+///
+/// **Falsification (run):** send the re-seed with `try_send` instead of through
+/// a reserved slot → it meets the queue the `SlotVisibility` frame just filled
+/// and is dropped, and the last `next_frame` times out.
+#[tokio::test]
+async fn the_unpark_reseed_follows_an_open_that_met_a_full_queue() {
+    let (vis_tx, vis_rx) = watch::channel(false);
+    let (_np_tx, np_rx) = watch::channel(NowPlaying::default());
+    let (out_tx, mut out_rx) = mpsc::channel::<HostMsg>(1);
+    let task = tokio::spawn(visibility_task(vis_rx, Some(np_rx), out_tx.clone()));
+    assert!(matches!(
+        next_frame(&mut out_rx, "seed").await,
+        HostMsg::SlotVisibility { visible: false }
+    ));
+
+    out_tx
+        .try_send(HostMsg::Ping { seq: 1 })
+        .expect("the one slot is free");
+    vis_tx.send_replace(true);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    assert!(matches!(
+        next_frame(&mut out_rx, "the stalled frame").await,
+        HostMsg::Ping { seq: 1 }
+    ));
+    let open = next_frame(&mut out_rx, "the open").await;
+    assert!(
+        matches!(open, HostMsg::SlotVisibility { visible: true }),
+        "{open:?}"
+    );
+    let reseed = next_frame(&mut out_rx, "the re-seed after the open").await;
+    assert!(matches!(reseed, HostMsg::NowPlaying { .. }), "{reseed:?}");
+    task.abort();
+}
+
+/// **Changes made while the queue is full collapse into the newest one.** A
+/// lock and an unlock, both while the plugin is not reading, reach it as one
+/// `locked: false` — the state the session is in, never the lock that is
+/// already over — and the task is still there for the next edge.
+///
+/// **Falsification (run):** read the value *before* waiting for room (build the
+/// frame, then `out.send(frame).await`) → the plugin is told the stale
+/// `locked: true` first and the "newest value" assertion reds.
+#[tokio::test]
+async fn level_changes_made_while_the_queue_is_full_arrive_as_the_newest() {
+    let (lock_tx, lock_rx) = watch::channel(false);
+    let (out_tx, mut out_rx) = mpsc::channel::<HostMsg>(1);
+    let task = tokio::spawn(push_latest(lock_rx, out_tx.clone(), |locked| {
+        HostMsg::SessionLocked { locked: *locked }
+    }));
+    assert!(matches!(
+        next_frame(&mut out_rx, "seed").await,
+        HostMsg::SessionLocked { locked: false }
+    ));
+
+    out_tx
+        .try_send(HostMsg::Ping { seq: 1 })
+        .expect("the one slot is free");
+    // The task meets the full queue with the lock, and while it waits for room
+    // the unlock changes the value under it.
+    lock_tx.send_replace(true);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    lock_tx.send_replace(false);
+
+    assert!(matches!(
+        next_frame(&mut out_rx, "the stalled frame").await,
+        HostMsg::Ping { seq: 1 }
+    ));
+    let newest = next_frame(&mut out_rx, "the newest value").await;
+    assert!(
+        matches!(newest, HostMsg::SessionLocked { locked: false }),
+        "{newest:?}"
+    );
+    assert_quiet(&mut out_rx, "the burst collapsed into one frame").await;
+
+    lock_tx.send_replace(true);
+    let lock = next_frame(&mut out_rx, "the next edge").await;
+    assert!(
+        matches!(lock, HostMsg::SessionLocked { locked: true }),
+        "{lock:?}"
+    );
+    task.abort();
+}
+
+/// **A stalled plugin blocks neither the producer nor another plugin.** Two
+/// connections subscribe one state; one stops reading. The producer's sends
+/// return at once, the healthy plugin receives every change as it happens, and
+/// the stalled one — whose task waits for room on *its own* queue — is told
+/// the newest value the moment it drains a frame.
+///
+/// **Falsification (run):** give `push_latest` the old `push_state` posture
+/// (`try_send`, drop on `Full`) → the stalled plugin is never told and its last
+/// `next_frame` times out.
+#[tokio::test]
+async fn a_stalled_plugin_blocks_neither_the_producer_nor_another_plugin() {
+    let (lock_tx, lock_rx) = watch::channel(false);
+    let frame = |locked: &bool| HostMsg::SessionLocked { locked: *locked };
+    let (stalled_tx, mut stalled_rx) = full_queue();
+    let (healthy_tx, mut healthy_rx) = mpsc::channel::<HostMsg>(1);
+    let stalled = tokio::spawn(push_latest(lock_rx.clone(), stalled_tx, frame));
+    let healthy = tokio::spawn(push_latest(lock_rx, healthy_tx, frame));
+    assert!(matches!(
+        next_frame(&mut healthy_rx, "the healthy seed").await,
+        HostMsg::SessionLocked { locked: false }
+    ));
+
+    for locked in [true, false, true] {
+        // `watch` sends never wait for a receiver: this returns at once however
+        // stuck the stalled plugin is.
+        lock_tx.send_replace(locked);
+        let got = next_frame(&mut healthy_rx, "the healthy plugin keeps up").await;
+        assert!(
+            matches!(got, HostMsg::SessionLocked { locked: l } if l == locked),
+            "{got:?}"
+        );
+    }
+
+    assert!(matches!(
+        next_frame(&mut stalled_rx, "the stalled frame").await,
+        HostMsg::Ping { seq: 1 }
+    ));
+    let newest = next_frame(&mut stalled_rx, "the stalled plugin converges").await;
+    assert!(
+        matches!(newest, HostMsg::SessionLocked { locked: true }),
+        "{newest:?}"
+    );
+    stalled.abort();
+    healthy.abort();
+}
+
+/// **A level push ends with its connection's queue, or with its source** — the
+/// two ways out of `push_latest`, which replace `push_state`'s `Push::Stop` for
+/// these tasks. A task waiting for room on a queue whose writer is gone must not
+/// wait forever, and one whose `watch` sender is gone has nothing left to send
+/// after its seed.
+///
+/// **Falsification (run):** `continue` on a failed `reserve` instead of
+/// returning → the first task spins and the first `timeout` reds.
+#[tokio::test]
+async fn a_level_push_ends_with_its_queue_or_its_source() {
+    let (_lock_tx, lock_rx) = watch::channel(false);
+    let (out_tx, out_rx) = full_queue();
+    let waiting = tokio::spawn(push_latest(lock_rx, out_tx, |locked| {
+        HostMsg::SessionLocked { locked: *locked }
+    }));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    drop(out_rx);
+    tokio::time::timeout(Duration::from_secs(5), waiting)
+        .await
+        .expect("a task waiting on a closed queue ends")
+        .expect("…cleanly");
+
+    let (lock_tx, lock_rx) = watch::channel(true);
+    let (out_tx, mut out_rx) = mpsc::channel::<HostMsg>(4);
+    let seeded = tokio::spawn(push_latest(lock_rx, out_tx, |locked| {
+        HostMsg::SessionLocked { locked: *locked }
+    }));
+    assert!(matches!(
+        next_frame(&mut out_rx, "seed").await,
+        HostMsg::SessionLocked { locked: true }
+    ));
+    drop(lock_tx);
+    tokio::time::timeout(Duration::from_secs(5), seeded)
+        .await
+        .expect("a task whose source is gone ends after its seed")
+        .expect("…cleanly");
+}
+
+// ── The render bound ───────────────────────────────────────────────────────────
+//
+// Every `Render` used to reach the region mailbox, and every mailbox write is a
+// region-wide deep clone + re-map + reconcile on the GTK main thread. The gate's
+// policy is pinned on `RenderGate` with synthetic instants (deterministic, no
+// socket); its wiring — the reader admitting, the flusher parking — through
+// `handle_conn` over a socketpair, counting `park_render` calls.
+
+/// `crates/hytte-plugin/src/runtime.rs`'s `VIEW_MIN_INTERVAL` — the SDK's own
+/// client-side view-rate cap (#560) — read out of its source, because the
+/// shell never links `hytte-plugin` and so cannot name the constant.
+///
+/// `include_str!` rather than a runtime read: the file is a workspace member's
+/// source, present wherever this crate's tests compile, so a moved or renamed
+/// constant fails this test rather than skipping it.
+fn sdk_view_min_interval() -> Duration {
+    const SDK: &str = include_str!("../../../crates/hytte-plugin/src/runtime.rs");
+    let ms = SDK
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("const VIEW_MIN_INTERVAL: Duration = Duration::from_millis(")
+                .and_then(|rest| rest.strip_suffix(");"))
+        })
+        .expect("hytte-plugin's runtime.rs declares VIEW_MIN_INTERVAL in milliseconds")
+        .parse::<u64>()
+        .expect("VIEW_MIN_INTERVAL is a whole number of milliseconds");
+    Duration::from_millis(ms)
+}
+
+/// A `render_of` card with its label at `text`, for the gate tests.
+fn gate_frame(text: &str, tx: &mpsc::Sender<HostMsg>) -> SlotRender {
+    render_of("paced", 0, 1, text, tx)
+}
+
+/// `RenderGate::admit`, reduced to which of the three answers it gave.
+fn admit(gate: &mut RenderGate, render: SlotRender, now: Instant) -> &'static str {
+    match gate.admit(render, now) {
+        RenderAdmission::Park(_) => "park",
+        RenderAdmission::Deferred => "deferred",
+        RenderAdmission::Unchanged => "unchanged",
+    }
+}
+
+/// **The host's bound sits at or above the SDK's cap**, so an honest plugin
+/// never meets it. The SDK sends at most one view per `VIEW_MIN_INTERVAL`; the
+/// host refills at least one token in that time.
+///
+/// **Falsification (run):** lower `RENDER_REFILL_PER_SEC` to `20.0` (below the
+/// SDK's ~30 Hz) → reds; so does raising the SDK's rate past the host's.
+#[test]
+fn the_render_bound_sits_above_the_sdk_view_rate_cap() {
+    let interval = sdk_view_min_interval().as_secs_f64();
+    assert!(
+        RENDER_REFILL_PER_SEC * interval >= 1.0,
+        "the host refills {RENDER_REFILL_PER_SEC}/s, below one token per SDK view \
+         interval ({interval}s) — an honest plugin would have frames deferred",
+    );
+}
+
+/// **An SDK-paced plugin is never deferred**: a frame every `VIEW_MIN_INTERVAL`
+/// for ten seconds, plus once a second the extra frame the SDK sends with a
+/// click's effects regardless of its cap — every one is parked the moment it
+/// arrives.
+///
+/// **Falsification (run):** `RENDER_REFILL_PER_SEC = 25.0` (below the SDK's
+/// rate) → the bucket drains a little every interval and a frame is deferred
+/// within the ten seconds.
+#[test]
+fn an_sdk_paced_plugin_is_never_deferred() {
+    let (tx, _rx) = mpsc::channel::<HostMsg>(1);
+    let interval = sdk_view_min_interval();
+    let t0 = Instant::now();
+    let mut gate = RenderGate::new_at(t0);
+    let mut seq = 0u32;
+    let mut at = t0;
+    while at < t0 + Duration::from_secs(10) {
+        seq += 1;
+        assert_eq!(
+            admit(&mut gate, gate_frame(&seq.to_string(), &tx), at),
+            "park",
+            "SDK-paced frame {seq} must park at once",
+        );
+        // Once a second, the click: one more frame a millisecond behind.
+        if seq.is_multiple_of(30) {
+            seq += 1;
+            assert_eq!(
+                admit(
+                    &mut gate,
+                    gate_frame(&seq.to_string(), &tx),
+                    at + Duration::from_millis(1)
+                ),
+                "park",
+                "the effect-carrying frame {seq} must park at once",
+            );
+        }
+        at += interval;
+    }
+}
+
+/// **A frame identical to the parked one parks nothing** — however many times
+/// it is sent — while a change to any of the three parked fields does: the
+/// tree, the panel, or only `hidden_on` (the SDK's own #1050 reasoning: a
+/// frame whose only change is where it hides carries the same tree).
+///
+/// **Falsification (run):** drop the `parked` compare in `admit` → the repeats
+/// spend the bucket and the first loop reds on the second frame.
+#[test]
+fn an_identical_frame_parks_nothing() {
+    let (tx, _rx) = mpsc::channel::<HostMsg>(1);
+    let t0 = Instant::now();
+    let mut gate = RenderGate::new_at(t0);
+    assert_eq!(admit(&mut gate, gate_frame("A", &tx), t0), "park");
+    for _ in 0..100 {
+        assert_eq!(admit(&mut gate, gate_frame("A", &tx), t0), "unchanged");
+    }
+    let hidden = SlotRender {
+        hidden_on: vec!["DP-2".to_owned()],
+        ..gate_frame("A", &tx)
+    };
+    assert_eq!(
+        admit(&mut gate, hidden, t0),
+        "park",
+        "hidden_on alone is a change"
+    );
+    let with_panel = SlotRender {
+        hidden_on: vec!["DP-2".to_owned()],
+        ..render_with_panel("paced", 0, 1, "A", "page", &tx)
+    };
+    assert_eq!(
+        admit(&mut gate, with_panel, t0),
+        "park",
+        "the panel alone is a change"
+    );
+    assert_eq!(gate.deadline(), None, "nothing was deferred");
+}
+
+/// **A burst parks the bucket's worth, then holds only the newest frame — and
+/// parks it at the deadline.** Latest-wins, never drop-on-the-floor: of fifty
+/// frames over the budget, the last is the one parked, at the moment the bucket
+/// has a token for it; nothing is parked early, and nothing after.
+///
+/// **Falsification (run):** keep the *first* deferred frame instead of the
+/// newest (`self.pending.get_or_insert(render)`) → the flushed label reads
+/// `burst 8` and reds.
+#[test]
+fn a_burst_parks_the_budget_then_the_newest_frame_at_the_deadline() {
+    let (tx, _rx) = mpsc::channel::<HostMsg>(1);
+    let t0 = Instant::now();
+    let mut gate = RenderGate::new_at(t0);
+    for i in 0..RENDER_BURST {
+        assert_eq!(
+            admit(&mut gate, gate_frame(&format!("burst {i}"), &tx), t0),
+            "park"
+        );
+    }
+    let last = RENDER_BURST + 49;
+    for i in RENDER_BURST..=last {
+        assert_eq!(
+            admit(&mut gate, gate_frame(&format!("burst {i}"), &tx), t0),
+            "deferred"
+        );
+    }
+
+    let deadline = gate.deadline().expect("a frame is owed");
+    let token = Duration::from_secs_f64(1.0 / RENDER_REFILL_PER_SEC);
+    assert!(
+        deadline >= t0 + token && deadline <= t0 + token + Duration::from_millis(1),
+        "the deadline is when the bucket next holds a token: {:?} after the burst",
+        deadline - t0,
+    );
+    assert!(
+        gate.flush(t0 + token / 2).is_none(),
+        "an early wake parks nothing"
+    );
+    let flushed = gate.flush(deadline).expect("the newest frame is parked");
+    assert_eq!(label_text(&flushed), format!("burst {last}"));
+    assert_eq!(gate.deadline(), None, "nothing is owed after the flush");
+    assert!(gate.flush(deadline + Duration::from_secs(1)).is_none());
+}
+
+/// **A burst that ends where it started parks nothing more**: after the budget
+/// is spent, a different frame is deferred, then the parked one comes back —
+/// the pending frame is forgotten rather than flushed over what is on screen.
+///
+/// **Falsification (run):** drop `self.pending = None` from `admit`'s second
+/// rule → the deadline survives and the flush parks the stale `detour`.
+#[test]
+fn a_burst_that_returns_to_the_parked_frame_parks_nothing_more() {
+    let (tx, _rx) = mpsc::channel::<HostMsg>(1);
+    let t0 = Instant::now();
+    let mut gate = RenderGate::new_at(t0);
+    for i in 0..RENDER_BURST {
+        assert_eq!(
+            admit(&mut gate, gate_frame(&i.to_string(), &tx), t0),
+            "park"
+        );
+    }
+    let parked = (RENDER_BURST - 1).to_string();
+    assert_eq!(admit(&mut gate, gate_frame("detour", &tx), t0), "deferred");
+    assert_eq!(admit(&mut gate, gate_frame(&parked, &tx), t0), "unchanged");
+    assert_eq!(gate.deadline(), None);
+    assert!(gate.flush(t0 + Duration::from_secs(1)).is_none());
+}
+
+/// **The sustained rate converges on the refill, and the flusher is not
+/// starved.** Two seconds of a distinct frame every millisecond, the flusher
+/// parking at each deadline it is handed: the parks stay within the bucket's
+/// budget for that window and come close to it, and the final frame is the
+/// last thing parked.
+///
+/// **Falsification (run):** park every frame that differs, skipping
+/// `bucket.allow` in `admit` → 2000 parks and the upper assertion reds; return
+/// `None` from `flush` unconditionally → the final frame is never parked and
+/// the last assertion reds.
+#[test]
+fn the_sustained_render_rate_converges_on_the_refill() {
+    let (tx, _rx) = mpsc::channel::<HostMsg>(1);
+    let t0 = Instant::now();
+    let mut gate = RenderGate::new_at(t0);
+    let mut parks = 0u32;
+    let mut last_parked = String::new();
+    let window_ms = 2000u32;
+    for ms in 0..window_ms {
+        let now = t0 + Duration::from_millis(u64::from(ms));
+        if gate.deadline().is_some_and(|d| d <= now)
+            && let Some(render) = gate.flush(now)
+        {
+            parks += 1;
+            last_parked = label_text(&render).to_owned();
+        }
+        if let RenderAdmission::Park(render) = gate.admit(gate_frame(&ms.to_string(), &tx), now) {
+            parks += 1;
+            last_parked = label_text(&render).to_owned();
+        }
+    }
+    let end = t0 + Duration::from_millis(u64::from(window_ms));
+    let deadline = gate.deadline().expect("the last frame is owed");
+    if let Some(render) = gate.flush(deadline.max(end)) {
+        parks += 1;
+        last_parked = label_text(&render).to_owned();
+    }
+    let budget = f64::from(RENDER_BURST) + RENDER_REFILL_PER_SEC * f64::from(window_ms) / 1000.0;
+    assert!(
+        f64::from(parks) <= budget + 1.0,
+        "{parks} parks over {window_ms} ms is over the {budget} budget",
+    );
+    assert!(
+        f64::from(parks) >= budget - f64::from(RENDER_BURST) - 1.0,
+        "{parks} parks over {window_ms} ms: the bound starved the plugin",
+    );
+    assert_eq!(
+        last_parked,
+        (window_ms - 1).to_string(),
+        "the final frame lands"
+    );
+}
+
+/// A `Render` frame carrying a single label and the given effects.
+fn label_frame(text: &str, effects: Vec<Effect>) -> PluginMsg {
+    PluginMsg::Render {
+        tree: wire::Node::Label {
+            id: None,
+            text: text.to_owned(),
+            classes: vec![],
+            tooltip: None,
+        },
+        panel: None,
+        effects,
+        hidden_on: Vec::new(),
+    }
+}
+
+/// Poll `region` until its only card reads `text`, failing rather than hanging.
+async fn wait_for_label(region: &Mutable<Vec<SlotRender>>, text: &str) {
+    for _ in 0..1000 {
+        {
+            let cards = region.lock_ref();
+            if cards.first().is_some_and(|card| label_text(card) == text) {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("the region never showed {text:?}");
+}
+
+/// **End to end: a hundred identical renders write the mailbox once.** Through
+/// `handle_conn` over a socketpair — the first frame parks; a hundred repeats,
+/// and a repeat carrying an ungranted effect as the fence (its drop bumps the
+/// runtime mirror's violation count, so the reader has provably processed every
+/// frame before it), park nothing; a different frame parks again.
+///
+/// **Falsification (run):** drop the dedup in `RenderGate::admit` → the
+/// repeats spend the bucket and the flusher parks the deferred repeat, so the
+/// count after the fence is far above 1.
+#[tokio::test]
+async fn identical_renders_write_the_mailbox_once_end_to_end() {
+    let (_clock_tx, clock_rx) = watch::channel(None);
+    let (_vis_tx, vis_rx) = watch::channel(false);
+    let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+    let region = ctx.sidebar_top.clone();
+    let runtime = ctx.runtime.clone();
+    let (host, plugin) = UnixStream::pair().expect("socketpair");
+    tokio::spawn(async move { handle_conn(host, &ctx).await });
+    let (_prd, mut pwr) = plugin.into_split();
+    write_frame(
+        &mut pwr,
+        &PluginMsg::Register {
+            manifest: Manifest::new("repeats", Mount::SidebarTop),
+        },
+    )
+    .await
+    .expect("Register");
+
+    let before = parked_renders();
+    write_frame(&mut pwr, &label_frame("same", Vec::new()))
+        .await
+        .expect("first Render");
+    wait_for_label(&region, "same").await;
+    assert_eq!(parked_renders() - before, 1, "the first frame parks");
+
+    for _ in 0..100 {
+        write_frame(&mut pwr, &label_frame("same", Vec::new()))
+            .await
+            .expect("repeat Render");
+    }
+    write_frame(
+        &mut pwr,
+        &label_frame("same", vec![Effect::OpenPage(Page::PowerMenu)]),
+    )
+    .await
+    .expect("fence Render");
+    wait_for_runtime(&runtime, "repeats", |rt| {
+        rt.is_some_and(|rt| rt.violations == 1)
+    })
+    .await;
+    // Past any deadline a deferred repeat could have had.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        parked_renders() - before,
+        1,
+        "101 repeats of the parked frame must not write the mailbox again",
+    );
+
+    write_frame(&mut pwr, &label_frame("changed", Vec::new()))
+        .await
+        .expect("a different Render");
+    wait_for_label(&region, "changed").await;
+    assert_eq!(parked_renders() - before, 2, "a change parks");
+}
+
+/// **End to end: a render storm is paced, its effects are not, and its last
+/// frame lands.** Three hundred distinct frames back to back, the last but one
+/// carrying a granted effect: the effect reaches the broker although its frame
+/// is far over the render budget, the mailbox ends on the final frame though
+/// nothing follows it (the flusher's deadline), and the number of mailbox
+/// writes stays inside what the bucket allows for the time the storm took —
+/// not one per frame.
+///
+/// The ceiling is sound on any machine speed: the bucket starts full and can
+/// refill at most `RENDER_REFILL_PER_SEC` per second of the measured window,
+/// which spans from before the first frame to after the last park.
+///
+/// **Falsification (run):** remove the flusher arm from `serve_conn`'s
+/// `select!` → the final frame stays pending and `wait_for_label` panics;
+/// park every admitted frame unconditionally → 300 writes, far over the
+/// ceiling.
+#[tokio::test]
+async fn a_render_storm_is_paced_and_its_last_frame_lands_end_to_end() {
+    const FRAMES: usize = 300;
+    let (_clock_tx, clock_rx) = watch::channel(None);
+    let (_vis_tx, vis_rx) = watch::channel(false);
+    let (ctx, mut effects_rx) = ctx_with(clock_rx, vis_rx);
+    let region = ctx.bar_left.clone();
+    let (host, plugin) = UnixStream::pair().expect("socketpair");
+    tokio::spawn(async move { handle_conn(host, &ctx).await });
+    let (_prd, mut pwr) = plugin.into_split();
+    let mut manifest = Manifest::new("storm", Mount::BarLeft);
+    manifest.capabilities = vec![Capability::OpenPage];
+    write_frame(&mut pwr, &PluginMsg::Register { manifest })
+        .await
+        .expect("Register");
+
+    let before = parked_renders();
+    let start = Instant::now();
+    for i in 0..FRAMES {
+        let effects = if i == FRAMES - 2 {
+            vec![Effect::OpenPage(Page::PowerMenu)]
+        } else {
+            Vec::new()
+        };
+        write_frame(&mut pwr, &label_frame(&i.to_string(), effects))
+            .await
+            .expect("storm Render");
+    }
+    let brokered = tokio::time::timeout(Duration::from_secs(5), effects_rx.recv())
+        .await
+        .expect("the storm's effect reaches the broker")
+        .expect("the effects channel is open");
+    assert!(matches!(brokered.effect, Effect::OpenPage(Page::PowerMenu)));
+
+    wait_for_label(&region, &(FRAMES - 1).to_string()).await;
+    let elapsed = start.elapsed().as_secs_f64();
+    let parks = parked_renders() - before;
+    let ceiling = f64::from(RENDER_BURST) + RENDER_REFILL_PER_SEC * elapsed + 1.0;
+    assert!(
+        f64::from(parks) <= ceiling,
+        "{parks} mailbox writes for {FRAMES} frames in {elapsed:.3}s — over the \
+         {ceiling:.1} the render bound allows",
     );
 }

@@ -526,6 +526,38 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
       `Failed` outcome naming the cap, on the same correlation, within the
       same frame — no different from a routing failure (unknown provider,
       denied scope) the plugin already has to handle.
+- [ ] **(#1520)** **A render storm cannot freeze the bar.** Point a scratch
+      plugin at the live socket, mounted `BarCenter`, and have it write
+      `Render` frames in a tight loop with no sleep — each a distinct tree
+      (a `Box` of a few hundred `Label`s whose text carries a frame counter) —
+      then stop after ten seconds on a final frame whose counter you note.
+      While it runs the bar's clock keeps ticking, the sidebar opens and closes
+      without a stall, and
+      `top -p "$(systemctl --user show -p MainPID --value trollshell)"` stays
+      well short of a pegged core (before this, the GTK thread re-mapped the
+      whole region on every frame). When it stops, the chip shows the
+      **final** counter: the last frame of a burst is parked at the bound's
+      deadline, never dropped. Then loop one _identical_ frame instead: the
+      shell should sit near idle, since a repeat of the parked frame no longer
+      reaches the GTK thread at all. An SDK plugin at full rate (the audio
+      widget while music plays, the stats chips) must look exactly as before —
+      the SDK's ~30 Hz view cap is half the host's 60/s bound.
+- [ ] **(#1520)** **A sidebar close reaches a plugin that stalled.** Pinned
+      hermetically on the push tasks; this is the same thing through a real
+      socket, whose kernel buffer is why the suite stops short of it (see
+      `push_state_stops_the_queue_at_capacity_and_resumes_after_a_drain`).
+      Mount a scratch plugin on `SidebarTop` subscribing `SlotVisible` and
+      `AudioSpectrum`, play music, open the sidebar, and have the plugin stop
+      reading its socket for ~50 s, starting right after it answers a
+      liveness `Ping`. On default socket buffers the ~20 Hz spectrum takes
+      ~45 s to fill the kernel buffer and then the host's 256-frame queue, and
+      starting just after a ping keeps the full queue clear of a ping tick —
+      a ping that meets a full queue drops the connection as hung, which is
+      a different test. Close the sidebar in the last few seconds of the
+      stall, then let the plugin read again. Once it has caught up it must
+      have received `SlotVisibility { visible: false }`, with no further
+      toggle. Before this, that frame was dropped on the full queue and the
+      plugin believed itself on screen until the sidebar next opened.
 
 ## Agents (hyperhive)
 

@@ -42,7 +42,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use hytte_config::places::{self, Place};
-use hytte_plugin::{CmdReceiver, poll};
+use hytte_plugin::CmdReceiver;
+use hytte_plugin::poll::{Gate, Wake};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
@@ -504,15 +505,22 @@ async fn fetch_and_send(msg_tx: &mpsc::UnboundedSender<BoardMsg>) {
 /// down to the comments on the `biased;` and the `, if visible` guard. What
 /// each of those buys is documented on the helper.
 pub(crate) async fn poll_task(cmds: CmdReceiver<Cmd>, msg_tx: mpsc::UnboundedSender<BoardMsg>) {
-    // An irrefutable pattern on purpose: a second `Cmd` variant would fail to
-    // compile here rather than being silently read as a visibility flip.
-    poll::gated(
-        cmds,
-        REFRESH_WHILE_OPEN,
-        |&Cmd::SetVisible(visible)| visible,
-        || fetch_and_send(&msg_tx),
-    )
-    .await;
+    // Driven through `Gate` directly: the lane carries more than the
+    // visibility flip. `Cmd::Refresh` is a datasource query waking one fetch
+    // through this same machinery, even while parked (no second HTTP path).
+    // The match is exhaustive on purpose: a new `Cmd` variant fails to compile
+    // here rather than being silently read as a visibility flip.
+    let mut gate = Gate::new(cmds, REFRESH_WHILE_OPEN, |cmd: &Cmd| match cmd {
+        Cmd::SetVisible(visible) => Some(*visible),
+        Cmd::Refresh => None,
+    });
+    while let Some(wake) = gate.next().await {
+        match wake {
+            Wake::Refresh | Wake::Cmd(Cmd::Refresh) => fetch_and_send(&msg_tx).await,
+            // Unreachable: the classifier absorbs every `SetVisible`.
+            Wake::Cmd(Cmd::SetVisible(_)) => {}
+        }
+    }
 }
 
 #[cfg(test)]

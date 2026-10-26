@@ -597,7 +597,11 @@ fn instance_to_calendar_event(
 ///   fall-back fold at midnight (America/Havana in November). The pair is
 ///   compared by value, not taken by position: chrono 0.4.44's Unix `Local`
 ///   hands a fold back as `(later, earlier)`, so `.earliest()` picks the
-///   wrong one there (#1490).
+///   wrong one there (#1490). And only an instant the zone reads back at
+///   00:00 or later counts: the same `Local` also answers `Ambiguous` at 00:00
+///   on the day after a fall-back at 24:00 (Santiago in April, Cairo and
+///   Beirut in October), where one side of the pair is the transition
+///   instant, which reads 23:00 the day before.
 /// - The first instant the day has when 00:00 is skipped, i.e. a
 ///   spring-forward gap at midnight (America/Santiago in September,
 ///   America/Havana in March). That is the transition itself, which reads
@@ -616,11 +620,28 @@ fn instance_to_calendar_event(
 #[must_use]
 pub fn local_midnight<Tz: TimeZone>(date: NaiveDate, tz: &Tz) -> DateTime<Tz> {
     let midnight = date.and_time(NaiveTime::MIN);
-    match tz.from_local_datetime(&midnight) {
-        MappedLocalTime::Single(t) => t,
-        MappedLocalTime::Ambiguous(a, b) => a.min(b),
-        MappedLocalTime::None => first_instant_reading_at_least(midnight, tz),
-    }
+    // A candidate starts the day only if the zone's own UTC-to-local map reads
+    // it at `midnight` or later. chrono 0.4.44's Unix `Local` closes a fold at
+    // its upper end (`tz_info/timezone.rs:249-250`, `rule.rs:265-266` and
+    // `277-278`), so on the day after a fall-back at 24:00 it answers
+    // `Ambiguous` at 00:00, and the earlier of that pair reads 23:00 the day
+    // before (#1577 review).
+    let starts_the_day = |t: &DateTime<Tz>| t.with_timezone(tz).naive_local() >= midnight;
+    let start = match tz.from_local_datetime(&midnight) {
+        MappedLocalTime::Single(t) if starts_the_day(&t) => t,
+        MappedLocalTime::Ambiguous(a, b) => match (starts_the_day(&a), starts_the_day(&b)) {
+            (true, true) => a.min(b),
+            (true, false) => a,
+            (false, true) => b,
+            (false, false) => first_instant_reading_at_least(midnight, tz),
+        },
+        _ => first_instant_reading_at_least(midnight, tz),
+    };
+    // Re-read the offset from the instant, so `Local`'s gap-start
+    // `Single(pre-gap offset)` carries the offset the clock really shows.
+    // Without it, a day the zone skipped whole (Pacific/Apia 2011-12-30)
+    // keeps that day's date, and `next_day_start` returns the start itself.
+    start.with_timezone(tz)
 }
 
 /// The first instant whose wall clock in `tz` reads `wall` or later.
@@ -1324,6 +1345,15 @@ mod local_midnight_tests {
     /// order the helper meets there. Plain `chrono_tz` answers
     /// `(earlier, later)`, where `.earliest()` and comparing by value agree,
     /// so it alone could not tell the two apart.
+    ///
+    /// It models that order and nothing else. In particular it does **not**
+    /// model where `Local` puts a fold's upper bound: `Local` closes a fold at
+    /// its upper end, so on the day after a fall-back at 24:00 (Santiago in
+    /// April, Cairo and Beirut in October) it answers `Ambiguous` at 00:00,
+    /// where chrono-tz, and so this wrapper, answer `Single`. A helper that
+    /// passes every `LocalOrder` sweep below can still be wrong on `Local`
+    /// there; it was, until the #1577 review. `TzInfoFallBack` and
+    /// `local_midnight_local_tests` cover that case.
     #[derive(Clone, Copy, Debug)]
     struct LocalOrder(Tz);
 
@@ -1360,6 +1390,133 @@ mod local_midnight_tests {
         fn offset_from_utc_datetime(&self, utc: &NaiveDateTime) -> TzOffset {
             self.0.offset_from_utc_datetime(utc)
         }
+    }
+
+    /// A hermetic zone with one fall-back, at the UTC instant `at`, from
+    /// `before` to `after` seconds east (`before > after`), whose local lookup
+    /// transcribes chrono 0.4.44's Unix `Local` for a backward transition
+    /// (`tz_info/timezone.rs:243-257`): a wall clock below the fold is `before`,
+    /// one from the fold's lower end **up to and including** its upper end is
+    /// `Ambiguous(after, before)`, and one above it is `after`. chrono-tz
+    /// excludes the upper end, so only this zone, not `LocalOrder`, shows the
+    /// spurious fold `Local` reports at 00:00 after a fall-back at 24:00.
+    #[derive(Clone, Copy, Debug)]
+    struct TzInfoFallBack {
+        at: i64,
+        before: i32,
+        after: i32,
+    }
+
+    /// The offset a [`TzInfoFallBack`] hands chrono. It carries its zone
+    /// because chrono rebuilds a `TimeZone` from an offset alone.
+    #[derive(Clone, Copy, Debug)]
+    struct TzInfoOffset {
+        zone: TzInfoFallBack,
+        fix: FixedOffset,
+    }
+
+    impl Offset for TzInfoOffset {
+        fn fix(&self) -> FixedOffset {
+            self.fix
+        }
+    }
+
+    impl TzInfoFallBack {
+        fn offset(self, secs_east: i32) -> TzInfoOffset {
+            TzInfoOffset {
+                zone: self,
+                fix: FixedOffset::east_opt(secs_east).unwrap(),
+            }
+        }
+    }
+
+    impl TimeZone for TzInfoFallBack {
+        type Offset = TzInfoOffset;
+
+        fn from_offset(offset: &TzInfoOffset) -> Self {
+            offset.zone
+        }
+
+        fn offset_from_local_date(&self, local: &NaiveDate) -> MappedLocalTime<TzInfoOffset> {
+            self.offset_from_local_datetime(&local.and_time(NaiveTime::MIN))
+        }
+
+        fn offset_from_local_datetime(
+            &self,
+            local: &NaiveDateTime,
+        ) -> MappedLocalTime<TzInfoOffset> {
+            let wall = local.and_utc().timestamp();
+            // `transition_start`/`transition_end` in chrono's own naming: the
+            // wall clock at `at` on the old offset, and on the new one.
+            let upper = self.at + i64::from(self.before);
+            let lower = self.at + i64::from(self.after);
+            if wall < lower {
+                MappedLocalTime::Single(self.offset(self.before))
+            } else if wall <= upper {
+                MappedLocalTime::Ambiguous(self.offset(self.after), self.offset(self.before))
+            } else {
+                MappedLocalTime::Single(self.offset(self.after))
+            }
+        }
+
+        fn offset_from_utc_date(&self, utc: &NaiveDate) -> TzInfoOffset {
+            self.offset_from_utc_datetime(&utc.and_time(NaiveTime::MIN))
+        }
+
+        fn offset_from_utc_datetime(&self, utc: &NaiveDateTime) -> TzInfoOffset {
+            if utc.and_utc().timestamp() < self.at {
+                self.offset(self.before)
+            } else {
+                self.offset(self.after)
+            }
+        }
+    }
+
+    /// The day after a fall-back at 24:00 starts at its own 00:00, not at the
+    /// transition, on a zone with `Local`'s fold bounds (#1577 review). Modelled
+    /// on Santiago 2026: Saturday 04-04 24:00 -03 (2026-04-05T03:00Z) becomes
+    /// 23:00 -04, so Sunday 00:00 happens once, at 04:00Z.
+    #[test]
+    fn a_fall_back_at_24_00_starts_the_next_day_at_its_own_midnight() {
+        let zone = TzInfoFallBack {
+            at: utc(2026, 4, 5, 3).timestamp(),
+            before: -3 * 3600,
+            after: -4 * 3600,
+        };
+        let day = ymd(2026, 4, 5);
+        let midnight = day.and_time(NaiveTime::MIN);
+        let MappedLocalTime::Ambiguous(a, b) = zone.from_local_datetime(&midnight) else {
+            panic!("this zone must answer the spurious fold `Local` does, or nothing is tested");
+        };
+        assert_eq!(
+            a.min(b),
+            utc(2026, 4, 5, 3),
+            "the earlier side is the transition"
+        );
+        assert_eq!(
+            utc(2026, 4, 5, 3).with_timezone(&zone).naive_local(),
+            ymd(2026, 4, 4).and_hms_opt(23, 0, 0).unwrap(),
+            "and the clock reads 23:00 the day before there"
+        );
+
+        let start = local_midnight(day, &zone);
+        assert_eq!(start, utc(2026, 4, 5, 4));
+        assert_first_instant_of(&start, day, "tz_info fall-back at 24:00");
+        // The sites that go through it.
+        assert_eq!(
+            next_day_start(local_midnight(ymd(2026, 4, 4), &zone)),
+            utc(2026, 4, 5, 4)
+        );
+        let at = day.and_time(NaiveTime::MIN).and_utc().timestamp();
+        assert_eq!(
+            unix_to_zone(at, true, &zone).map(|t| t.with_timezone(&Utc)),
+            Some(utc(2026, 4, 5, 4))
+        );
+        // Viewing May, whose grid starts on Monday 2026-04-27, the scan
+        // reaches back to today.
+        let now = zone.with_ymd_and_hms(2026, 4, 5, 15, 0, 0).unwrap();
+        let (scan_start, _) = scan_window(&now, Some((2026, 5)));
+        assert_eq!(scan_start, utc(2026, 4, 5, 4));
     }
 
     /// One midnight gap per zone #1554 names, each checked against the bundled
@@ -1572,5 +1729,96 @@ mod local_midnight_tests {
         // A grid that ends before the forward window: the forward end wins.
         let (_, end) = scan_window(&now, Some((2026, 5)));
         assert_eq!(end, now + Duration::days(WINDOW_DAYS));
+    }
+}
+
+/// #1577 review: chrono 0.4.44's Unix `Local` closes a fold at its upper end
+/// (`offset/local/tz_info/timezone.rs:249-250`, `rule.rs:265-266` and
+/// `277-278`), so a zone that falls back at 24:00 answers `Ambiguous` at
+/// 00:00 the next day, and the earlier instant of that pair is the transition
+/// itself, which reads 23:00 the day before. chrono-tz, and `LocalOrder` over
+/// it, answer `Single` there, so only the real `Local` shows it. This re-execs
+/// the test binary with a POSIX `TZ` string, which chrono parses itself, so no
+/// tzdata file is needed and the parallel suite's `TZ` is never touched.
+#[cfg(test)]
+mod local_midnight_local_tests {
+    use super::*;
+
+    const CHILD: &str = "HYTTE_1577_LOCAL_MIDNIGHT_CHILD";
+    const CHILD_OK: &str = "hytte-1577-local-midnight-child-reached-the-end";
+
+    #[test]
+    fn a_day_after_a_fall_back_at_24_00_starts_at_its_own_midnight_in_local() {
+        for (tz, day, want) in [
+            // Santiago: Saturday 2026-04-04 24:00 -03 becomes 23:00 -04.
+            (
+                "CLT4CLST,M9.1.6/24,M4.1.6/24",
+                "2026-04-05",
+                "2026-04-05T04:00:00+00:00",
+            ),
+            // Cairo: Thursday 2026-10-29 24:00 +03 becomes 23:00 +02.
+            (
+                "EET-2EEST,M4.5.5/0,M10.5.4/24",
+                "2026-10-30",
+                "2026-10-29T22:00:00+00:00",
+            ),
+            // Beirut: Saturday 2026-10-24 24:00 +03 becomes 23:00 +02.
+            (
+                "EET-2EEST,M3.5.0/0,M10.5.0/0",
+                "2026-10-25",
+                "2026-10-24T22:00:00+00:00",
+            ),
+            // Santiago's gap at 00:00, which this `Local` answers `None`.
+            (
+                "CLT4CLST,M9.1.6/24,M4.1.6/24",
+                "2026-09-06",
+                "2026-09-06T04:00:00+00:00",
+            ),
+        ] {
+            let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "--nocapture",
+                    "--test-threads=1",
+                    "calendar::local_midnight_local_tests::local_midnight_child",
+                ])
+                .env("TZ", tz)
+                .env(CHILD, format!("{day} {want}"))
+                .output()
+                .expect("re-exec the test binary");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.contains(CHILD_OK),
+                "TZ={tz} {day}:\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    /// The child half of the test above; a no-op outside its child.
+    #[test]
+    fn local_midnight_child() {
+        let Ok(arg) = std::env::var(CHILD) else {
+            return;
+        };
+        let (day, want) = arg.split_once(' ').expect("`<day> <want>`");
+        let day: NaiveDate = day.parse().expect("a date");
+        let start = local_midnight(day, &Local);
+        assert_eq!(start.with_timezone(&Utc).to_rfc3339(), want, "{day}");
+        // Read back through the zone's own UTC-to-local map, not the offset
+        // the result happens to carry.
+        let midnight = day.and_time(NaiveTime::MIN);
+        assert!(
+            start.with_timezone(&Local).naive_local() >= midnight,
+            "{day}: reads the day before"
+        );
+        assert!(
+            (start - Duration::seconds(1))
+                .with_timezone(&Local)
+                .naive_local()
+                < midnight,
+            "{day}: the day began earlier"
+        );
+        println!("{CHILD_OK}");
     }
 }

@@ -5,26 +5,37 @@
 //! two tools. Read that module's doc for the full census; the short version:
 //!
 //! `AdwPreferencesRow:use-markup` and `AdwToast:use-markup` default to
-//! **`TRUE`**, and `AdwPreferencesGroup`'s title and description labels are
-//! hardcoded to markup with no property at all. Text we do not author (a place
-//! name the user typed, a config key, a systemd error quoting the file, a place name the user typed, a D-Bus error, a plugin's
-//! declared mount) containing `&`, `<` or `>` then fails to parse and renders
-//! **blank**: the message meant to explain the problem disappears.
+//! **`TRUE`** (both set it in their `init`), and `AdwPreferencesGroup`'s title
+//! and description labels are hardcoded to markup with no property at all.
+//! Text we do not author (a place name the user typed, a config key or record
+//! name, a TOML parse error quoting the file, `systemd-run`'s stderr, a D-Bus
+//! error, a plugin's declared mount) containing `&`, `<` or `>` then fails to
+//! parse and renders **blank**: the message meant to explain the problem
+//! disappears.
 //!
 //! - [`plain_text`] for rows: turns markup off. Call it **right after
 //!   `new()`/`build()` and before the first non-literal text is set**: the
 //!   label tries to parse a title the moment it is set, so setting text first
 //!   logs a `Gtk-WARNING` on every build (measured in the #1544 review), and
 //!   `.use_markup(false)` in a builder does not help.
-//! - [`escape`] for everything with no working off switch: toast titles
-//!   and group titles/descriptions. [`toast`] wraps the one toast sink so call
-//!   sites cannot forget.
+//! - [`escape`] for group titles and descriptions, which have no off switch.
+//! - [`toast`] for the one toast sink, so call sites cannot forget. A toast
+//!   *could* turn markup off instead: `AdwToast` is not a widget, and the
+//!   label that draws it is created when the toast is shown, with `use-markup`
+//!   bound before the title (`adw-toast-widget.c`, `update_title_widget`).
+//!   Escaping is the chosen remedy all the same, one rule for every toast.
 //!
-//! **`AdwBanner` is not on that list.** Its `use-markup` is documented as
-//! opt-in (default off, measured on libadwaita 1.9.3: a banner given `Tom &
-//! <b>Jerry</b>` shows exactly that), so a banner title must NOT be escaped:
-//! it would show `&amp;`. The #1564 report had this wrong; `main.rs`'s banner
-//! test pins the measured behaviour.
+//! **`AdwBanner` is not on that list: its title is plain text by default**, so
+//! a banner title must NOT be escaped (it would show `&amp;`). Adw-1.gir says
+//! `use-markup` defaults to `TRUE`, and that is misleading. The `TRUE` is the
+//! pspec default in `adw-banner.c:422-425`, which carries no
+//! `G_PARAM_CONSTRUCT`, so `GObject` never applies it. The property has no
+//! storage of its own: its getter and setter proxy the template's title
+//! `GtkLabel` (`adw-banner.c:681-712`, `adw-banner.ui`), which never sets
+//! `use-markup` and so keeps `GtkLabel`'s `FALSE`. The class doc says the
+//! same ("use `use-markup` to enable it"). Measured on libadwaita 1.9.3: a
+//! banner given `Tom & <b>Jerry</b>` shows exactly that, and `main.rs`'s
+//! banner test pins it, so a libadwaita that changes this goes red there.
 //!
 //! Do not escape text a row shows through [`plain_text`]: it would display the
 //! entities (`&amp;`) literally.

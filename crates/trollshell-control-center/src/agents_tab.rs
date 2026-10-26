@@ -91,11 +91,13 @@
 //! `AdwNavigationPage:title` needs neither: it renders through `AdwWindowTitle`,
 //! whose labels declare no `use-markup` and so are plain text.
 //!
-//! `adw::Toast:title` uses Pango markup by default and has no way to turn it off
-//! before the text is set, so the one caller ([`toast`]) escapes through
-//! `crate::markup::toast` (#1564). Its argument is **not** only a GIO message:
-//! `launch_detached` returns `systemd-run`'s stderr when the helper starts but
-//! the unit fails, and #1147 review NIT N4 wrongly called that safe.
+//! `adw::Toast:title` uses Pango markup by default. A toast could switch it
+//! off (its label is only created when the toast is shown, with `use-markup`
+//! bound first), but the crate's one rule for toasts is to escape, so the one
+//! caller ([`toast`]) goes through `crate::markup::toast` (#1564). Its
+//! argument is **not** only a GIO message: `launch_detached` returns
+//! `systemd-run`'s stderr when the helper starts but the unit fails, and #1147
+//! review NIT N4 wrongly called that safe.
 //!
 //! # Why the poll is a `glib` timer and not a task
 //!

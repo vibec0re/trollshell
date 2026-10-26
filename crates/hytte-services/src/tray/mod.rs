@@ -375,7 +375,8 @@ struct State {
 
 impl State {
     /// Re-read one item's properties and update the map.  Returns `false`
-    /// when the item should be removed (proxy read failed).
+    /// when the item should be removed: it answered none of its identifying
+    /// properties (see [`read_item_props`]'s `# Errors`).
     async fn refresh_item(&self, bus_name: &str, object_path: &str) -> bool {
         match read_item_props(bus_name, object_path).await {
             Ok(item) => {
@@ -643,6 +644,15 @@ async fn watch_item(state: State, bus_name: String, object_path: String) {
     // forwarders above: a panic here used to silently stop PeerGone
     // detection for this item, leaving a disconnected item's row in the
     // published list forever with no observable cause.
+    //
+    // `PeerGone` alone cannot see a peer that left *before* this proxy's
+    // `NameOwnerChanged` subscription existed — and that is the
+    // register-then-exit race: the item is inserted after the session-wide
+    // NOC watcher has already pruned (nothing, yet) for that name, and this
+    // proxy subscribes after the name is gone, so no emission is left for
+    // either to see. `watch_liveness` closes it by asking the bus whether the
+    // name still has an owner each time the proxy reports `Live`, which
+    // `hytte_bus` only does once that subscription is active.
     {
         let state2 = state.clone();
         let bus2 = bus_name.clone();
@@ -654,20 +664,14 @@ async fn watch_item(state: State, bus_name: String, object_path: String) {
             let path2 = path2.clone();
             let proxy2 = proxy2.clone();
             async move {
-                let mut liveness = proxy2.liveness().to_stream();
-                while let Some(s) = liveness.next().await {
-                    if s == ProxyState::PeerGone {
-                        tracing::debug!(
-                            bus_name = bus2,
-                            object_path = path2,
-                            "item proxy: PeerGone"
-                        );
-                        let key = format!("{bus2}{path2}");
-                        state2.registered.lock().await.remove(&key);
-                        state2.rebuild_published_list().await;
-                        state2.emit_unregistered(key).await;
-                        return;
-                    }
+                let end =
+                    watch_liveness(proxy2.liveness().to_stream(), || name_has_owner(&bus2)).await;
+                if end == LivenessEnd::Gone {
+                    tracing::debug!(bus_name = bus2, object_path = path2, "item peer gone");
+                    let key = format!("{bus2}{path2}");
+                    state2.registered.lock().await.remove(&key);
+                    state2.rebuild_published_list().await;
+                    state2.emit_unregistered(key).await;
                 }
             }
         });
@@ -690,6 +694,73 @@ async fn watch_item(state: State, bus_name: String, object_path: String) {
     state.registered.lock().await.remove(&key);
     state.rebuild_published_list().await;
     state.emit_unregistered(key).await;
+}
+
+/// Why [`watch_liveness`] returned.
+#[derive(Debug, PartialEq, Eq)]
+enum LivenessEnd {
+    /// The item's bus name has no owner: unregister the row.
+    Gone,
+    /// The liveness stream ended (every proxy handle dropped) without the peer
+    /// leaving. Nothing to remove.
+    StreamEnded,
+}
+
+/// Fold an item proxy's liveness stream into "is the peer gone".
+///
+/// Gone is either a [`ProxyState::PeerGone`] — the peer left while the
+/// proxy's `NameOwnerChanged` subscription was up — or `still_owned`
+/// answering `Some(false)` on a [`ProxyState::Live`]. `hytte_bus` reports
+/// `Live` only once that subscription is active, so asking then covers exactly
+/// the window the subscription cannot: a name that left before it existed (the
+/// register-then-exit race), or during a bus reconnect, when the old
+/// subscription is down and the new one has not been made. Any departure after
+/// the question is answered arrives as `PeerGone`. `None` — the bus could not
+/// answer — keeps the row; the next `Live` asks again.
+///
+/// `still_owned` is injected so the fold is testable without a bus.
+async fn watch_liveness<S, Owned, Fut>(mut liveness: S, mut still_owned: Owned) -> LivenessEnd
+where
+    S: futures_util::Stream<Item = ProxyState> + Unpin,
+    Owned: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<bool>>,
+{
+    while let Some(state) = liveness.next().await {
+        match state {
+            ProxyState::PeerGone => return LivenessEnd::Gone,
+            ProxyState::Live => {
+                if still_owned().await == Some(false) {
+                    return LivenessEnd::Gone;
+                }
+            }
+            ProxyState::Reconnecting => {}
+        }
+    }
+    LivenessEnd::StreamEnded
+}
+
+/// `org.freedesktop.DBus.NameHasOwner(bus_name)`, or `None` if the bus did
+/// not answer.
+///
+/// `NameHasOwner` rather than `GetNameOwner`: the answer we need is the
+/// boolean, and `GetNameOwner` spells "no owner" as an error reply
+/// (`NameHasNoOwner`) that would have to be told apart from a failed call by
+/// its error name.
+async fn name_has_owner(bus_name: &str) -> Option<bool> {
+    match call(BusKind::Session, "org.freedesktop.DBus")
+        .at_path("/org/freedesktop/DBus")
+        .iface("org.freedesktop.DBus")
+        .method("NameHasOwner")
+        .args((bus_name.to_string(),))
+        .send::<bool>()
+        .await
+    {
+        Ok(owned) => Some(owned),
+        Err(e) => {
+            tracing::debug!(error = %e, bus_name, "tray: NameHasOwner failed; keeping the item");
+            None
+        }
+    }
 }
 
 // ── NameOwnerChanged watcher ──────────────────────────────────────────────────
@@ -873,16 +944,69 @@ where
         .ok()
 }
 
+/// The four `StatusNotifierItem` properties that say *something is there*:
+/// each `None` is a `Get` that did not answer, as opposed to `Some("")`, a
+/// `Get` that answered with an empty string.
+///
+/// The spec makes `Id` and `Status` mandatory, so a live item answers at least
+/// those two. `Title` and `IconName` are included so an item that is merely
+/// sloppy about one of the mandatory pair is still recognised.
+#[derive(Debug, Default)]
+struct Identity {
+    title: Option<String>,
+    id: Option<String>,
+    status: Option<String>,
+    icon_name: Option<String>,
+}
+
+impl Identity {
+    async fn read(bus_name: &str, object_path: &str) -> Self {
+        Self {
+            title: get_sni_property(bus_name, object_path, "Title").await,
+            id: get_sni_property(bus_name, object_path, "Id").await,
+            status: get_sni_property(bus_name, object_path, "Status").await,
+            icon_name: get_sni_property(bus_name, object_path, "IconName").await,
+        }
+    }
+
+    /// Whether any of the four answered. `false` is the read that has to fail:
+    /// a peer that has left the bus (`ServiceUnknown`) or an object that is no
+    /// longer exported (`UnknownObject`/`UnknownMethod`) answers none of them.
+    fn answered(&self) -> bool {
+        self.title.is_some()
+            || self.id.is_some()
+            || self.status.is_some()
+            || self.icon_name.is_some()
+    }
+}
+
+/// Read every property a [`TrayItem`] carries.
+///
+/// # Errors
+///
+/// Fails when the item answered **none** of its identifying properties (see
+/// [`Identity::answered`]). Every individual read is still best-effort — a
+/// missing `ToolTip` or `IconPixmap` is an ordinary item — but before #1201's
+/// follow-up this function could not fail at all, since every read ended in
+/// `.ok()`/`unwrap_or_default()`. That made three things dead code:
+/// registering an item whose peer had already left published an empty row,
+/// [`watch_item`]'s `still_alive` re-read never said no, and the re-sync's
+/// object-level re-read (`resync_items`, #1201 L7) always answered "alive" in
+/// production, so the row it was written to prune stayed.
 async fn read_item_props(bus_name: &str, object_path: &str) -> Result<TrayItem> {
-    let title: String = get_sni_property(bus_name, object_path, "Title")
-        .await
-        .unwrap_or_default();
-    let icon_name: String = get_sni_property(bus_name, object_path, "IconName")
-        .await
-        .unwrap_or_default();
-    let status_str: String = get_sni_property(bus_name, object_path, "Status")
-        .await
-        .unwrap_or_default();
+    let identity = Identity::read(bus_name, object_path).await;
+    if !identity.answered() {
+        anyhow::bail!("item answered none of Title/Id/Status/IconName: its peer or object is gone");
+    }
+    let Identity {
+        title,
+        status,
+        icon_name,
+        ..
+    } = identity;
+    let title = title.unwrap_or_default();
+    let icon_name = icon_name.unwrap_or_default();
+    let status_str = status.unwrap_or_default();
 
     // IconPixmap: a(iiay) — always read; the widget layer decides whether to use
     // it (e.g. when `icon_name` is non-empty but not present in the icon theme).
@@ -1237,6 +1361,125 @@ mod tests {
             1,
             "only the survivor is re-read"
         );
+    }
+
+    // ── Ghost rows: the identity check and the owner check ──────────────────
+
+    use super::{Identity, LivenessEnd, ProxyState, watch_liveness};
+    use std::collections::VecDeque;
+
+    /// The read that has to fail. Before this, `read_item_props` could not
+    /// fail at all, so an item whose peer had already left registered as an
+    /// empty row, and both of the "re-read and drop it if it no longer
+    /// answers" paths (`watch_item`'s `still_alive`, `resync_items`' survivor
+    /// pass) always answered "alive".
+    #[test]
+    fn an_item_that_answered_nothing_is_not_an_item() {
+        assert!(!Identity::default().answered());
+    }
+
+    /// One answer is enough, and an empty string is an answer: a live item
+    /// with no title and a pixmap-only icon still says `Id`/`Status`.
+    #[test]
+    fn any_one_identifying_answer_is_enough_even_an_empty_one() {
+        let empty = || Some(String::new());
+        assert!(
+            Identity {
+                id: empty(),
+                ..Identity::default()
+            }
+            .answered()
+        );
+        assert!(
+            Identity {
+                status: Some("Passive".to_string()),
+                ..Identity::default()
+            }
+            .answered()
+        );
+        assert!(
+            Identity {
+                title: empty(),
+                ..Identity::default()
+            }
+            .answered()
+        );
+        assert!(
+            Identity {
+                icon_name: empty(),
+                ..Identity::default()
+            }
+            .answered()
+        );
+    }
+
+    /// An owner check that answers from a fixed script, counting the asks.
+    fn scripted(
+        answers: Vec<Option<bool>>,
+        asked: &Arc<AtomicUsize>,
+    ) -> impl FnMut() -> std::future::Ready<Option<bool>> {
+        let mut answers: VecDeque<Option<bool>> = answers.into();
+        let asked = asked.clone();
+        move || {
+            asked.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(answers.pop_front().flatten())
+        }
+    }
+
+    /// The register-then-exit race: the item's peer is gone before its proxy
+    /// subscribes to `NameOwnerChanged`, so the proxy goes `Reconnecting` →
+    /// `Live` and `PeerGone` never arrives. The owner check at `Live` is what
+    /// removes the row.
+    ///
+    /// Falsifiable: without the check on `Live`, this returns `StreamEnded`
+    /// — in production, a row that stays forever.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_peer_that_left_before_the_subscription_is_gone_at_live() {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let states = futures_util::stream::iter([ProxyState::Reconnecting, ProxyState::Live]);
+        let end = watch_liveness(states, scripted(vec![Some(false)], &asked)).await;
+        assert_eq!(end, LivenessEnd::Gone);
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+    }
+
+    /// A peer that is still there keeps its row; a later `PeerGone` removes it
+    /// without another question.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_live_owner_keeps_the_item_until_peer_gone() {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let states = futures_util::stream::iter([ProxyState::Live]);
+        let end = watch_liveness(states, scripted(vec![Some(true)], &asked)).await;
+        assert_eq!(end, LivenessEnd::StreamEnded);
+
+        let asked = Arc::new(AtomicUsize::new(0));
+        let states = futures_util::stream::iter([
+            ProxyState::Reconnecting,
+            ProxyState::Live,
+            ProxyState::PeerGone,
+        ]);
+        let end = watch_liveness(states, scripted(vec![Some(true)], &asked)).await;
+        assert_eq!(end, LivenessEnd::Gone);
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            1,
+            "PeerGone needs no second question"
+        );
+    }
+
+    /// A check the bus could not answer keeps the row, and the next `Live`
+    /// (after a reconnect — the window in which a departure is also missed)
+    /// asks again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unanswered_owner_check_keeps_the_item_and_asks_again_on_the_next_live() {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let states = futures_util::stream::iter([
+            ProxyState::Live,
+            ProxyState::Reconnecting,
+            ProxyState::Live,
+        ]);
+        let end = watch_liveness(states, scripted(vec![None, Some(false)], &asked)).await;
+        assert_eq!(end, LivenessEnd::Gone);
+        assert_eq!(asked.load(Ordering::SeqCst), 2);
     }
 
     /// A re-sync that finds everything present must not churn the published

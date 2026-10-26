@@ -270,6 +270,9 @@ fn parse_nvidia_csv(s: &str) -> Option<GpuState> {
     })
 }
 
+/// True while a detached thread is reaping a timed-out `nvidia-smi`.
+static REAPER_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Run `program` (normally `nvidia-smi`) with a hard `deadline`.
 ///
 /// The child is polled with `try_wait` rather than waited on, so a hung
@@ -307,9 +310,18 @@ fn query_nvidia_smi(program: &str, deadline: Duration) -> Result<GpuState, Nvidi
             }
             Ok(None) | Err(_) => {
                 let _ = child.kill();
-                std::thread::spawn(move || {
-                    let _ = child.wait();
-                });
+                // At most one reaper thread at a time: a child stuck in
+                // D-state keeps its reaper blocked, and every further timeout
+                // would otherwise add another blocked thread. While one is
+                // outstanding, later killed children are simply dropped
+                // (left as zombies until the process exits) - bounded by the
+                // retry backoff, which allows one new child per few minutes.
+                if !REAPER_BUSY.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                    std::thread::spawn(move || {
+                        let _ = child.wait();
+                        REAPER_BUSY.store(false, std::sync::atomic::Ordering::Release);
+                    });
+                }
                 return Err(NvidiaFailure::Transient);
             }
         }
@@ -421,6 +433,10 @@ impl GpuCache {
     /// was added for).
     pub fn forget_readings(&mut self) {
         self.nvidia_last = None;
+        // The retry gate is an `Instant` (monotonic, paused across suspend):
+        // a failure just before a suspend would otherwise keep gating
+        // recovery for minutes of awake time after the resume.
+        self.nvidia_backoff = None;
         self.intel_rc6_prev = None;
     }
 }
@@ -836,6 +852,18 @@ mod tests {
         assert_eq!(state.as_ref().map(|s| s.name.as_str()), Some("recovered"));
         assert_eq!(cache.nvidia_available, Some(true));
         assert!(cache.nvidia_backoff.is_none());
+    }
+
+    #[test]
+    fn forget_readings_clears_the_retry_gate() {
+        let t0 = Instant::now();
+        let (_, mut cache) =
+            read_nvidia_with_cache_at(GpuCache::default(), t0, || Err(NvidiaFailure::Transient));
+        assert!(cache.nvidia_backoff.is_some());
+        cache.forget_readings();
+        assert!(cache.nvidia_backoff.is_none());
+        let (state, _) = read_nvidia_with_cache_at(cache, t0, || Ok(fake_reading("back")));
+        assert!(state.is_some(), "the gate survived a park/unpark");
     }
 
     #[test]

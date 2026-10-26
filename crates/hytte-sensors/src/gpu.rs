@@ -1304,4 +1304,53 @@ mod tests {
             "zombie left behind"
         );
     }
+
+    /// Voluntary context switches of one thread, from `<task>/status`.
+    fn voluntary_switches(task: &std::path::Path) -> u64 {
+        std::fs::read_to_string(task.join("status"))
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("voluntary_ctxt_switches:"))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap()
+    }
+
+    /// An idle reaper sleeps in `recv()`: it must not wake every
+    /// `REAPER_POLL` for the life of the process, on every machine.
+    ///
+    /// Counts the thread's `voluntary_ctxt_switches` (each block-and-wake is
+    /// one) over a 2 s idle window. Measured: 0-1 for the shipped loop, and
+    /// about 9 per second (~19 here) with the idle arm mutated into the
+    /// 100 ms poll. The threshold of 5 leaves room for a stray wakeup on a
+    /// loaded runner and is still far below the mutant. Runs `reaper_loop` on
+    /// a private channel so sibling tests' children cannot keep it busy.
+    #[test]
+    fn an_idle_reaper_does_not_wake() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (task_tx, task_rx) = std::sync::mpsc::channel();
+        let reaper = std::thread::spawn(move || {
+            task_tx
+                .send(std::fs::read_link("/proc/thread-self").unwrap())
+                .unwrap();
+            reaper_loop(&rx);
+        });
+        let task = std::path::Path::new("/proc").join(task_rx.recv().unwrap());
+        // One busy spell first, so the loop has been through its polling arm
+        // and must find its way back to the blocking one.
+        let mut child = sleeper();
+        let pid = child.id();
+        child.kill().unwrap();
+        tx.send(child).unwrap();
+        assert!(
+            wait_reaped(pid, Duration::from_secs(5)),
+            "zombie left behind"
+        );
+        std::thread::sleep(REAPER_POLL * 3);
+        let before = voluntary_switches(&task);
+        std::thread::sleep(REAPER_POLL * 20);
+        let woke = voluntary_switches(&task) - before;
+        assert!(woke < 5, "an idle reaper woke {woke} times in 2 s");
+        drop(tx);
+        reaper.join().unwrap();
+    }
 }

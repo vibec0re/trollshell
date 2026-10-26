@@ -2187,7 +2187,9 @@ const GAP_SEARCH_STEPS: i64 = 48 * 60 / GAP_SEARCH_STEP_MINUTES;
 /// Of a fold's two candidates, only the ones that read back as `naive`
 /// count. chrono 0.4.44's Unix `Local` counts a fold's **upper bound** as part
 /// of the fold (`offset/local/tz_info/timezone.rs:249-250`, `rule.rs:265-266`
-/// and `277-278`). At exactly 03:00 on Berlin's fall-back day it answers
+/// and `277-278`, and on the negative-DST branches `rule.rs:302-303` and
+/// `330-331`, which `Europe/Dublin`'s rule takes). At exactly 03:00 on Berlin's
+/// fall-back day it answers
 /// `Ambiguous(03:00 +01:00, 03:00 +02:00)`. The second of those is the
 /// transition instant, 01:00Z, which reads **02:00**, so taking the earlier
 /// instant put a floating 03:00 an hour early (#1579). If neither candidate
@@ -2206,6 +2208,9 @@ pub fn wall_clock_to_unix<Tz: chrono::TimeZone>(
 
     let reads_back = |dt: &chrono::DateTime<Tz>| dt.with_timezone(tz).naive_local() == naive;
     let resolved = match tz.from_local_datetime(&naive) {
+        // Taken as is, even where it does not read back: `Local` answers
+        // `Single(pre-gap offset)` at a gap's first instant, and that instant
+        // is exactly what the gap rule below would return.
         MappedLocalTime::Single(dt) => return Some(dt.timestamp()),
         // The first occurrence is the earlier *instant*, picked by value and
         // not by position. chrono documents the pair as `(earliest, latest)`

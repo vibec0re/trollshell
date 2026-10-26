@@ -123,11 +123,13 @@ chrono = { version = "0.4.44", default-features = false, features = [
   "clock",
   "std",
 ] }
-# Test-only, a dev-dependency of `hytte-services` and `trollshell` (#1554): the
-# IANA zones the local-midnight tests pin a real DST gap and fold against
+# A normal dependency of `hytte-services` since #1588, which resolves a task
+# due's `TZID` with it, and a dev-dependency of `trollshell` (#1554): the IANA
+# zones the local-midnight tests pin a real DST gap and fold against
 # (America/Santiago, America/Havana), so they bite on a UTC CI host without
 # touching the process-wide `TZ`. Already in `Cargo.lock` through
-# `icalendar`'s `chrono-tz` feature, so it adds no resolved package.
+# `icalendar`'s `chrono-tz` feature, with the same default features, so it
+# adds no resolved package.
 chrono-tz = "0.10.4"
 # clap + clap_complete (#1116, kaesaecracker's recommendation on that thread):
 # every binary that parses argv (`hytte-infobroker`, `hytte-plugin-niri-layouts`,

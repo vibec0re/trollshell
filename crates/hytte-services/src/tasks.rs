@@ -877,12 +877,20 @@ fn dpt_to_local(dpt: DatePerhapsTime) -> Option<(DateTime<Local>, bool)> {
 /// - A date-only `DUE` is the first instant of that day,
 ///   [`local_midnight`](crate::calendar::local_midnight): the earlier
 ///   midnight on a fold (Havana's November Sunday), the transition on a gap.
-/// - A floating `DUE`, and a `TZID` one whose zone icalendar cannot resolve,
-///   is read by RFC 5545 §3.3.5's rule, through the same
+/// - A floating `DUE` is read by RFC 5545 §3.3.5's rule, through the same
 ///   [`hytte_ecal::wall_clock_to_unix`] the calendar reads a floating
 ///   `DTSTART` by (#1490): the first occurrence in a fold, the offset before
 ///   the gap in a gap, and at a fold's upper bound the instant that reads it
 ///   (#1579).
+/// - A `TZID` `DUE` is read by that same rule **in its own zone** (#1588),
+///   resolved with chrono-tz the way icalendar's `try_into_utc` resolves it.
+///   That call took `.single()` in the task's zone, so a wall clock in that
+///   zone's fold or gap fell through to the viewer's zone: a `TZID=
+///   America/Chicago` 01:30 on 2026-11-01, viewed from New York, read 05:30Z
+///   instead of 06:30Z (01:30 CDT). Off a transition, the rule's answer is
+///   `.single()`'s, so nothing else moves. A `TZID` chrono-tz does not know (a
+///   Windows zone name, say) is read in the viewer's zone, like a floating
+///   time.
 ///
 /// `None` only when the instant is outside chrono's range.
 fn dpt_to_zone<Tz: TimeZone>(dpt: DatePerhapsTime, tz: &Tz) -> Option<(DateTime<Tz>, bool)> {
@@ -891,10 +899,17 @@ fn dpt_to_zone<Tz: TimeZone>(dpt: DatePerhapsTime, tz: &Tz) -> Option<(DateTime<
         DatePerhapsTime::DateTime(cdt) => match cdt {
             CalendarDateTime::Utc(dt) => Some((dt.with_timezone(tz), false)),
             CalendarDateTime::Floating(naive) => Some((wall_clock_in(tz, naive)?, false)),
-            ref other @ CalendarDateTime::WithTimezone { ref date_time, .. } => other
-                .try_into_utc()
-                .map(|utc| (utc.with_timezone(tz), false))
-                .or_else(|| Some((wall_clock_in(tz, *date_time)?, false))),
+            // The zone is resolved here rather than after `try_into_utc`
+            // answers `None`: that `None` means either "unknown zone" or "a
+            // fold or gap in a known one", so telling them apart would parse
+            // the `TZID` a second time, and leave two rules for one zone.
+            CalendarDateTime::WithTimezone { date_time, tzid } => tzid
+                .parse::<chrono_tz::Tz>()
+                .ok()
+                .and_then(|own| wall_clock_in(&own, date_time))
+                .map(|at| at.with_timezone(tz))
+                .or_else(|| wall_clock_in(tz, date_time))
+                .map(|at| (at, false)),
         },
     }
 }
@@ -1385,5 +1400,388 @@ mod tests {
             assert_eq!(reads, at, "{kind} {at}: reads another wall clock");
         }
         println!("{LOCAL_CHILD_OK}");
+    }
+
+    // ── A resolved `TZID` due on its own zone's transition (#1588) ───────
+    //
+    // icalendar's `try_into_utc` resolves the `TZID` with chrono-tz and then
+    // takes `.single()`, which is `None` when the wall clock happens twice or
+    // never in that zone. These pin that such a due is read by #1490's rule
+    // in the task's own zone, not in the viewer's.
+
+    /// The UTC instant `naive` names in `zone` by `wall_clock_to_unix`'s
+    /// rule, for the fixtures below.
+    fn instant_in<Tz: TimeZone>(zone: &Tz, naive: NaiveDateTime) -> DateTime<chrono::Utc> {
+        wall_clock_in(zone, naive)
+            .expect("an instant")
+            .with_timezone(&chrono::Utc)
+    }
+
+    /// Asserts icalendar gives up on `tzid` at `at` (so the row reaches the
+    /// fold/gap path), and that the viewer's own reading of `at` is not
+    /// `want` (so a due read in the viewer's zone fails the row).
+    fn assert_bites<V: TimeZone>(
+        tzid: &str,
+        at: NaiveDateTime,
+        viewer: &V,
+        want: DateTime<chrono::Utc>,
+    ) {
+        assert_eq!(
+            CalendarDateTime::WithTimezone {
+                date_time: at,
+                tzid: tzid.to_string(),
+            }
+            .try_into_utc(),
+            None,
+            "fixture: icalendar resolves {tzid} {at} by itself"
+        );
+        assert_ne!(
+            instant_in(viewer, at),
+            want,
+            "fixture: the viewer reads {at} as {want} too, so the row cannot tell the zones apart"
+        );
+    }
+
+    /// The issue's example: `TZID=America/Chicago` 01:30 on 2026-11-01 is in
+    /// Chicago's fold, and New York, which falls back at the same wall time,
+    /// has its own fold there. The first Chicago 01:30 is 01:30 CDT, 06:30Z.
+    /// Read in New York's zone it was 05:30Z, an hour early.
+    #[test]
+    fn a_chicago_due_in_its_fold_viewed_from_new_york_is_01_30_cdt() {
+        use chrono::MappedLocalTime;
+        use chrono_tz::America::{Chicago, New_York};
+
+        let at = naive(2026, 11, 1, 1, 30);
+        assert!(
+            matches!(
+                Chicago.from_local_datetime(&at),
+                MappedLocalTime::Ambiguous(..)
+            ),
+            "fixture: Chicago's 01:30 on 2026-11-01 happens twice"
+        );
+        assert_eq!(
+            instant_in(&New_York, at),
+            utc(2026, 11, 1, 5, 30),
+            "fixture: New York's own first 01:30 is 05:30Z"
+        );
+        assert_bites("America/Chicago", at, &New_York, utc(2026, 11, 1, 6, 30));
+        assert_eq!(
+            due_in(with_tzid("America/Chicago", at), &New_York),
+            Some((utc(2026, 11, 1, 6, 30), false))
+        );
+    }
+
+    /// A due in its own zone's fold is that zone's first occurrence, whatever
+    /// zone the viewer is in, including one with no transition that day.
+    #[test]
+    fn a_resolved_tzid_due_in_its_own_fold_is_the_first_occurrence_there() {
+        use chrono::MappedLocalTime;
+        use chrono_tz::America::{Chicago, New_York};
+        use chrono_tz::Asia::Kolkata;
+        use chrono_tz::Australia::Lord_Howe;
+        use chrono_tz::Europe::Berlin;
+
+        for (zone, tzid, at, want) in [
+            // 01:30 CDT, not 01:30 CST (07:30Z).
+            (
+                Chicago,
+                "America/Chicago",
+                naive(2026, 11, 1, 1, 30),
+                utc(2026, 11, 1, 6, 30),
+            ),
+            // 02:30 CEST, not 02:30 CET (01:30Z).
+            (
+                Berlin,
+                "Europe/Berlin",
+                naive(2026, 10, 25, 2, 30),
+                utc(2026, 10, 25, 0, 30),
+            ),
+            // Lord Howe's half-hour fold: 01:45 +11:00, not +10:30 (15:15Z).
+            (
+                Lord_Howe,
+                "Australia/Lord_Howe",
+                naive(2026, 4, 5, 1, 45),
+                utc(2026, 4, 4, 14, 45),
+            ),
+        ] {
+            assert!(
+                matches!(
+                    zone.from_local_datetime(&at),
+                    MappedLocalTime::Ambiguous(..)
+                ),
+                "fixture: {tzid} {at} happens twice"
+            );
+            for viewer in [New_York, Berlin, Kolkata, chrono_tz::UTC] {
+                if viewer == zone {
+                    continue;
+                }
+                assert_bites(tzid, at, &viewer, want);
+                assert_eq!(
+                    due_in(with_tzid(tzid, at), &viewer),
+                    Some((want, false)),
+                    "{tzid} {at} viewed from {viewer}"
+                );
+            }
+            // In its own zone too, where it now reads back as the wall clock.
+            assert_eq!(
+                due_in(with_tzid(tzid, at), &zone),
+                Some((want, false)),
+                "{tzid} {at} viewed from its own zone"
+            );
+            assert_eq!(want.with_timezone(&zone).naive_local(), at, "{tzid} {at}");
+        }
+    }
+
+    /// A due in its own zone's gap is read with that zone's offset before
+    /// the gap (RFC 5545 §3.3.5, #1490), whatever zone the viewer is in.
+    #[test]
+    fn a_resolved_tzid_due_in_its_own_gap_is_read_with_the_offset_before_it() {
+        use chrono::MappedLocalTime;
+        use chrono_tz::America::{Chicago, New_York};
+        use chrono_tz::Asia::Kolkata;
+        use chrono_tz::Australia::Lord_Howe;
+        use chrono_tz::Europe::Berlin;
+
+        for (zone, tzid, at, want) in [
+            // Read at CST −06:00: 03:30 CDT. New York springs forward at the
+            // same wall time, and read there it was 07:30Z.
+            (
+                Chicago,
+                "America/Chicago",
+                naive(2026, 3, 8, 2, 30),
+                utc(2026, 3, 8, 8, 30),
+            ),
+            // Read at CET +01:00: 03:30 CEST.
+            (
+                Berlin,
+                "Europe/Berlin",
+                naive(2026, 3, 29, 2, 30),
+                utc(2026, 3, 29, 1, 30),
+            ),
+            // Lord Howe's half-hour gap, read at +10:30: 02:45 +11:00.
+            (
+                Lord_Howe,
+                "Australia/Lord_Howe",
+                naive(2026, 10, 4, 2, 15),
+                utc(2026, 10, 3, 15, 45),
+            ),
+        ] {
+            assert!(
+                matches!(zone.from_local_datetime(&at), MappedLocalTime::None),
+                "fixture: {tzid} {at} never happens"
+            );
+            for viewer in [New_York, Berlin, Kolkata, chrono_tz::UTC] {
+                if viewer == zone {
+                    continue;
+                }
+                assert_bites(tzid, at, &viewer, want);
+                assert_eq!(
+                    due_in(with_tzid(tzid, at), &viewer),
+                    Some((want, false)),
+                    "{tzid} {at} viewed from {viewer}"
+                );
+            }
+            assert_eq!(
+                due_in(with_tzid(tzid, at), &zone),
+                Some((want, false)),
+                "{tzid} {at} viewed from its own zone"
+            );
+        }
+    }
+
+    /// What a `TZID=<tzid>` due at `at` must resolve to, worked out without
+    /// `wall_clock_to_unix`, and which case that is: icalendar's own answer
+    /// where it has one; else the earlier instant in a fold; else `at` read
+    /// with the offset three hours before it, in a gap (no zone swept here
+    /// changes twice within three hours).
+    fn expected_due<Tz: TimeZone>(
+        tzid: &str,
+        zone: &Tz,
+        at: NaiveDateTime,
+    ) -> (DateTime<chrono::Utc>, &'static str) {
+        use chrono::{MappedLocalTime, Offset as _};
+
+        let icalendar = CalendarDateTime::WithTimezone {
+            date_time: at,
+            tzid: tzid.to_string(),
+        }
+        .try_into_utc();
+        match (icalendar, zone.from_local_datetime(&at)) {
+            (Some(resolved), _) => (resolved, "ordinary"),
+            (None, MappedLocalTime::Ambiguous(a, b)) => {
+                (a.min(b).with_timezone(&chrono::Utc), "fold")
+            }
+            (None, MappedLocalTime::None) => {
+                let before = zone
+                    .offset_from_local_datetime(&(at - Duration::hours(3)))
+                    .single()
+                    .expect("no transition three hours before a gap")
+                    .fix();
+                let read = at.checked_sub_offset(before).expect("in range");
+                (read.and_utc(), "gap")
+            }
+            (None, MappedLocalTime::Single(_)) => {
+                panic!("{tzid} {at}: icalendar gave up on a time that happens once")
+            }
+        }
+    }
+
+    /// Off a transition, a resolved `TZID` due is exactly what icalendar's
+    /// `try_into_utc` resolves, as before #1588; on one, it is the zone's own
+    /// answer. Every 30 minutes of 2026 in six zones, with half-hour and
+    /// southern-hemisphere DST among them, from two viewers.
+    #[test]
+    fn a_resolved_tzid_due_off_a_transition_is_what_icalendar_resolves() {
+        use chrono_tz::America::New_York;
+        use chrono_tz::Asia::Kolkata;
+        use chrono_tz::Tz;
+
+        let (mut ordinary, mut folds, mut gaps) = (0_u32, 0_u32, 0_u32);
+        for tzid in [
+            "America/Chicago",
+            "America/New_York",
+            "Europe/Berlin",
+            "Australia/Lord_Howe",
+            "America/Santiago",
+            "Asia/Kolkata",
+        ] {
+            let zone: Tz = tzid.parse().expect("an IANA zone");
+            let mut at = naive(2026, 1, 1, 0, 0);
+            while at < naive(2027, 1, 1, 0, 0) {
+                let (want, kind) = expected_due(tzid, &zone, at);
+                for viewer in [New_York, Kolkata] {
+                    assert_eq!(
+                        due_in(with_tzid(tzid, at), &viewer),
+                        Some((want, false)),
+                        "{kind}: {tzid} {at} viewed from {viewer}"
+                    );
+                }
+                match kind {
+                    "fold" => folds += 1,
+                    "gap" => gaps += 1,
+                    _ => ordinary += 1,
+                }
+                at += Duration::minutes(30);
+            }
+        }
+        // Two 30-minute slots in each one-hour fold and gap of Chicago, New
+        // York, Berlin and Santiago, one in each of Lord Howe's half-hour
+        // ones, none in Kolkata (tzdb 2025b, chrono-tz 0.10.4).
+        assert_eq!((folds, gaps), (9, 9), "the sweep's folds and gaps");
+        assert_eq!(ordinary, 6 * 365 * 48 - 18, "the sweep's ordinary slots");
+    }
+
+    const TZID_CHILD: &str = "HYTTE_1588_TZID_DUE_LOCAL_CHILD";
+    const TZID_CHILD_OK: &str = "hytte-1588-tzid-due-local-child-reached-the-end";
+
+    /// The same against the real `Local` as the viewer, the zone production
+    /// passes: the answer is the task's own zone's, whatever POSIX `TZ` the
+    /// viewer runs under. This re-execs the test binary with that `TZ`, as
+    /// `a_due_on_a_transition_resolves_in_local` does, so the parallel
+    /// suite's `TZ` is never touched.
+    #[test]
+    fn a_resolved_tzid_due_does_not_depend_on_the_viewers_local_zone() {
+        const NEW_YORK: &str = "EST5EDT,M3.2.0,M11.1.0";
+        const BERLIN: &str = "CET-1CEST,M3.5.0,M10.5.0/3";
+        const UTC: &str = "UTC0";
+        for (viewer, tzid, at, want) in [
+            // The issue's example, then the same due from two other viewers.
+            (
+                NEW_YORK,
+                "America/Chicago",
+                "2026-11-01T01:30:00",
+                "2026-11-01T06:30:00+00:00",
+            ),
+            (
+                BERLIN,
+                "America/Chicago",
+                "2026-11-01T01:30:00",
+                "2026-11-01T06:30:00+00:00",
+            ),
+            (
+                UTC,
+                "America/Chicago",
+                "2026-11-01T01:30:00",
+                "2026-11-01T06:30:00+00:00",
+            ),
+            // Chicago's gap, which New York shares at the same wall time.
+            (
+                NEW_YORK,
+                "America/Chicago",
+                "2026-03-08T02:30:00",
+                "2026-03-08T08:30:00+00:00",
+            ),
+            (
+                BERLIN,
+                "America/Chicago",
+                "2026-03-08T02:30:00",
+                "2026-03-08T08:30:00+00:00",
+            ),
+            // Berlin's fold and gap, from a viewer with no transition then.
+            (
+                NEW_YORK,
+                "Europe/Berlin",
+                "2026-10-25T02:30:00",
+                "2026-10-25T00:30:00+00:00",
+            ),
+            (
+                NEW_YORK,
+                "Europe/Berlin",
+                "2026-03-29T02:30:00",
+                "2026-03-29T01:30:00+00:00",
+            ),
+            // An ordinary day, unchanged.
+            (
+                NEW_YORK,
+                "America/Chicago",
+                "2026-07-22T09:00:00",
+                "2026-07-22T14:00:00+00:00",
+            ),
+            (
+                BERLIN,
+                "America/Chicago",
+                "2026-07-22T09:00:00",
+                "2026-07-22T14:00:00+00:00",
+            ),
+        ] {
+            let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "--nocapture",
+                    "--test-threads=1",
+                    "tasks::tests::tzid_due_local_child",
+                ])
+                .env("TZ", viewer)
+                .env(TZID_CHILD, format!("{tzid} {at} {want}"))
+                .output()
+                .expect("re-exec the test binary");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.contains(TZID_CHILD_OK),
+                "TZ={viewer} TZID={tzid} {at}:\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    /// The child half of the test above; a no-op outside its child.
+    #[test]
+    fn tzid_due_local_child() {
+        let Ok(arg) = std::env::var(TZID_CHILD) else {
+            return;
+        };
+        let mut args = arg.split(' ');
+        let (Some(tzid), Some(at), Some(want)) = (args.next(), args.next(), args.next()) else {
+            panic!("`<tzid> <wall clock> <want>`: {arg}");
+        };
+        let at: NaiveDateTime = at.parse().expect("a wall clock");
+        let (due, all_day) = dpt_to_local(with_tzid(tzid, at)).expect("the due date is kept");
+        assert_eq!(
+            due.with_timezone(&chrono::Utc).to_rfc3339(),
+            want,
+            "TZID={tzid} {at}"
+        );
+        assert!(!all_day, "TZID={tzid} {at}");
+        println!("{TZID_CHILD_OK}");
     }
 }

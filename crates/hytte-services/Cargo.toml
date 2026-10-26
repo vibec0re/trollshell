@@ -27,6 +27,12 @@ anyhow.workspace = true
 # resolves a package. `hytte-sensors` takes the baseline alone.
 nix = { workspace = true, features = ["signal", "poll"] }
 chrono.workspace = true
+# Resolves a task due's `TZID` to its own zone, so a wall clock inside that
+# zone's DST fold or gap is read there and not in the viewer's (#1588; see
+# `tasks::dpt_to_zone`). Also the IANA zones `calendar::local_midnight`'s DST
+# tests pin against (#1554). The same crate and features as `icalendar`'s
+# `chrono-tz` edge, so it adds no resolved package and changes no feature set.
+chrono-tz.workspace = true
 futures-channel.workspace = true
 futures-signals.workspace = true
 futures-util = { workspace = true, features = ["std"] }
@@ -95,8 +101,6 @@ wayland-client = "0.31.10"
 wayland-protocols = { version = "0.32.13", features = ["staging", "client"] }
 
 [dev-dependencies]
-# Real IANA zones for `calendar::local_midnight`'s DST gap/fold tests (#1554).
-chrono-tz.workspace = true
 futures-executor.workspace = true
 # `hytte-config`'s `test_support` (#1044): `scratch_home`, the one helper that
 # keeps a path-resolving test out of the real `~/.config/trollshell` and

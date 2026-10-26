@@ -1,6 +1,7 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use hytte::futures_signals::signal::Signal;
 use hytte::gtk::{self, prelude::*};
@@ -10,6 +11,65 @@ use hytte::services::niri;
 use crate::components::chip::wire_scroll;
 use crate::components::diff::{DiffOp, plan_diff};
 use crate::components::focus::{FocusTarget, yield_to_niri_focus};
+
+/// How long the strip steps from its **own** last scroll request rather than
+/// from the active workspace niri reports.
+///
+/// Every notch used to step from the list's `is_active` pill, and that list
+/// only moves once niri has answered the `focus_workspace` and its event has
+/// come back round. A fast flick lands several notches before that — GDK
+/// compresses a burst into one `scroll` with `|dy| > 1`, so they can even
+/// arrive inside a single callback — and every one of them computed the same
+/// "active + 1", so N notches moved one workspace. Inside this window a notch
+/// steps from the workspace the strip last asked for instead: the shape of the
+/// brightness chip's `pending` (#1495).
+///
+/// The hold rarely runs out in practice, because the binding clears the
+/// pending request the moment niri reports it active ([`bind_workspace_pills`]).
+/// It is the fallback for when niri never does — the workspace vanished, or a
+/// keybind went elsewhere mid-burst — after which niri's active workspace is
+/// the base again. A second is a long time next to an IPC round trip and
+/// still shorter than a deliberate "scroll again".
+const SCROLL_HOLD: Duration = Duration::from_secs(1);
+
+/// The workspace this strip's last scroll notch asked niri to focus, and when.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingFocus {
+    id: u64,
+    at: Instant,
+}
+
+/// The workspace one scroll notch should focus, or `None` to send nothing (the
+/// notch would step past either end; the strip clamps rather than wraps).
+///
+/// `ids` is this output's workspaces in order, `active` the index of niri's
+/// active one, `direction` [`wire_scroll`]'s `±1.0` (positive = scroll down =
+/// the next workspace). The base is the strip's own `pending` request while it
+/// is fresh and still in the list, else `active`. Compared against the *base*,
+/// not `active`: with niri still on its way to workspace 3, a notch back to 2
+/// must be sent even though 2 is what niri reports active.
+fn scroll_step(
+    ids: &[u64],
+    active: Option<usize>,
+    pending: Option<PendingFocus>,
+    now: Instant,
+    direction: f64,
+) -> Option<u64> {
+    let from_pending = pending
+        .filter(|p| now.saturating_duration_since(p.at) < SCROLL_HOLD)
+        .and_then(|p| ids.iter().position(|&id| id == p.id));
+    let base = from_pending.or(active)?;
+    let last = ids.len().checked_sub(1)?;
+    let next = if direction > 0.0 {
+        (base + 1).min(last)
+    } else {
+        base.saturating_sub(1)
+    };
+    if next == base {
+        return None;
+    }
+    ids.get(next).copied()
+}
 
 pub fn widget(monitor: &Monitor) -> gtk::Widget {
     let container = gtk::Box::new(gtk::Orientation::Horizontal, 4);
@@ -43,33 +103,37 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     // of tearing the whole strip down and rebuilding it (#229).
     let button_map: Rc<RefCell<HashMap<u64, gtk::Button>>> = Rc::new(RefCell::new(HashMap::new()));
 
-    bind_workspace_pills(&container, signal, &current_workspaces, &button_map);
+    // The strip's own last scroll request, until niri reports it active
+    // (`SCROLL_HOLD`). Shared with the binding, which is what clears it.
+    let pending: Rc<Cell<Option<PendingFocus>>> = Rc::new(Cell::new(None));
+
+    bind_workspace_pills(
+        &container,
+        signal,
+        &current_workspaces,
+        &button_map,
+        &pending,
+    );
 
     // Scroll over the pill strip to cycle the active workspace on this
     // monitor. Steps relative to the *active* workspace on this output —
     // not the globally-focused one, since focus can currently be on another
-    // monitor while this strip still shows its own active pill — and clamps
-    // at both ends rather than wrapping.
+    // monitor while this strip still shows its own active pill — or to the
+    // strip's own unanswered request (`scroll_step`), and clamps at both ends
+    // rather than wrapping.
     let container_for_scroll = container.clone();
     let current_workspaces_for_scroll = Rc::clone(&current_workspaces);
     wire_scroll(&container, move |direction| {
-        let list = current_workspaces_for_scroll.borrow();
-        if list.is_empty() {
-            return;
-        }
-        let Some(current_idx) = list.iter().position(|ws| ws.is_active) else {
+        let (ids, active) = {
+            let list = current_workspaces_for_scroll.borrow();
+            let ids: Vec<u64> = list.iter().map(|ws| ws.id).collect();
+            (ids, list.iter().position(|ws| ws.is_active))
+        };
+        let now = Instant::now();
+        let Some(id) = scroll_step(&ids, active, pending.get(), now, direction) else {
             return;
         };
-        let new_idx = if direction > 0.0 {
-            (current_idx + 1).min(list.len() - 1)
-        } else {
-            current_idx.saturating_sub(1)
-        };
-        if new_idx == current_idx {
-            return;
-        }
-        let id = list[new_idx].id;
-        drop(list);
+        pending.set(Some(PendingFocus { id, at: now }));
         niri::focus_workspace(id);
         yield_to_niri_focus(&container_for_scroll, FocusTarget::WorkspaceSwitch);
     });
@@ -81,6 +145,13 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
 /// `button_map`, and keep `current_workspaces` in step so the scroll handler
 /// can find prev/next without re-deriving the per-monitor filter.
 ///
+/// Also clears the scroll handler's `pending` request once niri reports that
+/// workspace active — niri has caught up, so the next notch steps from what is
+/// on screen again. Only *that* answer clears it: an emission for a workspace
+/// an earlier notch of the same burst asked for is niri still on its way, and
+/// dropping the request then would base the next notch on a workspace already
+/// left behind, losing a step.
+///
 /// Split out of [`widget`] so this `bind` call site's `WeakRef` contract
 /// (#224, `hytte-reactive/src/bind.rs:16-22`) can be driven with a synthetic
 /// signal in tests, the same extraction #772 made for its four sites. The
@@ -91,15 +162,24 @@ fn bind_workspace_pills<S>(
     signal: S,
     current_workspaces: &Rc<RefCell<Vec<niri::Workspace>>>,
     button_map: &Rc<RefCell<HashMap<u64, gtk::Button>>>,
+    pending: &Rc<Cell<Option<PendingFocus>>>,
 ) where
     S: Signal<Item = Vec<niri::Workspace>> + 'static,
 {
     let current_workspaces_for_bind = Rc::clone(current_workspaces);
     let button_map = button_map.clone();
+    let pending = Rc::clone(pending);
     bind(signal, container, move |container, workspaces| {
         current_workspaces_for_bind
             .borrow_mut()
             .clone_from(&workspaces);
+        if let Some(asked) = pending.get()
+            && workspaces
+                .iter()
+                .any(|ws| ws.is_active && ws.id == asked.id)
+        {
+            pending.set(None);
+        }
 
         update_workspaces(container, &button_map, &workspaces);
     });
@@ -407,7 +487,13 @@ mod tests {
         let current: WorkspaceList = Rc::new(RefCell::new(Vec::new()));
         let map: ButtonMap = Rc::new(RefCell::new(HashMap::new()));
         let workspaces: Mutable<Vec<niri::Workspace>> = Mutable::new(Vec::new());
-        super::bind_workspace_pills(&container, workspaces.signal_cloned(), &current, &map);
+        super::bind_workspace_pills(
+            &container,
+            workspaces.signal_cloned(),
+            &current,
+            &map,
+            &Rc::new(Cell::new(None)),
+        );
         pump();
 
         workspaces.set(vec![ws(1, 1)]);
@@ -440,7 +526,13 @@ mod tests {
         let current: WorkspaceList = Rc::new(RefCell::new(Vec::new()));
         let map: ButtonMap = Rc::new(RefCell::new(HashMap::new()));
         let workspaces: Mutable<Vec<niri::Workspace>> = Mutable::new(vec![ws(1, 1)]);
-        super::bind_workspace_pills(&container, workspaces.signal_cloned(), &current, &map);
+        super::bind_workspace_pills(
+            &container,
+            workspaces.signal_cloned(),
+            &current,
+            &map,
+            &Rc::new(Cell::new(None)),
+        );
         pump();
 
         // The pills are children of the container; a GTK child holds no
@@ -462,5 +554,129 @@ mod tests {
         // a dead weak ref: `bind` upgrades, gets `None`, and breaks its loop.
         workspaces.set(vec![ws(2, 2)]);
         pump();
+    }
+
+    /// The scroll handler's unanswered request is cleared by niri's answer
+    /// **to it**, and by nothing earlier: an emission activating a workspace
+    /// an earlier notch of the burst asked for is niri on its way, not there.
+    ///
+    /// **Falsification:** clear `pending` on every emission → the first
+    /// assertion reds; delete the clearing → the second does.
+    #[gtk::test]
+    fn the_binding_clears_a_scroll_request_once_niri_reports_it_active() {
+        use super::PendingFocus;
+        use std::time::Instant;
+
+        let active = |id: u64, idx: u8| niri::Workspace {
+            is_active: true,
+            ..ws(id, idx)
+        };
+        let container = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        let current: WorkspaceList = Rc::new(RefCell::new(Vec::new()));
+        let map: ButtonMap = Rc::new(RefCell::new(HashMap::new()));
+        let pending = Rc::new(Cell::new(None));
+        let workspaces: Mutable<Vec<niri::Workspace>> =
+            Mutable::new(vec![active(1, 1), ws(2, 2), ws(3, 3)]);
+        super::bind_workspace_pills(
+            &container,
+            workspaces.signal_cloned(),
+            &current,
+            &map,
+            &pending,
+        );
+        pump();
+
+        // Two notches down: the strip has asked for 3; niri answers the first.
+        let asked = PendingFocus {
+            id: 3,
+            at: Instant::now(),
+        };
+        pending.set(Some(asked));
+        workspaces.set(vec![ws(1, 1), active(2, 2), ws(3, 3)]);
+        pump();
+        assert_eq!(
+            pending.get(),
+            Some(asked),
+            "niri reaching the first notch's workspace is not an answer to the second"
+        );
+
+        workspaces.set(vec![ws(1, 1), ws(2, 2), active(3, 3)]);
+        pump();
+        assert_eq!(pending.get(), None, "niri reached the request: cleared");
+    }
+}
+
+/// [`scroll_step`]'s arithmetic — hermetic, no GTK.
+#[cfg(test)]
+mod scroll_tests {
+    use super::{PendingFocus, SCROLL_HOLD, scroll_step};
+    use std::time::{Duration, Instant};
+
+    const DOWN: f64 = 1.0;
+    const UP: f64 = -1.0;
+    const IDS: [u64; 5] = [10, 20, 30, 40, 50];
+
+    /// Feed `notches` through `scroll_step` the way the handler does — each
+    /// request becomes the next notch's `pending` — with niri answering none of
+    /// them, and return every id sent.
+    fn burst(active: usize, notches: &[f64], start: Instant) -> Vec<u64> {
+        let mut pending = None;
+        let mut sent = Vec::new();
+        for (i, &direction) in notches.iter().enumerate() {
+            let now = start + Duration::from_millis(10 * u64::try_from(i).unwrap());
+            if let Some(id) = scroll_step(&IDS, Some(active), pending, now, direction) {
+                pending = Some(PendingFocus { id, at: now });
+                sent.push(id);
+            }
+        }
+        sent
+    }
+
+    /// A three-notch flick before niri answers moves three workspaces. Each
+    /// notch used to step from the same `is_active` pill, so all three sent
+    /// workspace 20.
+    ///
+    /// **Falsification:** ignore `pending` in `scroll_step` → `[20, 20, 20]`.
+    #[test]
+    fn a_fast_flick_moves_one_workspace_per_notch() {
+        assert_eq!(burst(0, &[DOWN, DOWN, DOWN], Instant::now()), [20, 30, 40]);
+    }
+
+    /// Steps past the last workspace send nothing; the strip clamps.
+    #[test]
+    fn a_burst_clamps_at_the_end() {
+        assert_eq!(burst(3, &[DOWN, DOWN, DOWN], Instant::now()), [50]);
+        assert_eq!(burst(1, &[UP, UP, UP], Instant::now()), [10]);
+    }
+
+    /// A reversal inside a burst steps back from the request, not from the
+    /// active workspace — so it is sent even when it lands on the workspace
+    /// niri still reports active.
+    #[test]
+    fn a_reversal_steps_back_from_the_request() {
+        assert_eq!(burst(0, &[DOWN, DOWN, UP], Instant::now()), [20, 30, 20]);
+        assert_eq!(burst(0, &[DOWN, UP], Instant::now()), [20, 10]);
+    }
+
+    /// Past the hold, or once the requested workspace is gone, niri's active
+    /// workspace is the base again.
+    #[test]
+    fn a_stale_or_vanished_request_falls_back_to_the_active_workspace() {
+        let then = Instant::now();
+        let stale = Some(PendingFocus { id: 40, at: then });
+        assert_eq!(
+            scroll_step(&IDS, Some(0), stale, then + SCROLL_HOLD, DOWN),
+            Some(20)
+        );
+        let gone = Some(PendingFocus { id: 99, at: then });
+        assert_eq!(scroll_step(&IDS, Some(0), gone, then, DOWN), Some(20));
+    }
+
+    /// No workspaces, or none active and nothing pending: nothing to step from.
+    #[test]
+    fn nothing_to_step_from_sends_nothing() {
+        let now = Instant::now();
+        assert_eq!(scroll_step(&[], None, None, now, DOWN), None);
+        assert_eq!(scroll_step(&IDS, None, None, now, DOWN), None);
     }
 }

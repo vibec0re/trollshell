@@ -113,6 +113,56 @@ range above is a floor, not a ceiling.
       `screensaver: owner absent at reconcile, dropping Inhibit cookie` at
       `RUST_LOG=hytte_services=debug`. Before this change it stayed until the
       shell restarted.
+- [ ] **(#1476)** A resume during an in-flight dim restores the backlight.
+      Native idle dim (`brightnessctl -s set 10%`, restore with `-r`).
+  1. Leave the seat idle past 240 s: the backlight dims to 10 %. Move the
+     mouse: it returns to the level it had before. Do it twice in a row. The
+     second restore must also go to the original level, never to 10 %.
+  2. With "Keep awake" on, idle past 240 s: no dim, and moving the mouse does
+     not change the brightness.
+  3. Optional, to widen the race: run with
+     `RUST_LOG=hytte_services::idle_notify=info`, sit still until just before
+     240 s, and move the mouse as the dim lands. If the resume lands while
+     `brightnessctl` runs, the journal shows `the seat resumed while the native dim ran; restoring the backlight now` and the screen comes back. If it lands
+     during the logind inhibitor check, the journal shows `native dim dropped`
+     and the screen never dims. Either way it must not stay at 10 %.
+- [ ] **(#1496)** A failed fullscreen `Inhibit(idle)` is retried while the hold
+      is still wanted.
+  1. Fullscreen a video. `systemd-inhibit --list` shows trollshell's `idle`
+     inhibitor, and the Power drawer lists "Fullscreen".
+  2. Make the call fail: start fullscreen while the system bus refuses it, or
+     run `systemctl restart systemd-logind` inside the window. The journal
+     shows one `Inhibit(idle) failed; retrying` warning, then a "succeeded
+     after retrying" line, and the inhibitor appears without leaving
+     fullscreen.
+  3. Leave fullscreen during the backoff. No inhibitor is taken afterwards,
+     and no further attempts appear at debug level.
+  4. Turn "Keep awake when fullscreen" off and on during the backoff. The
+     hold ends up matching the switch.
+
+## Power drawer: brightness and battery
+
+- [ ] **(#1495)** The brightness slider and chip are drag-safe, coalesced and
+      share one floor.
+  1. Power drawer: drag the brightness slider slowly, then quickly. The thumb
+     stays under the pointer, and the backlight ends at the release position.
+  2. Brightness chip: flick five notches up within a second. It moves about
+     25 %, and the OSD and the drawer percentage agree within about a second.
+  3. Chip: scroll down past the bottom. It stops at 5 % with the panel
+     visibly lit, and one notch up gives 10 %.
+  4. Change brightness with the Fn keys, wait two seconds, then scroll the
+     chip. It steps from the Fn-key level.
+  5. On a box with more than one `/sys/class/backlight` entry: the same device
+     is driven across restarts. Use `RUST_LOG=hytte_services=debug`, or watch
+     which `brightness` file changes.
+- [ ] **(#1493)** UPower's low-battery baseline is seeded from the first
+      loaded `WarningLevel`.
+  1. With the battery below UPower's low threshold (or `WarningLevel` = 3 on a
+     test box), restart `trollshell`. No "Battery low" toast.
+  2. Unplug at a healthy charge and let it drain past the low threshold. One
+     "Battery low" toast with a real percentage.
+  3. Plug in, then unplug again while still Low. One fresh toast.
+  4. `systemctl restart upower` while Low. No toast.
 
 ## Plugin host & protocol
 
@@ -1498,6 +1548,16 @@ four window properties below are pinned nowhere but here.
       drawer, then a sidebar card's page on the same screen. `Esc` must close
       **only** the dialog, and it takes two outside clicks to reach the desktop
       (the dialog's catcher, then the drawer's).
+- [ ] **(#1482)** A resolved consent card releases its slot, so plugin dialogs
+      are not refused for the rest of the session.
+  1. Trigger one consent card (for example an infobroker knock) and answer it,
+     or let it time out. Then click a sidebar plugin card (clock-demo's
+     sidebar card): its page dialog opens. Before the fix it was refused for
+     the rest of the session.
+  2. Raise two consent knocks back to back so the second supersedes the first.
+     After about 60 s, no `Deny` for the first request appears in the
+     infobroker's journal or in `hytte-infobroker grants`. The first
+     requester gets its own transient timeout instead.
 
 ## Plugins & launcher
 
@@ -1882,6 +1942,17 @@ four window properties below are pinned nowhere but here.
      10 s later. On `main` it logs "plugin launch failed … already loaded or
      has a fragment file" and the unit stays down.
   3. Clean up: remove `stuck` and rebuild.
+- [ ] **(#1516)** A niri-layouts reflow that fails partway puts the column and
+      focus back. Needs two outputs (DP-1 and DP-2 below).
+  1. Focus a window on DP-1, then click a layout chip on DP-2. DP-2's columns
+     are re-laid out, and focus returns to the DP-1 window.
+  2. Focus an **empty** workspace on DP-1, then click a chip on DP-2. Focus
+     returns to DP-1's empty workspace. **Note whether the cursor jumps to
+     DP-1.** That is an open design call on the PR.
+  3. Apply a layout from the drawer page with a middle column active. The
+     middle column is active again afterwards.
+  4. With `workspace-auto-back-and-forth` enabled, apply from a chip on the
+     focused screen. You stay on the same workspace.
 
 ## Infobroker
 
@@ -2071,6 +2142,20 @@ title` in the stderr tail — worth a deliberate look on first run, since
      `plugin::tests::a_wedged_poll_drops_its_meters_past_the_staleness_ceiling`)
      cover the ceiling directly with an injected `at`. There is no live step
      for it.
+- [ ] **(#1481)** The backing `claude` runs with no tools, no MCP servers and
+      no slash commands, and the response write is bounded.
+  1. Deploy and restart the `claude-bridge` plugin unit. Confirm it still
+     serves: poke the pet and wait for a caw briefing.
+  2. While a turn is in flight, run `pgrep -af -- '--disable-slash-commands'`.
+     The child's argv contains
+     `--strict-mcp-config --tools  --disable-slash-commands` (hive-claude's
+     emit order). The empty `--tools` value shows as a double space.
+  3. Ask for something that needs a tool:
+     `curl --unix-socket "$XDG_RUNTIME_DIR/trollshell/claude-bridge.sock" -s localhost/v1/chat/completions -H 'content-type: application/json' -d '{"messages":[{"role":"user","content":"List the files in your working directory using your tools."}]}'`.
+     Expect a plain-text answer and no new file or command activity in
+     `$XDG_STATE_HOME/hytte-claude-bridge`.
+  4. Optional: `journalctl --user -u trollshell-plugin-claude-bridge` shows no
+     new errors on the first resumed turn of an existing conversation.
 
 ## Caw (morning briefing)
 
@@ -2974,6 +3059,38 @@ node is negotiated, so an older shell gets `Progress` bars instead of lines
      titles therefore ellipsize slightly sooner than before #851. Tunable,
      but only by re-coupling the widget to its neighbours, which is the thing
      that failed four times.
+- [ ] **(#1468)** The MPRIS bar chip hides while the player is stopped with no
+      title. Needs a real MPRIS player.
+  1. Stop a player that reports no title (or whitespace only): the chip
+     disappears.
+  2. Play, then pause: the chip returns and stays, even with an empty title.
+  3. A stopped player that still has a title keeps the chip showing.
+- [ ] **(#1504)** Seek-bar drags defer a suppressed value instead of dropping
+      it. Media drawer.
+  1. Playing track: drag the seek bar. It does not fight the poller, and on
+     release the thumb settles onto the player's position (#445 behaviour,
+     unchanged).
+  2. **Paused** player: start a seek drag and, while holding it, skip the
+     track from another client (`playerctl next`). Release. Within about
+     0.6 s the bar shows the new track's position. Before this change it
+     stayed where you dropped it.
+  3. Start a seek drag and press Esc while still holding the button (the
+     drawer closes). Reopen the drawer: the bar follows the poller again.
+     Before this change it froze until restart.
+  4. While dragging with the primary button, click the secondary button. The
+     thumb does not jump back to the poller mid-drag.
+- [ ] **(#1505)** Cover-art fetches land only on the URL they were for, and
+      are bounded.
+  1. Play a playlist whose tracks have distinct `https://` art. Skip several
+     tracks quickly: the cover always ends on the art of the track that is
+     playing.
+  2. Skip to a track with no `xesam:artUrl` (local files often have none): the
+     placeholder shows, not the previous cover.
+  3. Close the player so the page shows "No player", then reopen it on the
+     same track: the cover comes back.
+  4. Optional: point a player's art URL at a host that accepts and never
+     answers (`nc -l 8000`). The page keeps the previous cover for about 10 s
+     and then shows the placeholder. Nothing else in the shell stalls.
 
 ## Preem raster kit (`hytte-plugin::preem`)
 
@@ -4244,6 +4361,22 @@ control-center's Plugins tab).
       bar instance also running (`mount = "BarCenter"`, see
       `docs/plugin-env.md`), its chip is unchanged and its click opens the
       **same** page, in the drawer.
+- [ ] **(#1543)** GL handle teardown and build refusals on a real GPU driver.
+      CI covers this only under llvmpipe, so run it once on the laptop's real
+      driver. _Steps reconstructed from the PR text._
+  1. Start the shell with several preem surfaces on screen (the sidebar clock
+     and stats cards, a bar chip). Open and close a drawer or dialog that
+     holds a preem widget, and hot-plug or switch an output so surfaces
+     unrealize and realize. No other preem widget goes blank or garbled when
+     one is torn down. This is the cross-context delete the fix guards.
+  2. `journalctl --user -u trollshell -b | grep -i leak`: at most a rare first
+     warning from the new context check. It must not repeat per frame or per
+     resize.
+  3. Use a plugin that asks for a data strip larger than the driver's
+     `GL_MAX_TEXTURE_SIZE` (the wire cap is 16384, and many drivers stop at
+     8192 or 4096). Only that widget is blank. Other widgets of the same kind
+     (every dot matrix, or every marquee) keep drawing, and the journal does
+     not say "this driver will not build that preem GL pipeline".
 
 ## Bar chip geometry (#1387)
 
@@ -4291,6 +4424,24 @@ control-center's Plugins tab).
       from the systemd-user PATH (e.g. a deploy predating #458's provisioning)
       — expect a **Critical-urgency toast** naming exactly what's missing
       ("slurp isn't installed or isn't on PATH"), not silent nothing.
+- [ ] **(#1500)** The recorder runs in its own user unit, so a shell restart
+      keeps recording.
+  1. Record a region, then `systemctl --user restart trollshell`. The
+     recording keeps going (`systemctl --user status trollshell-recorder.service`),
+     and the chip comes back showing it with the right elapsed time.
+  2. Stop from the chip. The "Recording saved" toast names the file, and it
+     plays. This also confirms that real `wf-recorder` exits 0 on SIGINT.
+     If it does not, every Stop toasts "failed".
+  3. Record, then crash the shell (`systemctl --user kill -s SEGV trollshell`)
+     and let `Restart=on-failure` bring it back. Stop. Same result as step 2.
+  4. Log out mid-recording. `trollshell-recorder.service` stops with the
+     session, and the file plays.
+  5. Make a recording fail
+     (`systemctl --user kill -s KILL trollshell-recorder.service`). A
+     "Recording failed" toast appears, no "saved" toast, and
+     `systemctl --user --failed` does not list the unit afterwards.
+  6. Without a user manager (for example `env -u DBUS_SESSION_BUS_ADDRESS` in a
+     dev loop), recording still works as a direct child.
 
 ## Shell chrome (regression-only, pixel-identical refactors)
 
@@ -4404,6 +4555,37 @@ control-center's Plugins tab).
       height. Any visible change here (a thinner line, a different colour, a
       collapsed row) means the shell's override did not load, not that the
       library default is wrong.
+- [ ] **(#1512)** The OSD stays quiet only under the page that shows the
+      control. Niri session.
+  1. Open the **Calendar** drawer, then press the volume, mic-mute and
+     brightness keys. The OSD shows each time. Before the fix it was silent.
+  2. Open the **Audio** drawer and drag the output slider, or press the volume
+     keys. No OSD. Same for the mic. Brightness keys still show the OSD there.
+  3. Open the **Power** drawer and press the brightness keys. No OSD. Volume
+     keys still show the OSD there.
+  4. With any drawer open, trigger a leave-by nudge (departures plugin, arm a
+     train). It shows. The battery OSD is hard to provoke on purpose, and a
+     hermetic test pins it.
+  5. Restart `trollshell` (`systemctl --user restart trollshell`) a few times.
+     No volume, mic or brightness OSD flashes at startup.
+  6. Unplug the default sink (USB or BT headset). No "0 %" volume OSD. A direct
+     default switch still shows the new sink's volume, as before.
+  7. Hot-plug or kanshi-switch with the Audio drawer open, then press the
+     volume keys on that output. The OSD shows (#618 still holds).
+- [ ] **(#1513)** A retracting drawer takes the closed arm of a chip toggle.
+      Niri session.
+  1. Open a drawer from a chip and close it with `Esc`. Within about 0.2 s,
+     click the same chip. On niri the catcher may take this click, which is
+     fine. If the chip gets it, the drawer slides back out instead of staying
+     shut.
+  2. Same, but click a _different_ chip within the retract. If the chip gets
+     the click, the new page opens under that chip and stays open. It does not
+     vanish with the closing drawer.
+  3. A bar plugin chip whose click opens its own page (for example the stats
+     bar): close its page and click the chip again straight away. The page
+     reopens.
+  4. A normal open, close and swap between two pages with the drawer fully
+     open are unchanged.
 
 ## Stats drawer
 
@@ -4766,6 +4948,18 @@ sudo mount -o loop /tmp/lv.img /mnt`. With the Stats drawer open on the
   - **Quiet journal.** `journalctl --user -u trollshell -b | grep -i mountinfo`
     is empty: neither `failed to open mountinfo for watch` nor
     `mountinfo poll error, exiting watcher` should appear.
+- [ ] **(#1501)** The failed-units chip tracks units that fail or clear with no
+      job.
+  1. Make a system unit fail with no job:
+     `sudo systemd-run --unit=ts-crash -p Restart=no sh -c 'sleep 2; exit 3'`.
+     The chip shows `ts-crash.service` within a second of the exit.
+  2. `sudo systemctl reset-failed ts-crash.service`. The chip clears within a
+     second.
+  3. `sudo systemctl daemon-reload` with a failed unit present. The chip does
+     not flicker, and the journal shows one refresh, not hundreds
+     (`RUST_LOG=hytte_services=debug`).
+  4. Make `hytte-bus` reconnect to the system bus (suspend and resume, for
+     example), then crash a unit as in step 1. It still shows up.
 
 ## Weather & location
 
@@ -4835,6 +5029,52 @@ color-scheme` → `'prefer-light'`), open the Settings drawer: the "Dark
       still expires normally, a plain hover still pauses and resumes with
       the remainder, and two monitors showing the same toast only resume on
       the last leave.
+- [ ] **(#1480)** Six notification-daemon spec edges. Needs `notify-send`,
+      `gdbus` and `dbus-monitor`.
+  1. `notify-send "Tom & Jerry" "Fish & Chips"` and
+     `notify-send "<b>hi</b>" "<i>there</i>"`, then open the notifications
+     drawer. Both history rows show the text exactly as sent, and
+     `journalctl --user -u trollshell` has no
+     `Failed to set text … from markup` line.
+  2. `notify-send t "errors < 5 in foo.rs"` shows the whole body in the toast
+     and in history. `notify-send t '<b>Tom &amp; Jerry</b> it&#39;s'` shows
+     `Tom & Jerry it's`.
+  3. A `replaces_id` that names nothing live gets a fresh id:
+     `gdbus call --session --dest org.freedesktop.Notifications --object-path /org/freedesktop/Notifications --method org.freedesktop.Notifications.Notify app 5000 '' bogus 'replaces 5000' '[]' '{}' -1`
+     returns a fresh id, not 5000.
+     `id=$(notify-send -p a); notify-send -r "$id" b` still updates in place
+     and returns `$id`.
+  4. The 1.1 `image_data` hint is honoured:
+     `gdbus call --session --dest org.freedesktop.Notifications --object-path /org/freedesktop/Notifications --method org.freedesktop.Notifications.Notify app 0 firefox img 'spec 1.1 image_data' '[]' "{'image_data': <(1, 1, 4, true, 8, 4, [byte 0xff, 0x00, 0x00, 0xff])>}" -1`
+     shows the red pixel, not the firefox icon.
+  5. Start
+     `dbus-monitor "interface='org.freedesktop.Notifications',member='NotificationClosed'" &`.
+     `CloseNotification 999` (the same `gdbus` call with that method) emits
+     nothing, and the call still returns `()`. `notify-send -p -t 0 x`, then
+     `CloseNotification <id>` twice, emits exactly one
+     `NotificationClosed(<id>, 3)`.
+  6. The timing is probabilistic by nature:
+     `for i in $(seq 20); do id=$(notify-send -p -t 1000 a); sleep 0.999; notify-send -r "$id" -t 5000 "b $i"; sleep 6; done`.
+     Every `b` stays up for about 5 s. Also rest the pointer on a toast just as
+     it is about to expire. It stays.
+- [ ] **(#1535)** Every emission reaches every toast surface, and DND/mute
+      share one backlog set. Needs two outputs. _Steps reconstructed from the
+      PR text; nobody has run this on two outputs yet._
+  1. Show a toast on output A (`notify-send -t 0 x`), move focus to output B,
+     then dismiss it (let it expire, or replace it with a short-lived one).
+     The card on A goes away without waiting for focus to return. Before the
+     fix it stayed up and clicking it did nothing.
+  2. Turn DND on with output A focused and send a notification (suppressed).
+     Move focus to B and turn DND off. The backlog does not pop up on B.
+     Repeat with muting and then unmuting an app.
+  3. Hot-plug or kanshi-switch an output while DND is on, then turn DND off.
+     The backlog still does not appear.
+  4. With a toast showing, change focus to the other output. The toast shows
+     on both outputs briefly and drops from both when it ends. A hovered toast
+     on the unfocused output is not unmapped under the pointer, and its
+     countdown still renews.
+  5. With more toasts than fit, move focus away: the old output's "+N more"
+     card disappears at the next emission instead of keeping a stale count.
 
 ## D-Bus name ownership
 
@@ -5076,6 +5316,54 @@ color-scheme` → `'prefer-light'`), open the Settings drawer: the "Dark
       stays on screen**, and it still joins when submitted. Before the fix the
       cancel drained every waiter and cleared the prompt, so the Wi-Fi join
       failed too.
+- [ ] **(#1492)** The iwd agent re-registers when iwd changes hands, and
+      `Network.Connect` outlasts the passphrase prompt. Needs an iwd host.
+  1. Join a new WPA network and wait more than 30 s before typing the
+     passphrase. No toast appears while the prompt is open, and it connects
+     once you submit.
+  2. `sudo kill -9 $(pidof iwd)` and let systemd restart it
+     (`Restart=on-failure`). The panel clears briefly and then comes back. The
+     journal shows "iwd changed hands" and then "hytte iwd agent registered".
+     Joining a network that needs a passphrase then raises the prompt instead
+     of failing with `NoAgent`.
+  3. `systemctl restart iwd`: same recovery.
+  4. `systemctl stop iwd` with the shell running. iwd stays stopped (check
+     `systemctl status iwd` after a minute) and the panel shows no station.
+     `systemctl start iwd` brings it back, agent included.
+- [ ] **(#1507)** The secret prompt's form goes with its window and is wiped
+      on unmap.
+  1. Wi-Fi connect to a PSK network: the prompt shows, typing enables Connect,
+     Enter or Connect submits, and the window closes when NM takes the secret.
+     No `no response 20s after submit` warning appears in the journal
+     afterwards.
+  2. Cancel and Esc close the prompt as before.
+  3. Multi-secret VPN prompt (password plus OTP): both fields work and submit
+     together.
+  4. Enter a wrong passphrase: the prompt reopens with the error line and
+     **empty** fields.
+
+## Bluetooth
+
+- [ ] **(#1491)** Pair and Connect get BlueZ's own deadline, the watcher
+      notices a `bluetoothd` restart, and a late prompt wake cannot clear a
+      newer prompt.
+  1. Pair a keyboard or phone that asks for a PIN or a confirmation, and take
+     more than 30 s to answer. No toast. Once you answer, it pairs, then shows
+     as trusted (star) and connected.
+  2. Tap a device that is already bonded but shows as unpaired (or let the
+     remote side finish pairing first). It trusts and connects, with no
+     "Couldn't pair: Already Exists" toast.
+  3. Open the Bluetooth panel and start a scan, then run
+     `systemctl restart bluetooth`. The adapter disappears briefly and comes
+     back with a fresh list. Devices scanned before the restart are gone, and
+     the scan toggle reads the new daemon's state.
+  4. `systemctl stop bluetooth` with the shell running. It stays stopped, and
+     the journal shows "waiting for bluetoothd to return".
+     `systemctl start bluetooth` brings the panel back.
+  5. `sudo kill -9 $(pidof bluetoothd)`: same recovery as a restart.
+  6. Prompt race, if you can provoke it: start pairing, let the prompt time
+     out on the remote side, then retry at once. The second prompt's banner
+     stays up.
 
 ## Night light
 
@@ -5132,6 +5420,18 @@ color-scheme` → `'prefer-light'`), open the Settings drawer: the "Dark
       should read "Cannot be stopped from here (wlr-screencopy)" and clicking
       should be an honest no-op (a single debug line, not a crash or a fake
       success).
+- [ ] **(#1494)** A tray item whose peer is already gone cannot become a ghost
+      row.
+  1. Normal tray apps (nm-applet, a Qt/KDE app, an Electron app) still appear,
+     update their icon and title, and disappear when quit.
+  2. Register-then-exit race: run a minimal StatusNotifierItem that calls
+     `RegisterStatusNotifierItem` and exits right away (a short `python3 -c`
+     does it). No row is left behind, or one appears and disappears.
+  3. An app that drops its SNI object but keeps running (for example
+     toggling "show tray icon" off in its settings) is pruned on the next
+     re-sync or the next signal.
+  4. `RUST_LOG=hytte_services=debug` shows `item peer gone` or
+     `initial property read failed` for the race, not a lingering row.
 
 ## Workspaces page (#1071)
 
@@ -5734,6 +6034,24 @@ trollshell`. Expect the cards to come back Active and **no notification at
     split form does not start scrolling before that and that Save/Cancel stay
     on screen throughout (they sit outside the scroller — #1134's review
     MEDIUM 5).
+- [ ] **(#1514)** A Start adopts only an unnamed workspace.
+  1. Press play on stack A, then on stack B within a few seconds while A's apps
+     are still opening. B gets a new workspace, and A's workspace keeps its
+     name and receives A's apps.
+  2. Name an empty workspace by hand (`niri msg action set-workspace-name foo`),
+     keep it focused, and start a stack. The stack lands on a new workspace,
+     and `foo` keeps its name.
+  3. Focus an empty unnamed workspace and start a stack. It is still adopted,
+     with no new workspace.
+- [ ] **(#1515)** Every `workspaces.toml` read-modify-write is serialized.
+      Needs two monitors.
+  1. Drag a saved card onto the _other_ monitor's column, dropping it before
+     another card. After the poll, `workspaces.toml` has both the new `order`
+     and the new `monitor`, and the card stays where it was dropped.
+  2. The same drag for an Active stack: the workspace moves screens, and the
+     order still lands.
+  3. A plain in-column reorder and a plain column move still each write exactly
+     their one key (the byte-identical tests cover this hermetically).
 
 ## Control-center
 

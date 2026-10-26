@@ -117,11 +117,42 @@ pub fn embed_url(base: &str) -> String {
 /// another port of the *same host* is the hive operator's own machine, where
 /// this window's premise ("the hive is trusted") already holds, and the
 /// attacker this guards against controls a different **name**.
+///
+/// # Case: the hive's spelling is folded, `WebKit`'s is taken as given
+///
+/// The two arguments do not come from the same place. `candidate` is what
+/// `decide-policy` hands over, and that is `WebKit`'s **canonical** URL: its
+/// WHATWG parser lower-cases an `http(s)` host before anything sees it.
+/// `embedded` is the hive's own string (`AgentStatusRow::url`), which
+/// `WebKit` has not touched. Compared byte for byte, a hive whose URL says
+/// `https://Hive.Example/…` refused the window's **own first load** — the
+/// initial `load_uri` comes back as `https://hive.example/…`, which then
+/// went to the desktop's browser while the view stayed blank (the October
+/// 2026 audit of this crate, M2).
+///
+/// So the hive's host is put into the spelling `WebKit` hands back — ASCII
+/// lower case, which is all a DNS name's case ever was (RFC 4343) — and the
+/// candidate is compared exactly as given. That is deliberately one-sided:
+/// folding the candidate too would change nothing `WebKit` can produce, and
+/// would only admit spellings that did not come from the engine, which this
+/// rule refuses rather than guesses at (the same reasoning that keeps the
+/// `https://` test above case-sensitive).
+///
+/// Nothing else is folded. A trailing dot is kept on both sides because
+/// `WebKit` keeps it (`hive.local.` is its own origin there too), and a
+/// non-ASCII name is left as the hive wrote it, so a hive URL in Unicode —
+/// which `WebKit` turns into punycode — still refuses its own page: closed,
+/// and rare enough not to buy an IDNA implementation for.
 #[must_use]
 pub fn navigable_in_place(embedded: &str, candidate: &str) -> bool {
+    // A page with no host of its own admits nothing: there is no origin to
+    // compare against, and two missing hosts are not a match.
+    let Some(ours) = crate::tls::host_of(embedded) else {
+        return false;
+    };
+    let ours = ours.to_ascii_lowercase();
     candidate.starts_with("https://")
-        && crate::tls::host_of(embedded).is_some()
-        && crate::tls::host_of(candidate) == crate::tls::host_of(embedded)
+        && crate::tls::host_of(candidate).is_some_and(|theirs| theirs == ours)
 }
 
 #[cfg(test)]
@@ -193,8 +224,14 @@ mod tests {
     /// slips past the guard and has no host — `None == None` — so it is the
     /// case the conjunct exists for.
     ///
-    /// Mutation (re-run this round, red): drop
-    /// `crate::tls::host_of(embedded).is_some()` and the `https://` pair
+    /// Since the October 2026 audit's M2 that conjunct is a `let … else` that
+    /// returns before anything is compared — the hive's host has to be in
+    /// hand to be lower-cased — so the hole is closed by shape rather than by
+    /// a term someone could drop: there is no `Option` left to compare.
+    ///
+    /// Mutation (run this round, red): go back to comparing the two `Option`s
+    /// with no early return (`host_of(candidate).map(…) ==
+    /// host_of(embedded).map(…)`, both lower-cased) and the `https://` pair
     /// passes.
     #[test]
     fn a_page_with_no_origin_admits_nothing() {
@@ -212,6 +249,83 @@ mod tests {
             "https://hive.local/agent/stray/",
             "https://"
         ));
+    }
+
+    /// **A hive URL in mixed case still loads its own page** — the October
+    /// 2026 audit's M2.
+    ///
+    /// Each candidate below is what `decide-policy` is handed for the URL
+    /// beside it: `WebKit`'s canonical form, host lower-cased. The first row
+    /// is the window's own first `load_uri`, so before this a hive configured
+    /// as `Hive.Local` never showed its page in the window at all. The
+    /// `:8443` and IPv6 rows say the fold is the host's and nothing else's;
+    /// the trailing-dot rows say a dot is kept, on both sides, as `WebKit`
+    /// keeps it.
+    ///
+    /// Mutation (run this round, red): drop the `to_ascii_lowercase` in
+    /// `navigable_in_place` and this reds on its first row — every positive
+    /// row spells the hive with upper case — as does the second row of
+    /// [`a_candidate_not_in_webkits_spelling_is_still_refused`], which a
+    /// comparison folding nothing admits.
+    #[test]
+    fn a_mixed_case_hive_url_still_loads_its_own_page() {
+        let page = "https://Hive.Local/agent/stray/?hide=header";
+        for (embedded, canonical) in [
+            (page, "https://hive.local/agent/stray/?hide=header"),
+            (page, "https://hive.local/agent/other/"),
+            (
+                "https://HIVE.LOCAL:8443/agent/stray/",
+                "https://hive.local:8443/agent/stray/",
+            ),
+            (
+                "https://[FD00::1]/agent/stray/",
+                "https://[fd00::1]/agent/stray/",
+            ),
+            (
+                "https://Hive.Local./agent/stray/",
+                "https://hive.local./agent/stray/",
+            ),
+        ] {
+            assert!(
+                navigable_in_place(embedded, canonical),
+                "{canonical} is what WebKit makes of {embedded}, so it is the hive"
+            );
+        }
+        // …and the fold admits nothing that was not the hive already.
+        for hostile in [
+            "https://hive.local.evil.example/login",
+            "https://evil.example/hive.local/",
+            "https://hive.local@evil.example/login",
+            "https://hive.local./agent/stray/",
+            "http://hive.local/agent/stray/",
+        ] {
+            assert!(
+                !navigable_in_place(page, hostile),
+                "{hostile} must not load in a window opened on {page}"
+            );
+        }
+    }
+
+    /// The fold is **one-sided**: the hive's spelling is put into `WebKit`'s,
+    /// and the candidate is taken exactly as given — so a candidate that is
+    /// not in `WebKit`'s spelling is still refused, even when it is the
+    /// hive's own raw string. `WebKit` never hands `decide-policy` one; if
+    /// something ever does, "not here" is the answer, not a guess.
+    ///
+    /// Mutation (run this round, red): lower-case the candidate's host too
+    /// and this reds on its first row (the second falls with it: folded, the
+    /// raw spelling is the hive).
+    #[test]
+    fn a_candidate_not_in_webkits_spelling_is_still_refused() {
+        assert!(!navigable_in_place(
+            "https://hive.local/agent/stray/",
+            "https://HIVE.local/agent/stray/"
+        ));
+        let mixed = "https://Hive.Local/agent/stray/";
+        assert!(
+            !navigable_in_place(mixed, mixed),
+            "the hive's raw spelling is not what WebKit hands back, so it is not compared as if it were"
+        );
     }
 
     /// The ordinary case: the hive's `https://<domain>/agent/<name>/`.

@@ -51,6 +51,10 @@ const VERIFYING: &str = "tls-verifying";
 /// card this file builds.
 const PROBE_DIED: &str = "tls-probe-died";
 
+/// The widget name [`unreachable()`] stamps on its state, and the whole of how
+/// [`is_unreachable`] recognises it — [`VERIFYING`]'s idiom once more.
+const UNREACHABLE: &str = "tls-unreachable";
+
 /// Build the page widget for `url`, under the policy
 /// [`crate::tls::resolve`] settled on.
 ///
@@ -199,6 +203,19 @@ pub fn page(url: &str, trust: &Resolved) -> gtk::Widget {
 /// and chain length is irrelevant to whether a pin takes. That is the one
 /// thing that could have made the launch-time verify decorative, and it does
 /// not.
+///
+/// # Case does not matter here, and that is `WebKit`'s doing
+///
+/// The October 2026 audit of this crate (M2) suspected the pin of the same
+/// fault the navigation policy had — a hive URL spelled `Hive.Example`
+/// storing its exception under a host `WebKit` would look up as
+/// `hive.example`. It does not have it: `SoupNetworkSession.h` declares the
+/// map `HashMap<String, HostTLSCertificateSet, ASCIICaseInsensitiveHash>`,
+/// and `checkTLSErrors` looks it up through
+/// `find<ASCIICaseInsensitiveStringViewHashTranslator>(hostForComparison(…))`
+/// (read on `webkitglib/2.52` and on `main`). So the host goes in as the hive
+/// spelled it, and only the brackets above are this function's business.
+/// [`crate::page::navigable_in_place`] is where case did matter.
 fn pin_for(policy: &TlsPolicy) -> Option<(&Pinned, &str)> {
     match policy {
         TlsPolicy::SystemStore => None,
@@ -325,6 +342,71 @@ pub fn verifying(host: &str) -> gtk::Widget {
 #[must_use]
 pub fn is_verifying(widget: &gtk::Widget) -> bool {
     widget.widget_name() == VERIFYING
+}
+
+/// What the page slot shows when the launch-time probe **could not reach the
+/// gateway** — [`crate::tls::Resolved::unreachable`] — while the window waits
+/// to ask again.
+///
+/// # Why this is a card and not the page (the October 2026 audit, M1)
+///
+/// That verdict used to mount the page anyway, under the system store, so
+/// `WebKit`'s own load could fail into the TLS card. Two things were wrong
+/// with that. With the gateway still down, `WebKit`'s load fails on the
+/// *connection*, not on TLS, so `load-failed-with-tls-errors` never fires and
+/// the operator got the engine's generic error page rather than any card of
+/// ours. And either way `page_loaded` latched, so the gateway coming back
+/// changed nothing: the view had no pin, nothing re-probed, and the only way
+/// out was to close the window. Now the page waits for a verdict the gateway
+/// actually gave, and this card says why it is waiting.
+///
+/// `tried` is the sentence [`crate::tls::Resolved::tried`] carries — what the
+/// probe dialled and what came back — and it opens the description the same
+/// way [`crate::tls::failure_message`] opens its own (`This launch …`), so the
+/// two cards read as one voice. `retry_in` is when the window will ask on its
+/// own; it is printed as "about" because the timer is the main loop's, not a
+/// stopwatch. `on_retry` is the button's — `Window::retry_now` — so an
+/// operator who has just restarted nginx does not sit out a backoff step.
+///
+/// Escaped, like every other description in this file: `tried` carries a path
+/// and the GIO error's own words, and neither is markup.
+#[must_use]
+pub fn unreachable(
+    tried: Option<&str>,
+    retry_in: std::time::Duration,
+    on_retry: impl Fn() + 'static,
+) -> gtk::Widget {
+    let attempt = tried.map_or_else(String::new, |t| format!("This launch {t}.\n\n"));
+    let page = adw::StatusPage::builder()
+        .icon_name("network-offline-symbolic")
+        .title("The hive's gateway did not answer")
+        .description(gtk::glib::markup_escape_text(&format!(
+            "{attempt}The page is not loaded until the gateway answers. The window asks again in \
+             about {} s, and loads the page the first time it does. The header above still \
+             follows this agent's live status over host.sock, which does not go through the \
+             gateway.",
+            retry_in.as_secs().max(1)
+        )))
+        .build();
+    let again = gtk::Button::builder()
+        .label("Try again now")
+        .halign(gtk::Align::Center)
+        .build();
+    again.add_css_class("pill");
+    again.connect_clicked(move |_| on_retry());
+    page.set_child(Some(&again));
+    page.set_widget_name(UNREACHABLE);
+    page.set_hexpand(true);
+    page.set_vexpand(true);
+    page.upcast()
+}
+
+/// Whether `widget` is the state [`unreachable()`] built.
+///
+/// `None`-free and total, like [`is_verifying`].
+#[must_use]
+pub fn is_unreachable(widget: &gtk::Widget) -> bool {
+    widget.widget_name() == UNREACHABLE
 }
 
 /// What the page slot shows when the launch-time TLS probe's worker thread

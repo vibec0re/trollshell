@@ -167,6 +167,20 @@ pub struct Resolved {
     /// `None` only when nothing was tried — route 4, or a URL with no host to
     /// scope anything to.
     pub tried: Option<String>,
+    /// The route-2 probe never got a chain to judge
+    /// ([`Presented::Unreachable`]): the gateway refused the connection, never
+    /// finished a handshake, or ran the probe out of its deadline.
+    ///
+    /// That is an answer about **reachability, not trust** — this module's own
+    /// log line has said so since #1242 — and it is the one answer that can
+    /// change while the window stays open. So the window does not mount the
+    /// page on it: `window.rs`'s `finish_probe` shows what happened, leaves
+    /// the page unlatched and asks again on a backoff, rather than loading a
+    /// view under [`TlsPolicy::SystemStore`] that a gateway coming back could
+    /// never rescue (the October 2026 audit of this crate, M1: `page_loaded`
+    /// latched on this verdict, and nothing re-probed for the life of the
+    /// window). Every other verdict is settled and leaves this `false`.
+    pub unreachable: bool,
 }
 
 impl Resolved {
@@ -175,6 +189,7 @@ impl Resolved {
         Self {
             policy: TlsPolicy::SystemStore,
             tried,
+            unreachable: false,
         }
     }
 }
@@ -306,6 +321,7 @@ fn pin_from_file(pem: &Path, source: &str, host: &str, port: u16) -> Resolved {
             host: host.to_owned(),
         },
         tried: Some(tried),
+        unreachable: false,
     }
 }
 
@@ -341,6 +357,7 @@ fn verify_then_pin(
                     "verified {host}'s certificate against the anchors in {shown} ({source}) and \
                      pinned the leaf it presented"
                 )),
+                unreachable: false,
             }
         }
         Presented::Refused { flags } => {
@@ -365,11 +382,17 @@ fn verify_then_pin(
                 "could not obtain a certificate from the gateway to check — this is a reachability \
                  problem, not a trust one"
             );
-            Resolved::system_store(Some(format!(
-                "could not check {host} against the anchors in {shown} ({source}): {why}. That is \
-                 a connection problem rather than a certificate one — the hive's gateway may be \
-                 down while its host.sock is up"
-            )))
+            // Still the system store — an unreachable gateway is never a
+            // reason to widen anything — but marked, because this is the one
+            // verdict that asking again can change (see `Resolved::unreachable`).
+            Resolved {
+                unreachable: true,
+                ..Resolved::system_store(Some(format!(
+                    "could not check {host} against the anchors in {shown} ({source}): {why}. \
+                     That is a connection problem rather than a certificate one — the hive's \
+                     gateway may be down while its host.sock is up"
+                )))
+            }
         }
         // **No connection was attempted**, so the sentence above would be a
         // lie: it is the anchors file itself that is unusable, and naming it
@@ -597,6 +620,7 @@ mod tests {
             Resolved {
                 policy: TlsPolicy::SystemStore,
                 tried: None,
+                unreachable: false,
             }
         );
     }
@@ -645,6 +669,7 @@ mod tests {
                 Resolved {
                     policy: TlsPolicy::SystemStore,
                     tried: None,
+                    unreachable: false,
                 },
                 "{url}"
             );

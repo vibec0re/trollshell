@@ -21,7 +21,9 @@ workspace = true
 # stays there); pulling "fs" alone here adds no new resolved package. Both
 # consumers now inherit the version from `[workspace.dependencies]` (#453)
 # rather than hand-repinning it.
-nix.workspace = true
+# Also "feature", for `app_usage::page_size`'s
+# `nix::unistd::sysconf(PAGE_SIZE)` - a safe wrapper, no new resolved package.
+nix = { workspace = true, features = ["feature"] }
 
 [dev-dependencies]
 # `cpufreq.rs` and `hwmon.rs` build fixture sysfs directories to exercise the

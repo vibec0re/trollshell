@@ -155,7 +155,7 @@ fn build_vpn_profile_row(profile: &wifi::VpnProfile) -> adw::ActionRow {
     // never wanted here (#753). Off before the text is set (#1564).
     markup::plain_text(&row);
     row.set_title(&truncate_for_row(&profile.name));
-    row.set_subtitle(&subtitle);
+    row.set_subtitle(subtitle);
     // A saved VPN profile's name is free text with no bound — capped (see
     // `truncate_for_row`) rather than letting it push the whole drawer wider
     // (#1302); `title_lines(1)` is a second line of defense.

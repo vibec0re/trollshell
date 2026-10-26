@@ -603,11 +603,13 @@ mod tests {
         Device, PairPrompt, bind_device_groups, bind_pair_prompt_banner, build_device_menu,
         build_device_row, build_discoverable_row, build_header_row, build_text_entry_row,
     };
-    use crate::components::markup::test_support::{MARKUP_WARNING, assert_shows, child_output, in_child};
+    use crate::components::markup::test_support::{
+        MARKUP_WARNING, assert_shows, child_output, in_child,
+    };
     use hytte::adw::{self, prelude::*};
     use hytte::futures_signals::signal::{Mutable, always};
-    use hytte::services::bluetooth::Adapter;
     use hytte::gtk;
+    use hytte::services::bluetooth::Adapter;
     use std::collections::HashSet;
 
     /// Run the GTK main loop until it has nothing left to dispatch.
@@ -927,4 +929,3 @@ mod tests {
         drop((header, disc));
     }
 }
-

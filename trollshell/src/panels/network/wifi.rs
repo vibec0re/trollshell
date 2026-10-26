@@ -538,7 +538,11 @@ mod markup_tests {
     use hytte::services::wifi;
 
     use super::build_network_row;
-    use crate::components::markup::test_support::{MARKUP_WARNING, assert_shows, child_output, in_child};
+    use crate::components::markup::test_support::{
+        MARKUP_WARNING, assert_shows, child_output, in_child,
+    };
+
+    const SSID: &str = "Tom & <span size=\"xx-large\">Jerry</span>";
 
     #[gtk::test]
     fn a_network_row_shows_a_hostile_ssid_literally() {
@@ -584,7 +588,6 @@ mod markup_tests {
             return;
         }
         adw::init().expect("libadwaita init");
-        const SSID: &str = "Tom & <span size=\"xx-large\">Jerry</span>";
         let net = wifi::WifiNetwork {
             path: "/ap/0".to_string(),
             ssid: SSID.to_string(),

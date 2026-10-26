@@ -93,7 +93,7 @@ pub(crate) mod test_support {
     /// Re-run this test binary on the single test `path` (the path `cargo
     /// test` lists, `module::sub::name`) and return everything it printed.
     ///
-    /// Why a child and not an in-process handler: GTK logs through GLib's
+    /// Why a child and not an in-process handler: GTK logs through `GLib`'s
     /// *structured* writer, which skips handlers installed with
     /// `g_log_set_handler` (measured: a handler on the `Gtk` domain saw
     /// nothing while the warning was printed), and the only hook that does see
@@ -194,12 +194,14 @@ mod gtk_tests {
         if test_support::in_child() {
             return;
         }
-        let old = test_support::child_output("components::markup::gtk_tests::order_probe_old_child");
+        let old =
+            test_support::child_output("components::markup::gtk_tests::order_probe_old_child");
         assert!(
             old.contains(test_support::MARKUP_WARNING),
             "premise: the old order must log the warning, or the probe sees nothing: {old}"
         );
-        let new = test_support::child_output("components::markup::gtk_tests::order_probe_new_child");
+        let new =
+            test_support::child_output("components::markup::gtk_tests::order_probe_new_child");
         assert!(
             !new.contains(test_support::MARKUP_WARNING),
             "plain_text first must not warn: {new}"

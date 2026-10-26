@@ -435,6 +435,10 @@ const SHIPPED: &[(&str, Policy)] = &[
         crate::networkd::STARTUP_REFRESH_RETRY,
     ),
     ("geoclue::RESOLVE_RETRY", crate::geoclue::RESOLVE_RETRY),
+    (
+        "nm_registrar::REGISTER_RETRY",
+        crate::wifi::nm_registrar::REGISTER_RETRY,
+    ),
 ];
 
 #[cfg(test)]

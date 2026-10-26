@@ -31,6 +31,16 @@
 //!   version is that only a verdict naming a *different* daemon acts, so a
 //!   daemon restart is not mistaken for a backend change.
 //!
+//! # Keeping the NM secret agent registered
+//!
+//! That restart rule keeps the NM backend — and its secret-agent export —
+//! alive across `systemctl restart NetworkManager`, but the agent's
+//! *registration* lives in NM and does not survive it, nor a reconnect of our
+//! system connection. The same `NameOwnerChanged` watch therefore also renews
+//! the registration (`DaemonChange::renews_nm_registration`), through a task
+//! per NM commit that registers, retries and re-registers on request: see
+//! the crate-private `nm_registrar` module.
+//!
 //! # Public API
 //!
 //! ```ignore
@@ -53,6 +63,9 @@
 mod agent;
 mod client;
 mod nm_agent;
+// `pub(crate)` only so `crate::retry`'s shipped-policy list can name
+// `REGISTER_RETRY`; nothing outside `wifi` calls into it.
+pub(crate) mod nm_registrar;
 mod parse;
 mod types;
 mod watcher;
@@ -60,13 +73,13 @@ mod watcher;
 use futures_channel::oneshot;
 use futures_signals::signal::{Mutable, Signal};
 use futures_util::StreamExt as _;
-use hytte_bus::BusKind;
+use hytte_bus::{BusKind, SignalItem};
 use hytte_reactive::{Service, registry, runtime, spawn_supervised, spawn_supervised_handle};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use tokio::sync::{Mutex as AsyncMutex, RwLock};
+use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock};
 
 use crate::retry;
 // `ProbeError` is no longer named outside the tests: since #646 the policy is
@@ -268,10 +281,32 @@ struct LiveBackend {
     /// Cancellation for the backend's watcher task. `None` for
     /// [`WifiBackend::None`], which starts no watcher.
     watcher: Option<hytte_reactive::SupervisorHandle>,
-    /// The NM secret-agent export; `None` for the other two backends. Dropping
-    /// it unmounts the agent object — see [`hytte_bus::ExportHandle`], whose
-    /// `Drop` is destructive by design.
-    nm_agent: Option<hytte_bus::ExportHandle>,
+    /// The NM secret agent — its export and the task keeping it registered;
+    /// `None` for the other two backends.
+    nm_agent: Option<NmAgentLive>,
+}
+
+/// The two halves of the NM secret agent, which NM sees as one thing and this
+/// process has to keep alive separately (see [`nm_registrar`]).
+struct NmAgentLive {
+    /// Dropping it unmounts the agent object — see
+    /// [`hytte_bus::ExportHandle`], whose `Drop` is destructive by design.
+    export: hytte_bus::ExportHandle,
+    /// The registrar task: registers on start-up, retries a failure, and
+    /// registers again on every [`Self::renew`]. Cancelled — and waited for —
+    /// by [`tear_down`] before it unregisters.
+    registrar: hytte_reactive::SupervisorHandle,
+    /// How the `NameOwnerChanged` watch asks the registrar to register again.
+    wake: Arc<Notify>,
+}
+
+impl NmAgentLive {
+    /// Ask the registrar to register the agent again. Coalescing and
+    /// non-blocking: see `nm_registrar::run_registrar` for why any number of
+    /// renewals during one attempt cost exactly one more.
+    fn renew(&self) {
+        self.wake.notify_one();
+    }
 }
 
 impl Drop for LiveBackend {
@@ -280,13 +315,18 @@ impl Drop for LiveBackend {
         // panic unwinding a switch, which drops the outgoing backend without
         // ever having cancelled it. Its watcher would then keep running and
         // race the replacement the restarted supervisor is about to start —
-        // the exact failure #633 exists to prevent, arrived at sideways.
+        // the exact failure #633 exists to prevent, arrived at sideways. The
+        // registrar the same: left running, it would keep registering an agent
+        // whose export this drop is about to unmount.
         //
-        // A `Drop` cannot await, so this only ends the restart loop; the
-        // *waiting* stays in `tear_down`, which takes the handle out first and
-        // leaves this a no-op on the ordinary path.
+        // A `Drop` cannot await, so this only ends the restart loops; the
+        // *waiting* stays in `tear_down`, which takes the handles out first
+        // and leaves this a no-op on the ordinary path.
         if let Some(watcher) = &self.watcher {
             watcher.cancel();
+        }
+        if let Some(agent) = &self.nm_agent {
+            agent.registrar.cancel();
         }
     }
 }
@@ -633,29 +673,30 @@ fn start_network_manager(targets: &WatchTargets, waiters: WaitersMap) -> LiveBac
     // also retires the "exported twice" hazard the `OnceLock` was guarding —
     // there is exactly one live export because there is exactly one live
     // backend, and `tear_down` runs before the next `start_network_manager`.
-    let nm_agent = nm_agent::NmAgent {
-        prompts: targets.prompts.clone(),
-        waiters,
-    };
+    let nm_agent = nm_agent::NmAgent::new(targets.prompts.clone(), waiters);
     let export =
         hytte_bus::export_object(BusKind::System, crate::wifi_nm::NM_AGENT_PATH).start(nm_agent);
 
-    runtime::handle().spawn(async {
-        // Give the export a moment to mount on the live connection before
-        // registering, so NM never calls back before the object exists.
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        match crate::wifi_nm::register_nm_agent().await {
-            Ok(()) => tracing::info!("wifi_nm: secret agent registered with NM"),
-            Err(e) => {
-                tracing::warn!(error = %e, "wifi_nm: secret agent registration failed");
-            }
-        }
-    });
+    // The registration is NM's to lose — an NM restart, a reconnect of our
+    // system connection, or a first attempt that found no NM — so it gets a
+    // task of its own that keeps it current rather than one fire-and-forget
+    // call. Per commit, like the export, and stopped by `tear_down`.
+    let wake = Arc::new(Notify::new());
+    let registrar = {
+        let wake = Arc::clone(&wake);
+        spawn_supervised_handle("wifi-nm-agent", move || {
+            nm_registrar::run(Arc::clone(&wake))
+        })
+    };
 
     LiveBackend {
         backend: WifiBackend::NetworkManager(device_path_store),
         watcher: Some(watcher),
-        nm_agent: Some(export),
+        nm_agent: Some(NmAgentLive {
+            export,
+            registrar,
+            wake,
+        }),
     }
 }
 
@@ -689,8 +730,10 @@ fn start_backend(
 /// so that by the time the `Mutable`s are reset there is no task left that could
 /// repopulate them — the race #633 named as the reason a naive switch is wrong
 /// ("a naive switch leaves the old watcher running and racing the new one to
-/// write the same `Mutable`s"). Only then does the NM registration go, then the
-/// export, then the backend value itself — which is what drops the path caches.
+/// write the same `Mutable`s"). Then the NM registrar is stopped and waited for
+/// the same way, so no registration can land after the `Unregister` that
+/// follows it; only then does the NM registration go, then the export, then the
+/// backend value itself — which is what drops the path caches.
 async fn tear_down(mut live: LiveBackend, targets: &WatchTargets) {
     // Taken out rather than destructured: `LiveBackend` has a `Drop` backstop
     // (which forbids a partial move), and taking the handle here is also what
@@ -710,7 +753,25 @@ async fn tear_down(mut live: LiveBackend, targets: &WatchTargets) {
         }
     }
 
-    if live.nm_agent.is_some() {
+    if let Some(agent) = live.nm_agent.take() {
+        // Stop the registrar before unregistering, and wait for it: a renewal
+        // that ran after the `Unregister` below would put the registration
+        // back for an object this function is about to unmount — the very
+        // hazard the `Unregister` exists to prevent. (A registration already
+        // on the wire when the abort lands is ahead of the `Unregister` on the
+        // same connection, so NM sees the two in that order.)
+        agent.registrar.cancel();
+        if tokio::time::timeout(TEARDOWN_GRACE, agent.registrar.stopped())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                grace_secs = TEARDOWN_GRACE.as_secs_f64(),
+                "wifi_nm: the secret-agent registrar did not stop within the teardown grace \
+                 period; unregistering anyway"
+            );
+        }
+
         // Withdraw the registration *before* the object goes away: NM calls
         // `GetSecrets` back on the unique name of the connection the agent
         // registered from, and that connection is `hytte_bus`'s pooled system
@@ -720,11 +781,12 @@ async fn tear_down(mut live: LiveBackend, targets: &WatchTargets) {
         if let Err(e) = crate::wifi_nm::unregister_nm_agent().await {
             tracing::warn!(error = %e, "wifi_nm: unregistering the secret agent failed");
         }
+
+        // `ExportHandle::drop` unmounts the interface; explicit so the
+        // ordering relative to the `Unregister` above is visible rather than
+        // incidental to where a binding happens to fall.
+        drop(agent.export);
     }
-    // `ExportHandle::drop` unmounts the interface; explicit so the ordering
-    // relative to the `Unregister` above is visible rather than incidental to
-    // where a binding happens to fall.
-    drop(live.nm_agent.take());
     // `live` — and with it the `WifiBackend` holding this backend's object-path
     // caches — is dropped when this returns, which is the whole point of moving
     // those caches into the payload (see `IwdPaths`).
@@ -751,15 +813,15 @@ struct BackendCtx {
 }
 
 /// Bring the committed backend in line with `choice`, doing nothing if it
-/// already is.
+/// already is. Returns whether it started a new backend.
 ///
 /// Holds the [`LiveSlot`] for the whole switch, so two changes arriving back to
 /// back cannot interleave a teardown with a commit.
-async fn apply(ctx: &BackendCtx, choice: BackendChoice) {
+async fn apply(ctx: &BackendCtx, choice: BackendChoice) -> bool {
     let mut slot = ctx.live.lock().await;
     let committed = slot.as_ref().map(|live| live.backend.kind());
     if !switch_needed(committed, choice.into()) {
-        return;
+        return false;
     }
 
     if let Some(outgoing) = slot.take() {
@@ -780,6 +842,7 @@ async fn apply(ctx: &BackendCtx, choice: BackendChoice) {
     // not been spawned yet.
     ctx.published.set(incoming.backend.clone());
     *slot = Some(incoming);
+    true
 }
 
 /// Re-probe after the daemon set changed, and switch if the verdict moved.
@@ -795,35 +858,114 @@ async fn apply(ctx: &BackendCtx, choice: BackendChoice) {
 ///
 /// `probe_backend` already logs an inconclusive result at `error!`, so
 /// declining to act on it stays visible without a line of its own.
-async fn recheck(ctx: &BackendCtx) {
+///
+/// Returns whether it started a new backend — never the case for an
+/// inconclusive probe.
+async fn recheck(ctx: &BackendCtx) -> bool {
     let Ok(choice) = crate::wifi_backend::probe_backend().await else {
         tracing::debug!(
             "wifi: re-probe after a daemon change was inconclusive; keeping the committed backend"
         );
-        return;
+        return false;
     };
-    apply(ctx, choice).await;
+    apply(ctx, choice).await
 }
 
-/// Does this `NameOwnerChanged` concern one of the two Wi-Fi daemons?
+/// Ask the committed backend's NM secret-agent registrar, if it has one, to
+/// register again. A no-op on the iwd and no-daemon backends.
 ///
-/// Filtered in-process because [`hytte_bus::signals`] builds no `arg0=` match
-/// rule, so the subscription receives every name-ownership change on the system
-/// bus. That is one tuple decode and two string compares per event against
-/// traffic that is a handful of events a minute on an idle session — cheaper
-/// than the alternative of polling the bus for a change that usually never
-/// comes.
-fn names_a_wifi_daemon(evt: &hytte_bus::SignalEvent) -> bool {
-    evt.body
-        .body()
-        .deserialize::<(String, String, String)>()
-        .is_ok_and(|(name, _old_owner, _new_owner)| {
-            name == crate::wifi_backend::NM_BUS_NAME || name == crate::wifi_backend::IWD_BUS_NAME
-        })
+/// Takes the [`LiveSlot`] lock only to reach the wake, so a renewal requested
+/// while a switch is in progress waits for the switch and then reaches
+/// whichever backend it committed.
+async fn renew_nm_registration(ctx: &BackendCtx) {
+    if let Some(agent) = ctx
+        .live
+        .lock()
+        .await
+        .as_ref()
+        .and_then(|live| live.nm_agent.as_ref())
+    {
+        agent.renew();
+    }
+}
+
+/// What one item on the `NameOwnerChanged` stream means for the Wi-Fi service.
+///
+/// Two separate questions ride the one subscription, and this is where they are
+/// told apart: whether the committed *backend* may be stale (#633 — re-probe),
+/// and whether the NM secret agent's *registration* may be gone (re-register;
+/// see [`nm_registrar`]). The second is the narrower one, and
+/// [`Self::renews_nm_registration`] answers it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DaemonChange {
+    /// One of the two Wi-Fi daemons' bus names changed hands.
+    Owner {
+        /// `NetworkManager`'s name gained a new, non-empty owner — it started
+        /// or restarted. Its `AgentManager` is then empty, whatever this
+        /// process registered with the previous instance.
+        nm_appeared: bool,
+    },
+    /// The subscription reported a hole in its history:
+    /// [`SignalItem::Resubscribed`] or [`SignalItem::Lagged`]. Anything could
+    /// have changed unseen, so both questions get a "maybe". A
+    /// `Resubscribed` is also how a reconnect of the pooled system connection
+    /// reaches this stream — and a reconnect gives this process a new unique
+    /// name, which NM's agent registry is keyed to.
+    Hole,
+}
+
+impl DaemonChange {
+    /// Classify one stream item, or `None` when it concerns neither daemon.
+    ///
+    /// Filtered in-process because [`hytte_bus::signals`] builds no `arg0=`
+    /// match rule, so the subscription receives every name-ownership change on
+    /// the system bus. That is one tuple decode and two string compares per
+    /// event against traffic that is a handful of events a minute on an idle
+    /// session — cheaper than the alternative of polling the bus for a change
+    /// that usually never comes.
+    fn of(item: &SignalItem) -> Option<Self> {
+        match item {
+            SignalItem::Event(evt) => evt
+                .body
+                .body()
+                .deserialize::<(String, String, String)>()
+                .ok()
+                .and_then(|(name, _old_owner, new_owner)| Self::of_owner_change(&name, &new_owner)),
+            SignalItem::Resubscribed | SignalItem::Lagged { .. } => Some(Self::Hole),
+        }
+    }
+
+    /// [`Self::of`] for a decoded `NameOwnerChanged(name, old_owner,
+    /// new_owner)`, less the old owner, which no rule here reads — the pure
+    /// half, so the rule is testable without building a D-Bus message.
+    fn of_owner_change(name: &str, new_owner: &str) -> Option<Self> {
+        if name == crate::wifi_backend::NM_BUS_NAME {
+            Some(Self::Owner {
+                nm_appeared: !new_owner.is_empty(),
+            })
+        } else if name == crate::wifi_backend::IWD_BUS_NAME {
+            Some(Self::Owner { nm_appeared: false })
+        } else {
+            None
+        }
+    }
+
+    /// Whether this change may have cost the NM secret agent its registration.
+    ///
+    /// **Not** NM *losing* its name: the instance that held the registration
+    /// is gone, and there is nobody to register with until the next one
+    /// appears — which is its own event. And not iwd changing hands, which NM
+    /// never hears about. A renewal that turns out unneeded is not free (see
+    /// `crate::wifi_nm::ensure_nm_agent_registered`), so this stays as narrow
+    /// as the two events that really do lose it.
+    fn renews_nm_registration(self) -> bool {
+        matches!(self, Self::Owner { nm_appeared: true } | Self::Hole)
+    }
 }
 
 /// Watch the system bus for either Wi-Fi daemon appearing or disappearing, and
-/// reconcile the committed backend when one does.
+/// reconcile the committed backend when one does — and keep the NM secret
+/// agent registered across the events that cost it its registration.
 ///
 /// `NameOwnerChanged` rather than a poll: it is the event that actually
 /// corresponds to "a wireless daemon started or stopped", and it costs nothing
@@ -831,6 +973,13 @@ fn names_a_wifi_daemon(evt: &hytte_bus::SignalEvent) -> bool {
 /// never started — that produces no bus traffic at all, so it is picked up on
 /// the next event or the next shell start, which for a daemon nobody has
 /// launched is the right amount of urgency.
+///
+/// Reads [`hytte_bus::SignalSubscription::items`] rather than `events`, so a
+/// hole in the stream (#1173) is seen rather than silently skipped: a daemon
+/// change missed during it is caught by the re-probe, and a reconnect — which
+/// is what a `Resubscribed` here usually is — renews the NM registration. A
+/// renewal is skipped when the re-probe has just committed a new backend,
+/// whose own registrar registers on start-up anyway.
 ///
 /// Returns only if the subscription ends, which it does not in practice; the
 /// caller is a supervised task, so a panic here is restarted and re-reconciled.
@@ -840,17 +989,21 @@ async fn watch_for_daemon_changes(ctx: &BackendCtx) {
         .iface("org.freedesktop.DBus")
         .signal("NameOwnerChanged")
         .start();
-    let mut events = sub.events();
+    let mut items = sub.items();
 
-    while let Some(evt) = events.next().await {
-        if !names_a_wifi_daemon(&evt) {
+    while let Some(item) = items.next().await {
+        let Some(change) = DaemonChange::of(&item) else {
             continue;
-        }
+        };
         tokio::time::sleep(CHANGE_SETTLE).await;
-        recheck(ctx).await;
+        let switched = recheck(ctx).await;
+        if change.renews_nm_registration() && !switched {
+            renew_nm_registration(ctx).await;
+        }
     }
     tracing::warn!(
-        "wifi: the NameOwnerChanged subscription ended; runtime backend switching is off until this task restarts"
+        "wifi: the NameOwnerChanged subscription ended; runtime backend switching and NM \
+         secret-agent re-registration are off until this task restarts"
     );
 }
 
@@ -1627,5 +1780,110 @@ mod tests {
             BackendKind::NetworkManager
         );
         assert_eq!(BackendKind::from(BackendChoice::None), BackendKind::None);
+    }
+
+    // ── Keeping the NM secret agent registered ───────────────────────────────
+    //
+    // `DaemonChange` is the whole of the "should the agent register again"
+    // decision; the registrar it wakes is tested in `nm_registrar`, and the
+    // two together over a real bus in `nm_agent`'s system tests.
+
+    use super::DaemonChange;
+    use crate::wifi_backend::{IWD_BUS_NAME, NM_BUS_NAME};
+    use hytte_bus::{SignalEvent, SignalItem};
+
+    /// A `NameOwnerChanged` item as the subscription delivers it, built as a
+    /// real D-Bus message so the decode in `DaemonChange::of` is exercised too.
+    fn owner_changed(name: &str, old_owner: &str, new_owner: &str) -> SignalItem {
+        let body = zbus::Message::signal(
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "NameOwnerChanged",
+        )
+        .expect("a valid signal header")
+        .build(&(name, old_owner, new_owner))
+        .expect("a valid NameOwnerChanged body");
+        SignalItem::Event(SignalEvent {
+            body,
+            sender: Some("org.freedesktop.DBus".to_string()),
+            timestamp: std::time::SystemTime::now(),
+        })
+    }
+
+    /// The bug itself: `systemctl restart NetworkManager` is NM's name lost and
+    /// then re-acquired, and the re-acquire must renew the registration —
+    /// NM's `AgentManager` comes back empty. Before the fix nothing did, and
+    /// the agent stayed deaf until the shell restarted.
+    #[test]
+    fn nm_gaining_an_owner_renews_the_registration() {
+        let change = DaemonChange::of(&owner_changed(NM_BUS_NAME, "", ":1.77"))
+            .expect("NM's name is one of the two daemons");
+        assert_eq!(change, DaemonChange::Owner { nm_appeared: true });
+        assert!(change.renews_nm_registration());
+    }
+
+    /// NM losing its name re-probes (the #633 rule) but does not renew: there
+    /// is no NM to register with until the next one appears, and that is its
+    /// own event. Renewing here would be a call to a name nobody owns.
+    #[test]
+    fn nm_losing_its_owner_does_not_renew() {
+        let change = DaemonChange::of(&owner_changed(NM_BUS_NAME, ":1.5", ""))
+            .expect("NM's name is one of the two daemons");
+        assert_eq!(change, DaemonChange::Owner { nm_appeared: false });
+        assert!(!change.renews_nm_registration());
+    }
+
+    /// iwd changing hands is a backend question only; NM never hears of it.
+    #[test]
+    fn iwd_changing_hands_re_probes_but_does_not_renew() {
+        for (old, new) in [("", ":1.9"), (":1.9", "")] {
+            let change = DaemonChange::of(&owner_changed(IWD_BUS_NAME, old, new))
+                .expect("iwd's name is one of the two daemons");
+            assert!(!change.renews_nm_registration(), "iwd {old:?} → {new:?}");
+        }
+    }
+
+    /// Everything else on the system bus is filtered out before either
+    /// question is asked — including this process's own unique names coming
+    /// and going, which is not how a reconnect is detected (see the next test).
+    #[test]
+    fn other_names_are_not_a_daemon_change() {
+        assert_eq!(
+            DaemonChange::of(&owner_changed("org.freedesktop.UPower", "", ":1.3")),
+            None
+        );
+        assert_eq!(DaemonChange::of(&owner_changed(":1.42", ":1.42", "")), None);
+    }
+
+    /// The bus-reconnect half: a reconnect of the pooled system connection
+    /// reaches this stream as `Resubscribed`, and it gives this process a new
+    /// unique name NM has never seen, so it must renew. A `Lagged` hole might
+    /// have swallowed either that or an NM restart, so it renews too.
+    #[test]
+    fn a_hole_in_the_stream_renews_the_registration() {
+        for item in [SignalItem::Resubscribed, SignalItem::Lagged { skipped: 3 }] {
+            let change = DaemonChange::of(&item).expect("a hole is always a change");
+            assert_eq!(change, DaemonChange::Hole);
+            assert!(change.renews_nm_registration(), "{item:?}");
+        }
+    }
+
+    /// A body that is not `(sss)` is ignored rather than misread.
+    #[test]
+    fn an_undecodable_body_is_not_a_daemon_change() {
+        let body = zbus::Message::signal(
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "NameOwnerChanged",
+        )
+        .expect("a valid signal header")
+        .build(&(7_u32,))
+        .expect("a valid body");
+        let item = SignalItem::Event(SignalEvent {
+            body,
+            sender: None,
+            timestamp: std::time::SystemTime::now(),
+        });
+        assert_eq!(DaemonChange::of(&item), None);
     }
 }

@@ -3551,28 +3551,52 @@ mod gtk_tests {
     /// shared backoff, and the backoff starts over once it answers** —
     /// #1557 item 2, the window's half.
     ///
-    /// The page is mounted under the system store — the route with no probe
-    /// — and the page's report is delivered straight to
-    /// [`Window::on_gateway`], because no web process runs where these tests
-    /// do (`webview.rs`'s `gtk_tests` module doc); `webview.rs`'s own tests
-    /// drive the signal half. The reload is observed through
-    /// `WebViewExt::uri`, which `load_uri` sets before any decision is made.
+    /// The page's report is delivered straight to [`Window::on_gateway`];
+    /// `webview.rs`'s own tests drive the signal half. The reload is observed
+    /// through `WebViewExt::uri`, which `load_uri` sets before any decision is
+    /// made.
+    ///
+    /// # The page in the slot reports to nobody
+    ///
+    /// The slot holds a real system-store [`webview::page`] — what
+    /// `finish_probe` mounts on the route with no probe — but one built here,
+    /// whose reports go nowhere, on a host that cannot resolve. A page the
+    /// window mounted itself would report to `on_gateway`, and **its own first
+    /// load is real where `checks.system-tests` runs**: that derivation exports
+    /// llvmpipe's EGL vendor for the GL tests, which gets `WebKit`'s web process
+    /// past the `EGL_BAD_PARAMETER` abort it dies of under a bare `xvfb-run`
+    /// (the only setting `webview.rs`'s `gtk_tests` module doc measured). There
+    /// the load fails on the hive's name and reports a second, real
+    /// [`webview::Gateway::Unanswered`] while this test pumps for its timer —
+    /// and the window does what it should with a newer failure: the page's own
+    /// URI replaces the scripted reload. That was #1578's CI red (`left:
+    /// …?hide=header`, `right: …/turn/3`), reproduced by running this test
+    /// with the derivation's four GL variables exported. This test is about
+    /// what the window does with one report, so it hears exactly one, with the
+    /// real timer and the real reload left in. `.invalid` (RFC 6761) keeps the
+    /// page's own load harmless too: it never reaches a server, so it can
+    /// neither raise the TLS card, behind which [`webview::reload`] refuses to
+    /// load, nor commit.
     ///
     /// Mutations (run this round, red): drop `on_gateway`'s
     /// `schedule_retry` and nothing is queued (the `waiting` assertion reds);
     /// drop its `unanswered.set(0)` on `Answered` and the backoff reds at 2;
     /// drop its `cancel_retry` there and a reload stays queued behind a page
-    /// that came back.
+    /// that came back; make `schedule_retry`'s timer not call `retry_due` and
+    /// the queued reload never fires.
     #[gtk::test]
     fn an_unanswered_page_is_reloaded_on_the_shared_backoff() {
         let (w, _rx) = window();
         let _quiet = RetryGuard(Rc::clone(&w));
-        w.update(Update::State(up(row_with_page())));
-        assert!(pump_until(Duration::from_secs(10), || !w.probing()));
-        let page = w.page_child().expect("the slot is filled");
-        let view = webview::view_of(&page).expect("the system store mounts the page at once");
+        let page = webview::page(
+            "https://hive.invalid/agent/stray/?hide=header",
+            &tls::Resolved::default(),
+            |_| {},
+        );
+        w.fill_page_slot(&page);
+        let view = webview::view_of(&page).expect("a page widget carries its view");
 
-        let again = "https://hive.local/agent/stray/turn/3";
+        let again = "https://hive.invalid/agent/stray/turn/3";
         w.on_gateway(webview::Gateway::Unanswered {
             uri: again.to_owned(),
             why: "Could not connect: Connection refused".to_owned(),

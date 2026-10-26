@@ -119,9 +119,62 @@ impl PairAgent {
     /// would then wait out bluetoothd's minute with nothing on screen.
     async fn cancel(&self) {
         tracing::debug!("agent cancel — aborting pending prompt");
-        if let Some(tx) = take_pending().await {
-            let _ = tx.send(AgentReply::Reject);
+        if let Some(shared) = shared_state() {
+            cancel_in(&shared.pending_response).await;
         }
+    }
+}
+
+/// The one agent request waiting on the user, keyed by the prompt it raised.
+///
+/// The key is what keeps an answer on the request it was given for (#1551).
+/// The slot used to hold the bare sender, and an answer went to whatever
+/// request held the slot when it landed. After a `Cancel` took request A's
+/// sender, request B could install itself before a click on A's banner was
+/// applied, and that click then answered B: a pairing confirmed for a code
+/// the user never saw.
+pub(crate) struct Waiting {
+    /// [`PairPrompt::id`] of the prompt this request raised.
+    id: u64,
+    /// The sender this request's [`await_reply_in`] is waiting on.
+    tx: oneshot::Sender<AgentReply>,
+}
+
+/// The reply slot: [`Waiting`] while a request waits on the user, `None`
+/// otherwise.
+pub(crate) type ReplySlot = AsyncMutex<Option<Waiting>>;
+
+/// Deliver the user's `reply` to the request that raised prompt `id`, and to
+/// no other.
+///
+/// A reply for a prompt that is no longer waiting (answered, cancelled, timed
+/// out, or replaced by a newer request) is dropped with a debug line. It
+/// decides nothing: the request in the slot, if any, keeps waiting on its own
+/// prompt (the #1510 rule the agents plugin follows for consent cards).
+pub(super) async fn answer_in(pending: &ReplySlot, id: u64, reply: AgentReply) {
+    let mut slot = pending.lock().await;
+    match slot.take() {
+        Some(waiting) if waiting.id == id => {
+            let _ = waiting.tx.send(reply);
+        }
+        other => {
+            tracing::debug!(
+                id,
+                waiting = ?other.as_ref().map(|w| w.id),
+                "bluetooth: a reply for a prompt that is no longer waiting; dropped"
+            );
+            *slot = other;
+        }
+    }
+}
+
+/// Reject whichever request is waiting, whatever its prompt. bluetoothd's
+/// `Cancel` names no request (it has one outstanding at a time), and the
+/// watcher's cleanup after bluetoothd went away rejects whatever the dead
+/// daemon left waiting.
+pub(super) async fn cancel_in(pending: &ReplySlot) {
+    if let Some(waiting) = pending.lock().await.take() {
+        let _ = waiting.tx.send(AgentReply::Reject);
     }
 }
 
@@ -162,16 +215,6 @@ fn lookup_alias(path: &str) -> String {
         .unwrap_or_else(|| "Unknown device".to_string())
 }
 
-fn pending_response_arc()
--> Option<std::sync::Arc<tokio::sync::Mutex<Option<oneshot::Sender<AgentReply>>>>> {
-    shared_state().map(|s| s.pending_response.clone())
-}
-
-async fn take_pending() -> Option<oneshot::Sender<AgentReply>> {
-    let arc = pending_response_arc()?;
-    arc.lock().await.take()
-}
-
 /// Suspend the calling Agent1 method until the user responds via the UI.
 /// Returns `AgentReply::Reject` if no prompt slot is available, the
 /// channel is dropped, or another pair is already in flight — callers
@@ -200,8 +243,11 @@ async fn await_reply(prompt: PairPrompt) -> AgentReply {
 /// the next request (#1551). Until then the dropped request's sender stayed
 /// in `pending`, and every later request saw it, took it for a pairing in
 /// flight and answered `Reject`, until something took it out.
+///
+/// The sender goes into `pending` under this request's prompt id, so only an
+/// answer given on this request's own prompt reaches it ([`answer_in`]).
 async fn await_reply_in(
-    pending: &AsyncMutex<Option<oneshot::Sender<AgentReply>>>,
+    pending: &ReplySlot,
     banner: &Mutable<Option<PairPrompt>>,
     prompt: PairPrompt,
 ) -> AgentReply {
@@ -212,12 +258,12 @@ async fn await_reply_in(
         // without anyone answering it. [`OwnBanner`] frees the slot when that
         // happens, but only if it can take the lock right then, so this is
         // the backstop for when it could not.
-        if guard.as_ref().is_some_and(|waiting| !waiting.is_closed()) {
+        if guard.as_ref().is_some_and(|waiting| !waiting.tx.is_closed()) {
             // Another pairing already pending — refuse cleanly so BlueZ
             // doesn't pile up coincident prompts.
             return AgentReply::Reject;
         }
-        *guard = Some(tx);
+        *guard = Some(Waiting { id: prompt.id, tx });
     }
 
     // From here on the banner and the reply slot are this request's to clean
@@ -251,7 +297,7 @@ async fn await_reply_in(
 /// closed and takes its place ([`await_reply_in`]).
 struct OwnBanner<'a> {
     banner: Mutable<Option<PairPrompt>>,
-    pending: &'a AsyncMutex<Option<oneshot::Sender<AgentReply>>>,
+    pending: &'a ReplySlot,
     id: u64,
     rx: oneshot::Receiver<AgentReply>,
 }
@@ -261,7 +307,7 @@ impl Drop for OwnBanner<'_> {
         clear_banner_if(&self.banner, self.id);
         self.rx.close();
         if let Ok(mut slot) = self.pending.try_lock()
-            && slot.as_ref().is_some_and(oneshot::Sender::is_closed)
+            && slot.as_ref().is_some_and(|waiting| waiting.tx.is_closed())
         {
             *slot = None;
         }
@@ -377,14 +423,16 @@ async fn try_register_agent() {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentReply, PairPrompt, PromptKind, await_reply_in, clear_banner_if};
+    use super::{
+        AgentReply, PairPrompt, PromptKind, ReplySlot, answer_in, await_reply_in, cancel_in,
+        clear_banner_if,
+    };
     use futures_signals::signal::{Mutable, Signal};
     use futures_util::FutureExt;
     use std::sync::Arc;
     use tokio::sync::Mutex as AsyncMutex;
-    use tokio::sync::oneshot;
 
-    type Pending = Arc<AsyncMutex<Option<oneshot::Sender<AgentReply>>>>;
+    type Pending = Arc<ReplySlot>;
 
     fn prompt(id: u64) -> PairPrompt {
         PairPrompt {
@@ -401,16 +449,9 @@ mod tests {
         banner.lock_ref().as_ref().map(|p| p.id)
     }
 
-    /// Answer whichever request is waiting, the way `send_reply` and
-    /// `PairAgent::cancel` do: take its sender and send on it.
-    async fn answer(pending: &Pending, reply: AgentReply) {
-        pending
-            .lock()
-            .await
-            .take()
-            .expect("a request is waiting")
-            .send(reply)
-            .expect("the waiting request is still listening");
+    /// The user answers prompt `id`, the way `send_reply` does.
+    async fn answer(pending: &Pending, id: u64, reply: AgentReply) {
+        answer_in(pending, id, reply).await;
     }
 
     /// Cancel(A), then Request(B), then A's task finally runs. A's late wake
@@ -438,7 +479,7 @@ mod tests {
         }
 
         // Cancel(A). A is now runnable but has not run.
-        answer(&pending, AgentReply::Reject).await;
+        cancel_in(&pending).await;
 
         // Request(B) lands first: one poll by hand installs it and raises its
         // banner, with no await point where A could be scheduled.
@@ -456,7 +497,7 @@ mod tests {
         );
 
         // B is answered: its own banner goes.
-        answer(&pending, AgentReply::Confirm).await;
+        answer(&pending, 2, AgentReply::Confirm).await;
         assert!(matches!(b.await, AgentReply::Confirm));
         assert_eq!(shown(&banner), None, "B takes its own banner down");
     }
@@ -472,7 +513,7 @@ mod tests {
         assert!(a.as_mut().now_or_never().is_none());
         assert_eq!(shown(&banner), Some(7));
 
-        answer(&pending, AgentReply::Confirm).await;
+        answer(&pending, 7, AgentReply::Confirm).await;
         assert!(matches!(a.await, AgentReply::Confirm));
         assert_eq!(shown(&banner), None);
     }
@@ -519,7 +560,7 @@ mod tests {
             "B waits on the user instead of being refused"
         );
         assert_eq!(shown(&banner), Some(2));
-        answer(&pending, AgentReply::Confirm).await;
+        answer(&pending, 2, AgentReply::Confirm).await;
         assert!(matches!(b.await, AgentReply::Confirm));
     }
 
@@ -541,7 +582,7 @@ mod tests {
             let held = pending.try_lock().expect("the slot is not locked");
             drop(a);
             assert!(
-                held.as_ref().is_some_and(oneshot::Sender::is_closed),
+                held.as_ref().is_some_and(|waiting| waiting.tx.is_closed()),
                 "A's sender is still in the slot, and closed"
             );
         }
@@ -552,7 +593,7 @@ mod tests {
             "B waits on the user instead of being refused"
         );
         assert_eq!(shown(&banner), Some(2));
-        answer(&pending, AgentReply::Confirm).await;
+        answer(&pending, 2, AgentReply::Confirm).await;
         assert!(matches!(b.await, AgentReply::Confirm));
     }
 
@@ -576,7 +617,7 @@ mod tests {
         );
         assert_eq!(shown(&banner), Some(1), "A's banner stays up");
 
-        answer(&pending, AgentReply::Confirm).await;
+        answer(&pending, 1, AgentReply::Confirm).await;
         assert!(
             matches!(a.await, AgentReply::Confirm),
             "A is still answerable"
@@ -596,7 +637,7 @@ mod tests {
 
         let mut a = Box::pin(await_reply_in(&pending, &banner, prompt(1)));
         assert!(a.as_mut().now_or_never().is_none());
-        answer(&pending, AgentReply::Reject).await;
+        answer(&pending, 1, AgentReply::Reject).await;
 
         let mut b = std::pin::pin!(await_reply_in(&pending, &banner, prompt(2)));
         assert!(b.as_mut().now_or_never().is_none());
@@ -607,7 +648,73 @@ mod tests {
             "B's sender must stay in the slot"
         );
         assert_eq!(shown(&banner), Some(2), "B's banner stays up");
-        answer(&pending, AgentReply::Confirm).await;
+        answer(&pending, 2, AgentReply::Confirm).await;
+        assert!(matches!(b.await, AgentReply::Confirm));
+    }
+
+    /// A Confirm clicked on A's banner never confirms B (#1551).
+    ///
+    /// bluetoothd cancels A, B installs itself and raises its banner, and
+    /// only then is the click the user made on A's banner applied. That click
+    /// is for a prompt that is no longer waiting, so it decides nothing: B
+    /// keeps waiting on its own prompt, and only an answer for B's id
+    /// reaches it.
+    ///
+    /// **Falsification:** let `answer_in` take whatever request is waiting
+    /// (the pre-#1551 `send_reply`) and B is confirmed by A's click, a
+    /// pairing for a code the user never saw.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_reply_for_a_cancelled_prompt_does_not_answer_the_next_request() {
+        let pending: Pending = Arc::new(AsyncMutex::new(None));
+        let banner: Mutable<Option<PairPrompt>> = Mutable::new(None);
+
+        let mut a = Box::pin(await_reply_in(&pending, &banner, prompt(1)));
+        assert!(a.as_mut().now_or_never().is_none());
+        // bluetoothd's Cancel for A.
+        cancel_in(&pending).await;
+
+        let mut b = std::pin::pin!(await_reply_in(&pending, &banner, prompt(2)));
+        assert!(b.as_mut().now_or_never().is_none());
+        assert_eq!(shown(&banner), Some(2), "B's banner is up");
+
+        // The click was on A's banner.
+        answer(&pending, 1, AgentReply::Confirm).await;
+        assert!(
+            b.as_mut().now_or_never().is_none(),
+            "A's answer must not reach B"
+        );
+        assert!(
+            pending.lock().await.is_some(),
+            "B is still waiting on its own prompt"
+        );
+        assert_eq!(shown(&banner), Some(2), "B's banner stays up");
+
+        answer(&pending, 2, AgentReply::Reject).await;
+        assert!(matches!(b.await, AgentReply::Reject));
+        assert!(matches!(a.await, AgentReply::Reject), "A was cancelled");
+    }
+
+    /// An answer for a prompt nobody is waiting on any more (already
+    /// answered, say, by a double click) changes nothing, and the next request
+    /// installs as usual.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_reply_with_nothing_waiting_is_dropped() {
+        let pending: Pending = Arc::new(AsyncMutex::new(None));
+        let banner: Mutable<Option<PairPrompt>> = Mutable::new(None);
+
+        let mut a = std::pin::pin!(await_reply_in(&pending, &banner, prompt(1)));
+        assert!(a.as_mut().now_or_never().is_none());
+        answer(&pending, 1, AgentReply::Confirm).await;
+        answer(&pending, 1, AgentReply::Reject).await;
+        assert!(
+            matches!(a.await, AgentReply::Confirm),
+            "the first answer stands"
+        );
+        assert!(pending.lock().await.is_none(), "nothing is waiting");
+
+        let mut b = std::pin::pin!(await_reply_in(&pending, &banner, prompt(2)));
+        assert!(b.as_mut().now_or_never().is_none(), "B is not refused");
+        answer(&pending, 2, AgentReply::Confirm).await;
         assert!(matches!(b.await, AgentReply::Confirm));
     }
 

@@ -34,7 +34,7 @@ mod types;
 pub(crate) use types::AgentReply;
 pub use types::{Adapter, Device, PairPrompt, PromptKind};
 
-use agent::{AGENT_ANCHOR_NAME, AGENT_PATH, PairAgent, run_agent};
+use agent::{AGENT_ANCHOR_NAME, AGENT_PATH, PairAgent, ReplySlot, run_agent};
 use devices::{ListenEnd, listen, wait_for_bluez};
 use futures_signals::signal::{Mutable, Signal};
 use hytte_bus::BusKind;
@@ -43,7 +43,6 @@ use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
-use tokio::sync::oneshot;
 
 use crate::retry;
 
@@ -89,7 +88,7 @@ const PAIRING_CALL_TIMEOUT: Duration = Duration::from_mins(5);
 //     pairing dialog hangs forever on a no-op.
 //   - `PairAgent` iface methods (`request_pin_code`, `request_passkey`,
 //     `request_confirmation`, `request_authorization`, `cancel`) call
-//     `lookup_alias`, `pending_response_arc` and `await_reply`, which reach
+//     `lookup_alias`, `cancel_in` and `await_reply`, which reach
 //     the prompt slot; all of them once used `registry::with`.
 //
 // The cross-thread-safe alternative is `hytte_reactive::shared` (the
@@ -100,7 +99,7 @@ pub(super) struct BluetoothShared {
     pub(super) devices: Mutable<Vec<Device>>,
     pub(super) device_actions: Mutable<HashSet<String>>,
     pub(super) pair_prompt: Mutable<Option<PairPrompt>>,
-    pub(super) pending_response: Arc<AsyncMutex<Option<oneshot::Sender<AgentReply>>>>,
+    pub(super) pending_response: Arc<ReplySlot>,
     /// Most recent connect/pair/disconnect failure (#1171), or `None` before
     /// the first one. `Mutable::set` always notifies subscribers, even on an
     /// unchanged value (see `mark_busy`'s doc below for the same invariant),
@@ -198,10 +197,12 @@ pub struct BluetoothHandles {
     /// or `None` when no prompt is pending. The UI renders a banner when
     /// `Some` and calls `respond_to_prompt(...)` on user action.
     pub(crate) pair_prompt: Mutable<Option<PairPrompt>>,
-    /// Sender half of the oneshot the agent method is awaiting. Held under
-    /// an async mutex so `respond_to_prompt` / `submit_pin` / `submit_passkey`
-    /// / `Cancel` can race-lessly take it. `None` when no prompt is in-flight.
-    pub(crate) pending_response: Arc<AsyncMutex<Option<oneshot::Sender<AgentReply>>>>,
+    /// Sender half of the oneshot the agent method is awaiting, keyed by the
+    /// [`PairPrompt::id`] of the prompt it raised. Held under an async mutex
+    /// so `respond_to_prompt` / `submit_pin` / `submit_passkey` / `Cancel`
+    /// can race-lessly take it; the three answers take it only for their own
+    /// prompt's id. `None` when no prompt is in-flight.
+    pub(crate) pending_response: Arc<ReplySlot>,
     /// Most recent connect/pair/disconnect failure, or `None` before the
     /// first one (#1171). The UI binds [`action_error`] and forwards each
     /// emission **newer than the binding itself** to a toast — see
@@ -296,10 +297,8 @@ impl Service for BluetoothService {
                         }
                         s.pending_response.clone()
                     });
-                    if let Some(pending) = pending_response
-                        && let Some(tx) = pending.lock().await.take()
-                    {
-                        let _ = tx.send(AgentReply::Reject);
+                    if let Some(pending) = pending_response {
+                        agent::cancel_in(&pending).await;
                     }
                     // Also reset the adapter path store so the next listen()
                     // call starts fresh.
@@ -432,49 +431,55 @@ fn set_action_error(action_error: &Mutable<Option<ActionError>>, message: String
     }));
 }
 
-/// Resolve the active yes/no pairing prompt. `accept = true` returns `Ok`
-/// to `BlueZ`, completing the pair; `false` returns `org.bluez.Error.Rejected`
-/// and aborts. No-op when no prompt is in flight or the prompt is a
-/// text-entry kind (use `submit_pin` / `submit_passkey` for those).
-pub fn respond_to_prompt(accept: bool) {
-    send_reply(if accept {
-        AgentReply::Confirm
-    } else {
-        AgentReply::Reject
-    });
+/// Resolve the yes/no pairing prompt `id` ([`PairPrompt::id`], the prompt
+/// the user answered). `accept = true` returns `Ok` to `BlueZ`, completing
+/// the pair; `false` returns `org.bluez.Error.Rejected` and aborts.
+///
+/// The answer reaches only the request that raised prompt `id`. If that
+/// request is no longer waiting (cancelled, timed out, or already answered),
+/// the answer is dropped and decides nothing, even if another request is
+/// waiting by then (#1551): a Confirm clicked on one device's code must never
+/// pair a different device whose code the user never saw.
+pub fn respond_to_prompt(id: u64, accept: bool) {
+    send_reply(
+        id,
+        if accept {
+            AgentReply::Confirm
+        } else {
+            AgentReply::Reject
+        },
+    );
 }
 
-/// Resolve a `RequestPinCode` prompt by submitting the user's PIN.
+/// Resolve the `RequestPinCode` prompt `id` by submitting the user's PIN.
 /// Empty string is treated as a reject so the user can dismiss the
-/// banner without triggering a malformed pair.
-pub fn submit_pin(pin: String) {
+/// banner without triggering a malformed pair. Bound to `id` the way
+/// [`respond_to_prompt`] is.
+pub fn submit_pin(id: u64, pin: String) {
     if pin.is_empty() {
-        send_reply(AgentReply::Reject);
+        send_reply(id, AgentReply::Reject);
     } else {
-        send_reply(AgentReply::Pin(pin));
+        send_reply(id, AgentReply::Pin(pin));
     }
 }
 
-/// Resolve a `RequestPasskey` prompt by submitting the user's numeric
+/// Resolve the `RequestPasskey` prompt `id` by submitting the user's numeric
 /// passkey. Out-of-range values reject so we never hand `BlueZ` something
-/// it'll trip on.
-pub fn submit_passkey(passkey: u32) {
+/// it'll trip on. Bound to `id` the way [`respond_to_prompt`] is.
+pub fn submit_passkey(id: u64, passkey: u32) {
     if passkey > 999_999 {
-        send_reply(AgentReply::Reject);
+        send_reply(id, AgentReply::Reject);
     } else {
-        send_reply(AgentReply::Passkey(passkey));
+        send_reply(id, AgentReply::Passkey(passkey));
     }
 }
 
-fn send_reply(reply: AgentReply) {
+fn send_reply(id: u64, reply: AgentReply) {
     let Some(pending) = shared_state().map(|s| s.pending_response.clone()) else {
         return;
     };
     runtime::handle().spawn(async move {
-        let mut guard = pending.lock().await;
-        if let Some(tx) = guard.take() {
-            let _ = tx.send(reply);
-        }
+        agent::answer_in(&pending, id, reply).await;
     });
 }
 

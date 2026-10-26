@@ -331,27 +331,30 @@ fn populate_pair_prompt(container: &gtk::Box, p: &PairPrompt) {
     detail.add_css_class("ts-bluetooth-prompt-detail");
     container.append(&detail);
 
+    // Every answer carries the id of the prompt it was given on, so a click
+    // that lands after this prompt was cancelled and replaced answers nothing
+    // rather than the newer request (#1551).
     match p.kind {
         PromptKind::ConfirmPasskey | PromptKind::Authorize => {
-            container.append(&build_yes_no_row());
+            container.append(&build_yes_no_row(p.id));
         }
         PromptKind::EnterPinCode => {
-            container.append(&build_text_entry_row(false));
+            container.append(&build_text_entry_row(false, p.id));
         }
         PromptKind::EnterPasskey => {
-            container.append(&build_text_entry_row(true));
+            container.append(&build_text_entry_row(true, p.id));
         }
     }
 }
 
-fn build_yes_no_row() -> gtk::Box {
+fn build_yes_no_row(id: u64) -> gtk::Box {
     let btn_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let confirm_btn = gtk::Button::with_label("Confirm");
     confirm_btn.add_css_class("suggested-action");
-    confirm_btn.connect_clicked(|_| bluetooth::respond_to_prompt(true));
+    confirm_btn.connect_clicked(move |_| bluetooth::respond_to_prompt(id, true));
     let reject_btn = gtk::Button::with_label("Reject");
     reject_btn.add_css_class("destructive-action");
-    reject_btn.connect_clicked(|_| bluetooth::respond_to_prompt(false));
+    reject_btn.connect_clicked(move |_| bluetooth::respond_to_prompt(id, false));
     btn_row.append(&confirm_btn);
     btn_row.append(&reject_btn);
     btn_row
@@ -359,8 +362,9 @@ fn build_yes_no_row() -> gtk::Box {
 
 /// Entry + Submit/Cancel row for legacy `RequestPinCode` / `RequestPasskey`.
 /// `numeric_only` switches input filtering so passkey entries can't contain
-/// non-digits — `BlueZ` would reject the malformed value anyway.
-fn build_text_entry_row(numeric_only: bool) -> gtk::Box {
+/// non-digits — `BlueZ` would reject the malformed value anyway. `id` is the
+/// prompt every answer from this row is bound to.
+fn build_text_entry_row(numeric_only: bool, id: u64) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
 
     let entry = gtk::Entry::new();
@@ -379,34 +383,34 @@ fn build_text_entry_row(numeric_only: bool) -> gtk::Box {
     let submit_btn = gtk::Button::with_label("Submit");
     submit_btn.add_css_class("suggested-action");
     let entry_for_submit = entry.clone();
-    submit_btn.connect_clicked(move |_| submit_entry(&entry_for_submit, numeric_only));
+    submit_btn.connect_clicked(move |_| submit_entry(&entry_for_submit, numeric_only, id));
     // The handler's own argument *is* this entry, so taking it costs nothing
     // and a strong `entry.clone()` here would be the `bind`-pin defect one
     // layer down (#224/#831/#1176): the entry's handler list would own the
     // entry, so the prompt row could never be freed and every `prompt()`
     // emission would leak one. `submit_btn`'s capture above is a *different*
     // widget's handler holding this entry (the carve-out) and stays a clone.
-    entry.connect_activate(move |entry| submit_entry(entry, numeric_only));
+    entry.connect_activate(move |entry| submit_entry(entry, numeric_only, id));
     row.append(&submit_btn);
 
     let cancel_btn = gtk::Button::with_label("Cancel");
     cancel_btn.add_css_class("destructive-action");
-    cancel_btn.connect_clicked(|_| bluetooth::respond_to_prompt(false));
+    cancel_btn.connect_clicked(move |_| bluetooth::respond_to_prompt(id, false));
     row.append(&cancel_btn);
 
     row
 }
 
-fn submit_entry(entry: &gtk::Entry, numeric_only: bool) {
+fn submit_entry(entry: &gtk::Entry, numeric_only: bool, id: u64) {
     let text = entry.text().to_string();
     if numeric_only {
         match text.trim().parse::<u32>() {
-            Ok(n) => bluetooth::submit_passkey(n),
+            Ok(n) => bluetooth::submit_passkey(id, n),
             // Empty / non-numeric → reject so `BlueZ` doesn't see junk.
-            Err(_) => bluetooth::respond_to_prompt(false),
+            Err(_) => bluetooth::respond_to_prompt(id, false),
         }
     } else {
-        bluetooth::submit_pin(text);
+        bluetooth::submit_pin(id, text);
     }
 }
 
@@ -812,7 +816,7 @@ mod tests {
     #[gtk::test]
     fn a_pin_entry_dies_with_its_row() {
         adw::init().expect("libadwaita init");
-        let row = build_text_entry_row(false);
+        let row = build_text_entry_row(false, 1);
         let entry = row.first_child().expect("the row leads with its entry");
         let weak_entry = entry.downgrade();
         drop(entry);

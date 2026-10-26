@@ -1798,6 +1798,167 @@
               touch $out
             '';
 
+          # Unit-text escaping on the home-manager side, on #1508's shape: the
+          # rendered unit strings are the assertion. A `"`, backslash and `%`
+          # in an option value must reach the `Environment=` line escaped (and
+          # `$` must NOT be doubled — `Environment=` expands no variables), a
+          # `%` in `petBrain.model` must be doubled in `ConditionPathExists=`
+          # as it already was in `ExecStart=`, and a nightlight coordinate
+          # string that is not a decimal number must fail evaluation (it is
+          # spliced into an `sh -c`), while a float and a numeric string keep
+          # working.
+          hm-module-unit-escaping =
+            let
+              fixture =
+                extra:
+                (home-manager.lib.homeManagerConfiguration {
+                  inherit pkgs;
+                  modules = [
+                    self.homeModules.default
+                    {
+                      home = {
+                        username = "alice";
+                        homeDirectory = "/home/alice";
+                        stateVersion = "24.11";
+                        enableNixpkgsReleaseCheck = false;
+                      };
+                      programs.trollshell = {
+                        enable = true;
+                        package = stubPackage;
+                      }
+                      // extra;
+                    }
+                  ];
+                }).config;
+              cfg = fixture {
+                ownerName = "100% \\o/ $HOME";
+                wallpaper.reloadCommand = ''sh -c "awww img {} --transition-type fade"'';
+                petBrain = {
+                  enable = true;
+                  package = stubLlamaCpp;
+                  model = "/data/100%/brain.gguf";
+                };
+                nightlight = {
+                  latitude = 52.52;
+                  longitude = "-13.405";
+                };
+              };
+              units = cfg.systemd.user.services;
+              env = builtins.toString units.trollshell.Service.Environment;
+              has = pkgs.lib.hasInfix;
+              nlExec = builtins.toString units.wlsunset.Service.ExecStart;
+              bad =
+                lat:
+                builtins.tryEval (
+                  builtins.deepSeq
+                    (fixture {
+                      nightlight = {
+                        latitude = lat;
+                        longitude = "1";
+                      };
+                    }).systemd.user.services.wlsunset.Service.ExecStart
+                    "ok"
+                );
+              probe =
+                assert has ''"TROLLSHELL_OWNER=100%% \\o/ $HOME"'' env;
+                assert has ''"TROLLSHELL_WALLPAPER_RELOAD_CMD=sh -c \"awww img {} --transition-type fade\""'' env;
+                assert
+                  builtins.toString units.trollshell-pet-brain.Unit.ConditionPathExists == "/data/100%%/brain.gguf";
+                assert has "set -- -l 52.520000 -L -13.405;" nlExec;
+                assert !(bad "1; touch /tmp/pwned").success;
+                assert !(bad "$(id)").success;
+                assert (bad "12.5").success;
+                "ok";
+            in
+            pkgs.runCommand "trollshell-hm-module-unit-escaping-check" { inherit probe; } ''
+              echo "$probe" >/dev/null
+              touch $out
+            '';
+
+          # The launcher silently drops a plugin id, secret slot or env key
+          # that breaks its Rust validity rules (`sanitize` in
+          # plugin_launcher.rs); `nix/module-common.nix` mirrors them as
+          # assertions. One bad entry of each kind must trip exactly one
+          # predicate apiece, each message naming the offending attribute, and
+          # the edge-valid control (64-char id, slot with `-`/`_`/digits, env
+          # key with odd characters other than `=`) must trip none.
+          nixos-module-plugin-validation =
+            let
+              mk =
+                plugins:
+                (nixpkgs.lib.nixosSystem {
+                  inherit system;
+                  modules = [
+                    self.nixosModules.default
+                    {
+                      programs.trollshell = {
+                        enable = true;
+                        package = stubPackage;
+                        weather.fallbackCity = "Berlin";
+                        inherit plugins;
+                      };
+                      boot.loader.grub.enable = false;
+                      fileSystems."/" = {
+                        device = "/dev/sda1";
+                        fsType = "ext4";
+                      };
+                      system.stateVersion = "24.11";
+                    }
+                  ];
+                }).config;
+              falseOf = cfg: builtins.filter (a: !a.assertion) cfg.assertions;
+              has = pkgs.lib.hasInfix;
+              bad = falseOf (mk {
+                "bad.id" = {
+                  package = stubPlugin;
+                };
+                good = {
+                  package = stubPlugin;
+                  secrets = [
+                    "OpenRouter"
+                    "9live"
+                    "fine-slot_2"
+                  ];
+                  env = {
+                    "A=B" = "x";
+                    OK_KEY = "y";
+                  };
+                };
+              });
+              msgs = map (a: a.message) bad;
+              all = builtins.concatStringsSep "\n" msgs;
+              control = falseOf (mk {
+                "${pkgs.lib.concatStrings (builtins.genList (_: "a") 64)}" = {
+                  package = stubPlugin;
+                  secrets = [
+                    "a"
+                    "a-b_c9"
+                  ];
+                  env."ODD key.1" = "v";
+                };
+              });
+              tooLong = falseOf (mk {
+                "${pkgs.lib.concatStrings (builtins.genList (_: "a") 65)}" = {
+                  package = stubPlugin;
+                };
+              });
+              probe =
+                assert builtins.length bad == 3;
+                assert has "programs.trollshell.plugins.\"bad.id\"" all;
+                assert has "programs.trollshell.plugins.good.secrets: \"OpenRouter\"" all;
+                assert has "programs.trollshell.plugins.good.secrets: \"9live\"" all;
+                assert !(has "fine-slot_2" all);
+                assert has "programs.trollshell.plugins.good.env.\"A=B\"" all;
+                assert !(has "OK_KEY" all);
+                assert control == [ ];
+                assert builtins.length tooLong == 1;
+                "ok";
+            in
+            pkgs.runCommand "trollshell-nixos-module-plugin-validation-check" { inherit probe; } ''
+              echo "$probe" >/dev/null
+              touch $out
+            '';
+
           # geoclue2's `appConfig.trollshell` is set by the module as
           # `mkDefault` like the rest of the recommended-services block, so a
           # user's explicit `isAllowed = false` must evaluate (a plain

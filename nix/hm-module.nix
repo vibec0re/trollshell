@@ -248,6 +248,21 @@ let
   escapeSystemdExecArg =
     arg: lib.replaceStrings [ "%" "$" ] [ "%%" "$$" ] (builtins.toJSON (toString arg));
 
+  # Quote one `NAME=value` assignment for a systemd `Environment=` line. Same
+  # family of bug as above, different rules (systemd.exec(5), systemd.syntax(7)):
+  # the whole assignment sits in double quotes, so a backslash or `"` in the
+  # value must be backslash-escaped or the quoted string ends early (a
+  # `wallpaper.reloadCommand` like `sh -c "awww img {}"` did exactly that), a
+  # newline would end the assignment, and `%` is still a unit specifier
+  # (`ownerName = "100%"` was rewritten). `$` is deliberately NOT doubled:
+  # unlike `Exec*=`, `Environment=` performs no variable expansion, so `$$`
+  # would reach the process as two dollars.
+  escapeSystemdEnvAssignment =
+    name: value:
+    "\""
+    + lib.replaceStrings [ "\\" "\"" "\n" "%" ] [ "\\\\" "\\\"" "\\n" "%%" ] "${name}=${value}"
+    + "\"";
+
   # Where the pet brain's GGUF lives. Resolved here rather than as the option's
   # own default because module-common.nix is shared with the NixOS module, where
   # `config.home` does not exist to point at.
@@ -369,9 +384,9 @@ let
   # ambient shell variable to expand in the first place (the whole reason
   # #568 exists), so appending to "whatever is already set" is meaningless
   # for a process a manager execs fresh.
-  configDirsUnitEnvironment = lib.optional (
-    configFiles != { }
-  ) "\"XDG_CONFIG_DIRS=${configBase}:/etc/xdg\"";
+  configDirsUnitEnvironment = lib.optional (configFiles != { }) (
+    escapeSystemdEnvAssignment "XDG_CONFIG_DIRS" "${configBase}:/etc/xdg"
+  );
 
   # #1041 step 3: `trollshell/src/config/core_leds.rs`'s `resolve` no longer
   # reads any of these four variables' VALUE — it only checks whether one is
@@ -545,16 +560,16 @@ in
             # actually reads it — the user manager never sources
             # hm-session-vars.sh (#568). Each assignment is quoted whole so a
             # value with spaces (wallpaper.reloadCommand) survives systemd's
-            # Environment= word splitting; embedded double quotes in a value
-            # are not supported. `configDirsUnitEnvironment` (#1041 H1 fix)
+            # Environment= word splitting, and `escapeSystemdEnvAssignment`
+            # escapes backslash, `"`, newline and `%` inside it.
+            # `configDirsUnitEnvironment` (#1041 H1 fix)
             # is appended rather than folded into `trollshellSessionEnv`
             # itself, since that attrset also feeds `home.sessionVariables`
             # and a literal XDG_CONFIG_DIRS there conflicts with
             # `xdg.systemDirs.config`'s own write to the same key — see the
             # long comment on `configDirsUnitEnvironment` in the `let` above.
             Environment =
-              (lib.mapAttrsToList (name: value: "\"${name}=${value}\"") trollshellSessionEnv)
-              ++ configDirsUnitEnvironment;
+              (lib.mapAttrsToList escapeSystemdEnvAssignment trollshellSessionEnv) ++ configDirsUnitEnvironment;
           };
           Install.WantedBy = [ cfg.systemd.target ];
         };
@@ -1037,7 +1052,9 @@ in
             # petBrain.enable description) — gate the unit on the file existing
             # instead of letting llama-server crash-loop against Restart=
             # on-failure until it is fetched. Same idiom as swaybg's args file.
-            ConditionPathExists = pbModel;
+            # `%`-escaped like the ExecStart below: a bare `%` in a user-chosen
+            # path is a unit specifier and fails the unit load.
+            ConditionPathExists = lib.replaceStrings [ "%" ] [ "%%" ] pbModel;
           };
           Service = {
             Type = "simple";

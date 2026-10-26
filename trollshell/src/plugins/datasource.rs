@@ -205,17 +205,17 @@ impl DatasourceRouter {
             Registered::Standby { holder } => tracing::warn!(
                 datasource = %log_field(id),
                 holder = %log_field(&holder),
-                standby = %log_field(&plugin_id),
+                standby = %log_field(plugin_id),
                 "datasource id is already served by another live plugin; the holder keeps \
                  serving, and this one stands by to take over when it leaves",
             ),
             Registered::Replaced => tracing::info!(
                 datasource = %log_field(id),
-                plugin = %log_field(&plugin_id),
+                plugin = %log_field(plugin_id),
                 "datasource provider re-registered by the same plugin; replacing its earlier entry",
             ),
             Registered::Serving => {
-                tracing::info!(datasource = %log_field(id), plugin = %log_field(&plugin_id), "datasource provider registered");
+                tracing::info!(datasource = %log_field(id), plugin = %log_field(plugin_id), "datasource provider registered");
             }
         }
     }

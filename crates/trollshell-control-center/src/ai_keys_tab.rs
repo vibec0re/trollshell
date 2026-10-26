@@ -2,9 +2,11 @@
 //! provider. Each row stores a key in the shell's keyring (`SetAiKey` over
 //! `Control`) and shows whether a key is currently stored (`ListAiKeys`) — the
 //! value itself is never read back. The apply button sets/updates the key
-//! (wiping the entry after, so the plaintext isn't retained in the widget);
-//! the trash button clears it. When the shell isn't running the calls fail and
-//! the rows show "Unavailable".
+//! (wiping the entry once the shell has taken it, so the plaintext isn't
+//! retained in the widget — and **only** then: a call that fails keeps what
+//! was typed and says so under the rows, see [`apply_outcome`]); the trash
+//! button clears it. When the shell isn't running the calls fail and the rows
+//! show "Unavailable".
 //!
 //! Lives in its own module for the reason [`crate::places_tab`] and
 //! [`crate::plugins_tab`] do: a tab with its own state struct is a module, not
@@ -205,7 +207,8 @@ pub(crate) fn build_page() -> (adw::PreferencesPage, impl Fn(bool) + 'static) {
         )
         .build();
 
-    // (slot, entry, status label, clear button) per provider while building.
+    // (slot, label, entry, status label, clear button, failure note) per
+    // provider while building.
     let mut built = Vec::new();
     for (slot, label, help) in KNOWN_AI_PROVIDERS {
         let entry = adw::PasswordEntryRow::builder()
@@ -227,20 +230,30 @@ pub(crate) fn build_page() -> (adw::PreferencesPage, impl Fn(bool) + 'static) {
         entry.add_suffix(&clear_btn);
 
         group.add(&entry);
-        built.push((*slot, entry, status_lbl, clear_btn));
+        built.push((*slot, *label, entry, status_lbl, clear_btn, failure_note()));
+    }
+    // Below the rows: `AdwPreferencesGroup` renders a child that is not a list
+    // row after its list (the Plugins tab's Settings group puts its status
+    // line in the same place). One note per provider, each hidden until that
+    // provider's key fails to store.
+    for (.., note) in &built {
+        group.add(note);
     }
     page.add(&group);
 
     let state = AiKeysState::new(
         built
             .iter()
-            .map(|(slot, _entry, lbl, btn)| ((*slot).to_owned(), lbl.clone(), btn.clone()))
+            .map(|(slot, _label, _entry, lbl, btn, _note)| {
+                ((*slot).to_owned(), lbl.clone(), btn.clone())
+            })
             .collect(),
     );
 
-    for (slot, entry, _lbl, clear_btn) in built {
-        // Apply → SetAiKey, then wipe the entry (don't keep the plaintext) and
-        // re-read the stored-key status.
+    for (slot, label, entry, _lbl, clear_btn, note) in built {
+        // Apply → SetAiKey, then — only once the shell has taken it — wipe the
+        // entry (don't keep the plaintext), and re-read the stored-key status
+        // either way.
         {
             let (slot, state) = (slot.to_owned(), state.clone());
             entry.connect_apply(move |e| {
@@ -248,12 +261,12 @@ pub(crate) fn build_page() -> (adw::PreferencesPage, impl Fn(bool) + 'static) {
                 if value.is_empty() {
                     return;
                 }
-                let (e, slot, state) = (e.clone(), slot.clone(), state.clone());
+                let (e, note, slot, state) = (e.clone(), note.clone(), slot.clone(), state.clone());
                 spawn_on_runtime(set_ai_key(slot, value), move |res| {
-                    if let Err(err) = res {
+                    if let Err(err) = &res {
                         tracing::info!(%err, "SetAiKey failed");
                     }
-                    e.set_text("");
+                    show_apply_outcome(&e, &note, &apply_outcome(label, &res));
                     refresh_ai_status(&state);
                 });
             });
@@ -390,6 +403,85 @@ fn apply_ai_status(state: &AiKeysState, res: Result<Vec<String>, hytte_bus::BusE
     }
 }
 
+// ── Apply's outcome ──────────────────────────────────────────────────────────
+
+/// What a finished `SetAiKey` leaves on its row.
+///
+/// Before this the entry was wiped whether or not the call landed, so with
+/// the shell down or mid-restart a freshly pasted key simply vanished: the
+/// status suffix said "Unavailable" (true of every row, and of the shell, not
+/// of this key), and the one trace of the failure was an `info!` line in the
+/// journal. The secret was gone from the widget and was never in the keyring.
+#[derive(Debug, PartialEq, Eq)]
+enum ApplyOutcome {
+    /// The shell took it: wipe the plaintext from the entry, and take down
+    /// any earlier failure shown for this provider.
+    Stored,
+    /// It did not: keep what was typed — so a retry is one click, not a
+    /// second trip to the provider's dashboard — and show this sentence.
+    NotStored(String),
+}
+
+/// [`ApplyOutcome`] for provider `label` from `SetAiKey`'s result. Pure, so
+/// the rule — wipe on `Ok` and only on `Ok` — is pinned without a bus.
+///
+/// `Ok` is the shell's answer, not the keyring's: `SetAiKey` replies empty
+/// even when `secrets::set` fails shell-side (the shape #707 fixed for the
+/// plugin methods). That case still reads as stored here; only the status
+/// re-read that follows every apply can show it, and only when no older key
+/// is there to keep saying "Key stored". Making `SetAiKey` answer with the
+/// keyring's error is a shell change, not this tab's.
+fn apply_outcome(label: &str, res: &Result<(), hytte_bus::BusError>) -> ApplyOutcome {
+    match res {
+        Ok(()) => ApplyOutcome::Stored,
+        Err(err) => {
+            let why = if crate::is_shell_not_running(err) {
+                "trollshell is not running".to_owned()
+            } else {
+                err.to_string()
+            };
+            ApplyOutcome::NotStored(format!(
+                "The {label} key was not stored: {why}. It is still in the field — press \
+                 apply to try again."
+            ))
+        }
+    }
+}
+
+/// Put an [`ApplyOutcome`] on screen: the entry itself (wiped, or kept and
+/// marked with the `error` class — the Places tab's coordinate rows' idiom
+/// for "not saved, still here to correct") and the provider's note below the
+/// rows.
+fn show_apply_outcome(entry: &adw::PasswordEntryRow, note: &gtk::Label, outcome: &ApplyOutcome) {
+    match outcome {
+        ApplyOutcome::Stored => {
+            entry.set_text("");
+            entry.remove_css_class("error");
+            note.set_text("");
+            note.set_visible(false);
+        }
+        ApplyOutcome::NotStored(text) => {
+            entry.add_css_class("error");
+            note.set_text(text);
+            note.set_visible(true);
+        }
+    }
+}
+
+/// A provider's failure note: hidden, wrapping, styled as an error — what
+/// [`show_apply_outcome`] writes into. The Plugins tab's Settings status
+/// line's shape.
+fn failure_note() -> gtk::Label {
+    let note = gtk::Label::builder()
+        .xalign(0.0)
+        .wrap(true)
+        .visible(false)
+        .margin_top(6)
+        .build();
+    note.add_css_class("error");
+    note
+}
+
 /// `ListAiKeys` → the provider slots that currently have a stored key. Values
 /// are never returned.
 async fn list_ai_keys() -> Result<Vec<String>, hytte_bus::BusError> {
@@ -432,7 +524,60 @@ async fn clear_ai_key(slot: String) -> Result<(), hytte_bus::BusError> {
 
 #[cfg(test)]
 mod tests {
-    use super::PollGenerations;
+    use super::{ApplyOutcome, PollGenerations, apply_outcome};
+
+    // ── Apply's outcome ──────────────────────────────────────────────────────
+
+    /// The not-running reply, shaped as a call against an unowned name
+    /// really produces it (#959).
+    fn not_running() -> hytte_bus::BusError {
+        hytte_bus::BusError::Permanent {
+            reason: "The name mov.vibec0re.trollshell.Control was not provided by any \
+                     .service files"
+                .to_owned(),
+            dbus_name: Some("org.freedesktop.DBus.Error.ServiceUnknown".to_owned()),
+        }
+    }
+
+    /// A stored key is wiped — the one outcome that may take the plaintext.
+    #[test]
+    fn a_stored_key_is_wiped_from_the_entry() {
+        assert_eq!(apply_outcome("OpenRouter", &Ok(())), ApplyOutcome::Stored);
+    }
+
+    /// The defect: with the shell down the key was wiped anyway. Now it is
+    /// kept, and the sentence says which key, why, and that it is still
+    /// there — in words, not as a D-Bus error name.
+    ///
+    /// **Red if `apply_outcome` answers `Stored` for an `Err`** (the old
+    /// unconditional `set_text("")`).
+    #[test]
+    fn a_key_the_shell_never_got_is_kept_and_the_reason_is_shown() {
+        let ApplyOutcome::NotStored(text) = apply_outcome("OpenRouter", &Err(not_running())) else {
+            panic!("a failed SetAiKey must keep the typed key");
+        };
+        assert_eq!(
+            text,
+            "The OpenRouter key was not stored: trollshell is not running. It is still in the \
+             field — press apply to try again."
+        );
+    }
+
+    /// Any other failure keeps the key too, and carries the bus's own reason
+    /// rather than claiming the shell is down.
+    #[test]
+    fn any_other_failure_keeps_the_key_and_names_the_bus_error() {
+        let err = hytte_bus::BusError::Permanent {
+            reason: "Timeout was reached".to_owned(),
+            dbus_name: None,
+        };
+        let shown = err.to_string();
+        let ApplyOutcome::NotStored(text) = apply_outcome("OpenRouter", &Err(err)) else {
+            panic!("a failed SetAiKey must keep the typed key");
+        };
+        assert!(text.contains(&shown), "{text}");
+        assert!(!text.contains("not running"), "{text}");
+    }
 
     // ── Poll ordering (#1003) ────────────────────────────────────────────────
 
@@ -877,5 +1022,44 @@ mod gtk_tests {
             "the one line must be the recovery: {:?}",
             lines[0]
         );
+    }
+
+    // ── Apply's outcome on the row ───────────────────────────────────────────
+
+    /// A failed apply keeps the typed key, marks the entry and shows the
+    /// note; the next stored apply wipes the key and takes both down.
+    ///
+    /// Through [`super::show_apply_outcome`] with a fabricated outcome, not
+    /// through `connect_apply`: that spawns a real `SetAiKey`, and a test run
+    /// inside a live session would store its fixture in the operator's own
+    /// keyring. The decision itself is [`super::apply_outcome`]'s, pinned
+    /// hermetically in `tests` above.
+    ///
+    /// **Red if the `NotStored` arm wipes the entry** — the old behaviour.
+    #[gtk::test]
+    fn a_failed_apply_keeps_the_key_and_says_why_until_one_lands() {
+        adw::init().expect("libadwaita init");
+        let entry = adw::PasswordEntryRow::new();
+        let note = super::failure_note();
+        entry.set_text("sk-or-fixture");
+
+        let why = "The OpenRouter key was not stored: trollshell is not running.".to_owned();
+        super::show_apply_outcome(&entry, &note, &super::ApplyOutcome::NotStored(why.clone()));
+        assert_eq!(entry.text(), "sk-or-fixture", "the typed key was wiped");
+        assert!(entry.has_css_class("error"), "the entry is not marked");
+        assert!(note.is_visible(), "the failure is not shown");
+        assert_eq!(note.text(), why);
+
+        super::show_apply_outcome(&entry, &note, &super::ApplyOutcome::Stored);
+        assert_eq!(
+            entry.text(),
+            "",
+            "a stored key's plaintext stays in the widget"
+        );
+        assert!(
+            !entry.has_css_class("error"),
+            "the old failure still marks the entry"
+        );
+        assert!(!note.is_visible(), "the old failure is still shown");
     }
 }

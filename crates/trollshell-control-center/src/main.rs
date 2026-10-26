@@ -138,7 +138,8 @@ fn main() -> glib::ExitCode {
 fn build_window(app: &adw::Application) {
     let stack = adw::ViewStack::new();
     // The Plugins tab (#348): start/stop/enable each plugin's systemd user unit.
-    let (plugins_page, plugins_poll) = plugins_tab::build_page();
+    // `flush_config_saves` writes its config forms' debounced edits on close.
+    let (plugins_page, plugins_poll, flush_config_saves) = plugins_tab::build_page();
     stack.add_titled_with_icon(
         &plugins_page,
         Some("plugins"),
@@ -237,6 +238,10 @@ fn build_window(app: &adw::Application) {
     // the one-shot removal is clean under the `Fn` close handler.
     let polls = RefCell::new(vec![plugins_poll, places_poll, shell_poll, agents_poll]);
     window.connect_close_request(move |_| {
+        // First, while every form is still mounted: the config forms debounce
+        // a change for 300 ms before writing it, and an edit made inside that
+        // window used to go down with the window unwritten.
+        flush_config_saves();
         for source in polls.take() {
             source.remove();
         }

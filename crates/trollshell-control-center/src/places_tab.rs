@@ -252,6 +252,12 @@ struct Editor {
     /// The weather override's auto/manual switch, kept in step by the same
     /// `GetPlace` read that fills [`Self::status_row`].
     auto_switch: adw::SwitchRow,
+    /// What the shell last said about auto-location — `GetPlace`'s `auto`,
+    /// or the shell's own default (automatic) before it has answered. Where
+    /// [`Self::auto_switch`] snaps back to when a `SetAutoLocation` fails or
+    /// a `GetPlace` cannot say, rather than staying on a position the shell
+    /// never took ([`Self::snap_auto_switch`]).
+    auto_known: Rc<Cell<bool>>,
     /// Where save failures surface.
     toasts: adw::ToastOverlay,
     /// Guard so programmatically setting a widget from the model doesn't loop
@@ -433,11 +439,8 @@ impl Editor {
                 editor
                     .status_row
                     .set_subtitle(&glib::markup_escape_text(&label));
-                // Suppress the switch's notify handler during the sync, or the
-                // programmatic set loops straight back into SetAutoLocation.
-                editor.syncing.set(true);
-                editor.auto_switch.set_active(auto);
-                editor.syncing.set(false);
+                editor.auto_known.set(auto);
+                editor.snap_auto_switch();
                 let changed = editor.resolved.borrow().as_deref() != Some(label.as_str());
                 *editor.resolved.borrow_mut() = Some(label);
                 if changed {
@@ -446,9 +449,13 @@ impl Editor {
             }
             Err(err) => {
                 tracing::info!(%err, "GetPlace failed");
-                editor.status_row.set_subtitle(
-                    "trollshell isn't running — edits here apply the next time it starts",
-                );
+                editor.status_row.set_subtitle(SHELL_DOWN_STATUS);
+                // A switch flipped while the shell was unreachable stays
+                // where it was put unless something puts it back — and the
+                // override it claims lives only in the running shell, so it
+                // will not "apply the next time it starts" the way a file
+                // edit does. Back to the last thing the shell actually said.
+                editor.snap_auto_switch();
                 // Bound the `RefMut` rather than leaving it a temporary in the
                 // condition: `rebuild` borrows the same cell, and "when exactly
                 // does this drop" is not a question to leave to the reader
@@ -459,6 +466,24 @@ impl Editor {
                 }
             }
         });
+    }
+
+    /// Put [`Self::auto_switch`] on [`Self::auto_known`], under [`Self::syncing`]
+    /// — or the programmatic set loops straight back into `SetAutoLocation`.
+    fn snap_auto_switch(&self) {
+        self.syncing.set(true);
+        self.auto_switch.set_active(self.auto_known.get());
+        self.syncing.set(false);
+    }
+
+    /// Toast a weather-override call the shell did not take
+    /// ([`override_failure`]'s sentence).
+    fn report_override_failure(&self, action: &str, err: &hytte_bus::BusError) {
+        // Toast titles are Pango markup, and a bus error's text is not ours.
+        let text = glib::markup_escape_text(&override_failure(action, err));
+        let toast = adw::Toast::new(&text);
+        toast.set_timeout(6);
+        self.toasts.add_toast(toast);
     }
 
     /// Re-read now and once more after the shell's resolve lag — a
@@ -618,10 +643,10 @@ impl Editor {
                 // Weakly (#1384 item 2): this button lives on the pushed
                 // detail page, itself a child of `nav` while it is on
                 // screen — a strong `Editor` here carries `nav` right back.
-                let (editor, name) = (self.downgrade(), place.name.clone());
+                let editor = self.downgrade();
                 delete.connect_clicked(move |btn| {
                     if let Some(editor) = editor.upgrade() {
-                        editor.confirm_delete(btn, index, &name);
+                        editor.confirm_delete(btn, index);
                     }
                 });
             }
@@ -982,7 +1007,26 @@ impl Editor {
     ///
     /// `adw::MessageDialog` rather than `AlertDialog`: libadwaita is pinned to
     /// `v1_4` here, and `AlertDialog` is 1.5.
-    fn confirm_delete(&self, anchor: &gtk::Button, index: usize, name: &str) {
+    ///
+    /// # The dialog deletes by name, not by `index`
+    ///
+    /// `index` is only trusted **now**, at the click: the detail page is on
+    /// screen, and the poll pops every detail page the moment the set moves
+    /// underneath one, so the page's index still addresses its own place.
+    /// The dialog is a different matter — it is modal and transient-for the
+    /// window, so it survives that pop, and while it is up the poll can
+    /// refresh [`Self::base`] to a reordered or shortened set. Deleting by
+    /// the captured index then removed whichever place had moved into that
+    /// slot, and `places::save(base, next)` raised no `ChangedOnDisk`,
+    /// because `base` had just been re-read. So the place's **name** — its
+    /// identity, unique across the set (`places::validate`) — is resolved
+    /// here and is what the answer deletes ([`without_place`]). Resolved at
+    /// the click rather than when the page was built, too: a rename on the
+    /// page keeps its index but changes the name.
+    fn confirm_delete(&self, anchor: &gtk::Button, index: usize) {
+        let Some(name) = self.places().get(index).map(|place| place.name.clone()) else {
+            return;
+        };
         let parent = anchor.root().and_downcast::<gtk::Window>();
         let dialog = adw::MessageDialog::new(
             parent.as_ref(),
@@ -1009,12 +1053,20 @@ impl Editor {
             let Some(editor) = editor.upgrade() else {
                 return;
             };
-            let mut next = editor.places();
-            if index < next.len() {
-                next.remove(index);
-            }
-            if editor.save(next) {
-                while editor.nav.pop() {}
+            match without_place(&editor.places(), &name) {
+                Ok(Some(next)) => {
+                    if editor.save(next) {
+                        while editor.nav.pop() {}
+                    }
+                }
+                // Gone already — a hand edit or another window deleted it
+                // while the dialog was up, and the poll that saw it has
+                // popped the page. There is nothing left to delete, and
+                // nothing else may be deleted in its place.
+                Ok(None) => {
+                    tracing::debug!(place = %name, "delete: the place is already gone");
+                }
+                Err(err) => editor.report(&err),
             }
         });
         dialog.present();
@@ -1064,6 +1116,7 @@ struct WeakEditor {
     resolved: Rc<RefCell<Option<String>>>,
     status_row: glib::WeakRef<adw::ActionRow>,
     auto_switch: glib::WeakRef<adw::SwitchRow>,
+    auto_known: Rc<Cell<bool>>,
     toasts: glib::WeakRef<adw::ToastOverlay>,
     syncing: Rc<Cell<bool>>,
 }
@@ -1083,6 +1136,7 @@ impl Editor {
             resolved: self.resolved.clone(),
             status_row: self.status_row.downgrade(),
             auto_switch: self.auto_switch.downgrade(),
+            auto_known: self.auto_known.clone(),
             toasts: self.toasts.downgrade(),
             syncing: self.syncing.clone(),
         }
@@ -1107,6 +1161,7 @@ impl WeakEditor {
             resolved: self.resolved.clone(),
             status_row: self.status_row.upgrade()?,
             auto_switch: self.auto_switch.upgrade()?,
+            auto_known: self.auto_known.clone(),
             toasts: self.toasts.upgrade()?,
             syncing: self.syncing.clone(),
         })
@@ -1179,6 +1234,12 @@ fn build_override_group(editor: &Editor) -> adw::PreferencesGroup {
             spawn_on_runtime(crate::set_manual_city(city), move |res| {
                 if let Err(err) = res {
                     tracing::info!(%err, "SetManualCity failed");
+                    // Said, not just logged: the status line's "apply the
+                    // next time it starts" is true of a file edit and false
+                    // of this, which lives only in the running shell — so
+                    // without a word here the operator is told it worked.
+                    // The typed city stays in the entry for a retry.
+                    editor.report_override_failure("The city was not set", &err);
                 }
                 editor.refresh_place_soon();
             });
@@ -1239,6 +1300,8 @@ pub(crate) fn build_page() -> (adw::ToastOverlay, glib::SourceId) {
             .subtitle("Detect your location automatically (GeoClue)")
             .active(true)
             .build(),
+        // The same default, and the same correction.
+        auto_known: Rc::new(Cell::new(true)),
         toasts: toasts.clone(),
         syncing: Rc::new(Cell::new(false)),
     };
@@ -1271,9 +1334,21 @@ pub(crate) fn build_page() -> (adw::ToastOverlay, glib::SourceId) {
             if handler.syncing.get() {
                 return;
             }
-            spawn_on_runtime(crate::set_auto_location(sw.is_active()), move |res| {
+            let auto = sw.is_active();
+            spawn_on_runtime(crate::set_auto_location(auto), move |res| {
                 if let Err(err) = res {
                     tracing::info!(%err, "SetAutoLocation failed");
+                    // Back to what the shell last said — the switch must not
+                    // claim a mode the shell never took — and say why.
+                    handler.snap_auto_switch();
+                    handler.report_override_failure(
+                        if auto {
+                            "Automatic location was not turned on"
+                        } else {
+                            "Automatic location was not turned off"
+                        },
+                        &err,
+                    );
                 }
                 handler.refresh_place_soon();
             });
@@ -1406,6 +1481,58 @@ fn endpoint_from_entry(text: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
+/// The set with the place named `name` deleted, or `Ok(None)` when no place
+/// by that name is left to delete — what the delete dialog's answer does
+/// (see [`Editor::confirm_delete`] for why by name and never by index).
+///
+/// [`places::removed`] is the deletion: the same identity rule the shell's
+/// own editing API uses (trimmed, case-folded — the key
+/// [`places::validate`] keeps unique), and the same validation of the result
+/// a save would run anyway. All this adds is the control center's answer to
+/// "it is not there": nothing, rather than a toast about a place the
+/// operator can no longer see.
+///
+/// # Errors
+/// Whatever [`places::removed`] refuses other than
+/// [`PlacesError::NotFound`] — an already-invalid file, which a save would
+/// have refused the same way.
+fn without_place(places: &[Place], name: &str) -> Result<Option<Vec<Place>>, PlacesError> {
+    match places::removed(places, name) {
+        Ok(next) => Ok(Some(next)),
+        Err(PlacesError::NotFound(_)) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// What the status line says when `GetPlace` fails.
+///
+/// Split by what it is true of: a `places.toml` or departures edit is a file
+/// the shell reads when it starts, so "the next time it starts" holds; the
+/// weather override is held only by the running shell and is lost with it,
+/// so the old blanket "edits here apply the next time it starts" was wrong
+/// about the one group on the page that needs the shell up.
+const SHELL_DOWN_STATUS: &str = "trollshell isn't running — place and departures edits apply the next time it starts; \
+     the weather override below needs it running";
+
+/// The toast for a weather-override call (`SetManualCity`,
+/// `SetAutoLocation`) the shell did not take: `action` (*"The city was not
+/// set"*), then why — in words when the shell is simply not running, the
+/// bus's own reason otherwise. Pure, so the wording is pinned without a bus.
+///
+/// The not-running sentence says the one thing the operator cannot infer:
+/// unlike everything above it on this page, the override is not saved
+/// anywhere, so nothing is waiting to apply when the shell starts.
+fn override_failure(action: &str, err: &hytte_bus::BusError) -> String {
+    if crate::is_shell_not_running(err) {
+        format!(
+            "{action}: trollshell isn't running. The weather override lives only in the running \
+             shell, so nothing was saved for when it starts."
+        )
+    } else {
+        format!("{action}: {err}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1501,6 +1628,96 @@ mod tests {
             Some("https://v6.hvv.transport.rest".to_owned())
         );
     }
+
+    // ── Delete by name (the dialog outliving its page) ──────────────────────
+
+    fn names(places: &[Place]) -> Vec<&str> {
+        places.iter().map(|place| place.name.as_str()).collect()
+    }
+
+    /// The defect in one assertion: the dialog was raised for "Office" at
+    /// index 1, and while it was up a hand edit moved "Gym" into that slot.
+    /// The delete must still take "Office".
+    ///
+    /// **Red with the old `next.remove(index)`**: "Gym" goes instead.
+    #[test]
+    fn a_delete_removes_the_named_place_even_after_a_reorder() {
+        let reordered = vec![place("Home"), place("Gym"), place("Office")];
+        let next = without_place(&reordered, "Office")
+            .expect("a valid set")
+            .expect("Office is still there");
+        assert_eq!(names(&next), ["Home", "Gym"]);
+    }
+
+    /// A place deleted elsewhere while the dialog was up: nothing is deleted
+    /// — in particular not whichever place now sits at the old index.
+    #[test]
+    fn a_delete_of_a_place_that_is_gone_is_a_no_op() {
+        let shrunk = vec![place("Home"), place("Gym")];
+        assert_eq!(without_place(&shrunk, "Office"), Ok(None));
+    }
+
+    /// The name is matched as the shell's editing API matches it — trimmed
+    /// and case-folded, the key `places::validate` keeps unique — so a
+    /// place's own name, however it was spelled in the file, finds it.
+    #[test]
+    fn a_delete_matches_names_as_the_editing_api_does() {
+        let set = vec![place("Home"), place("Office")];
+        let next = without_place(&set, " office ")
+            .expect("a valid set")
+            .expect("the same place");
+        assert_eq!(names(&next), ["Home"]);
+    }
+
+    /// A refusal other than "not found" is still a refusal — an
+    /// already-invalid file is reported, not silently treated as "gone".
+    #[test]
+    fn a_delete_from_an_invalid_set_is_refused_not_dropped() {
+        let broken = vec![
+            place("Home"),
+            Place::new("Moon", 500.0, 0.0),
+            place("Office"),
+        ];
+        assert!(matches!(
+            without_place(&broken, "Office"),
+            Err(PlacesError::Latitude { .. })
+        ));
+    }
+
+    // ── The weather override's failures ─────────────────────────────────────
+
+    /// With the shell down, the toast says the override was **not** saved
+    /// for later — the opposite of what the status line says about the file
+    /// edits above it, and the reason it has to be said at all.
+    #[test]
+    fn a_shell_down_override_failure_says_nothing_was_saved() {
+        let err = hytte_bus::BusError::Permanent {
+            reason: "The name mov.vibec0re.trollshell.Control was not provided by any \
+                     .service files"
+                .to_owned(),
+            dbus_name: Some("org.freedesktop.DBus.Error.ServiceUnknown".to_owned()),
+        };
+        assert_eq!(
+            override_failure("The city was not set", &err),
+            "The city was not set: trollshell isn't running. The weather override lives only \
+             in the running shell, so nothing was saved for when it starts."
+        );
+    }
+
+    /// Any other failure carries the bus's own reason and does not claim the
+    /// shell is down.
+    #[test]
+    fn another_override_failure_names_the_bus_error() {
+        let err = hytte_bus::BusError::Permanent {
+            reason: "Timeout was reached".to_owned(),
+            dbus_name: None,
+        };
+        let text = override_failure("Automatic location was not turned off", &err);
+        assert_eq!(
+            text,
+            format!("Automatic location was not turned off: {err}")
+        );
+    }
 }
 
 /// The window-controls-duplication regression for the Places tab's pushed
@@ -1574,6 +1791,8 @@ mod gtk_tests {
             auto_switch: adw::SwitchRow::builder()
                 .title("Automatic location")
                 .build(),
+            // Matching the switch above, which starts off.
+            auto_known: Rc::new(Cell::new(false)),
             toasts: toasts.clone(),
             syncing: Rc::new(Cell::new(false)),
         };
@@ -2026,5 +2245,50 @@ mod gtk_tests {
             "vb",
             "…but the draft is theirs until they press apply"
         );
+    }
+
+    /// A failed `SetAutoLocation` (or a `GetPlace` that cannot answer) puts
+    /// the switch back on what the shell last said, under `syncing` — so the
+    /// snap does not loop back into another `SetAutoLocation`.
+    ///
+    /// Driven through `snap_auto_switch` directly: the handlers that call it
+    /// spawn real `Control` calls, which a test must not make.
+    ///
+    /// **Red if the snap skips the guard**: the recording handler sees
+    /// `syncing == false` — exactly the state in which the real handler would
+    /// send the shell the snapped value as a fresh request.
+    #[gtk::test]
+    fn a_failed_override_snaps_the_switch_back_under_the_guard() {
+        adw::init().expect("libadwaita init");
+        let (_toasts, editor) = build_editor();
+        editor.auto_known.set(true);
+        editor.snap_auto_switch();
+        assert!(
+            editor.auto_switch.is_active(),
+            "sanity: on, as the shell said"
+        );
+
+        // The operator turns it off; the shell never takes it.
+        editor.auto_switch.set_active(false);
+        let guarded = Rc::new(RefCell::new(Vec::new()));
+        let handler = {
+            let (guarded, syncing) = (guarded.clone(), editor.syncing.clone());
+            editor
+                .auto_switch
+                .connect_active_notify(move |_| guarded.borrow_mut().push(syncing.get()))
+        };
+        editor.snap_auto_switch();
+        editor.auto_switch.disconnect(handler);
+
+        assert!(
+            editor.auto_switch.is_active(),
+            "the switch still claims a mode the shell never took"
+        );
+        assert_eq!(
+            *guarded.borrow(),
+            [true],
+            "the snap must run under `syncing`, exactly once"
+        );
+        assert!(!editor.syncing.get(), "…and lower it again");
     }
 }

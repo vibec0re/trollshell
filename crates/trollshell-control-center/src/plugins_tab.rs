@@ -1082,7 +1082,11 @@ impl WeakPluginsState {
 /// Returns the tab's root widget and the poll `SourceId`; the caller ties the
 /// latter to the window so the timer dies with it (#542) rather than polling
 /// `Control` forever after the window closes.
-pub(crate) fn build_page() -> (adw::BreakpointBin, glib::SourceId) {
+///
+/// The third value writes every config-form edit still inside its debounce
+/// window ([`flush_config_saves`]); the caller runs it when the window closes,
+/// before the forms go down with it.
+pub(crate) fn build_page() -> (adw::BreakpointBin, glib::SourceId, impl Fn() + 'static) {
     let (bin, state) = build_tab();
 
     refresh_plugins(&state);
@@ -1098,7 +1102,43 @@ pub(crate) fn build_page() -> (adw::BreakpointBin, glib::SourceId) {
             glib::ControlFlow::Continue
         })
     };
-    (bin, poll)
+    // Weakly: the window's close handler owns this, and the window owns the
+    // widgets `state` carries.
+    let flush = {
+        let state = state.downgrade();
+        move || {
+            if let Some(state) = state.upgrade() {
+                flush_config_saves(&state);
+            }
+        }
+    };
+    (bin, poll, flush)
+}
+
+/// Write every config-form edit still inside its debounce window, now — the
+/// shell families' forms and the selected plugin's — each exactly as its
+/// timer would have ([`crate::config_form::Form::flush_pending_saves`]).
+///
+/// `main.rs`'s close handler calls this (via [`build_page`]'s third return
+/// value) before it takes the timers down. A switch flipped or a spin row
+/// nudged in the last 300 ms before the window closed used to be lost: the
+/// save sat in a timer the close never ran, and dropping a form cancelled it.
+fn flush_config_saves(state: &PluginsState) {
+    for form in state.shell_forms.iter() {
+        form.flush_pending_saves();
+    }
+    // Out of the cell before anything is written: a save re-reads and
+    // redraws, and a redraw that reaches a handler which re-enters this cell
+    // is a `BorrowMutError` inside a glib callback — an abort (#643).
+    let mounted = state
+        .detail
+        .config
+        .borrow()
+        .as_ref()
+        .map(|mounted| mounted.form.flusher());
+    if let Some(flush) = mounted {
+        flush();
+    }
 }
 
 /// The widget tree and its state, with no `Control` traffic and no timer.
@@ -8630,6 +8670,105 @@ mod gtk_tests {
         assert!(
             state.detail.config.borrow().is_none(),
             "a plugin's form does not poll behind the Shell page"
+        );
+
+        dismiss(&window);
+    }
+
+    /// The first widget of type `T` under any of `groups`, in tree order.
+    fn first_under<T: IsA<gtk::Widget>>(groups: &[adw::PreferencesGroup]) -> Option<T> {
+        fn walk<T: IsA<gtk::Widget>>(root: &gtk::Widget) -> Option<T> {
+            let mut child = root.first_child();
+            while let Some(widget) = child {
+                if let Ok(found) = widget.clone().downcast::<T>() {
+                    return Some(found);
+                }
+                if let Some(found) = walk(&widget) {
+                    return Some(found);
+                }
+                child = widget.next_sibling();
+            }
+            None
+        }
+        groups.iter().find_map(|group| walk(group.upcast_ref()))
+    }
+
+    /// The flush `main.rs`'s close handler runs ([`super::build_page`]'s third
+    /// value) writes a change still inside the config forms' 300 ms debounce
+    /// window — on a **shell** family's form and on the **selected plugin's**
+    /// both, since those are the two places this tab holds a form.
+    ///
+    /// The close handler's own wiring is `build_window`'s, which no test can
+    /// reach (the `install_shell_probe` gap #1002 already names); this pins
+    /// everything below it. Its own tree, for
+    /// `a_config_form_is_unmounted_when_its_plugin_stops_being_shown`'s
+    /// reason: it writes.
+    ///
+    /// **Red if `flush_config_saves` skips either holder**: that family's
+    /// file is never created.
+    #[gtk::test]
+    fn a_close_flush_writes_every_config_forms_pending_save() {
+        adw::init().expect("libadwaita init");
+        let tree = tempfile::tempdir().expect("a config tree of this test's own");
+        let config_home = tree.path().join("home");
+        std::fs::create_dir_all(config_home.join("trollshell")).expect("it is writable");
+        std::fs::write(
+            config_home.join("trollshell").join("plugins.json"),
+            r#"{"plugins":{"stats":{"exec":"/nix/store/x/bin/hytte-plugin-stats"}}}"#,
+        )
+        .expect("the plugins.json is writable");
+        let env = Rc::new(hytte_config::xdg::Env {
+            home: None,
+            config_home: Some(config_home.to_string_lossy().into_owned()),
+            config_dirs: Some(tree.path().join("etc").to_string_lossy().into_owned()),
+            state_home: None,
+        });
+        let (bin, state) = build_tab_in(env);
+        apply_state(&state, &["stats"], "active");
+        let window = present(&bin, 640);
+
+        // One change on `core-leds.toml`'s form (its first spin row)…
+        let shell_groups: Vec<adw::PreferencesGroup> = state
+            .shell_forms
+            .iter()
+            .flat_map(|form| form.groups().to_vec())
+            .collect();
+        let spin: adw::SpinRow = first_under(&shell_groups).expect("a shell family has a spin row");
+        let upper = spin.adjustment().upper();
+        spin.set_value(if spin.value() < upper {
+            spin.value() + 1.0
+        } else {
+            spin.value() - 1.0
+        });
+        // …and one on the mounted `stats.toml` form (its first switch). Only
+        // the form's own groups are walked: the detail pane's own switch row
+        // starts and stops a systemd unit.
+        let plugin_groups = state
+            .detail
+            .config
+            .borrow()
+            .as_ref()
+            .expect("sanity: the stats plugin owns a family, so a form is mounted")
+            .form
+            .groups()
+            .to_vec();
+        let switch: adw::SwitchRow = first_under(&plugin_groups).expect("stats has a switch row");
+        switch.set_active(!switch.is_active());
+
+        let core_leds = config_home.join("trollshell").join("core-leds.toml");
+        let stats = config_home.join("trollshell").join("stats.toml");
+        assert!(
+            !core_leds.exists() && !stats.exists(),
+            "sanity: both changes are still debounced"
+        );
+        super::flush_config_saves(&state);
+        assert!(
+            core_leds.exists(),
+            "the shell family's pending save was lost"
+        );
+        assert!(
+            stats.exists(),
+            "the mounted plugin form's pending save was lost"
         );
 
         dismiss(&window);

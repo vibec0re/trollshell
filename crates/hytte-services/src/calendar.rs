@@ -614,9 +614,17 @@ fn instance_to_calendar_event(
 /// is `None` on a fold, which dropped a task's due date or an all-day event;
 /// `.earliest()` on Unix `Local` is the later midnight of a fold; and a zone
 /// that reads a gap strictly (chrono-tz does) answers `None` to both, where
-/// the old fallbacks put `now` in place of the day's start. Unix `Local`
-/// itself resolves a gap that begins exactly at 00:00 as `Single` at the
-/// pre-gap offset, which is already the transition instant.
+/// the old fallbacks put `now` in place of the day's start.
+///
+/// Unix `Local` reads a gap that begins exactly at 00:00 two ways, and the
+/// gap arm matters for both. Through a `TZif` file's explicit transition table
+/// it answers `Single` at the pre-gap offset, which is already the transition
+/// instant. Where there is no table entry to read (a POSIX `TZ` string, slim
+/// tzdata, or any date past the table's end, 2037 in a "fat" `TZif`) it uses
+/// the TZ-string rule, and there chrono's southern-hemisphere branch closes
+/// the gap at its start (`tz_info/rule.rs:285-288`) and answers `None`:
+/// `TZ=America/Santiago` gives `None` for 2040-09-02 even on NixOS's fat
+/// files, and for 2026-09-06 under its POSIX rule.
 #[must_use]
 pub fn local_midnight<Tz: TimeZone>(date: NaiveDate, tz: &Tz) -> DateTime<Tz> {
     let midnight = date.and_time(NaiveTime::MIN);
@@ -1354,6 +1362,13 @@ mod local_midnight_tests {
     /// passes every `LocalOrder` sweep below can still be wrong on `Local`
     /// there; it was, until the #1577 review. `TzInfoFallBack` and
     /// `local_midnight_local_tests` cover that case.
+    ///
+    /// Nor does it model `Local`'s gaps. chrono-tz answers `None` throughout a
+    /// gap, and so does this wrapper; `Local` answers `Single` at a gap's start
+    /// through a `TZif` transition table, and `None` there through the TZ-string
+    /// rule (see [`local_midnight`]). The `None` arm is what these tests drive,
+    /// and `local_midnight_local_tests` drives the rule path's `None` on the
+    /// real `Local`.
     #[derive(Clone, Copy, Debug)]
     struct LocalOrder(Tz);
 

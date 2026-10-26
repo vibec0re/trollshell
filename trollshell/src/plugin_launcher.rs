@@ -738,7 +738,7 @@ async fn load_declared() -> Option<Declared> {
 /// rather than reading the environment so the watch's production task is
 /// drivable in a test against scratch files (see [`reconcile_then_watch`]).
 async fn load_declared_from(sources: &Sources) -> Option<Declared> {
-    let mut declared = load_nix_declared(&sources.config).await?;
+    let (mut declared, _raw_ids) = load_nix_declared(&sources.config).await?;
     fold_overrides(&mut declared, &read_overrides(sources.overrides.as_deref()));
     if let Some(path) = &sources.settings {
         fold_settings(&mut declared, &hytte_config::plugin_settings::load_at(path));
@@ -762,11 +762,18 @@ async fn load_declared_from(sources: &Sources) -> Option<Declared> {
 /// read as "stop everything". A broken file also stops the search rather than
 /// falling through to a lower-precedence one: masking a broken user file with a
 /// system one would be quiet drift.
-async fn load_nix_declared(paths: &[PathBuf]) -> Option<Declared> {
+///
+/// The second element is every plugin id the file names **before**
+/// [`sanitize`] dropped the invalid ones, for [`prune_overrides`]: an entry
+/// that is merely invalid is still *named*, so its override is not stale.
+async fn load_nix_declared(paths: &[PathBuf]) -> Option<(Declared, BTreeSet<String>)> {
     for path in paths {
         match tokio::fs::read_to_string(path).await {
             Ok(json) => match parse_state(&json) {
-                Ok(state) => return Some(sanitize(state)),
+                Ok(state) => {
+                    let raw_ids = state.plugins.keys().cloned().collect();
+                    return Some((sanitize(state), raw_ids));
+                }
                 Err(err) => {
                     tracing::warn!(path = %path.display(), %err, "plugins.json unparsable; leaving plugins as they are");
                     return None;
@@ -779,7 +786,7 @@ async fn load_nix_declared(paths: &[PathBuf]) -> Option<Declared> {
             }
         }
     }
-    Some(Declared::default())
+    Some((Declared::default(), BTreeSet::new()))
 }
 
 // ── The Plugins tab's persisted switch (#1400) ───────────────────────────────
@@ -807,10 +814,12 @@ const OVERRIDES_SUBSYSTEM: &str = "plugins";
 /// `StartPlugin`/`StopPlugin` right after, so a watch would only ever
 /// re-apply what the switch is already doing.
 ///
-/// An entry is **ignored**, not deleted, when its plugin is pinned in nix or
-/// no longer declared at all ([`fold_overrides`]): a pin that is later
-/// relaxed back to `lib.mkDefault`, or a plugin that comes back, finds the
-/// last choice the switch made.
+/// An entry is **ignored** when its plugin is pinned in nix or no longer
+/// declared at all ([`fold_overrides`]). A pinned plugin's entry is kept, so
+/// a pin later relaxed to `lib.mkDefault` finds the last choice; an
+/// undeclared or now-redundant one is pruned on the next switch
+/// ([`prune_overrides`]), so a plugin that comes back starts from nix's
+/// value rather than a stale choice nothing explains.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 struct Overrides {
     /// Plugin id → the `enabled` the switch chose.
@@ -859,6 +868,57 @@ fn record_override(overrides: &mut Overrides, id: &str, declared: bool, wanted: 
 fn read_overrides(path: Option<&Path>) -> Overrides {
     path.and_then(hytte_config::state::load_at)
         .unwrap_or_default()
+}
+
+/// [`read_overrides`] for a caller about to **write the file back**
+/// (#1400's read-modify-write in [`set_enabled_in`]): a file that is absent
+/// is no overrides, and one that does not parse is the shell's own doing —
+/// logged, and the write that follows repairs it — but one that exists and
+/// cannot be *read* (EIO, EACCES, a directory in its place) is an error,
+/// because writing back an empty map would silently replace every other
+/// persisted switch with the one being flipped.
+fn read_overrides_for_write(path: &Path) -> std::io::Result<Overrides> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Overrides::default()),
+        Err(e) => return Err(e),
+    };
+    Ok(toml::from_str(&text).unwrap_or_else(|e| {
+        tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "state file does not parse; the next write overwrites this file"
+        );
+        Overrides::default()
+    }))
+}
+
+/// Drop every override that can no longer matter against nix's current
+/// declaration `nix`: an id `plugins.json` no longer declares, or one whose
+/// stored value now equals the declared one (nix's default moved to meet it).
+/// Left alone, either would resurface later as an unexplained off/on when the
+/// id comes back or the default flips again. A **pinned** id is kept: its
+/// entry is ignored while the pin holds, and the documented point of keeping
+/// it is that a pin relaxed to `lib.mkDefault` finds the last choice.
+/// Returns whether anything was removed. Pure; callers must only pass a
+/// declaration they actually read (never an unknown one).
+///
+/// Two guards keep a damaged file from wiping saved switches: an id counts
+/// as undeclared only if it is absent from `raw_ids` (the file's own names,
+/// before [`sanitize`] dropped invalid entries), and an empty declaration —
+/// `{"plugins":{}}`, a half-written file — prunes nothing at all.
+fn prune_overrides(overrides: &mut Overrides, nix: &Declared, raw_ids: &BTreeSet<String>) -> bool {
+    if nix.plugins.is_empty() {
+        return false;
+    }
+    let before = overrides.enabled.len();
+    overrides
+        .enabled
+        .retain(|id, stored| match nix.plugins.get(id) {
+            Some(spec) => spec.enable_locked() || spec.enabled != *stored,
+            None => raw_ids.contains(id),
+        });
+    overrides.enabled.len() != before
 }
 
 /// Write `overrides` to `path`, or delete the file once nothing is
@@ -2450,7 +2510,7 @@ async fn stop_unit(id: &str) -> anyhow::Result<()> {
 ///   static units.
 ///
 /// # Errors
-/// A pinned plugin; an unreadable `plugins.json`; no state directory to
+/// A pinned plugin; an unreadable `plugins.json` or override file; no state directory to
 /// persist into (neither `$XDG_STATE_HOME` nor `$HOME` set) or a failed write;
 /// on the legacy path, an invalid id or an unreachable user manager.
 pub async fn set_enabled(id: &str, enabled: bool) -> anyhow::Result<()> {
@@ -2469,7 +2529,7 @@ async fn set_enabled_in(sources: &Sources, id: &str, enabled: bool) -> anyhow::R
     let unit_file = converge_locked(async {
         // Nix's own declaration, not the effective one: an override is stored
         // relative to what nix declares.
-        let Some(nix) = load_nix_declared(&sources.config).await else {
+        let Some((nix, raw_ids)) = load_nix_declared(&sources.config).await else {
             anyhow::bail!(
                 "plugins.json exists but cannot be read; not persisting plugin {id}'s switch \
                  (the journal names the file)"
@@ -2483,8 +2543,15 @@ async fn set_enabled_in(sources: &Sources, id: &str, enabled: bool) -> anyhow::R
         let path = sources.overrides.as_deref().with_context(|| {
             format!("cannot persist plugin {id}'s switch: neither $XDG_STATE_HOME nor $HOME is set")
         })?;
-        let mut overrides = read_overrides(Some(path));
-        if record_override(&mut overrides, id, declared, enabled) {
+        let mut overrides = read_overrides_for_write(path).with_context(|| {
+            format!(
+                "reading {}; not persisting plugin {id}'s switch so the other saved switches survive",
+                path.display()
+            )
+        })?;
+        // `nix` was read successfully above, so it is safe to prune by.
+        let pruned = prune_overrides(&mut overrides, &nix, &raw_ids);
+        if record_override(&mut overrides, id, declared, enabled) || pruned {
             write_overrides(path, &overrides)
                 .with_context(|| format!("writing {}", path.display()))?;
             tracing::info!(
@@ -5163,6 +5230,119 @@ mod tests {
         set_enabled_in(&sources, "pet", true).await.expect("back");
         assert!(!toml.exists(), "no override left, no file left");
         assert_eq!(effective(&sources).await, both(false, true));
+    }
+
+    /// A switch prunes the entries that can no longer matter: an id nix no
+    /// longer declares, and one whose stored value now equals the declared
+    /// one. Red if either survives, or if the flipped id's own entry is lost.
+    #[tokio::test]
+    async fn a_switch_prunes_undeclared_and_redundant_overrides() {
+        let (_dir, sources, toml) = scratch_sources(TWO_FREE);
+        std::fs::create_dir_all(toml.parent().expect("parent")).expect("mkdir");
+        // gone: undeclared; pet = true equals the declared `true`.
+        std::fs::write(&toml, "[enabled]\ngone = false\npet = true\n").expect("seed");
+        set_enabled_in(&sources, "timer", true).await.expect("on");
+        assert_eq!(
+            std::fs::read_to_string(&toml).expect("state"),
+            "[enabled]\ntimer = true\n"
+        );
+    }
+
+    /// A parsed-but-damaged `plugins.json` cannot prune: an entry `sanitize`
+    /// drops (empty exec) is still named, so its override stays, and an empty
+    /// declaration prunes nothing.
+    #[tokio::test]
+    async fn a_damaged_plugins_json_prunes_nothing() {
+        let (_dir, sources, toml) = scratch_sources(
+            r#"{"version":1,"plugins":{
+                "timer":{"exec":"/bin/timer","enabled":false},
+                "broken":{"exec":""}
+            }}"#,
+        );
+        std::fs::create_dir_all(toml.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&toml, "[enabled]\nbroken = false\ngone = false\n").expect("seed");
+        set_enabled_in(&sources, "timer", true).await.expect("on");
+        assert_eq!(
+            std::fs::read_to_string(&toml).expect("state"),
+            "[enabled]\nbroken = false\ntimer = true\n",
+            "the sanitized-away id keeps its entry; the unnamed one is pruned"
+        );
+
+        // `{"plugins":{}}`: nothing declared, so nothing may be pruned.
+        let mut overrides = Overrides {
+            enabled: [("broken".to_owned(), false)].into_iter().collect(),
+        };
+        assert!(!prune_overrides(
+            &mut overrides,
+            &Declared::default(),
+            &BTreeSet::new()
+        ));
+        assert_eq!(overrides.enabled.get("broken"), Some(&false));
+    }
+
+    /// A pinned plugin's entry survives pruning (a relaxed pin finds it), and
+    /// an unreadable `plugins.json` prunes nothing.
+    #[tokio::test]
+    async fn pruning_keeps_pinned_entries_and_needs_a_known_declaration() {
+        let (_dir, sources, toml) = scratch_sources(
+            r#"{"version":1,"plugins":{
+                "timer":{"exec":"/bin/timer","enabled":false},
+                "pet":{"exec":"/bin/pet","enabled":true,"_locked":["enabled"]}
+            }}"#,
+        );
+        assert!(
+            load_nix_declared(&sources.config)
+                .await
+                .expect("parses")
+                .0
+                .plugins["pet"]
+                .enable_locked(),
+            "the fixture pins pet"
+        );
+        std::fs::create_dir_all(toml.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&toml, "[enabled]\npet = false\n").expect("seed");
+        set_enabled_in(&sources, "timer", true).await.expect("on");
+        assert_eq!(
+            read_overrides(Some(&toml)).enabled.get("pet"),
+            Some(&false),
+            "the pinned id's entry is kept"
+        );
+
+        let (_d2, bad, toml2) = scratch_sources("{ not json");
+        std::fs::create_dir_all(toml2.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&toml2, "[enabled]\ngone = false\n").expect("seed");
+        set_enabled_in(&bad, "timer", true)
+            .await
+            .expect_err("unknown");
+        assert_eq!(
+            std::fs::read_to_string(&toml2).expect("untouched"),
+            "[enabled]\ngone = false\n"
+        );
+    }
+
+    /// An override file that exists but cannot be read refuses the switch
+    /// instead of replacing every other saved switch. A directory in its
+    /// place forces a non-NotFound error. An unparsable file is still
+    /// overwritten (documented).
+    #[tokio::test]
+    async fn an_unreadable_override_file_refuses_the_switch() {
+        let (_dir, sources, toml) = scratch_sources(TWO_FREE);
+        std::fs::create_dir_all(&toml).expect("directory at the path");
+        let err = set_enabled_in(&sources, "timer", true)
+            .await
+            .expect_err("unreadable state must refuse");
+        assert!(format!("{err:#}").contains("reading"), "{err:#}");
+        assert!(toml.is_dir(), "nothing was written over it");
+
+        std::fs::remove_dir(&toml).expect("rm dir");
+        std::fs::write(&toml, "this = is [not toml").expect("corrupt");
+        set_enabled_in(&sources, "timer", true)
+            .await
+            .expect("a corrupt file is repaired");
+        assert_eq!(
+            std::fs::read_to_string(&toml).expect("state"),
+            "[enabled]\ntimer = true\n"
+        );
     }
 
     /// A plugin nix pins refuses the switch with the option's name and writes

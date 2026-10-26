@@ -194,6 +194,13 @@ fn main() -> hytte::ui::Result<()> {
     // It chains to the previous hook, so the default backtrace still prints.
     hytte::reactive::install_panic_hook();
 
+    // The plugin host remembers a plugin's settings form only while
+    // `plugins.json` declares it or it is connected; the launcher is what
+    // reads that file, and it lives here in the binary rather than in the
+    // library the host is also compiled into. Before `App::new`, so the
+    // reader is in place before the first plugin can register.
+    plugins::settings::read_declared_with(|| Box::pin(plugin_launcher::declared_ids()));
+
     App::new("mov.vibec0re.trollshell")
         // The config-file layering's first live subsystem (#869, phase 1 of
         // #866): `core-leds.toml` dresses the Stats drawer's per-core LED

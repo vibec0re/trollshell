@@ -223,6 +223,18 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
       (not the broker's old internal fetch), under the same grant/token flow
       as `calendar`. Confirm both still resolve correctly through
       `hytte-infobroker get <name>` with a grant in place.
+  - [ ] **A second plugin cannot take a datasource over.** With
+        `hytte-plugin-weather` running, start a second instance of it under
+        another id (a second `programs.trollshell.plugins.<id>` entry, or
+        `HYTTE_PLUGIN_ID=weather-2 hytte-plugin-weather` from a terminal).
+        The shell's journal has one line, _"datasource id is already served
+        by another live plugin; registration refused, the holder keeps
+        serving"_, naming `holder=weather` and `refused=weather-2`, and
+        `hytte-infobroker get weather` keeps answering from the first
+        instance. Before this, the second instance silently took the
+        datasource. Restarting the first instance itself
+        (`systemctl --user restart trollshell-plugin-weather`) still gets it
+        back.
 - [ ] **(#539)** Domain `StateKey`s (calendar / session-lock / now-playing) —
       see the Caw and Infobroker sections below for the per-consumer checks;
       the underlying push only fires when a plugin **both** subscribes the key
@@ -6199,3 +6211,16 @@ Plugins tab first if it is off.
       pet from the tab. It starts normally, the environment
       (`systemctl --user show -p Environment …`) has no `LD_PRELOAD`, and the
       shell's journal has one line saying the variable is not passed.
+- [ ] **Only declared plugins are remembered.** Note
+      `stat -c %Y ~/.local/state/trollshell/plugin-settings-schema.toml`. Run
+      a plugin that declares settings by hand under an id `plugins.json` does
+      not declare (`HYTTE_PLUGIN_ID=pet-adhoc hytte-plugin-pet`). While it
+      runs, the Plugins tab shows a Settings group for `pet-adhoc`; stop it
+      (Ctrl-C) and, within a poll or two, the group is gone. The file's
+      mtime has not moved, and `pet-adhoc` is not in it. `pet`'s own form is
+      still there, and still in the file.
+- [ ] **An upgraded manifest's form wins.** Restart a declared plugin
+      several times in quick succession after changing the settings it
+      declares (or switch between two builds that declare different ones).
+      The tab ends on the form the running build declares, and the file
+      agrees after the last restart.

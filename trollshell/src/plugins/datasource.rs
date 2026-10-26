@@ -80,6 +80,10 @@ struct PendingQuery {
     /// router's decoupled request/answer legs (the two never share one future to
     /// wrap, so an abort handle stands in for cancelling the timer).
     timeout: tokio::task::AbortHandle,
+    /// Whether the provider's session has already let one answer for this query
+    /// past its effect bucket unmetered ([`DatasourceRouter::admit_answer`]). One
+    /// per query, so the exemption is bounded by the queries the host forwarded.
+    answer_admitted: bool,
 }
 
 /// The cross-thread datasource query router (#509). One per host, shared (as an
@@ -101,9 +105,24 @@ impl DatasourceRouter {
     /// Register datasource `id` as served by a connection (its `plugin_id`,
     /// `outbound`, declared `scopes`, and `generation`). The `plugin_id` is the
     /// answer-leg identity check (#553): only this provider may resolve a query
-    /// routed here. Latest-wins on a duplicate id from a *different* provider
-    /// (logged) — teardown's generation guard keeps a stale provider from evicting a
-    /// live successor.
+    /// routed here.
+    ///
+    /// **Another plugin's datasource cannot be taken over.** While a plugin
+    /// holds `id`, a registration from a *different* plugin id is refused, with
+    /// one warning naming both, and the holder keeps serving. A requester names
+    /// a datasource, not a plugin, so replacing the holder would hand its
+    /// queries — and the answers the requester trusts — to whichever plugin
+    /// registered last. The holder's entry goes at its teardown
+    /// ([`unregister_provider`](Self::unregister_provider)), and from then on
+    /// any plugin may claim the id. Every entry here belongs to a live
+    /// connection, because teardown is what removes it.
+    ///
+    /// The **same** plugin id still replaces its own entry, which is what #509's
+    /// latest-wins was for: a reconnecting provider's newer generation
+    /// supersedes its stale one, and the stale connection's teardown is then a
+    /// no-op under the generation guard. (`IdGuard`'s one live connection per id
+    /// makes that sequential today, so the case that reaches this arm in
+    /// practice is a manifest listing the same datasource twice.)
     pub(super) fn register_provider(
         &self,
         id: &str,
@@ -112,23 +131,45 @@ impl DatasourceRouter {
         outbound: mpsc::Sender<HostMsg>,
         generation: u64,
     ) {
-        let prev = self
-            .providers
-            .lock()
-            .expect("datasource providers poisoned")
-            .insert(
-                id.to_owned(),
-                ProviderEntry {
-                    plugin_id: plugin_id.to_owned(),
-                    outbound,
-                    scopes,
-                    generation,
-                },
-            );
-        if prev.is_some() {
-            tracing::warn!(datasource = %id, "datasource id already had a provider; replacing (latest-wins)");
-        } else {
-            tracing::info!(datasource = %id, "datasource provider registered");
+        // `Err(holder)` when another plugin holds `id`, else `Ok(whether this
+        // replaced the same plugin's earlier entry)`. Decided under the lock,
+        // logged after it.
+        let outcome = {
+            let mut providers = self
+                .providers
+                .lock()
+                .expect("datasource providers poisoned");
+            match providers.get(id) {
+                Some(holder) if holder.plugin_id != plugin_id => Err(holder.plugin_id.clone()),
+                _ => Ok(providers
+                    .insert(
+                        id.to_owned(),
+                        ProviderEntry {
+                            plugin_id: plugin_id.to_owned(),
+                            outbound,
+                            scopes,
+                            generation,
+                        },
+                    )
+                    .is_some()),
+            }
+        };
+        match outcome {
+            Err(holder) => tracing::warn!(
+                datasource = %id,
+                holder = %holder,
+                refused = %plugin_id,
+                "datasource id is already served by another live plugin; registration refused, \
+                 the holder keeps serving",
+            ),
+            Ok(true) => tracing::info!(
+                datasource = %id,
+                plugin = %plugin_id,
+                "datasource provider re-registered by the same plugin; replacing its earlier entry",
+            ),
+            Ok(false) => {
+                tracing::info!(datasource = %id, plugin = %plugin_id, "datasource provider registered");
+            }
         }
     }
 
@@ -218,6 +259,7 @@ impl DatasourceRouter {
                     request_id,
                     provider_id,
                     timeout,
+                    answer_admitted: false,
                 },
             );
             tracing::info!(
@@ -253,6 +295,38 @@ impl DatasourceRouter {
                 .await;
             }
         });
+    }
+
+    /// Whether an [`Effect::DatasourceResult`](hytte_plugin_proto::Effect::DatasourceResult)
+    /// that `responder_id` emitted for correlation `corr` answers a query the host
+    /// parked for exactly that provider, and is the first answer to it to ask —
+    /// marking it admitted if so. The provider's session asks this before its
+    /// effect bucket (`session::throttle_effects`), and a `true` answer skips the
+    /// bucket.
+    ///
+    /// The exemption is bounded by things the host controls, not the provider:
+    /// every correlation that can say `true` was minted by
+    /// [`route_query`](Self::route_query) for a query a requester paid for from
+    /// its own effect bucket, and each says `true` once. A busy provider's
+    /// honest answers therefore never compete with its own toasts and page
+    /// opens for one token a second — which used to drop them and time the
+    /// requesters out. Anything else (an unknown or expired correlation, another
+    /// provider's, a second answer to the same query) is `false` and metered as
+    /// before.
+    ///
+    /// Admitting changes nothing about delivery:
+    /// [`deliver_result`](Self::deliver_result) still checks the responder and
+    /// resolves the entry, and drops a later answer to the same query as
+    /// unknown.
+    pub(super) fn admit_answer(&self, corr: u64, responder_id: &str) -> bool {
+        let mut pending = self.pending.lock().expect("datasource pending poisoned");
+        match pending.get_mut(&corr) {
+            Some(query) if query.provider_id == responder_id && !query.answer_admitted => {
+                query.answer_admitted = true;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Route a provider's [`Effect::DatasourceResult`](hytte_plugin_proto::Effect::DatasourceResult)
@@ -396,16 +470,103 @@ mod tests {
         assert!(!r.providers.lock().unwrap().contains_key("weather"));
     }
 
+    /// #509's latest-wins, kept for the case it was written for: the same plugin
+    /// registering again under a newer generation replaces its own entry, and
+    /// the older generation's teardown is then a no-op.
     #[test]
-    fn latest_provider_wins_on_a_duplicate_id() {
+    fn a_reregistering_provider_replaces_its_own_entry() {
         let r = DatasourceRouter::default();
-        r.register_provider("x", "first", vec!["a".into()], chan(), 1);
-        r.register_provider("x", "second", vec!["b".into()], chan(), 2);
-        // The newer registration wins; the older generation's teardown is a no-op.
+        r.register_provider("x", "weather", vec!["a".into()], chan(), 1);
+        r.register_provider("x", "weather", vec!["b".into()], chan(), 2);
         r.unregister_provider("x", 1);
         let guard = r.providers.lock().unwrap();
         let entry = guard.get("x").expect("newer provider still present");
         assert_eq!(entry.generation, 2);
         assert!(entry.scopes.iter().any(|s| s == "b"));
+    }
+
+    /// A different plugin declaring a datasource another live plugin serves is
+    /// refused, with one warning naming both, and the holder keeps serving —
+    /// including through the refused connection's teardown. Once the holder
+    /// goes, the id is free for anyone.
+    ///
+    /// Red against #509's unconditional latest-wins: the holder's entry is
+    /// replaced and the `generation == 1` assertion fails.
+    #[test]
+    fn another_plugin_cannot_take_over_a_live_datasource() {
+        let r = DatasourceRouter::default();
+        r.register_provider("weather", "wx-plugin", vec!["current".into()], chan(), 1);
+        let (captured, guard) = hytte_config::test_support::capture();
+        r.register_provider("weather", "squatter", vec!["forged".into()], chan(), 2);
+        drop(guard);
+        {
+            let providers = r.providers.lock().unwrap();
+            let entry = providers.get("weather").expect("the holder still serves");
+            assert_eq!(entry.plugin_id, "wx-plugin");
+            assert_eq!(entry.generation, 1);
+            assert_eq!(entry.scopes, ["current"]);
+        }
+        let warnings: Vec<_> = captured
+            .events()
+            .into_iter()
+            .filter(|e| e.level == tracing::Level::WARN)
+            .collect();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings[0].fields["holder"], "wx-plugin", "{warnings:?}");
+        assert_eq!(warnings[0].fields["refused"], "squatter", "{warnings:?}");
+
+        // The refused connection's teardown leaves the holder alone.
+        r.unregister_provider("weather", 2);
+        assert_eq!(
+            r.providers.lock().unwrap()["weather"].plugin_id,
+            "wx-plugin"
+        );
+        // The holder's own teardown frees the id for the next plugin.
+        r.unregister_provider("weather", 1);
+        r.register_provider("weather", "squatter", vec!["current".into()], chan(), 3);
+        assert_eq!(r.providers.lock().unwrap()["weather"].plugin_id, "squatter");
+    }
+
+    /// Park a query at `corr` for `provider_id`, as `route_query` does, with a
+    /// timeout task that never fires.
+    fn park(r: &DatasourceRouter, corr: u64, provider_id: &str) {
+        let timeout = tokio::spawn(std::future::pending::<()>()).abort_handle();
+        r.pending.lock().unwrap().insert(
+            corr,
+            PendingQuery {
+                requester: chan(),
+                request_id: corr,
+                provider_id: provider_id.to_owned(),
+                timeout,
+                answer_admitted: false,
+            },
+        );
+    }
+
+    /// The bucket exemption admits exactly one answer per query the host parked,
+    /// and only from the provider it was routed to.
+    #[tokio::test]
+    async fn admit_answer_admits_one_answer_per_parked_query_from_its_provider() {
+        let r = DatasourceRouter::default();
+        park(&r, 7, "departures");
+        assert!(
+            !r.admit_answer(7, "squatter"),
+            "another plugin's answer is metered"
+        );
+        assert!(
+            !r.admit_answer(8, "departures"),
+            "an unknown correlation is metered"
+        );
+        assert!(
+            r.admit_answer(7, "departures"),
+            "the routed provider's answer"
+        );
+        assert!(
+            !r.admit_answer(7, "departures"),
+            "a second answer to the same query is metered"
+        );
+        // Admitting delivers nothing and removes nothing: the entry is still
+        // parked for `deliver_result` to resolve.
+        assert!(r.pending.lock().unwrap().contains_key(&7));
     }
 }

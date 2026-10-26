@@ -357,9 +357,11 @@ impl ControlIface {
     /// Not only the connected plugins are here: each id's last declaration is
     /// remembered under `$XDG_STATE_HOME`, so a plugin that is switched off,
     /// or cannot start without its setting, still has a form. An id is
-    /// forgotten once `plugins.json` stops declaring it and it has not
-    /// registered this session (#1415 review L3). A plugin that declares none
-    /// is absent. Every list is already sanitised (`plugins::settings`).
+    /// forgotten once `plugins.json` stops declaring it and it is not
+    /// connected (#1415 review L3), and only declared ids are remembered
+    /// across sessions — so a hand-installed static unit has a form only while
+    /// it is connected. A plugin that declares none is absent. Every list is
+    /// already sanitised (`plugins::settings`).
     async fn list_plugin_settings(&self) -> std::collections::HashMap<String, String> {
         let declared = plugin_launcher::declared_ids().await;
         let snapshot = tokio::task::spawn_blocking(move || {

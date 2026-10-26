@@ -1311,9 +1311,9 @@ fn throttle_effects(
             // in this file exist to bound — so the unlatched `?effect` line was
             // a per-frame journal write of arbitrary plugin-supplied bytes,
             // which is the flood it was reporting. The audit log below keeps
-            // a line per dropped effect up to its drop budget, then a count of
-            // the rest: that is the per-occurrence record,
-            // and it is rotated and bounded.
+            // a line per dropped effect up to its drop budget, then lines
+            // carrying a `suppressed=` count of the rest; it is rotated and
+            // bounded.
             if warned.insert(std::mem::discriminant(&effect)) {
                 tracing::warn!(
                     plugin = %plugin_id,
@@ -1490,8 +1490,8 @@ pub(super) fn enforce_capabilities(
                         ?cap,
                         "plugin effect requires a capability it didn't declare; dropped. Add it \
                          to the manifest's capabilities (further drops of this effect kind on \
-                         this connection are silenced — the audit log keeps a line each up to the drop \
-                         budget, then a count)",
+                         this connection are silenced — the audit log keeps a line each up to \
+                         the drop budget, then a count)",
                     );
                 }
                 // Budgeted per plugin inside `record_audit`, so a frame of
@@ -1518,11 +1518,11 @@ pub(super) fn enforce_capabilities(
 /// before it gets here, so 64 is four times the larger vocabulary with every
 /// entry listed, and duplicates are still accepted.
 ///
-/// The cap matters for two reasons. `enforce_capabilities` runs `contains`
+/// The cap matters for three reasons. `enforce_capabilities` runs `contains`
 /// over the capability list once per effect, so a 100 000-entry list made each
-/// frame's capability check cost its effect count times that. And the
-/// "plugin registered" line prints both lists. `provides` is bounded because the
-/// registrar loops over every entry, so an unbounded list was an unbounded
+/// frame's capability check cost its effect count times that. The
+/// "plugin registered" line prints the first two lists. And the registrar
+/// loops over every `provides` entry, so an unbounded list was an unbounded
 /// number of datasource ids registered from one frame (#1555).
 pub(super) const MAX_MANIFEST_LIST_ENTRIES: usize = 64;
 
@@ -1780,10 +1780,12 @@ pub(super) async fn serve_conn(
         );
         return;
     }
-    // Two lists every frame consults (`enforce_capabilities` runs `contains`
-    // over `capabilities` once per effect) and the "plugin registered" line
-    // below prints. Both are lists of unit variants from a small vocabulary,
-    // so a long one is a malformed manifest rather than a big plugin.
+    // Three lists with one cap. `subscribes` and `capabilities` are lists of
+    // unit variants from a small vocabulary that every frame consults
+    // (`enforce_capabilities` runs `contains` over `capabilities` once per
+    // effect) and the "plugin registered" line below prints, so a long one is
+    // a malformed manifest rather than a big plugin. `provides` is one entry
+    // per datasource, and the registrar loops over every one of them.
     if manifest.subscribes.len() > MAX_MANIFEST_LIST_ENTRIES
         || manifest.capabilities.len() > MAX_MANIFEST_LIST_ENTRIES
         || manifest.provides.len() > MAX_MANIFEST_LIST_ENTRIES

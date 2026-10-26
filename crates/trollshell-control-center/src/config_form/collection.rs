@@ -1458,10 +1458,11 @@ fn prune_empty_record(weak: &Weak<FormInner>, key: &str, index: usize) {
     // so an element this form last read as `{}` may well carry the field the
     // operator set a moment before pressing Back. Sweeping on the cached
     // read would remove that element, and the edit with it. A read that
-    // failed leaves the cached one in place and raises the banner, and a
-    // layer nobody can read is no reason to rewrite one, so that is a no-op.
-    inner.reload(false);
-    if inner.banner.is_visible() {
+    // failed leaves the cached one in place, and a layer nobody can read is
+    // no reason to rewrite one, so that is a no-op — asked of the read
+    // itself, not of the banner, which an earlier failure can leave up over
+    // a read that has since succeeded unchanged.
+    if inner.try_reload(false).is_none() {
         return;
     }
     let empty =

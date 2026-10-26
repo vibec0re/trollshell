@@ -407,11 +407,23 @@ impl Drop for FormInner {
         // cancelled: cancelling it is how a change made just before the
         // selection moved — or just before the window closed — used to vanish
         // with no refusal anywhere. Only the write, though: the rows are on
-        // their way out, so there is nothing to re-read into and nobody to
-        // show a refusal to, and a drop can run from inside a parent's
-        // `popped` handler, which is no place to re-render a drill-down (see
-        // `write_on_drop`). The sub-pages' own forms flush the same way when
-        // `pop_all` below drops them.
+        // their way out, so there is nobody to show a refusal to, and a drop
+        // can run from inside a parent's `popped` handler, which is no place
+        // to re-render a drill-down (see `write_on_drop`).
+        //
+        // The order is load-bearing. This form's own rows write **first**,
+        // in schema order; the sub-pages' forms write after, each on its own
+        // drop, when `pop_all` below drops it. Every one of those writes is
+        // made against a read taken just before it (`write_on_drop`), so a
+        // later write — a second row of one record, or a sub-page after its
+        // parent — rebuilds an array from what the earlier one left on disk
+        // rather than from a cache that predates it. What that order still
+        // decides is whose edit wins when a parent row and an open sub-page
+        // both have a pending save on the **same array key**: the sub-page's
+        // lands on top. No family reaches that today — a collection row's
+        // only save is its reset, and its sub-page covers the row, so both
+        // would have to be armed inside one debounce window — but a parent
+        // that grows a second writer of an array its sub-pages edit would.
         for (index, row) in self.rows.iter().enumerate() {
             if let Some(pending) = row.pending.take() {
                 self.write_on_drop(index, pending.disarm());
@@ -697,11 +709,23 @@ impl FormInner {
     /// `force` is the first load: there is nothing to compare against yet, so
     /// every row is filled regardless.
     fn reload(&self, force: bool) -> bool {
+        self.try_reload(force).unwrap_or(false)
+    }
+
+    /// [`Self::reload`], saying whether the layers could be read at all:
+    /// `None` when one could not (its error is now on the banner, and the
+    /// cached read is left as it was), otherwise whether anything moved.
+    ///
+    /// For a caller that must not act on the cached read when the fresh one
+    /// failed. The banner is not that signal: it is only taken down on the
+    /// path where the view moved, so one raised by an earlier failure can
+    /// still be up over a read that has since succeeded unchanged.
+    fn try_reload(&self, force: bool) -> Option<bool> {
         let next = match (self.ops.load)(&self.layers) {
             Ok(raw) => raw,
             Err(err) => {
                 self.show_load_error(&err);
-                return false;
+                return None;
             }
         };
         let unchanged = !force && same_view(&self.raw.borrow(), &next);
@@ -715,13 +739,13 @@ impl FormInner {
             // re-renders only what moved and a sub-form's own reload has this
             // same fast path.
             collection::refresh_open(self, &next);
-            return false;
+            return Some(false);
         }
         self.banner.set_visible(false);
         self.apply(&next);
         collection::refresh_open(self, &next);
         *self.raw.borrow_mut() = next;
-        true
+        Some(true)
     }
 
     /// Put `raw` on screen: every row's value (when *its own* key moved), its
@@ -853,27 +877,53 @@ impl FormInner {
         })
     }
 
-    /// A pending save, written as the form is dropped — [`Self::write`] and
-    /// a journal line on refusal, and nothing else.
+    /// A pending save, written as the form is dropped — a fresh read of the
+    /// layers into [`Self::raw`], [`Self::write`] against it, and a journal
+    /// line on refusal. Nothing is redrawn.
     ///
-    /// Not [`Self::save`]: that re-reads and redraws, and a drop is the wrong
-    /// moment for either. The rows are leaving the screen, so a refusal on
-    /// one would be shown to nobody; and a sub-page's form is dropped from
-    /// inside its parent's `popped` handler, which holds the parent's
-    /// [`Self::open`] — re-rendering a drill-down from there is the #643
-    /// shape. The write alone touches only this form's own cells and the
-    /// file, and with the strong count already at zero no handler can
-    /// upgrade back into it. The parent picks the change up on its next read
-    /// (the record page's empty-record sweep re-reads first for exactly this
-    /// reason — see `collection::prune_empty_record`).
+    /// Not [`Self::save`]: that redraws, and a drop is the wrong moment for
+    /// it. The rows are leaving the screen, so a refusal on one would be
+    /// shown to nobody; and a sub-page's form is dropped from inside its
+    /// parent's `popped` handler, which holds the parent's [`Self::open`] —
+    /// re-rendering a drill-down from there is the #643 shape. The read and
+    /// the write touch only this form's own cells and the file, and with the
+    /// strong count already at zero no handler can upgrade back into it. The
+    /// parent picks the change up on its next read (the record page's
+    /// empty-record sweep re-reads first for exactly this reason — see
+    /// `collection::prune_empty_record`).
+    ///
+    /// # Why it reads first
+    ///
+    /// A [`Subject::Element`] write re-emits the **whole array**, built from
+    /// [`Self::raw`] ([`Self::array_at`]). The timer path keeps that current
+    /// because [`Self::save`] re-reads after every write; a drop that only
+    /// wrote would not, so with two rows of one record pending — Name and
+    /// Icon edited inside 300 ms, then Back — the second write rebuilt the
+    /// array from the read that predates the first and silently put the
+    /// first edit back. Reading **before** each write rather than after it
+    /// is the one rule that covers that, a sub-page writing after its parent
+    /// (see the ordering note in `Drop`), and an external edit since the
+    /// last poll. Folding a record's pending rows into one array write would
+    /// cover only the first, and would need a second copy of
+    /// [`Self::write_element`]'s create-and-name rules to do it.
+    ///
+    /// A read that fails refuses the write rather than falling back to the
+    /// cache: a write against a read this form cannot make is the guess the
+    /// load-error banner's rule already forbids ([`Self::show_load_error`]).
     fn write_on_drop(&self, index: usize, value: Option<toml_edit::Value>) {
         let Some(row) = self.rows.get(index) else {
             return;
         };
-        let refusal = match self.write(row, value) {
-            Some(Ok(())) => return,
-            Some(Err(err)) => err.to_string(),
-            None => NO_OVERLAY.to_owned(),
+        let refusal = match (self.ops.load)(&self.layers) {
+            Err(err) => format!("the layers could not be re-read: {err}"),
+            Ok(fresh) => {
+                *self.raw.borrow_mut() = fresh;
+                match self.write(row, value) {
+                    Some(Ok(())) => return,
+                    Some(Err(err)) => err.to_string(),
+                    None => NO_OVERLAY.to_owned(),
+                }
+            }
         };
         tracing::warn!(
             family = self.ops.family.name,
@@ -4801,6 +4851,50 @@ mod gtk_tests {
         );
         settle_nothing();
         assert!(wrote(&Scratch::read(&overlay), &line));
+    }
+
+    /// Two rows of one **record** pending when its form drops: both land.
+    ///
+    /// A record write re-emits the whole array from the form's cached read.
+    /// The timer path re-reads after each write; the drop path used to only
+    /// write, so the second row rebuilt the array from the read that
+    /// predates the first and put the first edit back — silently, with both
+    /// writes reporting success.
+    ///
+    /// The parent form is dropped rather than the page popped, because that
+    /// is synchronous: `pop_all` drops the record page's form inside the
+    /// parent's own drop, with no main-loop turn in which a debounce timer
+    /// could fire first and make the test pass for the wrong reason.
+    ///
+    /// **Red without `write_on_drop`'s read before each write**: the file
+    /// ends `id = "first", exec = "walk"` — the rename is gone.
+    #[gtk::test]
+    fn dropping_a_record_page_with_two_pending_rows_writes_both() {
+        let scratch = Scratch::new();
+        let overlay = scratch.overlay("form-fixture");
+        let before = "items = [{ id = \"first\", exec = \"run\" }, { id = \"second\" }]\n";
+        Scratch::write(&overlay, before);
+        let page = mounted(&scratch, None);
+        page.open("items");
+        page.activate_row("first");
+
+        // Two fields of the same record, each inside its own debounce window.
+        page.type_into("ID", "renamed");
+        page.type_into("Exec", "walk");
+        assert_eq!(
+            Scratch::read(&overlay),
+            before,
+            "sanity: both are still debounced"
+        );
+
+        let Mounted { form, nav } = page;
+        drop(form);
+        assert_eq!(
+            Scratch::read(&overlay),
+            "items = [{ id = \"renamed\", exec = \"walk\" }, { id = \"second\" }]\n",
+            "both pending rows reached the file, and the sibling is untouched"
+        );
+        drop(nav);
     }
 
     /// A flush reaches an open collection sub-page's pending save, too: the

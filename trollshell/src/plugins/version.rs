@@ -56,6 +56,30 @@ pub(super) fn sanitize_capped(raw: &str, max_chars: usize) -> Option<String> {
     Some(capped)
 }
 
+/// Put plugin-supplied text on one line for the host's own journal: every
+/// character [`is_dropped`] names is removed, except that the ones that break a
+/// line (`\n`, `\r`, `\t`, `U+0085`, `U+2028`, `U+2029`, …) become a space, so
+/// a multi-line message stays readable as one record instead of running its
+/// words together.
+///
+/// No trimming and no cap, unlike [`sanitize_capped`]: a log line is not a
+/// table cell, and its callers bound its length themselves. One rule for what
+/// counts as invisible, shared with the display text, so the two can't drift.
+#[must_use]
+pub(super) fn single_line(raw: &str) -> String {
+    raw.chars()
+        .filter_map(|c| {
+            if !is_dropped(c) {
+                Some(c)
+            } else if c.is_whitespace() {
+                Some(' ')
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// Whether [`sanitize`] drops `c`: anything that is invisible, moves text
 /// between lines, or reorders how the rest displays.
 ///
@@ -90,7 +114,7 @@ fn is_dropped(c: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_VERSION_CHARS, sanitize};
+    use super::{MAX_VERSION_CHARS, sanitize, single_line};
 
     /// `"1{c}.2"` for each `c` must come back as `"1.2"`.
     fn assert_each_stripped(chars: impl IntoIterator<Item = char>) {
@@ -213,5 +237,26 @@ mod tests {
         let capped = sanitize(Some(&long)).expect("kept");
         assert_eq!(capped.chars().count(), MAX_VERSION_CHARS);
         assert!(capped.starts_with('é') && capped.ends_with('…'));
+    }
+
+    // ── A plugin log line on one line ────────────────────────────────────
+
+    /// A plugin's `Log` text cannot start a fresh journal record or carry a
+    /// terminal escape: line breaks become spaces, every other character
+    /// `sanitize` strips is removed, and ordinary text (spaces, non-ASCII)
+    /// is untouched.
+    ///
+    /// **Falsified** by returning `raw.to_owned()`: the forged second record
+    /// and the ESC survive.
+    #[test]
+    fn single_line_keeps_a_log_message_on_one_line() {
+        assert_eq!(
+            single_line("fetch failed\ntrollshell: plugin registered\r\n"),
+            "fetch failed trollshell: plugin registered  ",
+        );
+        assert_eq!(single_line("\u{1b}[31mred\u{1b}[0m"), "[31mred[0m");
+        assert_eq!(single_line("a\u{2028}b\u{2029}c\u{85}d\te"), "a b c d e");
+        assert_eq!(single_line("x\u{202e}y\u{200b}z"), "xyz");
+        assert_eq!(single_line("  ünïcode ok  "), "  ünïcode ok  ");
     }
 }

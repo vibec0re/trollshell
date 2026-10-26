@@ -315,6 +315,55 @@ impl std::fmt::Display for IdOverrideError {
 
 impl std::error::Error for IdOverrideError {}
 
+/// A [`Plugin::manifest`] id that is not a usable plugin id, with no [`ID_ENV`]
+/// override standing in for it.
+///
+/// The shell refuses such an id at `Register` (the launcher's rule, the one
+/// [`is_valid_plugin_id`] mirrors) and drops the connection, with one warning
+/// in the *shell's* journal. This process would redial on every backoff and
+/// never say why, so, like an unusable override, it is a startup failure
+/// refused before the first dial, with a message that states the rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManifestIdError {
+    /// The manifest's id, verbatim. The message `Debug`-quotes it, so a
+    /// newline or an escape in it is shown rather than acted on.
+    value: String,
+}
+
+impl std::fmt::Display for ManifestIdError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the manifest's id {:?} is not a plugin id; expected 1..={MAX_PLUGIN_ID_BYTES} \
+             bytes of ASCII letters, digits, `-` or `_`, and the shell refuses any other id at \
+             Register. Fix the id given to `Manifest::new`, or launch with {ID_ENV} set to a \
+             valid one",
+            self.value,
+        )
+    }
+}
+
+impl std::error::Error for ManifestIdError {}
+
+/// The id this process registers under: the [`ID_ENV`] override when there is
+/// one (already checked by [`id_override`]), otherwise the manifest's own id,
+/// which has to pass the same rule.
+///
+/// The manifest's id is taken byte for byte, never trimmed: it is what goes on
+/// the wire, so the check has to be on exactly that.
+fn registered_id(
+    manifest_id: &str,
+    id_override: Option<String>,
+) -> Result<String, ManifestIdError> {
+    match id_override {
+        Some(id) => Ok(id),
+        None if is_valid_plugin_id(manifest_id) => Ok(manifest_id.to_owned()),
+        None => Err(ManifestIdError {
+            value: manifest_id.to_owned(),
+        }),
+    }
+}
+
 /// Parse one raw [`ID_ENV`] value. The whole decision, with no environment in
 /// it, so the charset and the refusal are testable without mutating process
 /// state (`unsafe` is forbidden workspace-wide, so `std::env::set_var` is not
@@ -1433,7 +1482,9 @@ async fn reconnect_loop<P, R, W, C, Fut>(
 /// value is a **startup failure** whose message states the rule, never a silent
 /// fallback to the manifest's id, which would look like a healthy second unit
 /// whose card never appears. As with the mount, the plugin's own code never sees
-/// it.
+/// it. With no override, the manifest's own id has to pass the same rule, or
+/// `run` exits before the first dial with a message stating it: the shell
+/// refuses any other id at `Register`, and says so only in its own journal.
 ///
 /// Also installs the `SIGTERM`/`SIGINT` listener for the shutdown lifecycle
 /// (#1079, crate docs' "Process shutdown" section): on either signal a
@@ -1468,7 +1519,17 @@ pub fn run<P: Plugin>() -> ! {
             std::process::exit(1);
         }
     };
-    let plugin_id = id_override.clone().unwrap_or_else(|| manifest.id.clone());
+    // With no override, the manifest's own id is what registers, so it has to
+    // pass the rule the shell enforces at `Register`. Refused here, with the
+    // rule, rather than by the shell, whose one journal line this process
+    // never sees (see `ManifestIdError`).
+    let plugin_id = match registered_id(&manifest.id, id_override.clone()) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
     // One line, only when the override actually changes something — the same
     // rule the mount override below follows. A second instance quietly wearing
     // the first one's id is exactly what the host rejects, so say which id this
@@ -1575,7 +1636,7 @@ mod tests {
         MountOverrideError, Redial, SHUTDOWN_GRACE, SKEW_WARN_AFTER, SessionEnd, effective_mount,
         effective_mount_from, id_override, id_override_from, id_override_from_env, mount_override,
         mount_override_from, mount_override_from_env, reconnect_loop, recv_and_acknowledge,
-        registered_line, session_end_line,
+        registered_id, registered_line, session_end_line,
     };
     use crate::display::{Marquee, StyleName};
     use crate::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View};
@@ -5239,6 +5300,122 @@ mod tests {
             "the environment's id must be the id in the Register frame",
         );
         println!("{ID_ENV_CHILD_OK}");
+    }
+
+    // ── The manifest's own id ────────────────────────────────────────────────
+
+    /// With no override, the manifest's id is what registers, so it is held to
+    /// the same rule as an override. The shell refuses anything else at
+    /// `Register` and says so only in its own journal, so a dotted id used to
+    /// leave a plugin redialing forever with no line of its own. An override
+    /// still wins over any manifest id, valid or not: that id never reaches the
+    /// wire.
+    ///
+    /// **Falsified** by having `registered_id` fall back to the manifest's id
+    /// unchecked: every bad row is accepted.
+    #[test]
+    fn an_unusable_manifest_id_is_refused_unless_an_override_replaces_it() {
+        assert_eq!(
+            registered_id("clock-demo", None),
+            Ok("clock-demo".to_owned())
+        );
+        let long = "a".repeat(MAX_PLUGIN_ID_BYTES + 1);
+        for bad in [
+            "",
+            "com.example.clock",
+            "two words",
+            " padded ",
+            "stäts",
+            &long,
+        ] {
+            let err = registered_id(bad, None)
+                .expect_err("an unusable manifest id must be refused before dialing");
+            assert_eq!(err.value, bad, "the value is kept verbatim, untrimmed");
+            let msg = err.to_string();
+            assert!(msg.contains(&format!("{bad:?}")), "it quotes the id: {msg}");
+            assert!(
+                msg.contains(&MAX_PLUGIN_ID_BYTES.to_string())
+                    && msg.contains("ASCII letters, digits, `-` or `_`"),
+                "it states the rule: {msg}",
+            );
+            assert!(msg.contains(ID_ENV), "it names the way out: {msg}");
+        }
+        assert_eq!(
+            registered_id("com.example.clock", Some("clock".to_owned())),
+            Ok("clock".to_owned()),
+            "a valid override replaces the manifest's id, which then never registers",
+        );
+    }
+
+    /// Set (to any value) only on the re-exec'd child that runs
+    /// [`a_dotted_manifest_id_stops_run_before_it_dials_inner`].
+    const MANIFEST_ID_CHILD: &str = "HYTTE_PLUGIN_MANIFEST_ID_TEST_CHILD";
+
+    /// A plugin whose manifest id the shell would refuse.
+    struct DottedId;
+
+    impl Plugin for DottedId {
+        type Msg = std::convert::Infallible;
+        type Cmd = std::convert::Infallible;
+
+        fn manifest() -> Manifest {
+            Manifest::new("com.example.dotted", Mount::SidebarTop)
+        }
+
+        fn init(_cmds: CmdSender<Self::Cmd>) -> Self {
+            Self
+        }
+
+        fn update(&mut self, _input: Input<Self::Msg>) -> Vec<Effect> {
+            Vec::new()
+        }
+
+        fn view(&self) -> View {
+            Node::Spacer.into()
+        }
+    }
+
+    /// **`run` itself refuses it**, in a real process: exit status 1 and the
+    /// rule on stderr, before the `dialing …` line. The child runs with no
+    /// `XDG_RUNTIME_DIR`, so without the check it would still exit 1, on the
+    /// "no host socket" line instead, which the stderr assertions tell apart
+    /// (and nothing can hang on a dial).
+    ///
+    /// **Falsified** by restoring `id_override.unwrap_or_else(|| manifest.id)`
+    /// in `run`: the child exits on the socket line and the rule is missing.
+    #[test]
+    fn a_dotted_manifest_id_stops_run_before_it_dials() {
+        let inner = "runtime::tests::a_dotted_manifest_id_stops_run_before_it_dials_inner";
+        let exe = std::env::current_exe().expect("this test binary's own path");
+        let out = std::process::Command::new(exe)
+            .args(["--exact", "--nocapture", "--test-threads=1", inner])
+            .env(MANIFEST_ID_CHILD, "1")
+            .env_remove("HYTTE_PLUGIN_ID")
+            .env_remove("HYTTE_PLUGIN_MOUNT")
+            .env_remove("XDG_RUNTIME_DIR")
+            .output()
+            .expect("re-exec this test binary");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "--- stderr ---\n{stderr}");
+        assert!(
+            stderr.contains("the manifest's id \"com.example.dotted\" is not a plugin id"),
+            "the refusal names the id and the rule:\n{stderr}",
+        );
+        assert!(
+            !stderr.contains("dialing") && !stderr.contains("XDG_RUNTIME_DIR unset"),
+            "it stops before anything about the socket:\n{stderr}",
+        );
+    }
+
+    /// The scenario body of [`a_dotted_manifest_id_stops_run_before_it_dials`].
+    /// Does nothing unless the parent's marker is set; in the child, `run`
+    /// exits the process and this never returns.
+    #[test]
+    fn a_dotted_manifest_id_stops_run_before_it_dials_inner() {
+        if std::env::var_os(MANIFEST_ID_CHILD).is_none() {
+            return;
+        }
+        crate::run::<DottedId>();
     }
 
     // ── Startup acknowledgement line (#1394) ─────────────────────────────────

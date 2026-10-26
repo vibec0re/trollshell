@@ -145,16 +145,16 @@ impl Cfg {
         // pet-specific `$PET_LLM_API_KEY`. #1330 retired the
         // `openrouter.key` file that used to sit between them, so this is two
         // steps rather than three.
-        let key = hytte_ai_providers::load_key("openrouter").or_else(|| {
-            std::env::var("PET_LLM_API_KEY")
-                .ok()
-                .filter(|s| !s.is_empty())
-        });
-        let model = std::env::var("PET_LLM_MODEL")
-            .ok()
-            .filter(|s| !s.is_empty());
-        let provider = resolve_provider(std::env::var("PET_LLM_URL").ok().as_deref(), key, model);
-        let name = std::env::var("PET_NAME").unwrap_or_else(|_| "nisse".to_owned());
+        let key = hytte_ai_providers::load_key("openrouter")
+            .or_else(|| non_blank(std::env::var("PET_LLM_API_KEY").ok().as_deref()));
+        let model = non_blank(std::env::var("PET_LLM_MODEL").ok().as_deref());
+        let provider = resolve_provider(
+            url_env(std::env::var("PET_LLM_URL").ok().as_deref()),
+            key,
+            model,
+        );
+        let name = non_blank(std::env::var("PET_NAME").ok().as_deref())
+            .unwrap_or_else(|| "nisse".to_owned());
         let owner = hytte_ai_providers::owner();
         let min_llm_gap = secs_or(
             std::env::var("PET_LLM_MIN_GAP_SECS").ok().as_deref(),
@@ -185,6 +185,24 @@ fn secs_or(raw: Option<&str>, default: Duration) -> Duration {
     raw.and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|s| *s > 0)
         .map_or(default, Duration::from_secs)
+}
+
+/// A string env value with surrounding whitespace trimmed, or `None` when it
+/// is unset, empty or whitespace-only. The settings form can leave a cleared
+/// field as `""` (or spaces), which must read as "not set" and not as a
+/// value (`You are , a tiny cat`; a blank model or key sent to the backend).
+fn non_blank(raw: Option<&str>) -> Option<String> {
+    let trimmed = raw?.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+/// `$PET_LLM_URL` as [`resolve_provider`] wants it: trimmed, but **not**
+/// blank-as-unset. Unlike the other knobs, an empty value is meaningful here
+/// (`Some("")` explicitly disables the model), so a whitespace-only value, as
+/// a cleared settings field can leave, must read as that same explicit
+/// disable and not reach the URL parser as a bogus endpoint.
+fn url_env(raw: Option<&str>) -> Option<&str> {
+    raw.map(str::trim)
 }
 
 /// Resolve `$PET_PERSONA` into the spliced style clause, or `None` when
@@ -541,6 +559,27 @@ mod tests {
             secs_or(Some("30"), hytte_ai_providers::DEFAULT_TIMEOUT),
             Duration::from_secs(30),
         );
+    }
+
+    /// `$PET_NAME`, `$PET_LLM_MODEL` and `$PET_LLM_API_KEY`: blank is unset,
+    /// a real value comes back trimmed.
+    #[test]
+    fn non_blank_treats_blank_as_unset() {
+        assert_eq!(non_blank(None), None);
+        assert_eq!(non_blank(Some("")), None);
+        assert_eq!(non_blank(Some("  	")), None);
+        assert_eq!(non_blank(Some(" mjau ")), Some("mjau".to_owned()));
+    }
+
+    /// `$PET_LLM_URL`: unset stays unset, blank stays the explicit disable
+    /// (empty, never unset), a real value is trimmed.
+    #[test]
+    fn url_env_keeps_blank_as_explicit_disable() {
+        assert_eq!(url_env(None), None);
+        assert_eq!(url_env(Some("")), Some(""));
+        assert_eq!(url_env(Some("  ")), Some(""));
+        assert!(resolve_provider(url_env(Some("  ")), Some("k".to_owned()), None).is_none());
+        assert_eq!(url_env(Some(" http://h:1 ")), Some("http://h:1"));
     }
 
     /// #698: `$PET_PERSONA` resolution — unset/empty/whitespace-only all

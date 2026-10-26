@@ -36,6 +36,22 @@ pub(crate) const RESUME_GAP: Duration = Duration::from_mins(5);
 /// `GeoClue` jitter must not trigger a refetch.
 const SAME_PLACE_DEG: f64 = 0.01;
 
+/// First retry delay after a failed attempt; doubles per further failure.
+const RETRY_BASE: Duration = Duration::from_mins(1);
+
+/// How long to wait before the next attempt given `failures` consecutive
+/// failures so far: the full `cap` (the normal period) after a success, else
+/// one minute doubling per failure, never above `cap`. The minute floor is
+/// also the worker's tick, so a retry is never sooner than the next wake.
+pub(crate) fn interval_after(failures: u32, cap: Duration) -> Duration {
+    if failures == 0 {
+        return cap;
+    }
+    RETRY_BASE
+        .saturating_mul(1u32 << (failures - 1).min(16))
+        .min(cap)
+}
+
 /// Time from `since` to `now`, or `None` when the wall clock went backwards.
 fn elapsed(since: SystemTime, now: SystemTime) -> Option<Duration> {
     now.duration_since(since).ok()
@@ -99,6 +115,31 @@ mod tests {
             label_hint: hint.map(str::to_owned),
             source: LocationSource::GeoClue,
         }
+    }
+
+    #[test]
+    fn retry_backs_off_from_a_minute_up_to_the_cap() {
+        let cap = Duration::from_mins(15);
+        assert_eq!(interval_after(0, cap), cap);
+        assert_eq!(interval_after(1, cap), Duration::from_mins(1));
+        assert_eq!(interval_after(2, cap), Duration::from_mins(2));
+        assert_eq!(interval_after(4, cap), Duration::from_mins(8));
+        assert_eq!(interval_after(5, cap), cap);
+        assert_eq!(interval_after(u32::MAX, cap), cap);
+        assert_eq!(
+            interval_after(1, LOCATION_RECHECK),
+            Duration::from_mins(1),
+            "a failed re-resolve is retried in a minute, not an hour"
+        );
+    }
+
+    #[test]
+    fn a_failed_attempt_is_due_again_in_a_minute_not_a_period() {
+        let cap = Duration::from_mins(15);
+        let i = interval_after(1, cap);
+        assert!(!due(Some(at(0)), at(59), i));
+        assert!(due(Some(at(0)), at(60), i));
+        assert!(!due(Some(at(0)), at(60), interval_after(0, cap)));
     }
 
     #[test]

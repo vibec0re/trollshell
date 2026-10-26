@@ -40,6 +40,10 @@ pub(crate) async fn run(
 
     let mut loc_checked = SystemTime::now();
     let mut last_attempt: Option<SystemTime> = None;
+    // Consecutive failures of each kind of attempt; they shorten the wait
+    // before the next try (see `schedule::interval_after`).
+    let mut fetch_failures: u32 = 0;
+    let mut loc_failures: u32 = 0;
     let mut last_wake = SystemTime::now();
     let mut tick = tokio::time::interval(schedule::TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -59,39 +63,52 @@ pub(crate) async fn run(
 
         let now = SystemTime::now();
         let resumed = schedule::resumed(last_wake, now);
-        last_wake = now;
 
         // Re-resolve the location hourly and straight after a resume. A failed
         // re-resolve keeps the previous location rather than blanking the card.
         let mut moved = false;
-        if resumed || schedule::due(Some(loc_checked), now, schedule::LOCATION_RECHECK) {
+        let loc_interval = schedule::interval_after(loc_failures, schedule::LOCATION_RECHECK);
+        if resumed || schedule::due(Some(loc_checked), now, loc_interval) {
             if let Some(fresh) = location::resolve_once().await {
                 moved = !schedule::same_place(&location, &fresh);
                 location = fresh;
+                loc_failures = 0;
+            } else {
+                // Typically Wi-Fi is not up yet right after a resume: retry soon.
+                loc_failures = loc_failures.saturating_add(1);
             }
             loc_checked = SystemTime::now();
         }
 
-        if !(forced || moved || schedule::due(last_attempt, now, POLL_INTERVAL)) {
+        let fetch_interval = schedule::interval_after(fetch_failures, POLL_INTERVAL);
+        if !(forced || moved || schedule::due(last_attempt, now, fetch_interval)) {
+            // Measure the next resume gap from the end of this iteration.
+            last_wake = SystemTime::now();
             continue;
         }
         last_attempt = Some(now);
 
         let loc = location.clone();
         let msg = match tokio::task::spawn_blocking(move || fetch_weather(&loc)).await {
-            Ok(Ok(snap)) => WeatherMsg::Weather(snap),
+            Ok(Ok(snap)) => {
+                fetch_failures = 0;
+                WeatherMsg::Weather(snap)
+            }
             Ok(Err(e)) => {
                 eprintln!("[weather] fetch failed: {e}");
+                fetch_failures = fetch_failures.saturating_add(1);
                 WeatherMsg::FetchError
             }
             Err(join) => {
                 eprintln!("[weather] fetch task failed: {join}");
+                fetch_failures = fetch_failures.saturating_add(1);
                 WeatherMsg::FetchError
             }
         };
         if msg_tx.send(msg).is_err() {
             return; // reducer gone
         }
+        last_wake = SystemTime::now();
     }
 }
 

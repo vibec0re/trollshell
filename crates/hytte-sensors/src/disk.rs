@@ -1,7 +1,9 @@
 //! `/proc/self/mountinfo` parsing, disk usage via `statvfs`, and process
 //! counting via `/proc`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Mutex, mpsc};
+use std::time::{Duration, Instant};
 
 use crate::cast::{octal_byte_from_u32, u64_to_f64_count};
 
@@ -161,32 +163,136 @@ pub fn read_mountlist() -> Vec<MountSpec> {
 
 // ── Disk usage ────────────────────────────────────────────────────────────────
 
+/// Filesystems whose `statvfs` can block **indefinitely**: network filesystems
+/// whose server stopped answering (a stale NFS/CIFS handle sits in
+/// uninterruptible sleep until the server returns). Any `fuse.*` subtype is
+/// treated the same way, since a FUSE `statfs` is answered by a userspace
+/// daemon that may itself be wedged (sshfs, rclone, ...).
+///
+/// These mounts are **kept in the list** (a user with a NAS mounted still
+/// wants it on the Stats page) but their `statvfs` runs on a side thread
+/// under [`STATVFS_DEADLINE`] instead of inline, so one dead mount costs that
+/// mount its row for a tick and not the sampler its life. Local filesystems
+/// are called inline: they do not hang, and a thread per mount per tick would
+/// be pure overhead.
+const BLOCKING_FSTYPES: &[&str] = &[
+    "nfs",
+    "nfs4",
+    "cifs",
+    "smb3",
+    "smbfs",
+    "9p",
+    "afs",
+    "ceph",
+    "glusterfs",
+    "lustre",
+    "ncpfs",
+    "fuse",
+];
+
+/// How long one tick waits, in total, for the mounts that may block. Short
+/// enough that a wedged mount is a one-second hiccup on a 1 Hz sampler, long
+/// enough that a healthy NAS answering in tens of milliseconds never misses.
+const STATVFS_DEADLINE: Duration = Duration::from_secs(1);
+
+/// True for a filesystem whose `statvfs` is run under [`STATVFS_DEADLINE`].
+fn may_block(fstype: &str) -> bool {
+    fstype.starts_with("fuse.") || BLOCKING_FSTYPES.contains(&fstype)
+}
+
+/// Mount points whose side-thread `statvfs` is still outstanding. A call
+/// stuck on a dead server never returns, so without this a new thread would
+/// be spawned for the same mount on every tick and pile up; instead the mount
+/// is skipped (no row) until the earlier call finally comes back.
+static IN_FLIGHT: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+fn in_flight() -> std::sync::MutexGuard<'static, BTreeSet<String>> {
+    IN_FLIGHT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// `statvfs` one mount point into a row; `None` when the call fails.
+fn stat_mount(path: &str) -> Option<DiskMount> {
+    use nix::sys::statvfs::statvfs;
+    let s = statvfs(path).ok()?;
+    let block_size = s.fragment_size();
+    let total = s.blocks() * block_size;
+    let free = s.blocks_available() * block_size;
+    let used = total.saturating_sub(free);
+    let usage = if total == 0 {
+        0.0
+    } else {
+        u64_to_f64_count(used) / u64_to_f64_count(total)
+    };
+    Some(DiskMount {
+        path: path.to_string(),
+        total_bytes: total,
+        used_bytes: used,
+        free_bytes: free,
+        usage,
+    })
+}
+
 #[must_use]
 pub fn read_disk_for_specs(specs: &[MountSpec]) -> DiskUsage {
-    use nix::sys::statvfs::statvfs;
-    let mut mounts = Vec::with_capacity(specs.len());
-    for spec in specs {
-        let Ok(s) = statvfs(spec.path.as_str()) else {
+    read_disk_with(specs, STATVFS_DEADLINE, stat_mount)
+}
+
+/// [`read_disk_for_specs`] over an injected `statvfs` and deadline, so the
+/// hung-mount path is testable with a probe that sleeps.
+fn read_disk_with(
+    specs: &[MountSpec],
+    deadline: Duration,
+    stat: fn(&str) -> Option<DiskMount>,
+) -> DiskUsage {
+    // One slot per spec, so the original mount order survives the split into
+    // inline and side-thread work.
+    let mut slots: Vec<Option<DiskMount>> = vec![None; specs.len()];
+    let (tx, rx) = mpsc::channel::<(usize, Option<DiskMount>)>();
+    let mut pending = 0usize;
+
+    for (i, spec) in specs.iter().enumerate() {
+        if !may_block(&spec.fstype) {
+            slots[i] = stat(&spec.path);
             continue;
-        };
-        let block_size = s.fragment_size();
-        let total = s.blocks() * block_size;
-        let free = s.blocks_available() * block_size;
-        let used = total.saturating_sub(free);
-        let usage = if total == 0 {
-            0.0
+        }
+        if !in_flight().insert(spec.path.clone()) {
+            continue; // an earlier call on this mount is still stuck
+        }
+        let path = spec.path.clone();
+        let tx = tx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("statvfs".into())
+            .spawn(move || {
+                let row = stat(&path);
+                in_flight().remove(&path);
+                // The receiver is gone if the deadline passed; that is fine.
+                let _ = tx.send((i, row));
+            });
+        if spawned.is_ok() {
+            pending += 1;
         } else {
-            u64_to_f64_count(used) / u64_to_f64_count(total)
-        };
-        mounts.push(DiskMount {
-            path: spec.path.clone(),
-            total_bytes: total,
-            used_bytes: used,
-            free_bytes: free,
-            usage,
-        });
+            in_flight().remove(&spec.path);
+        }
     }
-    DiskUsage { mounts }
+    drop(tx);
+
+    let end = Instant::now() + deadline;
+    while pending > 0 {
+        let Some(left) = end.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        let Ok((i, row)) = rx.recv_timeout(left) else {
+            break;
+        };
+        slots[i] = row;
+        pending -= 1;
+    }
+
+    DiskUsage {
+        mounts: slots.into_iter().flatten().collect(),
+    }
 }
 
 // ── Process count ─────────────────────────────────────────────────────────────
@@ -345,5 +451,67 @@ not a real line at all
         assert_eq!(v[0].fstype, "fuse.sshfs");
         assert_eq!(v[1].path, "/");
         assert_eq!(v[1].fstype, "ext4");
+    }
+
+    fn spec(path: &str, fstype: &str) -> MountSpec {
+        MountSpec {
+            path: path.to_string(),
+            dev_id: (0, 0),
+            fstype: fstype.to_string(),
+        }
+    }
+
+    fn fake_stat(path: &str) -> Option<DiskMount> {
+        if path == "/test-hung-mount" {
+            std::thread::sleep(Duration::from_secs(4));
+        }
+        if path == "/test-unreadable" {
+            return None;
+        }
+        Some(DiskMount {
+            path: path.to_string(),
+            total_bytes: 100,
+            used_bytes: 40,
+            free_bytes: 60,
+            usage: 0.4,
+        })
+    }
+
+    #[test]
+    fn network_and_fuse_filesystems_are_the_ones_that_may_block() {
+        for t in ["nfs", "nfs4", "cifs", "smb3", "9p", "fuse.sshfs", "fuse"] {
+            assert!(may_block(t), "{t}");
+        }
+        for t in ["ext4", "btrfs", "xfs", "vfat", "zfs", "f2fs"] {
+            assert!(!may_block(t), "{t}");
+        }
+    }
+
+    #[test]
+    fn a_hung_remote_mount_loses_its_row_not_the_whole_tick() {
+        let specs = [
+            spec("/", "ext4"),
+            spec("/test-hung-mount", "nfs4"),
+            spec("/home", "btrfs"),
+            spec("/test-unreadable", "ext4"),
+            spec("/mnt/healthy-nas", "cifs"),
+        ];
+        let started = Instant::now();
+        let usage = read_disk_with(&specs, Duration::from_millis(300), fake_stat);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the deadline did not bound the read"
+        );
+        let paths: Vec<&str> = usage.mounts.iter().map(|m| m.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            ["/", "/home", "/mnt/healthy-nas"],
+            "healthy mounts (remote included) keep their rows, in mountinfo order"
+        );
+        // While the stuck call is outstanding the mount is skipped, not
+        // re-spawned onto yet another thread.
+        assert!(in_flight().contains("/test-hung-mount"));
+        let again = read_disk_with(&specs[1..2], Duration::from_millis(50), fake_stat);
+        assert!(again.mounts.is_empty());
     }
 }

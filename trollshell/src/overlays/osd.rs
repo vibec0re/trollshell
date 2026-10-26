@@ -525,8 +525,10 @@ impl StartupGuard {
 /// seeds too, because a switch between two present sinks changes the value
 /// with no volume key involved. A volume change on the new sink right after
 /// the switch compares against the seeded value, so it still shows. A
-/// placeholder (`None`, no default sink) shows nothing and leaves the
-/// baseline alone.
+/// placeholder (`None`, no default sink) shows nothing and clears the
+/// baseline, so whatever comes back next seeds: no volume key can reach the
+/// default sink while there is none, and `PipeWire` reuses freed global ids,
+/// so a sink returning under the old id is not evidence it is the same sink.
 ///
 /// [`StartupGuard` documents]: StartupGuard
 #[derive(Debug, Default)]
@@ -537,7 +539,12 @@ struct VolumeGate {
 impl VolumeGate {
     /// Feed one emission; the volume to show, if any.
     fn admit(&mut self, reading: Option<(u32, Volume)>) -> Option<Volume> {
-        let (id, volume) = reading?;
+        let Some((id, volume)) = reading else {
+            // No default sink: whatever comes back next seeds, even under a
+            // recycled id.
+            self.last = None;
+            return None;
+        };
         match self.last.replace((id, volume)) {
             Some((last_id, last_volume)) if last_id == id && last_volume != volume => Some(volume),
             _ => None,
@@ -1122,7 +1129,7 @@ mod tests {
                 Some(reading(2, 0.8)), // repeat: nothing
                 Some(reading(2, 0.9)), // change on the new sink: shows
                 None,                  // device gone: nothing
-                Some(reading(2, 0.9)), // back, same value: nothing
+                Some(reading(2, 0.9)), // back: seeds
                 Some(reading(1, 0.4)), // switch back: silent
             ]),
             vec![
@@ -1145,6 +1152,18 @@ mod tests {
         let mut gate = VolumeGate::default();
         assert_eq!(gate.admit(Some(reading(1, 0.5))), None);
         assert_eq!(gate.admit(Some((1, vol(0.5, true)))), Some(vol(0.5, true)));
+    }
+
+    /// A default sink that goes away and comes back seeds again, whatever
+    /// its id says: `PipeWire` reuses freed global ids, so a different node
+    /// (a Bluetooth profile switch re-creates its node) can return under the
+    /// old one at a different volume, with no volume key pressed.
+    #[test]
+    fn a_sink_coming_back_after_none_seeds_silently() {
+        assert_eq!(
+            gated(&[Some(reading(1, 0.3)), None, Some(reading(1, 0.6))]),
+            vec![None, None, None],
+        );
     }
 
     /// The id the gate keys on is the *default* sink's own, read through

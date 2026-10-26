@@ -9,11 +9,21 @@
 //! Latest signal wins: if volume changes and brightness changes 200ms
 //! later, the OSD switches kind immediately and resets its hide timer.
 //!
-//! Bootstrap suppression: each of the three subscribed signals fires
-//! immediately on install with the service's current snapshot. Without
-//! suppression, opening the laptop with the bar starting up would flash
-//! three OSDs in a row. We track one `Cell<bool>` per signal and silently
-//! consume the FIRST emission; subsequent emissions show the OSD.
+//! Bootstrap suppression: each of the subscribed signals fires immediately on
+//! install with the service's current snapshot, and the services start from a
+//! placeholder (no backlight, no sinks, no sources) until their backend
+//! reports — so the first *real* reading can arrive as a later emission.
+//! Without suppression, opening the laptop with the bar starting up would
+//! flash three OSDs in a row. Volume, microphone and brightness each swallow
+//! emissions until their first real reading, which seeds silently
+//! (`StartupGuard`); every emission after it shows the OSD. Battery keeps
+//! its own seeded-baseline diff (`detect_battery_event`).
+//!
+//! Drawer suppression: the OSD stays quiet only while the drawer on its own
+//! monitor shows the very control that changed — volume and microphone under
+//! the Audio page, brightness under the Power page's slider
+//! (`drawer_shows_control`). Battery alerts and a plugin's leave-by nudge
+//! are never swallowed: no drawer page is a substitute for them.
 //!
 //! Multi-monitor: `install` mounts one layer-shell window per monitor,
 //! keyed by `Monitor.connector()`. Module-level signal subscriptions
@@ -43,8 +53,9 @@ use hytte::gtk::{self, glib, prelude::*};
 use hytte::prelude::*;
 
 use crate::components::{cast, focused_output};
+use crate::modal::Page;
 use hytte::services::brightness::{self, Brightness};
-use hytte::services::pipewire::{self, Source, Volume};
+use hytte::services::pipewire::{self, Sink, Source, Volume};
 use hytte::services::upower::{self, Battery, BatteryState};
 use hytte::ui::layer_window;
 
@@ -120,11 +131,12 @@ struct OsdView {
     /// them up on each update without growing a leaky class list.
     current_kind: Cell<Option<&'static str>>,
     current_muted: Cell<bool>,
-    /// Set to `true` while the modal drawer on this monitor is open.
-    /// When true, `route_show` skips the OSD to avoid redundant noise
-    /// while the user is interacting with the live slider.
-    drawer_open: Cell<bool>,
-    /// Per-monitor `drawer_open_signal` subscription handle. Unlike the
+    /// The built-in page the modal drawer on this monitor is showing, `None`
+    /// while it is closed (or showing no built-in page). `route_show` skips
+    /// an OSD the page already shows the live control for
+    /// ([`drawer_shows_control`]) — and only that one.
+    drawer_page: Cell<Option<Page>>,
+    /// Per-monitor `drawer_page_signal` subscription handle. Unlike the
     /// module-level singletons this is one-per-install, so it MUST be aborted
     /// on teardown — parked here and `.abort()`ed in [`close_all`], else it
     /// accumulates a dangling subscription per monitor rebuild.
@@ -149,9 +161,9 @@ pub fn install(monitor: &Monitor) {
 
     let view = build_osd_view(monitor);
 
-    // Subscribe to the drawer-open state for this monitor so route_show
-    // can suppress the OSD while the user is looking at the live slider.
-    // The signal is backed by a lazily-allocated `Mutable` keyed by
+    // Subscribe to the page the drawer on this monitor shows so route_show
+    // can suppress an OSD while the user is looking at that control's live
+    // slider. The signal is backed by a lazily-allocated `Mutable` keyed by
     // connector, so this works even though `osd::install` runs before
     // `modal::install` during boot.
     //
@@ -160,10 +172,10 @@ pub fn install(monitor: &Monitor) {
     // teardown or it accumulates one per rebuild.
     let connector_for_sub = connector.clone();
     let drawer_sub = glib::MainContext::default().spawn_local(
-        crate::modal::drawer_open_signal(monitor).for_each(move |open| {
+        crate::modal::drawer_page_signal(monitor).for_each(move |page| {
             OSDS.with(|map| {
                 if let Some(view) = map.borrow().get(&connector_for_sub) {
-                    view.drawer_open.set(open);
+                    view.drawer_page.set(page);
                 }
             });
             std::future::ready(())
@@ -190,7 +202,7 @@ pub fn install(monitor: &Monitor) {
     }
 }
 
-/// Close every OSD surface, abort its per-monitor `drawer_open_signal`
+/// Close every OSD surface, abort its per-monitor `drawer_page_signal`
 /// subscription, cancel any pending hide/fade timers, and drop the
 /// per-monitor entries. Called before rebuilding on monitor hot-plug so a
 /// vanished output's `OsdView` doesn't linger in `OSDS` — otherwise
@@ -292,7 +304,7 @@ fn build_osd_view(monitor: &Monitor) -> Rc<OsdView> {
         fade_out_timeout: Cell::new(None),
         current_kind: Cell::new(None),
         current_muted: Cell::new(false),
-        drawer_open: Cell::new(false),
+        drawer_page: Cell::new(None),
         drawer_sub: RefCell::new(None),
     })
 }
@@ -323,23 +335,34 @@ fn install_click_through(window: &gtk::Window) {
 /// Wire the four module-level signal subscriptions exactly once on the
 /// first [`install`] call, regardless of monitor count.
 ///
-/// Bootstrap suppression: each signal's first emission carries the
-/// snapshot at install time. We don't want the OSD flashing on
-/// startup, so silently consume that first event per signal.
+/// Bootstrap suppression: we don't want the OSD flashing on startup, so
+/// volume, microphone and brightness each swallow emissions until their
+/// first real reading, which seeds silently ([`StartupGuard`]); battery
+/// seeds its diff baseline from its first emission.
 fn install_subscriptions() {
-    // ── Volume ────────────────────────────────────────────────────────
+    // ── Volume (default sink) ─────────────────────────────────────────
+    //
+    // Derived from `sinks()` the way the microphone below is from
+    // `sources()`, not read off `default_sink()`: that handle collapses "no
+    // default sink known yet" into `Volume::default()`, a real-looking 0 %,
+    // so the startup guard could not tell its placeholder from a reading.
+    // The value is the one the backend publishes there — the default sink's
+    // averaged volume and its mute — and `dedupe` keeps another sink's
+    // change from re-firing it.
     {
-        let first = Cell::new(true);
-        glib::MainContext::default().spawn_local(pipewire::default_sink().for_each(
-            move |v: Volume| {
-                if first.replace(false) {
-                    return std::future::ready(());
-                }
-                let state = render_volume(v);
-                route_show(&state);
-                std::future::ready(())
-            },
-        ));
+        let mut guard = StartupGuard::default();
+        let volume = pipewire::sinks()
+            .map(|sinks| default_volume(&sinks))
+            .dedupe();
+
+        glib::MainContext::default().spawn_local(volume.for_each(move |volume: Option<Volume>| {
+            if guard.admits(volume.is_some())
+                && let Some(v) = volume
+            {
+                route_show(&render_volume(v));
+            }
+            std::future::ready(())
+        }));
     }
 
     // ── Microphone (default source) ───────────────────────────────────
@@ -350,7 +373,7 @@ fn install_subscriptions() {
     // unrelated source list changes (e.g. a USB mic plug event when
     // the system mic is still the default).
     {
-        let first = Cell::new(true);
+        let mut guard = StartupGuard::default();
         let combined = map_ref! {
             let sources = pipewire::sources() => {
                 sources.iter().find(|s| s.is_default).cloned()
@@ -360,10 +383,9 @@ fn install_subscriptions() {
 
         glib::MainContext::default().spawn_local(combined.for_each(
             move |source: Option<Source>| {
-                if first.replace(false) {
-                    return std::future::ready(());
-                }
-                if let Some(state) = render_mic(source.as_ref()) {
+                if guard.admits(source.is_some())
+                    && let Some(state) = render_mic(source.as_ref())
+                {
                     route_show(&state);
                 }
                 std::future::ready(())
@@ -372,16 +394,16 @@ fn install_subscriptions() {
     }
 
     // ── Brightness ────────────────────────────────────────────────────
+    //
+    // `None` until the service's first sysfs read finds a backlight.
     {
-        let first = Cell::new(true);
+        let mut guard = StartupGuard::default();
         glib::MainContext::default().spawn_local(brightness::current().for_each(
             move |b: Option<Brightness>| {
-                if first.replace(false) {
-                    return std::future::ready(());
-                }
-                if let Some(b) = b {
-                    let state = render_brightness(b);
-                    route_show(&state);
+                if guard.admits(b.is_some())
+                    && let Some(b) = b
+                {
+                    route_show(&render_brightness(b));
                 }
                 std::future::ready(())
             },
@@ -441,10 +463,55 @@ fn route_show(state: &State) {
             .map(Rc::clone)
     });
     if let Some(view) = view {
-        if view.drawer_open.get() {
-            return; // drawer is showing the same control; OSD is redundant
+        if drawer_shows_control(state.kind, view.drawer_page.get()) {
+            return; // the drawer is showing this very control; OSD is redundant
         }
         show(&view, state);
+    }
+}
+
+/// Whether the drawer page `shown` on an OSD's monitor already shows the live
+/// control an OSD of `kind` would report — the one case [`route_show`]
+/// swallows it as redundant.
+///
+/// Volume and microphone have their sliders on the Audio page, brightness on
+/// the Power page; any other page (or none) hides nothing. Battery events and
+/// leave-by nudges are alerts, not readouts of a slider the user is holding:
+/// no page stands in for "critical battery" or "leave now", so they always
+/// show.
+fn drawer_shows_control(kind: Kind, shown: Option<Page>) -> bool {
+    match kind {
+        Kind::Volume | Kind::Mic => shown == Some(Page::Audio),
+        Kind::Brightness => shown == Some(Page::Power),
+        Kind::Battery | Kind::LeaveBy => false,
+    }
+}
+
+/// The startup guard for one OSD signal: it swallows every emission up to
+/// and including the first real reading, which seeds the baseline silently.
+///
+/// A service handle starts from a placeholder until its backend reports —
+/// `brightness::current()` is `None`, and the default sink and source this
+/// module derives are `None` while their lists are empty — so the first
+/// *real* reading can land as the second emission, or later. The guard this
+/// replaced swallowed exactly the first emission whatever it carried, which
+/// let that reading through as a change and flashed an OSD at startup. Once
+/// seeded the guard admits everything; a later placeholder (a device gone)
+/// renders nothing at the call site, as before.
+#[derive(Debug, Default)]
+struct StartupGuard {
+    seeded: bool,
+}
+
+impl StartupGuard {
+    /// Feed one emission; `real` is whether it carries a reading rather than
+    /// the placeholder. `true` when the emission may be shown.
+    fn admits(&mut self, real: bool) -> bool {
+        if self.seeded {
+            return true;
+        }
+        self.seeded = real;
+        false
     }
 }
 
@@ -563,6 +630,17 @@ fn detect_battery_event(prev: Option<&Battery>, curr: &Battery) -> Option<Batter
     }
 
     None
+}
+
+/// The default sink's volume and mute out of the sink list — the value the
+/// backend publishes as `pipewire::default_sink()` — or `None` while no sink
+/// is the default, which `default_sink()` instead reports as a real-looking
+/// `Volume::default()`.
+fn default_volume(sinks: &[Sink]) -> Option<Volume> {
+    sinks.iter().find(|s| s.is_default).map(|s| Volume {
+        linear: s.volume,
+        muted: s.muted,
+    })
 }
 
 fn render_volume(v: Volume) -> State {
@@ -885,5 +963,139 @@ mod tests {
         let prev = batt(50.0, BatteryState::Unknown);
         let curr = batt(50.0, BatteryState::Charging);
         assert!(detect_battery_event(Some(&prev), &curr).is_none());
+    }
+
+    // ── Which drawer page silences which OSD ─────────────────────────────
+
+    /// Every drawer state the OSD can be handed: closed, then each page.
+    fn every_drawer_state() -> impl Iterator<Item = Option<Page>> {
+        std::iter::once(None).chain(Page::ALL.into_iter().map(Some))
+    }
+
+    /// Volume and microphone are silenced by the Audio page — where both of
+    /// their sliders live — and by nothing else. Before the fix *any* open
+    /// page silenced them, so the volume keys gave no feedback with Calendar
+    /// open.
+    ///
+    /// **Falsification:** `Kind::Volume | Kind::Mic => shown.is_some()` (the
+    /// pre-fix "any page" rule) reds on the first non-Audio page.
+    #[test]
+    fn volume_and_mic_are_quiet_only_under_the_audio_page() {
+        for kind in [Kind::Volume, Kind::Mic] {
+            for shown in every_drawer_state() {
+                assert_eq!(
+                    drawer_shows_control(kind, shown),
+                    shown == Some(Page::Audio),
+                    "{kind:?} with the drawer on {shown:?}",
+                );
+            }
+        }
+    }
+
+    /// Brightness is silenced only by the Power page, which carries the
+    /// brightness slider.
+    #[test]
+    fn brightness_is_quiet_only_under_the_power_page() {
+        for shown in every_drawer_state() {
+            assert_eq!(
+                drawer_shows_control(Kind::Brightness, shown),
+                shown == Some(Page::Power),
+                "Brightness with the drawer on {shown:?}",
+            );
+        }
+    }
+
+    /// A battery alert (critical, imminent shutdown, plug/unplug) and a
+    /// plugin's leave-by nudge show whatever the drawer shows — the Power
+    /// page included, which shows the charge but raises no alert.
+    ///
+    /// **Falsification:** route `Kind::Battery` with `Kind::Brightness` → the
+    /// Power page swallows a critical-battery OSD and this reds.
+    #[test]
+    fn battery_and_leave_by_are_never_silenced() {
+        for kind in [Kind::Battery, Kind::LeaveBy] {
+            for shown in every_drawer_state() {
+                assert!(
+                    !drawer_shows_control(kind, shown),
+                    "{kind:?} swallowed with the drawer on {shown:?}",
+                );
+            }
+        }
+    }
+
+    // ── The startup guard ────────────────────────────────────────────────
+
+    fn sink(name: &str, volume: f64, muted: bool, is_default: bool) -> Sink {
+        Sink {
+            id: 0,
+            name: name.to_owned(),
+            description: String::new(),
+            volume,
+            muted,
+            is_default,
+        }
+    }
+
+    /// The volume the OSD reads is the default sink's, and a list with no
+    /// default — the empty list a fresh handle starts from included — is the
+    /// placeholder, not a 0 % reading. That is what lets the startup guard
+    /// tell the two apart.
+    #[test]
+    fn default_volume_is_none_until_a_sink_is_the_default() {
+        assert_eq!(
+            default_volume(&[]),
+            None,
+            "the handle's startup placeholder"
+        );
+        assert_eq!(default_volume(&[sink("hdmi", 0.4, false, false)]), None);
+        assert_eq!(
+            default_volume(&[
+                sink("hdmi", 0.4, false, false),
+                sink("speakers", 0.7, true, true),
+            ]),
+            Some(vol(0.7, true)),
+        );
+        assert_eq!(
+            default_volume(&[sink("silent", 0.0, false, true)]),
+            Some(vol(0.0, false)),
+            "a real 0 % default sink is a reading",
+        );
+    }
+
+    /// What `guard` answers for each emission in `real`, in order.
+    fn admitted(real: &[bool]) -> Vec<bool> {
+        let mut guard = StartupGuard::default();
+        real.iter().map(|&r| guard.admits(r)).collect()
+    }
+
+    /// The startup flash: the handle's placeholder arrives first, then the
+    /// backend's first real reading. That reading seeds the baseline; only the
+    /// change after it shows.
+    ///
+    /// **Falsification:** the pre-fix "swallow exactly the first emission"
+    /// guard admits the second emission here — the first real reading — and
+    /// this reds.
+    #[test]
+    fn the_first_real_reading_after_a_placeholder_seeds_silently() {
+        assert_eq!(admitted(&[false, true, true]), [false, false, true]);
+        assert_eq!(
+            admitted(&[false, false, true, true]),
+            [false, false, false, true]
+        );
+    }
+
+    /// A service that already had its reading when the OSD subscribed: the
+    /// first emission is real and seeds, exactly as the old guard did.
+    #[test]
+    fn a_real_first_emission_seeds_like_before() {
+        assert_eq!(admitted(&[true, true, true]), [false, true, true]);
+    }
+
+    /// Once seeded the guard steps aside: a later placeholder (a device gone)
+    /// is admitted — the call site renders nothing for it — and the reading
+    /// after it shows, as every emission after the first did before.
+    #[test]
+    fn a_seeded_guard_admits_everything_after() {
+        assert_eq!(admitted(&[true, false, true]), [false, true, true]);
     }
 }

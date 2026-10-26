@@ -6,10 +6,11 @@
 //! put one in.
 //!
 //! This drives `modal.rs`'s two `Mutable`-wake sites #673/#674 name by hand
-//! — `show_panel_active`'s `open_state.set(true)` and
-//! `wire_retract_finish`'s `open_state.set(false)` — with a hand-rolled
+//! — `show_panel_active` publishing the page it opens and
+//! `wire_retract_finish` clearing it, both through `set_current`'s
+//! `shown_page.set_neq` — with a hand-rolled
 //! *synchronous* `Waker` subscribed to modal's own public
-//! `drawer_open_signal`, so a subscriber reentering modal's public API runs
+//! `drawer_page_signal`, so a subscriber reentering modal's public API runs
 //! genuinely *nested* inside the `Mutable::set` call that woke it — the
 //! same shape the historical bug had, not a deferred/safe-by-timing
 //! approximation of it. `hytte::prelude::bind`'s own apply-loop can't
@@ -24,7 +25,7 @@
 //! own signal to see what changed, then react — deadlocks, and not just for
 //! the tempting-but-wrong reentrant action (an earlier draft of this file
 //! tried routing the reentrant action through `modal::close_all`, which
-//! calls `set_neq` on every `open_state`; that's a *second* self-deadlock
+//! calls `set_neq` on every `shown_page`; that's a *second* self-deadlock
 //! on top of this one). `futures_signals::Mutable::set` holds its internal
 //! `RwLock` **write** guard for the entire `notify()` walk — the guard
 //! doesn't drop until `set` returns, after every registered waker has
@@ -49,7 +50,7 @@
 //!
 //! `modal::install` is the one `PANELS.borrow_mut()` site reachable without
 //! re-touching any `Mutable` (it only *clones* an existing
-//! `drawer_open_state` entry, never `.set()`/`.set_neq()`s one) — see #631's
+//! `drawer_page_state` entry, never `.set()`/`.set_neq()`s one) — see #631's
 //! note on `install` racing a second `install`/`close_all` for the same key
 //! for why this is a real, previously-fixed hazard and not a contrived one.
 //!
@@ -103,6 +104,7 @@ use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
+use trollshell::modal::Page;
 
 thread_local! {
     /// The `Monitor`/`BarHandle` the reentrant `wake()` callback below
@@ -150,10 +152,20 @@ fn reentrant_reinstall() {
     });
 }
 
+/// The page both scenarios open. The power menu, because it is the one
+/// built-in page that builds and shows without any service registered —
+/// its rows call into logind/niri only when clicked — so `plugins::service()`
+/// (which `modal::install`'s eager plugin child needs) stays the whole
+/// registration, as it was when these scenarios opened a plugin page.
+const SCENARIO_PAGE: Page = Page::PowerMenu;
+
 /// Drain every value the signal has ready and re-arm the waker for the
 /// next change. Must only be called from *outside* any `Mutable::set` call
 /// on the signal's own backing `Mutable` — see the module doc.
-fn drain_and_rearm<S: Signal<Item = bool>>(mut signal: std::pin::Pin<&mut S>, cx: &mut Context) {
+fn drain_and_rearm<S: Signal<Item = Option<Page>>>(
+    mut signal: std::pin::Pin<&mut S>,
+    cx: &mut Context,
+) {
     while let Poll::Ready(Some(_)) = signal.as_mut().poll_change(cx) {}
 }
 
@@ -174,6 +186,11 @@ fn drain_and_rearm<S: Signal<Item = bool>>(mut signal: std::pin::Pin<&mut S>, cx
 /// before the waker subscribes) before `trigger` runs — the retract
 /// scenario needs this for the same reason: `dismiss_all` on a
 /// never-opened drawer is a no-op.
+///
+/// Both scenarios open a **built-in** page, [`SCENARIO_PAGE`], not a
+/// plugin's: `drawer_page_signal` publishes only the built-in page a drawer
+/// shows, so a plugin page opening or closing is no change on it and would
+/// wake nothing.
 fn run_scenario(
     ctx: &glib::MainContext,
     monitor: &Monitor,
@@ -183,7 +200,7 @@ fn run_scenario(
     reentrant_reinstall();
 
     if open_first {
-        trollshell::modal::open_plugin_on_focused(None, "system-tests-modal-plugin-pre");
+        trollshell::modal::open_on_focused(None, SCENARIO_PAGE);
         while ctx.iteration(false) {}
     }
 
@@ -192,7 +209,7 @@ fn run_scenario(
     });
     let waker: Waker = Waker::from(Arc::clone(&waker_state));
     let mut cx = Context::from_waker(&waker);
-    let mut signal = std::pin::pin!(trollshell::modal::drawer_open_signal(monitor));
+    let mut signal = std::pin::pin!(trollshell::modal::drawer_page_signal(monitor));
 
     // Prime the subscription: consume the signal's current value (not a
     // real transition), then arm for the first genuine change.
@@ -223,7 +240,7 @@ fn modal_tolerates_reentrant_install_from_a_synchronous_open_state_wake() {
             // its transition — and fires `notify::child-revealed` — inside the
             // call itself instead of over a real ~180ms frame-clock-driven
             // animation. That's what makes `wire_retract_finish`'s handler (and
-            // the `open_state.set(false)` inside it) run synchronously nested
+            // the `shown_page` clear inside it) run synchronously nested
             // in whatever triggered the retract, matching the shape of the
             // historical GTK-emission-driven reentrancy this module's fixes
             // guard against.
@@ -247,26 +264,26 @@ fn modal_tolerates_reentrant_install_from_a_synchronous_open_state_wake() {
                 *cell.borrow_mut() = Some((monitor.clone(), bar));
             });
 
-            // Scenario 1: `show_panel_active`'s `open_state.set(true)`,
-            // reached via `open_plugin_on_focused` → `open_plugin_by_key` →
+            // Scenario 1: `show_panel_active` publishing the page it opens,
+            // reached via `open_on_focused` → `open_by_key` → `show_panel` →
             // `show_panel_active`. The wake fires nested inside that call
             // and reentrantly reinstalls the very panel it's still in the
             // middle of presenting.
             let fired = run_scenario(&ctx, &monitor, false, || {
-                trollshell::modal::open_plugin_on_focused(None, "system-tests-modal-plugin-open");
+                trollshell::modal::open_on_focused(None, SCENARIO_PAGE);
             });
             open_fired_for_closure.store(fired, Ordering::SeqCst);
 
-            // Scenario 2: `wire_retract_finish`'s `open_state.set(false)`,
-            // reached via the revealer's synchronous (animations-off)
+            // Scenario 2: `wire_retract_finish` clearing the page, reached
+            // via the revealer's synchronous (animations-off)
             // transition completing inside `set_reveal_child` when
             // `dismiss_all` retracts an open drawer.
             let fired = run_scenario(&ctx, &monitor, true, trollshell::modal::dismiss_all);
             close_fired_for_closure.store(fired, Ordering::SeqCst);
 
             // Deliberately *not* `modal::close_all()` here: it calls
-            // `reset_drawer_open_states`, which `set_neq`s every
-            // `open_state`. Scenario 2's `signal`/waker have gone out of
+            // `reset_drawer_page_states`, which `set_neq`s every
+            // `shown_page`. Scenario 2's `signal`/waker have gone out of
             // scope by now (each `run_scenario` call is self-contained), so
             // this wouldn't hit the same reentrant-wake trap that made an
             // earlier draft of this test call `close_all` unsafe — it's
@@ -285,14 +302,14 @@ fn modal_tolerates_reentrant_install_from_a_synchronous_open_state_wake() {
     assert!(
         open_fired >= 1,
         "expected the reentrant `install` to fire from inside \
-         `show_panel_active`'s `open_state.set(true)`; got {open_fired} \
+         `show_panel_active`'s page publish; got {open_fired} \
          wakes — the waker never observed the open transition, so this run \
          didn't actually exercise the regression"
     );
     assert!(
         close_fired >= 1,
         "expected the reentrant `install` to fire from inside \
-         `wire_retract_finish`'s `open_state.set(false)`; got {close_fired} \
+         `wire_retract_finish`'s page clear; got {close_fired} \
          wakes — the waker never observed the retract transition, so this \
          run didn't actually exercise the regression"
     );

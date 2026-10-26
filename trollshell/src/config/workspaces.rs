@@ -462,30 +462,67 @@ fn unknown_app_keys(value: &toml::Value) -> Vec<String> {
 /// poll then snaps the card back to whichever change survived.
 ///
 /// This mirrors `hytte_services::places`' `EDIT_LOCK`. The critical section is
-/// a read, a patch and one small atomic write with no `.await` inside, so a
-/// plain `Mutex` is safe and cheap. It is taken inside each `*_to` writer,
-/// because that is where the read-modify-write is, so every caller is covered:
-/// the four process-environment wrappers and the tests' explicit paths alike.
+/// a few file reads, a patch and one small atomic write with no `.await`
+/// inside, so a plain `Mutex` is safe and cheap.
 ///
-/// The **guard reads** stay outside it: [`save_stack`]'s taken-name check and
-/// [`save_edit`]'s [`EditContext`] run before the writer takes the lock. So two
-/// Saves *of the same name* could both pass their check, and the second would
-/// then replace the first. Both writes still land whole, which is the lost update
-/// this lock exists for. A form keeps one Save in flight, so that needs two
-/// drawers saving one name at the same moment.
+/// Where it is taken depends on whether the writer has a guard:
+///
+/// * [`set_order_to`] and [`set_stack_monitor_to`] have none, and take it
+///   themselves, around their read-modify-write.
+/// * The two Saves do: [`save_stack_in`]'s taken-name check and
+///   [`save_edit_in`]'s [`EditContext`]. Those are read **under the same hold**
+///   as the write, so two Saves of one name cannot both pass their check before
+///   either has written (#1559). With the check outside, the second Save would
+///   replace the first. The writers they call, [`save_stack_to`] and
+///   [`save_edit_to`], therefore take a [`Serialized`] instead of the lock, so
+///   the hold they write under is the one the guard was read under.
 ///
 /// It covers this process only, which is every writer there is. The
 /// control-center renders `workspaces` read-only, and a hand edit is outside any
 /// lock.
 static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Proof that the caller holds the lock that serializes every
+/// `workspaces.toml` read-modify-write in this process.
+///
+/// [`save_stack_to`] and [`save_edit_to`] take one rather than locking
+/// themselves, because what they write was decided by a guard the caller read
+/// first — [`save_stack_in`] and [`save_edit_in`] read it under this same hold.
+/// Only this module can make one.
+pub struct Serialized {
+    _held: std::sync::MutexGuard<'static, ()>,
+}
+
 /// Hold [`WRITE_LOCK`]. A poisoned lock is taken anyway, as `places` does: the
 /// `()` behind it carries no state a panicking writer could have left torn, and
 /// the file itself is only ever replaced atomically.
-fn serialized() -> std::sync::MutexGuard<'static, ()> {
-    WRITE_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+fn serialized() -> Serialized {
+    Serialized {
+        _held: WRITE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    }
+}
+
+/// Every stack name the merged `layers` hold — what both Saves check a new name
+/// against.
+///
+/// A base-pinned name is taken too, and only the merged view can see that. A
+/// layer stack that does not load counts as no stacks, as `load_or_default`
+/// reads it, and is logged; the writer then re-reads the overlay and reports
+/// its own error if that is the broken layer.
+fn merged_names(layers: &xdg::Layers) -> BTreeSet<String> {
+    match hytte_config::subsystem::load_from::<WorkspacesConfig>(layers) {
+        Ok(loaded) => loaded.config.parsed().0.stacks.into_keys().collect(),
+        Err(e) => {
+            tracing::error!(
+                subsystem = WorkspacesConfig::NAME,
+                error = %e,
+                "config unusable; checking the name against no stacks"
+            );
+            BTreeSet::new()
+        }
+    }
 }
 
 /// Add the stack `name` to the **overlay**, keeping everything else in the file
@@ -511,34 +548,53 @@ fn serialized() -> std::sync::MutexGuard<'static, ()> {
 /// [`ConfigError::NoOverlayPath`] when there is no `XDG_CONFIG_HOME` to write
 /// to, plus whatever the reader and the format-preserving writer report.
 pub fn save_stack(name: &str, stack: &Stack) -> Result<(), ConfigError> {
+    save_stack_in(&xdg::config_layers(WorkspacesConfig::NAME), name, stack)
+}
+
+/// [`save_stack`] over explicit `layers`, writing to their overlay slot, so the
+/// guard and the write are testable without an `XDG_CONFIG_HOME`.
+///
+/// The taken-name check is against the **merged** view, not the overlay: a
+/// base-pinned name is taken too, and [`save_stack_to`] reads only the overlay,
+/// so a collision with the base would otherwise be invisible right up until the
+/// merge produced a stack the user never described.
+///
+/// The check and the write run under one hold of the write lock, so of two
+/// Saves of one name exactly one creates it and the other is refused (#1559).
+///
+/// # Errors
+/// As [`save_stack`].
+pub fn save_stack_in(layers: &xdg::Layers, name: &str, stack: &Stack) -> Result<(), ConfigError> {
     let name = normalize_workspace_name(name)
         .ok_or_else(|| ConfigError::Invalid(format!("invalid workspace name: {name:?}")))?;
-    // Against the **merged** view, not the overlay: a base-pinned name is taken
-    // too, and `save_stack_to` reads only the overlay, so a collision with the
-    // base would otherwise be invisible right up until the merge produced a
-    // stack the user never described.
-    let taken = hytte_config::subsystem::load_or_default::<WorkspacesConfig>()
-        .is_some_and(|config| config.parsed().0.stacks.contains_key(&name));
-    if taken {
+    let serialized = serialized();
+    if merged_names(layers).contains(&name) {
         return Err(ConfigError::Invalid(format!(
             "a workspace called {name:?} already exists"
         )));
     }
-    let path = xdg::overlay_path(WorkspacesConfig::NAME).ok_or(ConfigError::NoOverlayPath)?;
-    save_stack_to(&path, &name, stack)
+    let path = layers
+        .overlay
+        .as_deref()
+        .ok_or(ConfigError::NoOverlayPath)?;
+    save_stack_to(&serialized, path, &name, stack)
 }
 
-/// [`save_stack`] against an explicit overlay path, so the round trip is
-/// testable without an `XDG_CONFIG_HOME`.
+/// [`save_stack`]'s writer, against an explicit overlay path.
 ///
-/// Does **not** repeat [`save_stack`]'s already-taken check: that one is stated
-/// against the merged layers, which an explicit single path cannot see. This is
-/// the writer; the guard is the caller's.
+/// Does **not** repeat [`save_stack_in`]'s already-taken check: that one is
+/// stated against the merged layers, which an explicit single path cannot see.
+/// This is the writer; the guard is the caller's, read under the hold
+/// `_serialized` proves.
 ///
 /// # Errors
 /// As [`save_stack`], minus the already-taken case.
-pub fn save_stack_to(path: &std::path::Path, name: &str, stack: &Stack) -> Result<(), ConfigError> {
-    let _serialized = serialized();
+pub fn save_stack_to(
+    _serialized: &Serialized,
+    path: &std::path::Path,
+    name: &str,
+    stack: &Stack,
+) -> Result<(), ConfigError> {
     let existing = hytte_config::subsystem::load_from::<WorkspacesConfig>(&[path.to_path_buf()])?;
     let mut table = existing
         .config
@@ -581,16 +637,45 @@ pub fn save_stack_to(path: &std::path::Path, name: &str, stack: &Stack) -> Resul
 /// other stack already has, or a `workspace` key that is not a table;
 /// [`ConfigError::NoOverlayPath`] when there is nowhere to write.
 pub fn save_edit(previous: Option<&str>, name: &str, stack: &Stack) -> Result<(), ConfigError> {
-    let path = xdg::overlay_path(WorkspacesConfig::NAME).ok_or(ConfigError::NoOverlayPath)?;
-    // Everything that needs the **layers** is read here, not in the writer — the
-    // same split `save_stack`/`save_stack_to` already established, and for a
-    // reason that bit: `save_edit_to` used to run the taken-name guard itself
-    // through `load_or_default`, which resolves the *process's* XDG search path
-    // rather than the `path` argument. So the guard was unfalsifiable from the
-    // tempdir tests (the one named for it asserted a tautology), and two of
-    // those tests' behaviour depended on what happened to be in the developer's
-    // real `~/.config/trollshell` — a test that can only fail on Annika's box.
-    save_edit_to(&path, previous, name, stack, &edit_context(previous))
+    save_edit_in(
+        &xdg::config_layers(WorkspacesConfig::NAME),
+        previous,
+        name,
+        stack,
+    )
+}
+
+/// [`save_edit`] over explicit `layers`, writing to their overlay slot, so the
+/// guard and the write are testable without an `XDG_CONFIG_HOME`.
+///
+/// Everything that needs the **layers** is read here, not in the writer — the
+/// same split [`save_stack_in`]/[`save_stack_to`] established, and for a reason
+/// that bit: `save_edit_to` used to run the taken-name guard itself through
+/// `load_or_default`, which resolves the *process's* XDG search path rather
+/// than the `path` argument. So the guard was unfalsifiable from the tempdir
+/// tests (the one named for it asserted a tautology), and two of those tests'
+/// behaviour depended on what happened to be in the developer's real
+/// `~/.config/trollshell` — a test that can only fail on Annika's box.
+///
+/// The [`EditContext`] is read under the same hold of the write lock as the
+/// write, so of two Saves onto one new name exactly one lands and the other is
+/// refused (#1559).
+///
+/// # Errors
+/// As [`save_edit`].
+pub fn save_edit_in(
+    layers: &xdg::Layers,
+    previous: Option<&str>,
+    name: &str,
+    stack: &Stack,
+) -> Result<(), ConfigError> {
+    let path = layers
+        .overlay
+        .as_deref()
+        .ok_or(ConfigError::NoOverlayPath)?;
+    let serialized = serialized();
+    let context = edit_context(layers, previous);
+    save_edit_to(&serialized, path, previous, name, stack, &context)
 }
 
 /// What only the layer stack can answer, gathered where reading it is allowed.
@@ -614,11 +699,9 @@ pub struct EditContext {
     pub previous_is_inherited: bool,
 }
 
-/// [`EditContext`] from the process's XDG layers.
-fn edit_context(previous: Option<&str>) -> EditContext {
-    let taken: BTreeSet<String> = hytte_config::subsystem::load_or_default::<WorkspacesConfig>()
-        .map(|config| config.parsed().0.stacks.into_keys().collect())
-        .unwrap_or_default();
+/// [`EditContext`] from `layers`.
+fn edit_context(layers: &xdg::Layers, previous: Option<&str>) -> EditContext {
+    let taken = merged_names(layers);
 
     // The layers below the writable one, **as bases**: `overlay: None` says no
     // path here is the operator's. This used to `split_last` a flat
@@ -627,7 +710,7 @@ fn edit_context(previous: Option<&str>) -> EditContext {
     // below it locking it, its own `_locked` dropped), and with no
     // `$HOME`/`$XDG_CONFIG_HOME` the split ate that base outright.
     let base = xdg::Layers {
-        bases: xdg::base_config_layers(WorkspacesConfig::NAME),
+        bases: layers.bases.clone(),
         overlay: None,
     };
     let previous_is_inherited = previous.is_some_and(|previous| {
@@ -643,12 +726,16 @@ fn edit_context(previous: Option<&str>) -> EditContext {
     }
 }
 
-/// [`save_edit`] against an explicit overlay path, so the round trip is testable
-/// without an `XDG_CONFIG_HOME`.
+/// [`save_edit`]'s writer, against an explicit overlay path, so the round trip
+/// is testable without an `XDG_CONFIG_HOME`.
+///
+/// `context` is the guard, read by the caller under the hold `_serialized`
+/// proves — see [`save_edit_in`].
 ///
 /// # Errors
 /// As [`save_edit`].
 pub fn save_edit_to(
+    _serialized: &Serialized,
     path: &std::path::Path,
     previous: Option<&str>,
     name: &str,
@@ -664,22 +751,24 @@ pub fn save_edit_to(
         })
         .transpose()?;
 
-    let _serialized = serialized();
     let existing = hytte_config::subsystem::load_from::<WorkspacesConfig>(&[path.to_path_buf()])?;
     let mut table = workspace_table(&existing)?;
     let mut order = existing.config.order.clone();
     let renaming = previous.as_deref().is_some_and(|p| p != name);
 
-    if renaming {
-        // A rename onto a name that is already somebody else's would silently
-        // eat that stack — `Table::insert` replaces. `taken` is the **merged**
-        // view, handed in by the caller (see `save_edit`), because a base-pinned
-        // name is taken too and this function must not go looking for one.
-        if context.taken.contains(&name) {
-            return Err(ConfigError::Invalid(format!(
-                "a workspace called {name:?} already exists"
-            )));
-        }
+    // A Save under a name that is already somebody else's would silently eat
+    // that stack — `Table::insert` replaces. That is a rename onto a taken
+    // name, and equally an ephemeral card's Save (`previous: None`, a
+    // creation) under one: the form's own `plan_save` refuses both, and so
+    // does this, because two Saves in flight can each pass the form's check
+    // against a view that predates the other (#1559). `taken` is the
+    // **merged** view, handed in by the caller (see `save_edit_in`), because a
+    // base-pinned name is taken too and this function must not go looking for
+    // one.
+    if previous.as_deref() != Some(name.as_str()) && context.taken.contains(&name) {
+        return Err(ConfigError::Invalid(format!(
+            "a workspace called {name:?} already exists"
+        )));
     }
 
     if let Some(previous) = previous.as_deref().filter(|_| renaming) {
@@ -1031,12 +1120,13 @@ pub fn current() -> Workspaces {
 mod tests {
     use super::{
         APP_KEYS, ConfigError, DEFAULT_TOML, EditContext, Layout, STACK_KEYS, Stack, StackApp,
-        Workspaces, WorkspacesConfig, save_edit_to, save_stack_to, set_order_to,
-        set_stack_monitor_to, stack_value,
+        Workspaces, WorkspacesConfig, save_edit_in, save_edit_to, save_stack_in, save_stack_to,
+        serialized, set_order_to, set_stack_monitor_to, stack_value,
     };
     use hytte_config::schema::{self, Kind};
     use hytte_config::subsystem::{self, Subsystem};
     use hytte_config::test_support::{Overlay, capture};
+    use hytte_config::xdg;
     use hytte_config_families::workspaces::SCHEMA;
     use std::collections::BTreeSet;
     use std::path::PathBuf;
@@ -1399,7 +1489,7 @@ apps = [
         let loaded =
             subsystem::load_from::<WorkspacesConfig>(std::slice::from_ref(&path)).expect("loads");
         let stack = loaded.config.parsed().0.stacks["chat"].clone();
-        save_stack_to(&path, "chat", &stack).expect("saves");
+        save_stack_to(&serialized(), &path, "chat", &stack).expect("saves");
 
         assert_eq!(
             std::fs::read_to_string(&path).expect("reads back"),
@@ -1421,7 +1511,7 @@ apps = [
         let path = dir.path().join("workspaces.toml");
         std::fs::write(&path, "# mine\n[workspace.chat]\nlayout = \"golden\"\n").expect("writes");
 
-        save_stack_to(
+        save_stack_to(&serialized(), 
             &path,
             "dev",
             &Stack {
@@ -1608,7 +1698,8 @@ apps = [
     /// is where an existing stack is changed.
     ///
     /// Stated on `save_stack_to`'s caller-side guard through the page's own
-    /// check and on `save_stack`'s merged-layer check; here it is the writer's
+    /// check and on `save_stack_in`'s merged-layer check
+    /// (`saves_of_one_name_at_once_create_it_once`); here it is the writer's
     /// behaviour that is pinned — it still *writes*, because the guard is
     /// deliberately the caller's (see its doc).
     #[test]
@@ -1619,7 +1710,7 @@ apps = [
 
         // The writer replaces, by design — it cannot see the base layer, so it
         // is not the place to decide.
-        save_stack_to(&path, "chat", &Stack::default()).expect("writes");
+        save_stack_to(&serialized(), &path, "chat", &Stack::default()).expect("writes");
         let ws = subsystem::load_from::<WorkspacesConfig>(std::slice::from_ref(&path))
             .expect("reloads")
             .config
@@ -1642,7 +1733,7 @@ apps = [
         std::fs::write(&base, "[workspace.base]\nlayout = \"golden\"\n").expect("writes");
         std::fs::write(&overlay, "# mine\n").expect("writes");
 
-        save_stack_to(&overlay, "mine", &Stack::default()).expect("saves");
+        save_stack_to(&serialized(), &overlay, "mine", &Stack::default()).expect("saves");
 
         let written = std::fs::read_to_string(&overlay).expect("reads back");
         assert!(written.contains("[workspace.mine]"), "{written}");
@@ -1782,12 +1873,12 @@ apps = [
 
     // ── #1071 §5, phase 4: the Edit form's writers ───────────────────────────
     //
-    // Every one of these drives an **explicit path** under a `tempfile::tempdir`.
-    // The `xdg::overlay_path` wrappers (`save_edit`, `set_order`) are never
-    // reached from a test, which is what keeps the suite off the developer's
-    // real `~/.config/trollshell` — the same rule phase 2 carved the `Ops` seam
-    // for, stated here as a convention because these writers have no seam and
-    // need none (one write, no ordering to falsify).
+    // Every one of these drives an **explicit path** under a `tempfile::tempdir`
+    // (or explicit layers around one). The process-XDG wrappers (`save_edit`,
+    // `set_order`) are never reached from a test, which is what keeps the suite
+    // off the developer's real `~/.config/trollshell` — the same rule phase 2
+    // carved the `Ops` seam for, stated here as a convention because these
+    // writers have no seam and need none (one write, no ordering to falsify).
 
     /// A file with an order and two stacks, for the reorder/rename rows.
     fn two_stacks(path: &std::path::Path) -> &'static str {
@@ -1836,7 +1927,7 @@ apps = [
                 },
             ],
         };
-        save_edit_to(
+        save_edit_to(&serialized(), 
             &path,
             Some("chat"),
             "chat",
@@ -1869,7 +1960,7 @@ apps = [
         let body = two_stacks(&path);
 
         let stack = stack_in(&path, "dev").expect("the stack is there");
-        save_edit_to(&path, Some("dev"), "dev", &stack, &EditContext::default()).expect("saves");
+        save_edit_to(&serialized(), &path, Some("dev"), "dev", &stack, &EditContext::default()).expect("saves");
 
         assert_eq!(
             std::fs::read_to_string(&path).expect("reads back"),
@@ -1910,7 +2001,7 @@ apps = [
         two_stacks(&path);
 
         let stack = stack_in(&path, "chat").expect("the stack is there");
-        save_edit_to(&path, Some("chat"), "talk", &stack, &EditContext::default())
+        save_edit_to(&serialized(), &path, Some("chat"), "talk", &stack, &EditContext::default())
             .expect("renames");
 
         let loaded =
@@ -1956,7 +2047,7 @@ apps = [
             taken: ["dev".to_owned()].into_iter().collect(),
             previous_is_inherited: false,
         };
-        let err = save_edit_to(&path, Some("chat"), "dev", &stack, &taken).expect_err("refused");
+        let err = save_edit_to(&serialized(), &path, Some("chat"), "dev", &stack, &taken).expect_err("refused");
         assert!(matches!(err, ConfigError::Invalid(_)), "{err}");
         assert_eq!(
             std::fs::read_to_string(&path).expect("reads back"),
@@ -1966,7 +2057,7 @@ apps = [
 
         // …and with the name genuinely free it goes through, so the refusal is
         // the guard rather than the writer simply not working.
-        save_edit_to(&path, Some("chat"), "talk", &stack, &EditContext::default())
+        save_edit_to(&serialized(), &path, Some("chat"), "talk", &stack, &EditContext::default())
             .expect("renames");
         assert!(stack_in(&path, "talk").is_some());
     }
@@ -2011,7 +2102,7 @@ apps = [
         assert!(merged(()).stacks.contains_key("chat"), "the base pins it");
 
         let renamed = merged(()).stacks["chat"].clone();
-        save_edit_to(
+        save_edit_to(&serialized(), 
             &overlay,
             Some("chat"),
             "talk",
@@ -2068,7 +2159,7 @@ apps = [
         two_stacks(&path);
 
         let stack = stack_in(&path, "chat").expect("the stack is there");
-        save_edit_to(&path, Some("chat"), "talk", &stack, &EditContext::default())
+        save_edit_to(&serialized(), &path, Some("chat"), "talk", &stack, &EditContext::default())
             .expect("renames");
 
         assert_eq!(
@@ -2094,14 +2185,14 @@ apps = [
         };
 
         let stack = stack_in(&path, "chat").expect("the stack is there");
-        save_edit_to(&path, Some("chat"), "talk", &stack, &inherited).expect("renames");
+        save_edit_to(&serialized(), &path, Some("chat"), "talk", &stack, &inherited).expect("renames");
         assert_eq!(
             unset_names(&path).as_deref(),
             Some(["chat".to_owned()].as_slice()),
             "the first rename records the removal"
         );
 
-        save_edit_to(&path, Some("talk"), "chat", &stack, &inherited).expect("renames back");
+        save_edit_to(&serialized(), &path, Some("talk"), "chat", &stack, &inherited).expect("renames back");
         let body = std::fs::read_to_string(&path).expect("reads");
         let marked = unset_names(&path).unwrap_or_default();
         assert!(
@@ -2124,7 +2215,7 @@ apps = [
         let path = dir.path().join("workspaces.toml");
         let body = two_stacks(&path);
 
-        let err = save_edit_to(
+        let err = save_edit_to(&serialized(), 
             &path,
             Some("chat"),
             "chat--dev",
@@ -2246,6 +2337,155 @@ apps = [
         assert_eq!(loaded.order, reversed, "the order rewrite was lost");
     }
 
+    /// The layers a Save sees in these tests: no base, and `overlay`'s scratch
+    /// file in the overlay slot — never the process's `XDG_CONFIG_HOME`.
+    fn overlay_layers(overlay: &Overlay) -> xdg::Layers {
+        xdg::Layers {
+            bases: Vec::new(),
+            overlay: Some(overlay.path().to_path_buf()),
+        }
+    }
+
+    /// One Save, as a thread body for [`released_together`].
+    type Save<'a> = Box<dyn FnOnce() -> Result<(), ConfigError> + Send + 'a>;
+
+    /// Run every one of `saves` on its own thread, all started while this test
+    /// holds the write lock and released together, and return their results in
+    /// the order given.
+    ///
+    /// Holding the lock is what makes the race land the same way every run. A
+    /// Save that reads its guard **outside** the lock reads it now, while nothing
+    /// has been written, and then parks on the lock with a stale answer. One
+    /// that reads it under the lock parks before reading anything. The pause is
+    /// only how long they get to reach the lock: it bounds how reliably the
+    /// mutation is caught, and has no bearing on a correct tree, where the
+    /// outcome is the same whatever the timing.
+    fn released_together(saves: Vec<Save<'_>>) -> Vec<Result<(), ConfigError>> {
+        let held = serialized();
+        std::thread::scope(|s| {
+            let running: Vec<_> = saves.into_iter().map(|save| s.spawn(save)).collect();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            drop(held);
+            running
+                .into_iter()
+                .map(|save| save.join().expect("a Save panicked"))
+                .collect()
+        })
+    }
+
+    /// The index of the one Save in `results` that landed, after asserting that
+    /// exactly one did and that every other was refused as a taken name.
+    fn the_one_that_landed(results: &[Result<(), ConfigError>]) -> usize {
+        let landed: Vec<usize> = (0..results.len())
+            .filter(|&i| results[i].is_ok())
+            .collect();
+        assert_eq!(landed.len(), 1, "exactly one Save may land: {results:?}");
+        for result in results {
+            assert!(
+                result.is_ok()
+                    || matches!(result, Err(ConfigError::Invalid(why)) if why.contains("already exists")),
+                "every other Save is refused as taken: {results:?}"
+            );
+        }
+        landed[0]
+    }
+
+    /// **#1559 item 8**: Saves of one new name at once create it **once**.
+    ///
+    /// `save_stack_in`'s taken-name check used to run before the write took the
+    /// lock, so every Save could pass it against a file none of them had written
+    /// yet. They all then wrote, and each replaced the one before — a stack
+    /// silently overwritten by a Save that should have been refused.
+    ///
+    /// **Mutation:** take the lock after the taken-name check and this reds:
+    /// every Save lands.
+    #[test]
+    fn saves_of_one_name_at_once_create_it_once() {
+        let mut overlay = Overlay::new(WorkspacesConfig::NAME);
+        overlay.write("[workspace.chat]\nlayout = \"golden\"\n");
+        let layers = overlay_layers(&overlay);
+        let stacks: Vec<Stack> = (0..4)
+            .map(|i| Stack {
+                monitor: Some(format!("OUT-{i}")),
+                ..Stack::default()
+            })
+            .collect();
+
+        let results = released_together(
+            stacks
+                .iter()
+                .map(|stack| {
+                    let layers = &layers;
+                    Box::new(move || save_stack_in(layers, "music", stack)) as Save<'_>
+                })
+                .collect(),
+        );
+
+        let landed = the_one_that_landed(&results);
+        assert_eq!(
+            stack_in(overlay.path(), "music").as_ref(),
+            Some(&stacks[landed]),
+            "the file holds the Save that landed, not one that was refused"
+        );
+        assert!(stack_in(overlay.path(), "chat").is_some(), "chat survives");
+    }
+
+    /// **#1559 item 8**, the Edit form's half: renames onto one new name and
+    /// ephemeral Saves (creations) of it, all at once, land **once**.
+    ///
+    /// `save_edit`'s `EditContext` used to be read before the write took the
+    /// lock, so two renames onto one name both passed and the second ate the
+    /// first's stack. A creation was never checked by the writer at all.
+    ///
+    /// **Mutations:** take the lock after reading the `EditContext` and this
+    /// reds (every rename lands); check `taken` for renames only and it reds
+    /// too (every creation lands).
+    #[test]
+    fn edit_saves_onto_one_name_at_once_land_once() {
+        let overlay = Overlay::new(WorkspacesConfig::NAME);
+        two_stacks(overlay.path());
+        let layers = overlay_layers(&overlay);
+        let chat = stack_in(overlay.path(), "chat").expect("chat is there");
+        let dev = stack_in(overlay.path(), "dev").expect("dev is there");
+        let created = |monitor: &str| Stack {
+            monitor: Some(monitor.to_owned()),
+            ..Stack::default()
+        };
+        let saves: Vec<(Option<&str>, Stack)> = vec![
+            (Some("chat"), chat),
+            (Some("dev"), dev),
+            (None, created("OUT-a")),
+            (None, created("OUT-b")),
+        ];
+
+        let results = released_together(
+            saves
+                .iter()
+                .map(|(previous, stack)| {
+                    let layers = &layers;
+                    Box::new(move || save_edit_in(layers, *previous, "talk", stack)) as Save<'_>
+                })
+                .collect(),
+        );
+
+        let landed = the_one_that_landed(&results);
+        let body = std::fs::read_to_string(overlay.path()).expect("reads back");
+        assert_eq!(
+            stack_in(overlay.path(), "talk").as_ref(),
+            Some(&saves[landed].1),
+            "the file holds the Save that landed: {body}"
+        );
+        for (i, (previous, _)) in saves.iter().enumerate() {
+            if let Some(previous) = previous {
+                assert_eq!(
+                    stack_in(overlay.path(), previous).is_some(),
+                    i != landed,
+                    "only the rename that landed may move {previous:?}: {body}"
+                );
+            }
+        }
+    }
+
     /// An ephemeral card's Save creates the entry and still invents no `order`
     /// key — arrays replace whole, so writing one would discard a base-pinned
     /// card order the user never asked to change.
@@ -2255,7 +2495,7 @@ apps = [
         let path = dir.path().join("workspaces.toml");
         std::fs::write(&path, "# mine\n[workspace.chat]\nlayout = \"golden\"\n").expect("writes");
 
-        save_edit_to(
+        save_edit_to(&serialized(), 
             &path,
             None,
             "music",

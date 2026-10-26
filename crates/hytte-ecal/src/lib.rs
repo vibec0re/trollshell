@@ -4280,7 +4280,7 @@ mod tests {
     ///
     /// The spring rows stop at the gap day: the occurrence after it is the
     /// iterator's own problem, not the conversion's (see
-    /// `the_occurrence_after_a_gap_day_keeps_the_series_time_of_day`).
+    /// `libical_iterator_carries_a_gap_days_shift_into_the_next_occurrence`).
     #[test]
     fn a_zoned_daily_series_takes_the_same_instants_on_transition_days() {
         let spring = berlin_calendar_of(&["UID:spring\r\nDTSTAMP:20260101T000000Z\r\n\
@@ -4361,6 +4361,115 @@ mod tests {
             sorted_starts(&autumn),
             vec![utc(2026, 10, 24, 0, 30), utc(2026, 10, 26, 1, 30)],
             "the fold occurrence is the one EXDATE cancels"
+        );
+    }
+
+    /// The wall clocks libical's recurrence iterator hands back for the first
+    /// `n` occurrences of the one RRULE'd event in `ical`, before any
+    /// conversion.
+    fn libical_iterator_walls(ical: &str, n: usize) -> Vec<super::WallClock> {
+        let comp = super::parse_vevent(ical).unwrap();
+        // SAFETY: `comp.raw` is the live VEVENT just parsed, owned by `comp`
+        // until this function returns; a new `ICalTime` ref (or null),
+        // released below after the iterator that borrows it.
+        let dtstart = unsafe { sys::i_cal_component_get_dtstart(comp.raw) };
+        assert!(!dtstart.is_null(), "the fixture has a DTSTART");
+        // SAFETY: the same live component, and libical's RRULE
+        // `ICalPropertyKind` discriminant; a new property ref (or null),
+        // released below.
+        let prop =
+            unsafe { sys::i_cal_component_get_first_property(comp.raw, sys::I_CAL_RRULE_PROPERTY) };
+        assert!(!prop.is_null(), "the fixture has an RRULE");
+        // SAFETY: `prop` is that non-null property; a new `ICalRecurrence`
+        // ref, released below after the iterator built from it.
+        let rule = unsafe { sys::i_cal_property_get_rrule(prop) };
+        assert!(!rule.is_null(), "the fixture's RRULE parses");
+        // SAFETY: `rule` and `dtstart` are live, and stay alive until after
+        // the iterator is released below, as libical requires.
+        let iter = unsafe { sys::i_cal_recur_iterator_new(rule, dtstart) };
+        assert!(!iter.is_null(), "the iterator constructs");
+        let walls = (0..n)
+            .map(|_| {
+                // SAFETY: `iter` is the live iterator above; each step
+                // returns a new `ICalTime` ref, released below.
+                let occ = unsafe { sys::i_cal_recur_iterator_next(iter) };
+                assert!(!occ.is_null(), "the series is unbounded");
+                // SAFETY: `occ` is the non-null, live time just taken.
+                let w = unsafe { super::WallClock::from_ical(occ) };
+                // SAFETY: that new ref, released exactly once.
+                unsafe { sys::g_object_unref(occ) }
+                w
+            })
+            .collect();
+        // SAFETY: the iterator's one ref, released exactly once and never
+        // stepped after, before the rule and start it borrows.
+        unsafe { sys::g_object_unref(iter) }
+        // SAFETY: the `ICalRecurrence` ref taken above, released exactly once.
+        unsafe { sys::g_object_unref(rule) }
+        // SAFETY: the property ref taken above, released exactly once.
+        unsafe { sys::g_object_unref(prop) }
+        // SAFETY: the `ICalTime` ref taken above, released exactly once, after
+        // the iterator that borrowed it.
+        unsafe { sys::g_object_unref(dtstart) }
+        walls
+    }
+
+    /// Found while checking #1590's recurrence step, **not fixed here**:
+    /// libical's recurrence iterator (built with ICU on this tree, so it
+    /// steps a series on an ICU calendar in the `TZID`'s location) moves a
+    /// gap day's missing 02:30 to 03:30, which is the right instant (RFC 5545
+    /// §3.3.5 reads 02:30 there as 03:30 CEST). It then **keeps** 03:30 for
+    /// the next occurrence: it sets the series' hour on the previous
+    /// occurrence's date and then adds the period, and on the gap day that
+    /// hour falls in the gap again (`icalrecur.c`'s `next_unit` sets the
+    /// hour, `increment_monthday` is `ucal_add`). So a daily 02:30 Berlin
+    /// series has its 2026-03-30 occurrence at 03:30 CEST (01:30Z) where the
+    /// RFC has 02:30 CEST (00:30Z). Weekly and yearly series carry it the same
+    /// way. The expansion converts whatever wall clock the iterator hands
+    /// back, so it shows that occurrence an hour late.
+    ///
+    /// Evolution expands with this same iterator (EDS's `e-cal-recur.c`), so
+    /// a `RECURRENCE-ID` or `EXDATE` it writes for that occurrence says 03:30
+    /// as well. Replacing the iterator's time of day with `DTSTART`'s would
+    /// fix the instant and break those matches, so the choice is left to the
+    /// issue. This pins the iterator's behaviour, so a libical upgrade that
+    /// changes it shows up here.
+    #[test]
+    fn libical_iterator_carries_a_gap_days_shift_into_the_next_occurrence() {
+        let event = |dtstart: &str, rrule: &str| {
+            berlin_calendar_of(&[&format!(
+                "UID:carry\r\nDTSTAMP:20250101T000000Z\r\n\
+                 DTSTART;TZID=Europe/Berlin:{dtstart}\r\nRRULE:{rrule}\r\nSUMMARY:Carry\r\n"
+            )])
+        };
+        assert_eq!(
+            libical_iterator_walls(&event("20260328T023000", "FREQ=DAILY"), 4),
+            vec![
+                wall(2026, 3, 28, 2, 30),
+                wall(2026, 3, 29, 3, 30), // the gap day: the right instant
+                wall(2026, 3, 30, 3, 30), // the carry: the RFC has 02:30
+                wall(2026, 3, 31, 2, 30),
+            ],
+            "daily"
+        );
+        assert_eq!(
+            libical_iterator_walls(&event("20260322T023000", "FREQ=WEEKLY"), 4),
+            vec![
+                wall(2026, 3, 22, 2, 30),
+                wall(2026, 3, 29, 3, 30),
+                wall(2026, 4, 5, 3, 30),
+                wall(2026, 4, 12, 2, 30),
+            ],
+            "weekly"
+        );
+        assert_eq!(
+            libical_iterator_walls(&event("20250329T023000", "FREQ=YEARLY"), 3),
+            vec![
+                wall(2025, 3, 29, 2, 30),
+                wall(2026, 3, 29, 3, 30),
+                wall(2027, 3, 29, 3, 30), // a Monday; 2027's gap is on the 28th
+            ],
+            "yearly"
         );
     }
 

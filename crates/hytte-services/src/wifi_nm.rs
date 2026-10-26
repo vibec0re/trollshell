@@ -25,7 +25,7 @@
 //!   an existing profile, so it can never join a never-before-seen network.
 //!
 //! Either way the dict/profile carries **no passphrase**: NM therefore asks the
-//! registered secret agent (see `register_nm_agent` and the `wifi::nm_agent`
+//! registered secret agent (see `ensure_nm_agent_registered` and the `wifi::nm_agent`
 //! module) for it via `GetSecrets`, which drives the same prompt overlay the iwd
 //! backend uses.
 
@@ -1644,26 +1644,68 @@ pub(crate) async fn nm_set_powered(on: bool) -> Result<(), hytte_bus::BusError> 
 /// hints — we use the first usable hint to pick which secret key to prompt for.)
 const NM_SECRET_AGENT_CAPABILITY_VPN_HINTS: u32 = 0x1;
 
-/// Register our secret agent with NM's `AgentManager`.
+/// The D-Bus error `AgentManager` answers a registration with when it already
+/// holds an agent under the same identifier for the caller's uid.
 ///
-/// Uses `RegisterWithCapabilities(identifier, capabilities)` with
-/// `capabilities = NM_SECRET_AGENT_CAPABILITY_VPN_HINTS` so NM passes the VPN
-/// service-type / secret-name hints with `vpn` `GetSecrets` requests. NM records
-/// the *unique* name of the connection this call arrives on and issues
-/// `GetSecrets` callbacks back on it, so the agent object must already be
-/// exported on the same shared system connection before calling this (it is —
-/// both go through `hytte_bus`'s pooled system connection).
+/// NM allows **one agent per identifier per user** and refuses a second rather
+/// than replacing the first — including a second `RegisterWithCapabilities`
+/// from the very connection that made the first, so registering is *not*
+/// idempotent. Measured against the `NetworkManager` 1.56 daemon this tree's
+/// nixpkgs ships: `nm-agent-manager.c` carries the literal
+/// [`NM_ALREADY_REGISTERED_MESSAGE`] beside `NM_AGENT_MANAGER_ERROR_PERMISSION_DENIED`,
+/// whose D-Bus name this is. The same name is also used for an unrelated
+/// refusal (`"Unable to determine request UID."`), which is why
+/// [`is_already_registered`] reads the message too.
+const NM_AGENT_MANAGER_PERMISSION_DENIED: &str =
+    "org.freedesktop.NetworkManager.AgentManager.PermissionDenied";
+
+/// The message NM attaches to the duplicate-identifier refusal — see
+/// [`NM_AGENT_MANAGER_PERMISSION_DENIED`]. NM does not translate D-Bus error
+/// messages, so matching on it is stable across locales.
+const NM_ALREADY_REGISTERED_MESSAGE: &str =
+    "An agent with this ID is already registered for this user.";
+
+/// Whether `err` is NM refusing a registration because an agent with our
+/// identifier is already registered for this user.
 ///
-/// Idempotent: NM lets the same connection re-register; a stale registration
-/// from a prior epoch is replaced.
-///
-/// # Errors
-///
-/// Returns a [`hytte_bus::BusError`] if the D-Bus call fails (e.g. NM is not
-/// running, or policy refuses agent registration).
-pub(crate) async fn register_nm_agent() -> Result<(), hytte_bus::BusError> {
-    let capabilities: u32 = NM_SECRET_AGENT_CAPABILITY_VPN_HINTS;
+/// That refusal is ambiguous on its own, and [`ensure_nm_agent_registered_via`]
+/// is what resolves it: the holder may be *this* connection (a renewal nobody
+/// needed), a stale registration from this process's previous unique name
+/// that NM has not dropped yet (the window right after a bus reconnect), or a
+/// different process entirely (a second shell for the same user).
+fn is_already_registered(err: &hytte_bus::BusError) -> bool {
+    matches!(
+        err,
+        hytte_bus::BusError::Permanent { reason, dbus_name: Some(name) }
+            if name == NM_AGENT_MANAGER_PERMISSION_DENIED
+                && reason.contains(NM_ALREADY_REGISTERED_MESSAGE)
+    )
+}
+
+/// A call to NM's `AgentManager` on the pooled system connection — the one the
+/// secret agent is exported on, so NM records the unique name that serves it.
+fn agent_manager() -> hytte_bus::CallBuilder<()> {
     hytte_bus::call(BusKind::System, NM_NAME)
+}
+
+/// `RegisterWithCapabilities` on `manager`.
+///
+/// Uses `capabilities = NM_SECRET_AGENT_CAPABILITY_VPN_HINTS` so NM passes the
+/// VPN service-type / secret-name hints with `vpn` `GetSecrets` requests. NM
+/// records the *unique* name of the connection this call arrives on and issues
+/// `GetSecrets` callbacks back on it, so the agent object must already be
+/// exported on the same connection before calling this (it is — both go
+/// through `hytte_bus`'s pooled system connection).
+///
+/// Takes the call builder rather than building it, so the `nm_agent` system
+/// tests can drive this exact wire body against a fake `AgentManager` on a
+/// throwaway bus; production reaches it only through
+/// [`ensure_nm_agent_registered`].
+async fn register_nm_agent_via(
+    manager: hytte_bus::CallBuilder<()>,
+) -> Result<(), hytte_bus::BusError> {
+    let capabilities: u32 = NM_SECRET_AGENT_CAPABILITY_VPN_HINTS;
+    manager
         .at_path(NM_AGENT_MANAGER_PATH)
         .iface(NM_AGENT_MANAGER_IFACE)
         .method("RegisterWithCapabilities")
@@ -1672,10 +1714,88 @@ pub(crate) async fn register_nm_agent() -> Result<(), hytte_bus::BusError> {
         .await
 }
 
+/// Register our secret agent with NM's `AgentManager`, converging on "the
+/// registration NM holds is this connection's" whatever it held before.
+///
+/// Called by the `wifi` service's registrar on start-up and again on every
+/// renewal (NM restarted, the system bus reconnected, a hole in the
+/// name-ownership stream). A plain `RegisterWithCapabilities` is not enough
+/// for that, because NM refuses a duplicate rather than replacing it (see
+/// [`NM_AGENT_MANAGER_PERMISSION_DENIED`]). So on that refusal this withdraws
+/// whatever *this connection* holds and registers once more:
+///
+/// - **The holder was us.** `Unregister` succeeds and the second register
+///   succeeds. The renewal was unnecessary, and it is not free: NM drops any
+///   `GetSecrets` it had in flight with the agent it just removed. That is why
+///   the registrar renews only on events that usually mean the registration
+///   is already gone (see `wifi::DaemonChange`).
+/// - **The holder was our previous unique name** — NM has not yet processed
+///   its disappearance after a reconnect. `Unregister` answers `NotRegistered`
+///   (it only ever removes the *caller's* agent), the second register is
+///   refused the same way, and the error goes back to the registrar's retry
+///   ramp. NM drops the stale entry as soon as it sees the old name go, and
+///   the next attempt succeeds.
+/// - **The holder is another process** (a second shell for this user). Same
+///   as above, except it never clears: the registrar keeps retrying at its
+///   capped backoff, quietly, and takes over the moment the other one exits.
+///
+/// # Errors
+///
+/// Returns a [`hytte_bus::BusError`] if the registration fails — NM is not
+/// running, policy refuses the agent, or the identifier is still held by
+/// someone other than this connection.
+pub(crate) async fn ensure_nm_agent_registered() -> Result<(), hytte_bus::BusError> {
+    ensure_nm_agent_registered_via(agent_manager).await
+}
+
+/// [`ensure_nm_agent_registered`] over an injectable `AgentManager` call — the
+/// seam [`register_nm_agent_via`] describes. `manager` is called once per
+/// D-Bus call made, because a [`hytte_bus::CallBuilder`] is consumed by
+/// `send`.
+///
+/// # Errors
+///
+/// As [`ensure_nm_agent_registered`].
+pub(crate) async fn ensure_nm_agent_registered_via(
+    manager: impl Fn() -> hytte_bus::CallBuilder<()>,
+) -> Result<(), hytte_bus::BusError> {
+    match register_nm_agent_via(manager()).await {
+        Err(e) if is_already_registered(&e) => {
+            tracing::debug!(
+                "wifi_nm: NM already holds a secret agent under our identifier; withdrawing \
+                 whatever this connection holds and registering again"
+            );
+            if let Err(e) = unregister_nm_agent_via(manager()).await {
+                // Expected when the holder is not this connection: NM's
+                // `Unregister` only ever removes the caller's own agent.
+                tracing::debug!(
+                    error = %e,
+                    "wifi_nm: the existing registration is not this connection's"
+                );
+            }
+            register_nm_agent_via(manager()).await
+        }
+        other => other,
+    }
+}
+
+/// `Unregister` on `manager` — the seam [`register_nm_agent_via`] describes.
+async fn unregister_nm_agent_via(
+    manager: hytte_bus::CallBuilder<()>,
+) -> Result<(), hytte_bus::BusError> {
+    manager
+        .at_path(NM_AGENT_MANAGER_PATH)
+        .iface(NM_AGENT_MANAGER_IFACE)
+        .method("Unregister")
+        .args(())
+        .send::<()>()
+        .await
+}
+
 /// Withdraw our secret-agent registration from NM's `AgentManager`.
 ///
-/// The counterpart to [`register_nm_agent`], and necessary because the two
-/// halves of an agent have different lifetimes. Dropping the
+/// The counterpart to [`ensure_nm_agent_registered`], and necessary because
+/// the two halves of an agent have different lifetimes. Dropping the
 /// [`hytte_bus::ExportHandle`] unmounts the object, but NM does not track the
 /// object — it recorded the *unique connection name* the registration arrived
 /// on, and that is `hytte_bus`'s pooled system connection, which outlives any
@@ -1685,7 +1805,8 @@ pub(crate) async fn register_nm_agent() -> Result<(), hytte_bus::BusError> {
 /// show for it.
 ///
 /// Called on the #633 backend-switch teardown path, before the export is
-/// dropped.
+/// dropped and after the registrar has been stopped, so no registration can
+/// land behind it.
 ///
 /// # Errors
 ///
@@ -1693,13 +1814,7 @@ pub(crate) async fn register_nm_agent() -> Result<(), hytte_bus::BusError> {
 /// benign case where NM has already gone away, which is often exactly why the
 /// switch is happening.
 pub(crate) async fn unregister_nm_agent() -> Result<(), hytte_bus::BusError> {
-    hytte_bus::call(BusKind::System, NM_NAME)
-        .at_path(NM_AGENT_MANAGER_PATH)
-        .iface(NM_AGENT_MANAGER_IFACE)
-        .method("Unregister")
-        .args(())
-        .send::<()>()
-        .await
+    unregister_nm_agent_via(agent_manager()).await
 }
 
 // ── Integration-test probe ─────────────────────────────────────────────────────
@@ -2961,5 +3076,63 @@ mod tests {
             1,
             "Lagged must re-check presence exactly once"
         );
+    }
+
+    // -- is_already_registered ------------------------------------------------
+
+    /// NM's refusal of a duplicate registration, exactly as `BusError::from_zbus`
+    /// renders the reply: the D-Bus name in `dbus_name`, NM's message in
+    /// `reason`.
+    fn refusal(dbus_name: &str, reason: &str) -> hytte_bus::BusError {
+        hytte_bus::BusError::Permanent {
+            reason: reason.to_string(),
+            dbus_name: Some(dbus_name.to_string()),
+        }
+    }
+
+    /// The one refusal `ensure_nm_agent_registered_via` resolves by withdrawing
+    /// and registering again.
+    #[test]
+    fn nm_s_duplicate_identifier_refusal_is_already_registered() {
+        assert!(is_already_registered(&refusal(
+            NM_AGENT_MANAGER_PERMISSION_DENIED,
+            NM_ALREADY_REGISTERED_MESSAGE,
+        )));
+    }
+
+    /// `PermissionDenied` is also how NM refuses a caller whose uid it cannot
+    /// determine. Withdrawing and re-registering cannot fix that, so it must
+    /// stay an ordinary failure for the retry ramp rather than trigger the
+    /// unregister dance.
+    #[test]
+    fn other_permission_denied_refusals_are_not_already_registered() {
+        assert!(!is_already_registered(&refusal(
+            NM_AGENT_MANAGER_PERMISSION_DENIED,
+            "Unable to determine request UID.",
+        )));
+    }
+
+    /// The message alone is not enough either: a different error name carrying
+    /// the same words is not NM's refusal.
+    #[test]
+    fn the_message_under_another_error_name_is_not_already_registered() {
+        assert!(!is_already_registered(&refusal(
+            "org.freedesktop.DBus.Error.AccessDenied",
+            NM_ALREADY_REGISTERED_MESSAGE,
+        )));
+        assert!(!is_already_registered(&hytte_bus::BusError::Permanent {
+            reason: NM_ALREADY_REGISTERED_MESSAGE.to_string(),
+            dbus_name: None,
+        }));
+    }
+
+    /// NM not running at all is the start-up race the registrar's retry exists
+    /// for; it must reach the ramp as a plain failure.
+    #[test]
+    fn nm_not_on_the_bus_is_not_already_registered() {
+        assert!(!is_already_registered(&refusal(
+            "org.freedesktop.DBus.Error.ServiceUnknown",
+            "The name org.freedesktop.NetworkManager was not provided by any .service files",
+        )));
     }
 }

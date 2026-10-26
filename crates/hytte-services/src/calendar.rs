@@ -543,7 +543,7 @@ fn instance_to_calendar_event(
     let end = if raw_end > start {
         raw_end
     } else if inst.all_day {
-        start + Duration::days(1)
+        next_day_start(start)
     } else {
         start + Duration::hours(1)
     };
@@ -583,6 +583,19 @@ fn instance_to_calendar_event(
         calendar_name: calendar_name.to_string(),
         calendar_color: calendar_color.map(str::to_string),
     })
+}
+
+/// The same wall-clock time on the next calendar day. A fixed `+ 24 h` is
+/// wrong on a DST transition: from local midnight it lands at 23:00 the same
+/// day on a 25-hour fall-back day and at 01:00 on a 23-hour spring-forward
+/// one. Falls back to `+ 24 h` only if the next day has no such wall-clock
+/// time at all (a skipped hour).
+fn next_day_start<Tz: TimeZone>(dt: DateTime<Tz>) -> DateTime<Tz> {
+    dt.date_naive()
+        .succ_opt()
+        .map(|d| d.and_time(dt.time()))
+        .and_then(|n| dt.timezone().from_local_datetime(&n).earliest())
+        .unwrap_or_else(|| dt + Duration::hours(24))
 }
 
 /// Convert a POSIX UTC timestamp to local time. For all-day instances we
@@ -703,8 +716,14 @@ fn run_worker(rx: &mpsc::Receiver<()>, writer: &Mutable<Vec<CalendarEvent>>) {
 /// rules; format choices match the user-visible spec in the task brief.
 #[must_use]
 pub fn format_when(event: &CalendarEvent) -> String {
-    let now = Local::now();
-    let today = now.date_naive();
+    format_when_on(event, Local::now().date_naive())
+}
+
+/// [`format_when`] with "today" supplied, so the labels can be tested
+/// without depending on the real date. Everything here is calendar-date
+/// arithmetic on [`NaiveDate`]s, never elapsed time, so the length of a DST
+/// day cannot shift a label.
+fn format_when_on(event: &CalendarEvent, today: NaiveDate) -> String {
     let start_date = event.start.date_naive();
     let end_date = event.end.date_naive();
 
@@ -1074,61 +1093,116 @@ mod tests {
         assert_eq!(ev.summary, "(no title)");
     }
 
-    #[test]
-    fn format_when_today_timed() {
-        let now = Local::now();
-        let start = Local
-            .with_ymd_and_hms(now.year(), now.month(), now.day(), 14, 0, 0)
-            .single()
-            .unwrap();
-        let end = start + Duration::hours(1);
-        let s = format_when(&ev_at(start, end, false));
-        assert!(s.starts_with("Today"), "got {s}");
-        assert!(s.contains("14:00"));
-        assert!(s.contains("15:00"));
+    /// Local wall-clock `h:00` on `date`. Dates, not elapsed time: adding
+    /// `Duration::days(n)` to a `DateTime<Local>` is wrong across a DST
+    /// transition (the wall-clock time shifts by an hour).
+    fn local_at(date: NaiveDate, h: u32) -> DateTime<Local> {
+        Local
+            .from_local_datetime(&date.and_hms_opt(h, 0, 0).unwrap())
+            .earliest()
+            .unwrap()
     }
+
+    fn ymd(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    /// The 2026 EU transitions, plus an ordinary day for contrast. On the
+    /// fall-back day local midnight + 24 h is 23:00 the *same* date, which
+    /// is what this suite's fixture used to build "tomorrow" from.
+    const DAYS: [(i32, u32, u32); 3] = [(2026, 3, 29), (2026, 10, 25), (2026, 6, 10)];
 
     #[test]
     fn format_when_all_day() {
-        let now = Local::now();
-        let start = Local
-            .with_ymd_and_hms(now.year(), now.month(), now.day(), 0, 0, 0)
-            .single()
-            .unwrap()
-            + Duration::days(1);
-        let end = start + Duration::days(1);
-        let s = format_when(&ev_at(start, end, true));
-        assert_eq!(s, "All day, Tomorrow");
+        for (y, m, d) in DAYS {
+            let today = ymd(y, m, d);
+            let tomorrow = today.succ_opt().unwrap();
+            let start = local_at(tomorrow, 0);
+            let end = local_at(tomorrow.succ_opt().unwrap(), 0);
+            let s = format_when_on(&ev_at(start, end, true), today);
+            assert_eq!(s, "All day, Tomorrow", "today = {today}");
+        }
+    }
+
+    #[test]
+    fn format_when_all_day_today() {
+        for (y, m, d) in DAYS {
+            let today = ymd(y, m, d);
+            let start = local_at(today, 0);
+            let end = local_at(today.succ_opt().unwrap(), 0);
+            let s = format_when_on(&ev_at(start, end, true), today);
+            assert_eq!(s, "All day, Today", "today = {today}");
+        }
+    }
+
+    #[test]
+    fn format_when_today_timed() {
+        for (y, m, d) in DAYS {
+            let today = ymd(y, m, d);
+            let event = ev_at(local_at(today, 14), local_at(today, 15), false);
+            let s = format_when_on(&event, today);
+            assert!(s.starts_with("Today"), "got {s}");
+            assert!(s.contains("14:00"), "got {s}");
+            assert!(s.contains("15:00"), "got {s}");
+        }
     }
 
     #[test]
     fn format_when_multi_day_timed() {
-        // Sat 09:00 → Mon 17:00 must show both endpoints.
-        let now = Local::now();
-        let start = Local
-            .with_ymd_and_hms(now.year(), now.month(), now.day(), 9, 0, 0)
-            .single()
-            .unwrap()
-            + Duration::days(2);
-        let end = start + Duration::days(2) + Duration::hours(8);
-        let s = format_when(&ev_at(start, end, false));
-        assert!(s.contains("09:00"), "got {s}");
-        assert!(s.contains("17:00"), "got {s}");
-        assert!(s.contains('\u{2192}'), "expected arrow in {s}");
+        // Sat 09:00 -> Mon 17:00 must show both endpoints.
+        for (y, m, d) in DAYS {
+            let today = ymd(y, m, d);
+            let start = local_at(today + chrono::Days::new(2), 9);
+            let end = local_at(today + chrono::Days::new(4), 17);
+            let s = format_when_on(&ev_at(start, end, false), today);
+            assert!(s.contains("09:00"), "got {s}");
+            assert!(s.contains("17:00"), "got {s}");
+            assert!(s.contains('\u{2192}'), "expected arrow in {s}");
+        }
     }
 
     #[test]
     fn format_when_multi_day_all_day() {
-        let now = Local::now();
-        let start = Local
-            .with_ymd_and_hms(now.year(), now.month(), now.day(), 0, 0, 0)
-            .single()
-            .unwrap()
-            + Duration::days(1);
-        // 3-day span: DTEND is exclusive ⇒ start + 3 days.
-        let end = start + Duration::days(3);
-        let s = format_when(&ev_at(start, end, true));
-        assert!(s.starts_with("All day, "), "got {s}");
-        assert!(s.contains('\u{2192}'), "expected arrow in {s}");
+        for (y, m, d) in DAYS {
+            let today = ymd(y, m, d);
+            let start = local_at(today + chrono::Days::new(1), 0);
+            // 3-day span: DTEND is exclusive => start + 3 calendar days.
+            let end = local_at(today + chrono::Days::new(4), 0);
+            let s = format_when_on(&ev_at(start, end, true), today);
+            assert!(s.starts_with("All day, Tomorrow"), "got {s}");
+            assert!(s.contains('\u{2192}'), "expected arrow in {s}");
+        }
+    }
+
+    #[test]
+    fn next_day_start_is_the_next_calendar_date() {
+        // Only bites when the host zone observes DST (e.g. Europe/Berlin);
+        // under UTC it still pins the contract.
+        for (y, m, d) in DAYS {
+            let today = ymd(y, m, d);
+            let next = next_day_start(local_at(today, 0));
+            assert_eq!(next.date_naive(), today.succ_opt().unwrap());
+            assert_eq!(next.time(), NaiveTime::from_hms_opt(0, 0, 0).unwrap());
+        }
+    }
+
+    #[test]
+    fn all_day_instance_without_end_spans_one_calendar_day() {
+        // libecal can hand back end == start; the fabricated end must be the
+        // next local midnight even when that day is 23 or 25 hours long.
+        for (y, m, d) in DAYS {
+            let day = ymd(y, m, d);
+            let ts = day.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
+            let instance = EventInstance {
+                ical: "BEGIN:VEVENT\r\nUID:x\r\nSUMMARY:s\r\nEND:VEVENT\r\n".into(),
+                start_unix: ts,
+                end_unix: ts,
+                all_day: true,
+            };
+            let before = local_at(day, 0) - Duration::days(1);
+            let ev =
+                instance_to_calendar_event(&instance, "c", None, before, 0).expect("event kept");
+            assert_eq!(ev.end.date_naive(), day.succ_opt().unwrap());
+        }
     }
 }

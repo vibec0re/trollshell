@@ -309,6 +309,10 @@ fn read_js(view: &webkit::WebView, expression: &str) -> String {
     answered.unwrap_or_else(|e| panic!("`{expression}` failed: {e}"))
 }
 
+/// Why `WebKit`'s web process did not start for the first test that tried,
+/// if it did not. See [`Watch::loaded_or_skip`].
+static NO_WEB_PROCESS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 /// What happened to one view's main frame, in order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Event {
@@ -370,14 +374,24 @@ impl Watch {
     /// Wait for `url` to finish loading, cleanly, in the main frame — `true`
     /// when it has; `false` when no web process started and this run is
     /// allowed to skip (see this module's doc).
+    ///
+    /// The first test to find no web process records why in
+    /// [`NO_WEB_PROCESS`], and every later one skips (or fails) on that at
+    /// once: what decides it is the process's environment, which does not
+    /// change mid-run, and waiting out each view's own crash cost about 8 s a
+    /// test under a bare `xvfb-run` (measured).
     fn loaded_or_skip(&self, url: &str, test: &str) -> bool {
         let finished = Event::Finished(url.to_owned());
-        wait_until(
-            &format!("{url} to load"),
-            || self.saw(&finished) || self.crash().is_some(),
-            || self.report(),
-        );
-        if let Some(why) = self.crash() {
+        let known = NO_WEB_PROCESS.get().cloned();
+        if known.is_none() {
+            wait_until(
+                &format!("{url} to load"),
+                || self.saw(&finished) || self.crash().is_some(),
+                || self.report(),
+            );
+        }
+        if let Some(why) = known.or_else(|| self.crash()) {
+            let why = NO_WEB_PROCESS.get_or_init(|| why);
             let required = std::env::var_os("TROLLSHELL_REQUIRE_GL").is_some_and(|v| v == "1");
             assert!(
                 !required,

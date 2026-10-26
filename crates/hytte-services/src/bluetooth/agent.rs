@@ -920,7 +920,6 @@ mod tests {
 mod registration_tests {
     use super::{AgentWake, agent_loop, agent_wake, register_until_accepted};
     use crate::retry;
-    use futures_util::StreamExt;
     use hytte_bus::{BusError, SignalEvent, SignalItem};
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
@@ -996,28 +995,36 @@ mod registration_tests {
     #[tokio::test(start_paused = true)]
     async fn a_reconnect_of_our_own_connection_registers_again() {
         let registrations = Cell::new(0_u32);
-        let mut items = futures_util::stream::iter([SignalItem::Resubscribed])
-            .chain(futures_util::stream::pending());
+        let (tx, mut items) = futures_channel::mpsc::unbounded::<SignalItem>();
 
-        let _ = tokio::time::timeout(
-            Duration::from_mins(1),
-            agent_loop(
-                &mut items,
-                || {
-                    registrations.set(registrations.get() + 1);
-                    async { Ok(()) }
-                },
-                || async { Ok(true) },
-                TEST_RAMP,
-            ),
-        )
-        .await;
-
-        assert_eq!(
-            registrations.get(),
-            2,
-            "the start-up registration, then one for the reconnect"
+        let looping = agent_loop(
+            &mut items,
+            || {
+                registrations.set(registrations.get() + 1);
+                async { Ok(()) }
+            },
+            || async { Ok(true) },
+            TEST_RAMP,
         );
+        let script = async {
+            // The marker comes once the start-up registration is done, as a
+            // reconnect does: a wake that lands before the first attempt
+            // just starts it over, and one registration covers both.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert_eq!(registrations.get(), 1, "the start-up registration");
+            tx.unbounded_send(SignalItem::Resubscribed)
+                .expect("loop is listening");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert_eq!(
+                registrations.get(),
+                2,
+                "the reconnect registers the agent again"
+            );
+        };
+        tokio::select! {
+            () = looping => panic!("the loop never ends while its stream is open"),
+            () = script => {}
+        }
     }
 
     /// A refused registration is tried again on the ramp until bluetoothd

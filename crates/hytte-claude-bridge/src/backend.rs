@@ -318,7 +318,8 @@ pub(crate) fn expired() -> Failure {
 }
 
 /// One async mutex per conversation title, minted on demand and retired when
-/// its last holder releases it.
+/// the last turn holding it or queued on it lets go — by releasing it, or by
+/// giving up the wait (#1550).
 ///
 /// **Per title, not global.** The title *is* the conversation's identity (see
 /// [`crate::session`]), so a global lock would park the pet's turn behind
@@ -335,18 +336,36 @@ struct TitleLocks {
 
 impl TitleLocks {
     /// Wait for exclusive use of `title`.
+    ///
+    /// Dropping the returned future while it still waits — the request's
+    /// deadline, a client that hung up — gives up the place in the queue
+    /// (and any lock already handed to it) and retires the title's entry if
+    /// no other turn holds or waits on it.
     async fn acquire(&self, title: &str) -> TitleGuard<'_> {
         let mutex = {
             let mut by_title = self.by_title.lock().unwrap_or_else(PoisonError::into_inner);
             Arc::clone(by_title.entry(title.to_owned()).or_default())
         };
-        TitleGuard {
+        // The guard exists from the moment this turn holds a clone of the
+        // mutex, not from the moment it holds the lock: a waiter dropped while
+        // queued has to run the same cleanup a holder does on release, or the
+        // entry outlives it (#1550). The holder's release cannot do it on the
+        // waiter's behalf — it rightly keeps an entry a waiter still holds a
+        // clone of, and that waiter may then never come back for it.
+        //
+        // Declared *before* the wait on purpose. The pending `lock_owned`
+        // owns the waiter's clone, and a future dropped mid-`.await` drops its
+        // locals innermost scope first, so the clone is gone by the time this
+        // guard's `Drop` counts what is left.
+        let mut guard = TitleGuard {
             locks: self,
             title: title.to_owned(),
-            // Owned rather than borrowed: the guard outlives the local `Arc`,
-            // and an owned guard keeps its mutex alive by itself.
-            held: Some(mutex.lock_owned().await),
-        }
+            held: None,
+        };
+        // Owned rather than borrowed: the guard outlives the local `Arc`, and
+        // an owned guard keeps its mutex alive by itself.
+        guard.held = Some(mutex.lock_owned().await);
+        guard
     }
 
     /// How many titles hold a lock right now. Only the invariant that this
@@ -360,12 +379,16 @@ impl TitleLocks {
     }
 }
 
-/// Exclusive use of one title, released on drop.
+/// Exclusive use of one title, released on drop — or, while
+/// [`TitleLocks::acquire`] is still waiting for it, a claim on the title's map
+/// entry that is given up on drop the same way.
 #[derive(Debug)]
 struct TitleGuard<'a> {
     locks: &'a TitleLocks,
     title: String,
-    /// An `Option` purely so [`Drop`] can release the mutex *before* deciding
+    /// `None` while `acquire` is still waiting for the lock — the one state
+    /// in which this guard can be dropped without ever having held it — and
+    /// an `Option` at all so [`Drop`] can release the mutex *before* deciding
     /// whether its map entry is still wanted.
     held: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
@@ -374,6 +397,8 @@ impl Drop for TitleGuard<'_> {
     fn drop(&mut self) {
         // Release first: an owned guard holds a strong reference of its own, so
         // the count below could never fall to one while this still held it.
+        // A guard dropped while still waiting has nothing to release here: its
+        // reference rode the pending `lock_owned`, which `acquire` drops first.
         drop(self.held.take());
         let mut by_title = self
             .locks
@@ -829,8 +854,11 @@ mod tests {
     use hive_claude::{Attach, Error as ClaudeError, Sink as _};
     use serde_json::json;
     use std::collections::HashSet;
+    use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll, Waker};
+    use tokio::sync::Barrier;
 
     /// How long one fake turn stays inside the seam, in scheduler yields. On a
     /// current-thread runtime a yield hands control to the other half of the
@@ -1247,6 +1275,171 @@ mod tests {
             drop(guard);
         }
         assert_eq!(locks.len(), 0);
+    }
+
+    // ---- #1550: a waiter dropped while queued retires its title's entry -----
+
+    /// Poll `fut` once, by hand, with a waker that does nothing.
+    ///
+    /// The tests below are about *when* a queued waiter is next polled, or
+    /// that it never is: a release hands the lock to the head of the queue and
+    /// wakes it, and the window #1550 is about lies between that wake and the
+    /// poll that would take the lock. A scheduler decides that on its own; this
+    /// leaves it to the test, so the window is hit every run rather than on a
+    /// lucky interleaving.
+    fn poll_once<F: Future + ?Sized>(fut: Pin<&mut F>) -> Poll<F::Output> {
+        fut.poll(&mut Context::from_waker(Waker::noop()))
+    }
+
+    /// **The leak, closed.** A turn queued behind another on its title is
+    /// dropped *after* the holder let go but *before* it was polled to take the
+    /// lock — the HTTP client hung up, say. The holder's release rightly kept
+    /// the entry, because the waiter still held a clone of its mutex; before
+    /// #1550 nothing ran the cleanup after that, so the entry stayed until the
+    /// title's next turn. One per cancelled title, without bound over a
+    /// session with many distinct titles.
+    #[tokio::test]
+    async fn a_waiter_dropped_after_the_release_retires_the_entry() {
+        let locks = TitleLocks::default();
+        let holder = locks.acquire("t").await;
+        let mut waiter = Box::pin(locks.acquire("t"));
+        assert!(
+            poll_once(waiter.as_mut()).is_pending(),
+            "the held title let a second turn in"
+        );
+
+        drop(holder);
+        assert_eq!(locks.len(), 1, "the release retired an entry a waiter held");
+        // The lock is now the waiter's, handed over but not yet taken.
+        drop(waiter);
+
+        assert_eq!(
+            locks.len(),
+            0,
+            "a waiter dropped while queued left its title's entry behind"
+        );
+        // And it gave back the lock it had been handed: the title is free.
+        let mut next = Box::pin(locks.acquire("t"));
+        let Poll::Ready(next) = poll_once(next.as_mut()) else {
+            panic!("the dropped waiter kept the lock it was handed");
+        };
+        assert_eq!(locks.len(), 1);
+        drop(next);
+        assert_eq!(locks.len(), 0);
+    }
+
+    /// The other half: a dropped waiter must **not** retire an entry that
+    /// another waiter still needs. If it did, the remaining waiter would be
+    /// queued on a mutex the map no longer names, and a newcomer would mint a
+    /// second one and not be excluded from it — the overlap the lock exists to
+    /// prevent, which is why "no other holder or waiter" is the condition and
+    /// not merely "this one gave up".
+    #[tokio::test]
+    async fn a_dropped_waiter_keeps_the_entry_another_waiter_needs() {
+        let locks = TitleLocks::default();
+        let holder = locks.acquire("t").await;
+        let mut dropped = Box::pin(locks.acquire("t"));
+        let mut kept = Box::pin(locks.acquire("t"));
+        assert!(poll_once(dropped.as_mut()).is_pending());
+        assert!(poll_once(kept.as_mut()).is_pending());
+
+        // The release hands the lock to the head of the queue, which then
+        // gives up without taking it.
+        drop(holder);
+        drop(dropped);
+
+        assert_eq!(
+            locks.len(),
+            1,
+            "the dropped waiter retired the entry another waiter is queued on"
+        );
+        let mut newcomer = Box::pin(locks.acquire("t"));
+        assert!(
+            poll_once(newcomer.as_mut()).is_pending(),
+            "a newcomer was not excluded from the waiter still queued"
+        );
+        let Poll::Ready(kept) = poll_once(kept.as_mut()) else {
+            panic!("the lock the dropped waiter was handed never reached the next in line");
+        };
+        // The newcomer gives up too, this time while the title is held.
+        drop(newcomer);
+        assert_eq!(locks.len(), 1, "the entry went while its title was held");
+        drop(kept);
+        assert_eq!(locks.len(), 0);
+    }
+
+    /// The path that does not give up is unchanged: an uncontended title is
+    /// taken on the first poll, a waiter polled after the release takes the
+    /// lock, and dropping the *finished* acquire — which handed its guard out
+    /// — retires nothing while that guard is held.
+    #[tokio::test]
+    async fn a_waiter_polled_after_the_release_takes_the_lock() {
+        let locks = TitleLocks::default();
+        let mut first = Box::pin(locks.acquire("t"));
+        let Poll::Ready(holder) = poll_once(first.as_mut()) else {
+            panic!("an uncontended title had to wait");
+        };
+        let mut waiter = Box::pin(locks.acquire("t"));
+        assert!(poll_once(waiter.as_mut()).is_pending());
+
+        drop(holder);
+        let Poll::Ready(guard) = poll_once(waiter.as_mut()) else {
+            panic!("the waiter was not handed the released lock");
+        };
+        drop(waiter);
+        drop(first);
+
+        assert_eq!(locks.len(), 1, "a finished acquire retired a held entry");
+        drop(guard);
+        assert_eq!(locks.len(), 0);
+    }
+
+    /// The tests above pin the window on one thread. Here the release and the
+    /// waiters' cancellation race for real: each round, one task holds the
+    /// title while three others queue on it, and then the holder lets go on
+    /// one worker while the waiters drop their queued acquires on others,
+    /// never polling them again. However that interleaves — the release
+    /// before, between or after the drops, and the lock handed to a waiter
+    /// that is already gone — the last of them out must retire the entry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dropped_waiters_leave_no_entry_on_a_multi_threaded_runtime() {
+        const ROUNDS: usize = 256;
+        const WAITERS: usize = 3;
+
+        let locks = Arc::new(TitleLocks::default());
+        for round in 0..ROUNDS {
+            let title = Arc::new(format!("t{round}"));
+            // Everyone arrives once the holder has the lock, and again once
+            // every waiter is queued; the second crossing is the race.
+            let held = Arc::new(Barrier::new(1 + WAITERS));
+            let queued = Arc::new(Barrier::new(1 + WAITERS));
+            let mut tasks = tokio::task::JoinSet::new();
+            {
+                let (locks, title) = (Arc::clone(&locks), Arc::clone(&title));
+                let (held, queued) = (Arc::clone(&held), Arc::clone(&queued));
+                tasks.spawn(async move {
+                    let guard = locks.acquire(&title).await;
+                    held.wait().await;
+                    queued.wait().await;
+                    drop(guard);
+                });
+            }
+            for _ in 0..WAITERS {
+                let (locks, title) = (Arc::clone(&locks), Arc::clone(&title));
+                let (held, queued) = (Arc::clone(&held), Arc::clone(&queued));
+                tasks.spawn(async move {
+                    held.wait().await;
+                    let mut waiting = Box::pin(locks.acquire(&title));
+                    assert!(poll_once(waiting.as_mut()).is_pending());
+                    queued.wait().await;
+                    drop(waiting);
+                });
+            }
+            while let Some(joined) = tasks.join_next().await {
+                joined.expect("no panic");
+            }
+            assert_eq!(locks.len(), 0, "round {round} left its title's entry");
+        }
     }
 
     // ---- the request deadline kills and reaps the child --------------------

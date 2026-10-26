@@ -709,6 +709,98 @@ pub async fn workspace_slice_is_up(name: &str) -> Result<bool> {
     Ok(workspace_slices_up().await?.contains(name))
 }
 
+// ── One named user unit (the screen recorder) ────────────────────────────────
+//
+// `recorder` runs `wf-recorder` as its own transient user unit so a shell
+// restart does not end a recording, and drives that unit by name through
+// these four calls. Like everything above they go to the **user** manager on
+// the session bus, one-shot, no `Subscribe()`.
+
+/// A loaded **user** unit's runtime state, as `ListUnitsByPatterns` reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UserUnit {
+    /// systemd `ActiveState`: `active`, `failed`, `inactive`, …
+    pub active_state: String,
+    /// The unit's `Description=`, verbatim.
+    pub description: String,
+    /// The unit's object path, for [`user_unit_property`].
+    pub object_path: String,
+}
+
+/// User unit `name`'s state, or `None` when the user manager has not loaded
+/// it (never started, or garbage-collected after it exited).
+///
+/// # Errors
+/// Propagates a `hytte_bus` call error.
+pub(crate) async fn user_unit(name: &str) -> Result<Option<UserUnit>> {
+    Ok(list_loaded_units(name.to_owned())
+        .await?
+        .into_iter()
+        .find(|unit| unit.0 == name)
+        .map(
+            |(_, description, _load, active_state, _sub, _follower, path, ..)| UserUnit {
+                active_state,
+                description,
+                object_path: path.to_string(),
+            },
+        ))
+}
+
+/// Send `signal` to user unit `name`'s processes (`KillUnit`). `whom` is
+/// systemd's own vocabulary: `main` for the main process, `all` for every
+/// process in the unit.
+///
+/// # Errors
+/// Propagates a `hytte_bus` call error, including systemd's refusal for a unit
+/// it has not loaded.
+pub(crate) async fn kill_user_unit(name: &str, whom: &str, signal: i32) -> Result<()> {
+    call(BusKind::Session, SYSTEMD_NAME)
+        .at_path(MANAGER_PATH)
+        .iface(MANAGER_IFACE)
+        .method("KillUnit")
+        .args((name.to_owned(), whom.to_owned(), signal))
+        .send::<()>()
+        .await
+        .with_context(|| format!("KillUnit for {name}"))
+}
+
+/// Clear user unit `name`'s `failed` state (`ResetFailedUnit`), which unloads
+/// a transient unit and frees its name for the next `systemd-run --unit=`.
+///
+/// # Errors
+/// Propagates a `hytte_bus` call error, including systemd's refusal for a unit
+/// it has not loaded.
+pub(crate) async fn reset_failed_user_unit(name: &str) -> Result<()> {
+    call(BusKind::Session, SYSTEMD_NAME)
+        .at_path(MANAGER_PATH)
+        .iface(MANAGER_IFACE)
+        .method("ResetFailedUnit")
+        .args((name.to_owned(),))
+        .send::<()>()
+        .await
+        .with_context(|| format!("ResetFailedUnit for {name}"))
+}
+
+/// One property of the user unit at `object_path` (`Properties.Get`), e.g.
+/// `org.freedesktop.systemd1.Service`'s `Result`.
+///
+/// # Errors
+/// Propagates a `hytte_bus` call error.
+pub(crate) async fn user_unit_property(
+    object_path: &str,
+    iface: &str,
+    property: &str,
+) -> Result<zbus::zvariant::OwnedValue> {
+    call(BusKind::Session, SYSTEMD_NAME)
+        .at_path(object_path)
+        .iface("org.freedesktop.DBus.Properties")
+        .method("Get")
+        .args((iface.to_owned(), property.to_owned()))
+        .send()
+        .await
+        .with_context(|| format!("{iface}.{property}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1307,5 +1399,110 @@ mod user_manager_tests {
             ),
             ("deactivating", "stop-sigterm")
         );
+    }
+
+    /// Starts `argv` as transient unit `unit` **without** `--collect`, as the
+    /// screen recorder does, or says why it skipped.
+    async fn launch_uncollected(unit: &str, argv: &[&str]) -> bool {
+        let launched = tokio::process::Command::new("systemd-run")
+            .args(["--user", "--quiet", &format!("--unit={unit}"), "--"])
+            .args(argv)
+            .output()
+            .await;
+        match launched {
+            Ok(out) if out.status.success() => true,
+            other => {
+                eprintln!("skipping: systemd-run --user could not start {unit}: {other:?}");
+                false
+            }
+        }
+    }
+
+    /// Re-reads [`user_unit`] until `done` holds, and returns that listing.
+    async fn wait_until(
+        unit: &str,
+        what: &str,
+        done: impl Fn(Option<&UserUnit>) -> bool,
+    ) -> Option<UserUnit> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let listing = user_unit(unit).await.expect("ListUnitsByPatterns");
+            if done(listing.as_ref()) {
+                return listing;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{unit} never {what}; last listing {listing:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// The recorder learns how a recording failed from the unit itself: a
+    /// unit that fails with no `--collect` stays loaded as `failed`, its
+    /// `Result` and `ExecMainStatus` decode as `recorder` reads them, and
+    /// `ResetFailedUnit` unloads it, freeing the name.
+    #[tokio::test]
+    async fn a_failed_uncollected_user_unit_is_read_then_reset() {
+        let unit = format!("ts-rec-failed-{}.service", std::process::id());
+        let _cleanup = Cleanup(unit.clone());
+        if !launch_uncollected(&unit, &["/bin/sh", "-c", "exit 3"]).await {
+            return;
+        }
+        let failed = wait_until(&unit, "failed", |u| {
+            u.is_some_and(|u| u.active_state == "failed")
+        })
+        .await
+        .expect("a failed unit stays loaded");
+
+        let service = "org.freedesktop.systemd1.Service";
+        let result = user_unit_property(&failed.object_path, service, "Result")
+            .await
+            .expect("Service.Result");
+        let status = user_unit_property(&failed.object_path, service, "ExecMainStatus")
+            .await
+            .expect("Service.ExecMainStatus");
+        assert_eq!(
+            (
+                String::try_from(result).expect("a string").as_str(),
+                i32::try_from(status).expect("an i32"),
+            ),
+            ("exit-code", 3)
+        );
+
+        reset_failed_user_unit(&unit)
+            .await
+            .expect("ResetFailedUnit");
+        assert_eq!(user_unit(&unit).await.expect("ListUnitsByPatterns"), None);
+    }
+
+    /// The recorder's Stop and adoption: a running unit reports a non-zero
+    /// `ActiveEnterTimestamp` (decoded as a `u64`), and SIGINT through
+    /// `KillUnit` ends it cleanly, so it is collected rather than kept as
+    /// `failed`.
+    #[tokio::test]
+    async fn a_sigint_through_kill_unit_ends_a_user_unit_cleanly() {
+        let unit = format!("ts-rec-live-{}.service", std::process::id());
+        let _cleanup = Cleanup(unit.clone());
+        // `systemd-run` resolves the bare name against this test's PATH.
+        if !launch_uncollected(&unit, &["sleep", "60"]).await {
+            return;
+        }
+        let live = wait_until(&unit, "became active", |u| {
+            u.is_some_and(|u| u.active_state == "active")
+        })
+        .await
+        .expect("listed while active");
+        let since = user_unit_property(
+            &live.object_path,
+            "org.freedesktop.systemd1.Unit",
+            "ActiveEnterTimestamp",
+        )
+        .await
+        .expect("Unit.ActiveEnterTimestamp");
+        assert!(u64::try_from(since).expect("a u64") > 0);
+
+        kill_user_unit(&unit, "main", 2).await.expect("KillUnit");
+        wait_until(&unit, "was collected", |u| u.is_none()).await;
     }
 }

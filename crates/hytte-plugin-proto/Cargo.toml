@@ -24,6 +24,10 @@ serde.workspace = true
 # (~2× the bytes ≥ 0x80); `serde_bytes` pins the compact `bin` representation.
 serde_bytes = "0.11"
 rmp-serde = "1.3"
+# The marker table `codec`'s pre-decode walk reads a body with. Not a new
+# package: `rmp-serde` already links it, so this names the version `Cargo.lock`
+# already resolves rather than adding one.
+rmp = "0.8"
 tokio = { workspace = true, optional = true, default-features = false, features = [
   "io-util",
 ] }

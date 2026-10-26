@@ -1721,21 +1721,27 @@ pub const MAX_BODY_TEXT_BYTES: usize = 16 * 1024;
 //
 // The caps in [`preem`](crate::preem) bound one widget's *geometry*, and the
 // proto enforces them itself in `PreemWidget::clamp_in_place`. These three bound
-// the *shape of a render tree*, and the proto cannot enforce them: it decodes a
-// frame, it never walks one. They are stated here so a plugin author reads the
-// bound in the same crate as everything else on the wire, and the host enforces
-// them where it walks the tree (`trollshell/src/plugins/wire_map.rs`).
+// the *shape of a render tree*, and the proto cannot enforce them: it never
+// walks a decoded tree. (It does walk a frame's encoding before decoding it,
+// for `MAX_FRAME_VALUES` and `MAX_FRAME_DEPTH` in `codec`. Those bound what
+// decoding costs, not what the host builds.) They are stated here so a plugin
+// author reads the bound in the same crate as everything else on the wire, and
+// the host enforces them where it walks the tree
+// (`trollshell/src/plugins/wire_map.rs`).
 
 /// How many [`Node`]s the host maps out of one render tree, of every kind
 /// together.
 ///
-/// A render frame is bounded on the wire only by
+/// A render frame is bounded on the wire by
 /// [`MAX_FRAME_LEN`](crate::MAX_FRAME_LEN) (16 MiB), and the cheapest node
 /// ([`Node::Spacer`]) encodes to a handful of bytes — so one legal frame can
 /// carry on the order of a million nodes, each of which becomes a GTK widget in
 /// the shell. That is a pre-existing stability hazard rather than a new one (a
 /// plugin is native code running as the user, #881), but it is unbounded, and
-/// nothing about it is diagnosable.
+/// nothing about it is diagnosable. (Since then,
+/// [`MAX_FRAME_VALUES`](crate::MAX_FRAME_VALUES) refuses a frame of more than
+/// about half a million values before it is decoded. That bounds what decoding
+/// costs. This cap is still what bounds what the host builds.)
 ///
 /// **4096** is [`MAX_SCOPE_SAMPLES`](crate::preem::MAX_SCOPE_SAMPLES) — the
 /// vocabulary's existing "a large but finite count of small things" — and it is

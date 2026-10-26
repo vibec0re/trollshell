@@ -112,8 +112,8 @@
 //! widget**.
 //!
 //! Every cap in this module bounds **one widget**. The number of widgets is
-//! bounded separately, and not here, because the proto decodes a frame but never
-//! walks one: see [`MAX_PREEM_NODES_PER_TREE`](crate::wire::MAX_PREEM_NODES_PER_TREE)
+//! bounded separately, and not here, because the proto never walks a decoded
+//! tree: see [`MAX_PREEM_NODES_PER_TREE`](crate::wire::MAX_PREEM_NODES_PER_TREE)
 //! and [`MAX_NODES_PER_TREE`](crate::wire::MAX_NODES_PER_TREE) in
 //! [`wire`](crate::wire), which the host enforces where it maps the tree
 //! (#901). Those two and these are one bound in two halves: the caps here fix

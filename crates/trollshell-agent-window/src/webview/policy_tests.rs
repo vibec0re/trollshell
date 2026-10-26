@@ -40,6 +40,9 @@
 //!   navigation elsewhere that the policy let through **would load**: it is
 //!   the attacker's origin with a certificate that verifies, the case the
 //!   policy exists for. Each server records the request lines it is sent.
+//!   The pin for elsewhere is load-bearing: measured with it and the policy
+//!   both removed, the frame's TLS handshake fails before any request, so
+//!   elsewhere's log stays empty and only the observer below notices.
 //! - Elsewhere is **https** on purpose. Measured with the policy removed: an
 //!   `http://` frame inside the hive's https page is never requested at all,
 //!   because `WebKit`'s mixed-content check stops it first, so an http
@@ -648,9 +651,9 @@ fn a_frame_off_the_hive_is_cancelled_and_a_frame_on_it_loads() {
 /// and the page stays where it was.
 ///
 /// Mutations (run this round, red): remove the `install_policy` call from the
-/// rig, and elsewhere is sent `GET /refresh` and the view moves; make
-/// `decide` hand every off-hive request to the desktop whatever the gesture,
-/// and `handed` holds both URIs.
+/// rig, and elsewhere is sent `GET /refresh` (with the two cases swapped,
+/// `GET /script`); make `decide` skip its gesture test, and the refresh is
+/// handed to the desktop.
 #[gtk::test]
 fn a_refresh_or_a_script_cannot_take_the_view_off_the_hive() {
     const TEST: &str = "a_refresh_or_a_script_cannot_take_the_view_off_the_hive";
@@ -711,16 +714,19 @@ fn a_refresh_or_a_script_cannot_take_the_view_off_the_hive() {
 ///
 /// Measured: `WebKit` asks neither handler. Its popup blocker stops an
 /// unclicked `window.open` before `decide-policy` or `create`, which is what
-/// `settings`' `javascript_can_open_windows_automatically(false)` states. The
-/// test asserts the outcome rather than which layer produced it: no second
-/// view, nothing handed to the desktop, no request elsewhere, and any decision
-/// `WebKit` did dispatch carrying no gesture.
+/// `settings`' `javascript_can_open_windows_automatically(false)` is for. So
+/// the test asserts that nothing was even asked for: no `create`, nothing
+/// handed to the desktop, no request elsewhere, and no decision `WebKit` did
+/// dispatch carrying a gesture.
 ///
-/// Mutation (run this round): set `javascript_can_open_windows_automatically`
-/// to `true` and this stays **green**, now on the policy's refusal rather than
-/// the popup blocker's (`WebKit` then asks `decide-policy` about each
-/// `NewWindowAction`, with no gesture). Two layers hold this, and the test
-/// cannot tell which; `the_settings_are_the_ones_we_state` pins the setting.
+/// Mutation (run this round, red): set
+/// `javascript_can_open_windows_automatically` to `true`, and `WebKit` sends
+/// both attempts straight to `create` (not through `decide-policy`), so the
+/// `create` assertion reds. The window would still build nothing there
+/// (`install_policy`'s `create` returns `None` and, with no gesture, hands
+/// nothing off), but a page that may ask is one step from a page that gets.
+/// `the_settings_are_the_ones_we_state` reds for that mutation too; it pins
+/// the value, and this pins what the value does on `WebKit`'s real dispatch.
 #[gtk::test]
 fn a_scripted_window_open_opens_nothing() {
     const TEST: &str = "a_scripted_window_open_opens_nothing";

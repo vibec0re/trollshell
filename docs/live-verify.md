@@ -2021,15 +2021,13 @@ title` in the stderr tail — worth a deliberate look on first run, since
 - [ ] **(#624)** OSD silenced by a hot-plug: open a drawer on any monitor and
       leave it open, then trigger a `monitors_changed` cycle (a kanshi
       profile switch, or a physical unplug/replug), then press the
-      volume/brightness/mic keys. The OSD card must appear as normal and the
-      bar's corner must round off again — before this fix, that output's OSD
-      stayed silent for the rest of the session and the bar kept its
-      squared-off `drawer-open` seam corner with no drawer attached. A
-      connector-less/virtual output is worth trying too, but only for the
-      bar-corner half of this check (`main.rs`'s `drawer-open` class bind is
-      unconditional) — `osd::install` skips any monitor with no connector
-      name by design, so no OSD card is ever expected to appear there, on
-      either side of this fix.
+      volume/brightness/mic keys. The OSD card must appear as normal — before
+      this fix, that output's OSD stayed silent for the rest of the session.
+      (A connector-less/virtual output is not worth trying: `osd::install`
+      skips any monitor with no connector name by design, so no OSD card is
+      expected there. The bar's squared-off seam corner this check once also
+      covered is gone with #1459 — the bar no longer binds a `drawer-open`
+      class.)
 - [ ] **(#737)** The sidebar reserves the width it actually paints rather
       than a flat 320. `exclusive_zone` was committed as the `SIDEBAR_WIDTH`
       constant while the surface itself is `em`-sized (`.ts-sidebar`'s padding

@@ -2,7 +2,7 @@
 //! subscription management.
 
 use futures_signals::signal::Mutable;
-use futures_util::{FutureExt as _, Stream, StreamExt};
+use futures_util::{Stream, StreamExt};
 use hytte_bus::{BusKind, SignalEvent, SignalItem, SignalSubscription};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -51,9 +51,10 @@ fn station_props_signal(station_path: &str) -> SignalSubscription {
         .start()
 }
 
-/// The streams [`pump_iwd_events`] reads. The first three belong to
-/// [`run_wifi_watcher`] and outlive any one pump; the station's is per
-/// discovery, since its path comes from the snapshot.
+/// The streams [`pump_iwd_events`] reads. The first three are receivers taken
+/// for one discovery from subscriptions [`run_wifi_watcher`] holds for its
+/// whole life; the station's subscription is per discovery too, since its
+/// path comes from the snapshot.
 struct IwdStreams<'a, O, E> {
     /// iwd's owner: [`name_owner_changed`], read with its markers.
     owner: &'a mut O,
@@ -63,31 +64,6 @@ struct IwdStreams<'a, O, E> {
     removed: &'a mut E,
     /// `PropertiesChanged` on the station.
     station: &'a mut E,
-}
-
-/// Discard whatever `stream` has queued, without waiting for more.
-///
-/// [`run_wifi_watcher`] does this right before each discovery: anything queued
-/// by then is older than the snapshot that discovery takes, which supersedes
-/// it. What arrives after this, while the snapshot is taken, stays queued for
-/// the pump.
-fn drain<S: Stream + Unpin>(stream: &mut S) {
-    while let Some(Some(_)) = stream.next().now_or_never() {}
-}
-
-/// Let `pause` pass, reading and discarding `owner` meanwhile.
-///
-/// The owner subscription matches every name on the system bus, and nothing
-/// else reads it while discovery waits to retry. Left unread, a busy bus can
-/// overrun its receiver, which `hytte-bus` logs as a lag. Whatever it carried
-/// is superseded by the next discovery, which drains, asks the bus, and
-/// re-reads iwd.
-async fn pause_reading<S: Stream + Unpin>(owner: &mut S, pause: Duration) {
-    let _ = tokio::time::timeout(pause, async {
-        while owner.next().await.is_some() {}
-        std::future::pending::<()>().await;
-    })
-    .await;
 }
 
 /// How long discovery waits before trying again when iwd did not answer, or
@@ -197,10 +173,10 @@ const IWD_RECHECK: Duration = Duration::from_secs(10);
 /// restart whenever the stopping iwd removed its station first, as a clean
 /// stop does. `bluetooth`'s `wait_for_bluez` is the same wait for bluetoothd.
 ///
-/// It reads `owner`, the watcher's own subscription, rather than opening one:
-/// that subscription is long in place, and the owner change that wakes this
-/// is consumed here instead of reaching the next pump as a change that
-/// predates its snapshot.
+/// It reads `owner`, a receiver on the watcher's own subscription, rather
+/// than opening a subscription: that one's match rule is long in place, and
+/// the owner change that wakes this is consumed here instead of reaching the
+/// next pump as a change that predates its snapshot.
 async fn wait_for_iwd<S>(owner: &mut S)
 where
     S: Stream<Item = SignalItem> + Unpin,
@@ -355,8 +331,20 @@ fn log_registration(
 /// iwd restart in between was missed until the next owner change, and the
 /// restarted iwd had no agent. Now an owner change made while a snapshot is
 /// taken is queued for the pump that follows it, and a pump reads it after
-/// the snapshot. Each discovery first drains what was queued before it
-/// ([`drain`]), since its snapshot supersedes that.
+/// the snapshot.
+///
+/// The subscriptions live for the watcher's life, but each discovery takes
+/// **fresh receivers** from them: the owner's at the top of the pass, before
+/// [`wait_for_iwd`] reads it, and iwd's two after that wait, right before the
+/// snapshot. A broadcast receiver sees only what is sent after it exists, so
+/// everything older than the pass is gone without being read, and the
+/// snapshot supersedes it. The old receivers are dropped unread. Between
+/// discoveries nothing reads them (the pump's post-removal pause, a retry's
+/// [`DISCOVERY_RETRY`]), and iwd's per-network and per-BSS
+/// `InterfacesAdded`/`InterfacesRemoved` around a radio toggle can overrun one
+/// there; a receiver that is never polled again never reports that as a lag
+/// (#1573 review). Draining them instead polled the overrun and logged a
+/// `warn!` for it.
 ///
 /// Only the watcher's first discovery calls iwd unasked: the backend probe
 /// chose iwd, maybe as an activatable name only, and that first call is what
@@ -372,26 +360,24 @@ pub(super) async fn run_wifi_watcher(
     let owner_sub = name_owner_changed();
     let added_sub = object_manager_signal("InterfacesAdded");
     let removed_sub = object_manager_signal("InterfacesRemoved");
-    // The receivers are taken now, not when a pump starts: a broadcast
-    // receiver only sees what is sent after it exists.
-    let mut owner_items = owner_sub.items();
-    let mut added_events = added_sub.events();
-    let mut removed_events = removed_sub.events();
 
     let mut first_discovery = true;
 
     'discovery: loop {
-        drain(&mut owner_items);
-        drain(&mut added_events);
-        drain(&mut removed_events);
+        // Fresh receivers for this pass, each taken before what it must not
+        // miss: the owner's before the wait reads it, iwd's before the
+        // snapshot.
+        let mut owner_items = owner_sub.items();
         if first_discovery {
             first_discovery = false;
         } else {
             wait_for_iwd(&mut owner_items).await;
         }
+        let mut added_events = added_sub.events();
+        let mut removed_events = removed_sub.events();
 
         let Some((managed, station_path)) = discover_station().await else {
-            pause_reading(&mut owner_items, DISCOVERY_RETRY).await;
+            tokio::time::sleep(DISCOVERY_RETRY).await;
             continue 'discovery;
         };
 
@@ -557,7 +543,7 @@ async fn handle_station_props_event(
 #[cfg(test)]
 mod tests {
     use super::{
-        IWD_RECHECK, IwdOwner, OwnerReaction, drain, iwd_owner_change, next_iwd_owner,
+        IWD_RECHECK, IwdOwner, OwnerReaction, iwd_owner_change, next_iwd_owner,
         owner_reaction, register_agent_until_accepted, wait_for_owner,
     };
     use crate::retry;
@@ -732,24 +718,6 @@ mod tests {
                 .is_err(),
             "a closed stream must leave the pacing to the re-check"
         );
-    }
-
-    /// Draining discards what is queued and nothing that comes after it. That
-    /// is what keeps an owner change made while a snapshot is taken for the
-    /// pump, while one older than the snapshot is dropped.
-    ///
-    /// **Falsification:** make `drain` a no-op and the stale item comes out
-    /// first.
-    #[tokio::test]
-    async fn draining_discards_only_what_is_already_queued() {
-        let (tx, mut rx) = futures_channel::mpsc::unbounded::<&str>();
-        tx.unbounded_send("before the snapshot").expect("open");
-        tx.unbounded_send("also before").expect("open");
-
-        drain(&mut rx);
-        tx.unbounded_send("during the snapshot").expect("open");
-
-        assert_eq!(rx.next().await, Some("during the snapshot"));
     }
 
     fn noc_item(name: &str, old: &str, new: &str) -> SignalItem {

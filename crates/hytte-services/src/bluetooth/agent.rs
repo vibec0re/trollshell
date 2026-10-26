@@ -194,6 +194,12 @@ async fn await_reply(prompt: PairPrompt) -> AgentReply {
 /// install itself and raise its own prompt before this task is scheduled
 /// again. Before this check, that late wake cleared the newer prompt, and the
 /// newer request waited out bluetoothd's minute with nothing on screen.
+///
+/// A request whose future is dropped before anyone answers it frees
+/// `pending` too, and a sender nobody is waiting on any more never refuses
+/// the next request (#1551). Until then the dropped request's sender stayed
+/// in `pending`, and every later request saw it, took it for a pairing in
+/// flight and answered `Reject`, until something took it out.
 async fn await_reply_in(
     pending: &AsyncMutex<Option<oneshot::Sender<AgentReply>>>,
     banner: &Mutable<Option<PairPrompt>>,
@@ -202,7 +208,11 @@ async fn await_reply_in(
     let (tx, rx) = oneshot::channel::<AgentReply>();
     {
         let mut guard = pending.lock().await;
-        if guard.is_some() {
+        // A closed sender is a request that is gone: its receiver was dropped
+        // without anyone answering it. [`OwnBanner`] frees the slot when that
+        // happens, but only if it can take the lock right then, so this is
+        // the backstop for when it could not.
+        if guard.as_ref().is_some_and(|waiting| !waiting.is_closed()) {
             // Another pairing already pending — refuse cleanly so BlueZ
             // doesn't pile up coincident prompts.
             return AgentReply::Reject;
@@ -210,26 +220,51 @@ async fn await_reply_in(
         *guard = Some(tx);
     }
 
-    // From here on the banner is this request's to take down, on every exit,
-    // including this future being dropped mid-await.
-    let _own = OwnBanner {
+    // From here on the banner and the reply slot are this request's to clean
+    // up, on every exit, including this future being dropped mid-await.
+    let mut own = OwnBanner {
         banner: banner.clone(),
+        pending,
         id: prompt.id,
+        rx,
     };
     banner.set(Some(prompt));
-    rx.await.unwrap_or(AgentReply::Reject)
+    (&mut own.rx).await.unwrap_or(AgentReply::Reject)
 }
 
-/// One request's claim on the banner. On drop it clears the banner only if
-/// the banner still shows request `id`. A newer request's prompt stays up.
-struct OwnBanner {
+/// One request's claim on the banner and on the reply slot, cleaned up when
+/// the request ends, however it ends.
+///
+/// On drop it clears the banner only if the banner still shows request `id`,
+/// so a newer request's prompt stays up. Then it frees `pending` if the
+/// sender there can no longer reach anyone. The guard closes its own receiver
+/// first, so if `pending` still holds this request's sender, that sender is
+/// now closed. A newer request's sender is open, because its receiver is
+/// waiting, so it is left alone. The only other closed sender `pending` could
+/// hold is one left behind by an earlier dropped request, and freeing that is
+/// right too. Once this request was answered, its sender had already been
+/// taken out of `pending`, so there is nothing of its own left to clear.
+///
+/// `pending` is an async mutex and `drop` cannot wait for it, so the slot is
+/// freed only if the lock is free right now. When it is not, the sender stays
+/// until whoever holds the lock takes it, or until the next request finds it
+/// closed and takes its place ([`await_reply_in`]).
+struct OwnBanner<'a> {
     banner: Mutable<Option<PairPrompt>>,
+    pending: &'a AsyncMutex<Option<oneshot::Sender<AgentReply>>>,
     id: u64,
+    rx: oneshot::Receiver<AgentReply>,
 }
 
-impl Drop for OwnBanner {
+impl Drop for OwnBanner<'_> {
     fn drop(&mut self) {
         clear_banner_if(&self.banner, self.id);
+        self.rx.close();
+        if let Ok(mut slot) = self.pending.try_lock()
+            && slot.as_ref().is_some_and(oneshot::Sender::is_closed)
+        {
+            *slot = None;
+        }
     }
 }
 
@@ -455,6 +490,125 @@ mod tests {
 
         drop(a);
         assert_eq!(shown(&banner), None);
+    }
+
+    /// A request whose future is dropped before anyone answers it frees the
+    /// reply slot, so the next request is not refused.
+    ///
+    /// Before #1551 only the banner was cleaned up on that path. The dropped
+    /// request's sender stayed in the slot, and every later request took it
+    /// for a pairing in flight and answered `Reject` without raising a prompt.
+    ///
+    /// **Falsification:** remove the slot clear from `OwnBanner::drop` and the
+    /// "frees the slot" assertion fails.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_dropped_request_frees_the_reply_slot() {
+        let pending: Pending = Arc::new(AsyncMutex::new(None));
+        let banner: Mutable<Option<PairPrompt>> = Mutable::new(None);
+
+        let mut a = Box::pin(await_reply_in(&pending, &banner, prompt(1)));
+        assert!(a.as_mut().now_or_never().is_none());
+        assert!(pending.lock().await.is_some(), "A's sender is in the slot");
+
+        drop(a);
+        assert!(
+            pending.lock().await.is_none(),
+            "dropping A frees the slot"
+        );
+
+        let mut b = std::pin::pin!(await_reply_in(&pending, &banner, prompt(2)));
+        assert!(
+            b.as_mut().now_or_never().is_none(),
+            "B waits on the user instead of being refused"
+        );
+        assert_eq!(shown(&banner), Some(2));
+        answer(&pending, AgentReply::Confirm).await;
+        assert!(matches!(b.await, AgentReply::Confirm));
+    }
+
+    /// The backstop for a drop that could not take the lock: a sender left in
+    /// the slot whose request is gone does not refuse the next request.
+    ///
+    /// **Falsification:** make `await_reply_in` refuse whenever the slot holds
+    /// any sender (the pre-#1551 `guard.is_some()`) and B is refused.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_dead_sender_left_in_the_slot_does_not_refuse_the_next_request() {
+        let pending: Pending = Arc::new(AsyncMutex::new(None));
+        let banner: Mutable<Option<PairPrompt>> = Mutable::new(None);
+
+        let mut a = Box::pin(await_reply_in(&pending, &banner, prompt(1)));
+        assert!(a.as_mut().now_or_never().is_none());
+        {
+            // Someone holds the lock while A is dropped, so A's guard cannot
+            // free the slot.
+            let held = pending.try_lock().expect("the slot is not locked");
+            drop(a);
+            assert!(
+                held.as_ref().is_some_and(oneshot::Sender::is_closed),
+                "A's sender is still in the slot, and closed"
+            );
+        }
+
+        let mut b = std::pin::pin!(await_reply_in(&pending, &banner, prompt(2)));
+        assert!(
+            b.as_mut().now_or_never().is_none(),
+            "B waits on the user instead of being refused"
+        );
+        assert_eq!(shown(&banner), Some(2));
+        answer(&pending, AgentReply::Confirm).await;
+        assert!(matches!(b.await, AgentReply::Confirm));
+    }
+
+    /// While a request is waiting on the user, a second one is still refused:
+    /// the backstop above only skips a sender nobody is waiting on.
+    ///
+    /// **Falsification:** let `await_reply_in` take the slot whatever it holds
+    /// and B replaces A instead of being refused.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_waiting_request_still_refuses_a_second() {
+        let pending: Pending = Arc::new(AsyncMutex::new(None));
+        let banner: Mutable<Option<PairPrompt>> = Mutable::new(None);
+
+        let mut a = std::pin::pin!(await_reply_in(&pending, &banner, prompt(1)));
+        assert!(a.as_mut().now_or_never().is_none());
+
+        let b = await_reply_in(&pending, &banner, prompt(2)).now_or_never();
+        assert!(
+            matches!(b, Some(AgentReply::Reject)),
+            "B is refused at once, got {b:?}"
+        );
+        assert_eq!(shown(&banner), Some(1), "A's banner stays up");
+
+        answer(&pending, AgentReply::Confirm).await;
+        assert!(matches!(a.await, AgentReply::Confirm), "A is still answerable");
+    }
+
+    /// A request answered and then dropped before its task ran leaves the
+    /// next request's sender in the slot: the drop frees only a sender
+    /// nobody is waiting on.
+    ///
+    /// **Falsification:** make `OwnBanner::drop` clear the slot whatever it
+    /// holds and B's sender is gone, so B can never be answered.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_an_answered_request_leaves_the_newer_sender() {
+        let pending: Pending = Arc::new(AsyncMutex::new(None));
+        let banner: Mutable<Option<PairPrompt>> = Mutable::new(None);
+
+        let mut a = Box::pin(await_reply_in(&pending, &banner, prompt(1)));
+        assert!(a.as_mut().now_or_never().is_none());
+        answer(&pending, AgentReply::Reject).await;
+
+        let mut b = std::pin::pin!(await_reply_in(&pending, &banner, prompt(2)));
+        assert!(b.as_mut().now_or_never().is_none());
+
+        drop(a);
+        assert!(
+            pending.lock().await.is_some(),
+            "B's sender must stay in the slot"
+        );
+        assert_eq!(shown(&banner), Some(2), "B's banner stays up");
+        answer(&pending, AgentReply::Confirm).await;
+        assert!(matches!(b.await, AgentReply::Confirm));
     }
 
     /// The check itself. Clearing for an id that is not on the banner leaves

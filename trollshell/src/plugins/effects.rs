@@ -424,7 +424,12 @@ fn broker_audio(plugin_id: &str, action: AudioAction) {
 
 /// The wire-documented bounds of [`AudioAction::SetVolume`] ("`0.0..=1.0`").
 const MIN_VOLUME: f64 = 0.0;
-const MAX_VOLUME: f64 = 1.0;
+/// The top of that range, and the shell's one volume ceiling for a level it
+/// *steps* to: `widgets::volume`'s scroll stops here too, rather than at a
+/// second copy of the number (a chip that could scroll past what a plugin is
+/// allowed to set, and past where the drawer's slider tops out, had no bound
+/// at all before).
+pub(crate) const MAX_VOLUME: f64 = 1.0;
 
 /// Bounds-check a plugin-requested linear volume (#648). Pure, so the host's
 /// policy on a hostile or buggy level is unit-testable without an audio daemon.

@@ -960,7 +960,10 @@ mod tests {
         // once the `bind` emission has been pumped), so a missing warning means
         // something.
         assert_shows(&header, HOSTILE_ALIAS);
-        assert_shows(&disc, &format!("Visible as \u{201c}{HOSTILE_ALIAS}\u{201d}"));
+        assert_shows(
+            &disc,
+            &format!("Visible as \u{201c}{HOSTILE_ALIAS}\u{201d}"),
+        );
         assert_shows(&device, HOSTILE_ALIAS);
     }
 }

@@ -1,11 +1,42 @@
 //! Layer-shell toast window for `org.freedesktop.Notifications`.
 //!
-//! Call [`install`] once after GTK initialises (before the main loop runs).
-//! It builds a single `gtk::Window` pinned to the top-right corner of the
-//! given monitor and subscribes to [`hytte::services::notifications::active`].
+//! Call [`install`] once per monitor after GTK initialises (before the main
+//! loop runs). Each call builds a `gtk::Window` pinned to the top-right corner
+//! of that monitor; the first also subscribes to
+//! [`hytte::services::notifications::active`].
 //!
-//! The window is stored in a thread-local so it is never dropped.  Callers
-//! do not hold a handle; the window stays alive for the process lifetime.
+//! The windows are stored in a thread-local so they are never dropped.
+//! Callers do not hold a handle; a window stays alive until [`close_all`]
+//! tears it down on a monitor hot-plug.
+//!
+//! # Multi-monitor routing
+//!
+//! Each emission goes to every mounted surface, but the surfaces do not all
+//! get the same list:
+//!
+//! - The **focused output's** surface gets every toast that passes the gates
+//!   below. If focus is unknown, or names an output with no surface, the
+//!   first mounted surface in connector order gets them instead. New toasts
+//!   show where the user is looking.
+//! - **Every other** surface gets only the toasts it already has mounted. A
+//!   toast that was showing when focus moved away stays where it is until it
+//!   ends: a `replaces_id` re-post still updates it there, and it leaves when
+//!   the notification expires or is dismissed. That surface never gains a
+//!   toast it was not already showing.
+//!
+//! The second rule is what the v0.2.6 design (`docs/superpowers/specs/
+//! 2026-04-26-v0.2.6-robustness-design.md`, "Focus changes mid-toast") already
+//! promised: an active toast "continues its lifecycle on its original
+//! monitor". Until #1535 that was not true. An emission reached the focused
+//! surface only, so a surface that focus had left never learned that its
+//! toast had gone. The card stayed up until focus came back and something
+//! else emitted. It could not be clicked away either: dismissing a closed id
+//! changes nothing upstream, so no emission follows.
+//!
+//! Non-target surfaces are not handed an empty list. That would move every
+//! toast to the focused output at the next unrelated emission. It would also
+//! unmap a card under a pointer still parked on it, which releases its hover
+//! hold and restarts the countdown on a toast someone is reading (#593).
 //!
 //! # Do-Not-Disturb gating
 //!
@@ -14,13 +45,22 @@
 //! via the underlying notifications service. Critical-urgency notifications
 //! (`urgency=2`) BYPASS DND per freedesktop spec.
 //!
+//! The gate runs **once per emission, before routing**, against one
+//! module-level record of what it has held back, so which output is focused
+//! has no bearing on what is suppressed. A monitor hot-plug does not clear
+//! that record either (#1535). Before #1535 the record lived on each
+//! per-monitor surface. Turning DND off while a different output was focused
+//! than the one that had suppressed a toast, or after a hot-plug had rebuilt
+//! the surfaces, then released the very backlog this gate exists to hold.
+//!
 //! # Per-app mute
 //!
 //! When an `app_name` is in [`notifications_mute::muted_apps()`], non-critical
 //! toasts from that app are suppressed before they're shown (history still
 //! records them). Critical urgency bypasses the per-app mute too. Like DND,
 //! this is a "from-now-forward" gate — toggling an app's mute off does NOT
-//! revive previously suppressed toasts.
+//! revive previously suppressed toasts. It shares DND's record, and so its
+//! independence from focus and hot-plug.
 //!
 //! # Queue cap
 //!
@@ -50,7 +90,7 @@
 //! correctness argument (#626).
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
 use hytte::futures_signals::map_ref;
@@ -84,13 +124,18 @@ const SUMMARY_MAX_LINES: usize = 2;
 
 // ── Per-monitor toast view ────────────────────────────────────────────────────
 
+/// One output's toast surface and the cards mounted on it.
+///
+/// Deliberately carries **no** gate state (#1535): which toasts DND or a mute
+/// has held back is a fact about the notification, not about the surface that
+/// happened to be focused when it arrived, so it lives in the module-level
+/// [`SUPPRESSED`] rather than here.
 struct ToastView {
     window: gtk::Window,
     vbox: gtk::Box,
     monitor: Monitor,
     card_map: RefCell<HashMap<u32, CardEntry>>,
     overflow_card: RefCell<Option<gtk::Widget>>,
-    suppressed_during_dnd: RefCell<HashSet<u32>>,
 }
 
 /// A mounted toast card, the notification snapshot it was built from, and the
@@ -121,8 +166,34 @@ thread_local! {
     /// hand a view to [`apply_emission`], which runs a long stretch of GTK work,
     /// and the only way to do that without holding this cell borrowed across all
     /// of it is to clone a handle out. Mirrors `overlays::osd`'s `OSDS`.
-    static TOAST_WINDOWS: RefCell<HashMap<String, Rc<ToastView>>> =
-        RefCell::new(HashMap::new());
+    ///
+    /// A `BTreeMap` rather than a `HashMap` (#1535, on `overlays::dialog`'s
+    /// #1361 precedent) so [`target_connector`]'s "focused output unknown"
+    /// fallback (the first entry) is the same output on every emission. Hash
+    /// order could pick a different screen each time, scattering one burst
+    /// of toasts across outputs.
+    static TOAST_WINDOWS: RefCell<BTreeMap<String, Rc<ToastView>>> =
+        const { RefCell::new(BTreeMap::new()) };
+
+    /// Ids of the non-critical notifications the DND / per-app-mute gate has
+    /// held back and that are still active upstream. [`filter_visible`] keeps
+    /// them hidden after the gate opens, so that turning DND off does **not**
+    /// release the backlog. [`gc_suppressed`] drops an id once its notification
+    /// leaves the active list.
+    ///
+    /// **One set for the module, not one per [`ToastView`]** (#1535). The
+    /// v0.2.6 design put it on the view, reasoning that "each notification only
+    /// ever touches one view via routing". That premise was false. Routing
+    /// picks a view per *emission*, and every emission carries the whole
+    /// active list, so a notification suppressed while output A was focused
+    /// reached B's empty set the first time an emission was routed to B. If
+    /// that emission was the DND-off toggle, the backlog popped up on B. A
+    /// hot-plug did the same by rebuilding every view with an empty set.
+    ///
+    /// Deliberately left alone by [`close_all`] for that second reason: a
+    /// suppressed id is a fact about the notification, which outlives every
+    /// toast surface a hot-plug rebuilds.
+    static SUPPRESSED: RefCell<HashSet<u32>> = RefCell::new(HashSet::new());
 
     /// Set after the first `install()` call so module-level
     /// subscriptions wire exactly once across all per-monitor mounts.
@@ -169,13 +240,17 @@ pub fn install(monitor: &Monitor) {
 
 /// Close every toast surface and drop the per-monitor entries. Called before
 /// rebuilding on monitor hot-plug so a vanished output's `ToastView` doesn't
-/// linger in `TOAST_WINDOWS` — otherwise `route_emission`'s
-/// `map.values().next()` fallback could route every toast into a dead surface.
+/// linger in `TOAST_WINDOWS` — otherwise `route_emission`'s first-mounted
+/// fallback could route every toast into a dead surface.
 ///
 /// The module-level subscriptions (focused-output + the combined toast signal)
 /// are left running: they route by connector on each emission, so a fresh
 /// `install` re-keys the map and they self-heal. `SUBS_INSTALLED` therefore
 /// stays set — subscriptions wire exactly once for the process lifetime.
+///
+/// The gate's suppressed set is left alone too (#1535). It records
+/// notifications rather than surfaces, so clearing it here would let the next
+/// DND-off or unmute emission release the backlog.
 ///
 /// Tears down with `destroy()`, not `close()` (#632): a toast surface that
 /// never showed a notification on this monitor is still unrealized, and
@@ -214,50 +289,122 @@ fn install_subscriptions() {
     };
     glib::MainContext::default().spawn_local(toast_signal.for_each(
         |(notifs, dnd_on, muted): (Vec<Notification>, bool, HashSet<String>)| {
-            route_emission(&notifs, dnd_on, &muted);
+            route_emission(
+                focused_output::current().as_deref(),
+                &notifs,
+                dnd_on,
+                &muted,
+            );
             std::future::ready(())
         },
     ));
 }
 
-/// Picks the [`ToastView`] on the focused output and forwards the
-/// emission to [`apply_emission`]. Falls back to the first mounted view
-/// when the focused output is unknown or absent from the map (covers
-/// startup before the first niri focus event lands, and outputs that
-/// trollshell hasn't mounted on).
-fn route_emission(notifs: &[Notification], dnd_on: bool, muted: &HashSet<String>) {
-    let target_name = focused_output::current();
-    // Resolve to an owned handle and let the borrow end at this `let` (#643).
+/// Gates one emission and hands every mounted [`ToastView`] its share of it.
+/// See the module doc's "Multi-monitor routing" for the rule, and
+/// [`target_connector`] / [`share_for_view`] for its two halves.
+///
+/// `focused` is the caller's read of [`focused_output::current`], taken as an
+/// argument rather than read here so the `system-tests` routing tests can name
+/// the focused output without a niri session behind them.
+///
+/// Three steps, in an order that matters:
+///
+/// 1. **Gate once** (#1535): run [`gate`] against the one module-level
+///    [`SUPPRESSED`] set, *before* any view is involved, so which output is
+///    focused cannot change what the gate lets through.
+/// 2. **Snapshot the views** as owned handles, with the target picked by
+///    [`target_connector`].
+/// 3. **Apply** each view's share. Every view, not just the target (#1535):
+///    a view that focus has left must still drop a toast that ended.
+fn route_emission(
+    focused: Option<&str>,
+    notifs: &[Notification],
+    dnd_on: bool,
+    muted: &HashSet<String>,
+) {
+    // Pure set surgery — no GTK call while `SUPPRESSED` is borrowed, so the
+    // #643 take-and-restore dance is not needed for this cell.
+    let visible = SUPPRESSED.with(|cell| gate(notifs, dnd_on, muted, &mut cell.borrow_mut()));
+
+    // Resolve to owned handles and let the borrow end at this `let` (#643).
     // `apply_emission` is nothing but GTK work — `remove`/`append`/`set_visible`
     // on the card stack — and `install`/`close_all` are the `borrow_mut()`
     // counterparties on this cell. A shared borrow held across all that would
     // panic on any re-entry, and a `BorrowMutError` unwinding through a glib
     // callback aborts the process rather than failing the update.
-    let view = TOAST_WINDOWS.with(|map| {
+    let views: Vec<(Rc<ToastView>, bool)> = TOAST_WINDOWS.with(|map| {
         let map = map.borrow();
-        target_name
-            .as_ref()
-            .and_then(|n| map.get(n))
-            .or_else(|| map.values().next())
-            .map(Rc::clone)
+        let target = target_connector(&map, focused);
+        map.iter()
+            .map(|(connector, view)| (Rc::clone(view), target == Some(connector.as_str())))
+            .collect()
     });
-    if let Some(view) = view {
-        apply_emission(&view, notifs, dnd_on, muted);
+
+    for (view, is_target) in views {
+        // Copied out, so this `Ref` is a temporary of the `let` and is gone
+        // before `apply_emission` takes the same cell.
+        let mounted: HashSet<u32> = view.card_map.borrow().keys().copied().collect();
+        apply_emission(&view, &share_for_view(&visible, is_target, &mounted));
     }
 }
 
-/// Toast-management logic running against a single per-monitor view.
-/// Applies DND + per-app-mute gates, GCs the suppressed set, partitions
-/// critical vs non-critical, collapses the non-critical tail into an
-/// overflow card, and toggles window visibility.
-fn apply_emission(
-    view: &ToastView,
-    notifs: &[Notification],
-    dnd_on: bool,
-    muted: &HashSet<String>,
-) {
-    // Take both cells for the duration of the rebuild rather than holding a
-    // `RefMut` across it (#643). The named bindings this replaces stayed live
+/// The connector whose view receives new toasts: the focused output's, or
+/// (focus unknown, or naming an output with no toast surface) the first
+/// mounted one in connector order. `None` only when nothing is mounted.
+///
+/// The fallback covers startup before the first niri focus event lands, and
+/// outputs trollshell has not mounted on. It is `overlays::dialog`'s
+/// `resolve_connector` rule, and deterministic for the same reason: the map
+/// is a `BTreeMap`. Generic over the value so the tests can drive it without
+/// building a `ToastView`.
+fn target_connector<'m, V>(
+    views: &'m BTreeMap<String, V>,
+    focused: Option<&str>,
+) -> Option<&'m str> {
+    focused
+        .and_then(|name| views.get_key_value(name))
+        .or_else(|| views.first_key_value())
+        .map(|(connector, _)| connector.as_str())
+}
+
+/// One view's share of a gated emission (#1535).
+///
+/// - The **target** gets everything `visible`: new toasts show on the focused
+///   output.
+/// - **Any other** view gets the part of `visible` it already has `mounted`,
+///   and nothing else. Its cards for notifications that ended (or that a gate
+///   now hides) are removed, a `replaces_id` re-post still updates a card it
+///   holds, and it never gains a card. Its overflow card goes too: the share
+///   never exceeds the cards already mounted, so the tail is empty. The
+///   focused surface renders its own "+N more" for the whole list.
+///
+/// Not an empty list for the non-target views. The module doc's
+/// "Multi-monitor routing" says why: that would tear a hovered card out from
+/// under a parked pointer on every unrelated emission (#593).
+fn share_for_view<'a>(
+    visible: &[&'a Notification],
+    is_target: bool,
+    mounted: &HashSet<u32>,
+) -> Vec<&'a Notification> {
+    if is_target {
+        return visible.to_vec();
+    }
+    visible
+        .iter()
+        .copied()
+        .filter(|n| mounted.contains(&n.id))
+        .collect()
+}
+
+/// Toast-management logic running against a single per-monitor view, given
+/// that view's share of an already-gated emission ([`share_for_view`]).
+/// Partitions critical vs non-critical, collapses the non-critical tail into
+/// an overflow card, and toggles window visibility. The DND / mute gate is not
+/// here: [`route_emission`] runs it once for all views (#1535).
+fn apply_emission(view: &ToastView, visible: &[&Notification]) {
+    // Take the cell for the duration of the rebuild rather than holding a
+    // `RefMut` across it (#643). The named binding this replaces stayed live
     // all the way down past `vbox.remove`, `replace_card`/`mount_card`, the
     // overflow `remove`/`append`, and the closing `set_visible` — spelling (2)
     // of the sweep, a `let`-bound borrow instead of a chained temporary, but
@@ -271,24 +418,25 @@ fn apply_emission(
     // is built on that being immediate. It doesn't panic today only because that
     // handler reaches for the expiry bookkeeping rather than for `card_map`.
     //
-    // Trade-off, stated plainly: while this runs, the cells hold empty
-    // `Default`s, so a re-entrant reader would see no cards rather than the live
+    // Trade-off, stated plainly: while this runs, the cell holds an empty
+    // `Default`, so a re-entrant reader would see no cards rather than the live
     // set. That is the same trade #643's other take-and-restore conversions make
     // (`panels::stats`'s per-core bars, `panels::connections`' row vecs), and it
     // is strictly better than the alternative, which is not a wrong answer but a
     // `BorrowMutError` unwinding through a glib callback — a process abort.
     // Nothing re-enters via the driver itself: `route_emission` is pumped from a
     // `spawn_local`ed `for_each`, which cannot re-poll itself synchronously.
+    //
+    // (This used to take the view's suppressed set as well. That set is
+    // module-level since #1535, and `route_emission` has already run the gate
+    // by the time a view is reached.)
     let mut map = view.card_map.take();
-    let mut suppressed = view.suppressed_during_dnd.take();
 
-    let visible = filter_visible(notifs, dnd_on, muted, &mut suppressed);
-    gc_suppressed(notifs, &mut suppressed);
     let Partition {
         critical_visible,
         head_noncritical,
         tail_noncritical_count,
-    } = partition_visible(&visible);
+    } = partition_visible(visible);
 
     // Build id sets.
     let new_ids: HashMap<u32, &Notification> = critical_visible
@@ -344,6 +492,12 @@ fn apply_emission(
     // Runs over every mounted card, not just the ones this pass rebuilt: an
     // identical re-post keeps its card via `card_content_eq` above and so takes
     // the `continue` branch, yet its entry is just as replaceable.
+    //
+    // Since #1535 this covers every output, not only the focused one, because
+    // `route_emission` now runs this function on every view. Before, a hovered
+    // card on an output that focus had left got no renewal until focus came
+    // back. #626's close-and-repost under a parked pointer could then still
+    // expire it there.
     for entry in map.values() {
         entry.hold.resync();
     }
@@ -378,13 +532,28 @@ fn apply_emission(
     let any_mounted = !map.is_empty() || overflow.is_some();
 
     // Store back. Each cell holds the empty `Default` its `take()` left behind
-    // (`HashMap`/`HashSet`/`Option::None` allocate nothing until first use), so
-    // these assignments drop nothing of consequence inside the borrow.
+    // (`HashMap`/`Option::None` allocate nothing until first use), so these
+    // assignments drop nothing of consequence inside the borrow.
     *view.card_map.borrow_mut() = map;
-    *view.suppressed_during_dnd.borrow_mut() = suppressed;
     *view.overflow_card.borrow_mut() = overflow;
 
     view.window.set_visible(any_mounted);
+}
+
+/// The whole DND / per-app-mute gate for one emission: [`filter_visible`],
+/// then [`gc_suppressed`], against one `suppressed` set. [`route_emission`]
+/// runs it once per emission against [`SUPPRESSED`], and the tests drive this
+/// same function against a local set, so the order they pin is the order the
+/// shell runs.
+fn gate<'a>(
+    notifs: &'a [Notification],
+    dnd_on: bool,
+    muted: &HashSet<String>,
+    suppressed: &mut HashSet<u32>,
+) -> Vec<&'a Notification> {
+    let visible = filter_visible(notifs, dnd_on, muted, suppressed);
+    gc_suppressed(notifs, suppressed);
+    visible
 }
 
 struct Partition<'a> {
@@ -398,6 +567,10 @@ struct Partition<'a> {
 /// DND is on, or whose `app_name` is muted, are recorded in `suppressed` and
 /// stay hidden even after the gate flips off — toggling DND off must NOT
 /// unleash the backlog.
+///
+/// That guarantee is only as wide as `suppressed`. In production it is always
+/// the module-level [`SUPPRESSED`], handed in by [`route_emission`] once per
+/// emission, never a per-view copy (#1535).
 fn filter_visible<'a>(
     notifs: &'a [Notification],
     dnd_on: bool,
@@ -477,7 +650,6 @@ fn build_toast_view(monitor: &Monitor) -> ToastView {
         monitor: monitor.clone(),
         card_map: RefCell::new(HashMap::new()),
         overflow_card: RefCell::new(None),
-        suppressed_during_dnd: RefCell::new(HashSet::new()),
     }
 }
 
@@ -1081,11 +1253,13 @@ fn build_image(image: &NotificationImage) -> gtk::Image {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, HashSet};
     use std::time::Duration;
 
     use super::{Action, Notification, NotificationImage, Urgency};
     use super::{HoldAction, HoldCall, HoldState};
     use super::{actions_eq, card_content_eq, clamp_lines, image_eq};
+    use super::{gate, share_for_view, target_connector};
 
     /// A plain notification to mutate one field of per test.
     fn notif() -> Notification {
@@ -1606,6 +1780,198 @@ mod tests {
         assert!(!timers.armed());
         assert_eq!(timers.hover_count(), 0);
     }
+
+    // ── The DND / mute gate (#1535) ──────────────────────────────────────────
+
+    /// A [`notif`] with its id, app and urgency set — the three fields the gate
+    /// and the routing read.
+    fn toast(id: u32, app: &str, urgency: Urgency) -> Notification {
+        Notification {
+            id,
+            app_name: app.to_string(),
+            urgency,
+            ..notif()
+        }
+    }
+
+    /// The ids [`gate`] lets through, in order.
+    fn gated(
+        notifs: &[Notification],
+        dnd_on: bool,
+        muted: &HashSet<String>,
+        suppressed: &mut HashSet<u32>,
+    ) -> Vec<u32> {
+        gate(notifs, dnd_on, muted, suppressed)
+            .iter()
+            .map(|n| n.id)
+            .collect()
+    }
+
+    fn muting(app: &str) -> HashSet<String> {
+        HashSet::from([app.to_string()])
+    }
+
+    #[test]
+    fn critical_bypasses_both_gates_and_is_never_recorded() {
+        let mut suppressed = HashSet::new();
+        let alarm = [toast(1, "Fractal", Urgency::Critical)];
+        assert_eq!(
+            gated(&alarm, true, &muting("Fractal"), &mut suppressed),
+            [1]
+        );
+        assert!(
+            suppressed.is_empty(),
+            "a critical toast is never held back, so it has nothing to be remembered for"
+        );
+    }
+
+    #[test]
+    fn turning_dnd_off_does_not_release_the_backlog() {
+        let mut suppressed = HashSet::new();
+        let none = HashSet::new();
+
+        let held = [toast(1, "Fractal", Urgency::Normal)];
+        assert!(gated(&held, true, &none, &mut suppressed).is_empty());
+
+        // DND off. The held toast stays hidden; one that arrives now shows.
+        let both = [
+            toast(1, "Fractal", Urgency::Normal),
+            toast(2, "Fractal", Urgency::Normal),
+        ];
+        assert_eq!(gated(&both, false, &none, &mut suppressed), [2]);
+    }
+
+    #[test]
+    fn unmuting_an_app_does_not_release_its_backlog() {
+        let mut suppressed = HashSet::new();
+        let held = [toast(1, "Fractal", Urgency::Low)];
+        assert!(gated(&held, false, &muting("Fractal"), &mut suppressed).is_empty());
+        assert!(gated(&held, false, &HashSet::new(), &mut suppressed).is_empty());
+    }
+
+    #[test]
+    fn dnd_on_hides_a_toast_already_showing() {
+        // The gate's other direction, unchanged by #1535 and pinned here because
+        // the routing relies on it: a toast showing when DND goes on is held
+        // back from then on. That is what lets a non-target view's share drop
+        // a card the moment DND goes on, whichever output is focused.
+        let mut suppressed = HashSet::new();
+        let none = HashSet::new();
+        let showing = [toast(1, "Fractal", Urgency::Normal)];
+        assert_eq!(gated(&showing, false, &none, &mut suppressed), [1]);
+        assert!(gated(&showing, true, &none, &mut suppressed).is_empty());
+        assert!(gated(&showing, false, &none, &mut suppressed).is_empty());
+    }
+
+    #[test]
+    fn the_gate_forgets_a_notification_once_it_leaves_upstream() {
+        let mut suppressed = HashSet::new();
+        let held = [toast(1, "Fractal", Urgency::Normal)];
+        assert!(gated(&held, true, &HashSet::new(), &mut suppressed).is_empty());
+        assert_eq!(suppressed, HashSet::from([1]));
+
+        // Dismissed or expired: the set does not grow for the process lifetime.
+        assert!(gated(&[], false, &HashSet::new(), &mut suppressed).is_empty());
+        assert!(suppressed.is_empty());
+    }
+
+    #[test]
+    fn a_per_view_set_would_release_the_backlog_on_another_output() {
+        // The negative control for #1535's first scenario, the way
+        // `renewing_pause_first_would_arm` is for #626: the shape this module
+        // had before, one set per output, gated one emission against A's set
+        // and the next against B's.
+        let none = HashSet::new();
+        let held = [toast(1, "Fractal", Urgency::Normal)];
+        let (mut on_a, mut on_b) = (HashSet::new(), HashSet::new());
+        assert!(
+            gated(&held, true, &none, &mut on_a).is_empty(),
+            "DND on, A focused"
+        );
+        assert_eq!(
+            gated(&held, false, &none, &mut on_b),
+            [1],
+            "DND off with B focused: B's set never saw toast 1, so it pops up"
+        );
+
+        // One set, whichever output each emission was routed to.
+        let mut shared = HashSet::new();
+        assert!(gated(&held, true, &none, &mut shared).is_empty());
+        assert!(gated(&held, false, &none, &mut shared).is_empty());
+    }
+
+    // ── Routing: which view gets which list (#1535) ──────────────────────────
+
+    /// A connector map with the given keys, in the shape `TOAST_WINDOWS` has.
+    /// Each value is its key's insertion position, which `target_connector`
+    /// must never consult.
+    fn outputs(connectors: &[&str]) -> BTreeMap<String, usize> {
+        connectors
+            .iter()
+            .enumerate()
+            .map(|(position, c)| ((*c).to_string(), position))
+            .collect()
+    }
+
+    #[test]
+    fn the_focused_output_is_the_target_when_it_has_a_surface() {
+        let map = outputs(&["eDP-1", "DP-1"]);
+        assert_eq!(target_connector(&map, Some("eDP-1")), Some("eDP-1"));
+        assert_eq!(target_connector(&map, Some("DP-1")), Some("DP-1"));
+    }
+
+    #[test]
+    fn the_fallback_target_is_the_first_connector_every_time() {
+        // Inserted out of order on purpose: the answer is the map's order, not
+        // the insertion order and not a hash order (#1535 LOW).
+        let map = outputs(&["eDP-1", "HDMI-A-1", "DP-1"]);
+        for _ in 0..3 {
+            assert_eq!(target_connector(&map, None), Some("DP-1"));
+            assert_eq!(
+                target_connector(&map, Some("DP-9")),
+                Some("DP-1"),
+                "a focused output with no toast surface falls back too"
+            );
+        }
+        assert_eq!(target_connector(&outputs(&[]), Some("DP-1")), None);
+    }
+
+    #[test]
+    fn the_target_is_handed_every_visible_toast() {
+        let toasts = [
+            toast(1, "Fractal", Urgency::Normal),
+            toast(2, "Fractal", Urgency::Critical),
+        ];
+        let visible: Vec<&Notification> = toasts.iter().collect();
+        let share = share_for_view(&visible, true, &HashSet::new());
+        assert_eq!(share.iter().map(|n| n.id).collect::<Vec<_>>(), [1, 2]);
+    }
+
+    #[test]
+    fn another_output_keeps_what_it_shows_and_gains_nothing() {
+        // Toast 1 was showing on this output when focus moved away; 2 arrived
+        // since. 3 was mounted here once but has since ended upstream.
+        let toasts = [
+            toast(1, "Fractal", Urgency::Normal),
+            toast(2, "Fractal", Urgency::Critical),
+        ];
+        let visible: Vec<&Notification> = toasts.iter().collect();
+        let share = share_for_view(&visible, false, &HashSet::from([1, 3]));
+        assert_eq!(
+            share.iter().map(|n| n.id).collect::<Vec<_>>(),
+            [1],
+            "keeps 1, never mounts 2 (not even a critical one), and is not handed 3"
+        );
+    }
+
+    #[test]
+    fn another_output_is_told_when_its_toast_ends() {
+        // #1535 itself, at the level of the lists: the toast that was showing
+        // on this output expired while another output had focus. Its share is
+        // empty, so `apply_emission` removes the card and hides the window.
+        let share = share_for_view(&[], false, &HashSet::from([1]));
+        assert!(share.is_empty());
+    }
 }
 
 // ── Reentrancy regression tests ───────────────────────────────────────────────
@@ -1670,7 +2036,6 @@ mod tests {
 #[cfg(all(test, feature = "system-tests"))]
 mod reentrancy_tests {
     use std::cell::{Cell, RefCell};
-    use std::collections::HashSet;
     use std::rc::Rc;
     use std::time::Duration;
 
@@ -1701,7 +2066,7 @@ mod reentrancy_tests {
     ///
     /// `#[gtk::test]` runs every test in this binary on one thread, so the
     /// cache needs no locking and cannot be raced regardless of test order.
-    fn test_monitor() -> Monitor {
+    pub(super) fn test_monitor() -> Monitor {
         if let Some(monitor) = TEST_MONITOR.with(|cell| cell.borrow().clone()) {
             return monitor;
         }
@@ -1721,7 +2086,7 @@ mod reentrancy_tests {
     /// `body`, so two calls with the same arguments compare equal under
     /// `card_content_eq` and the card is *kept* rather than rebuilt. Passing a
     /// different `body` for the same `id` is how a test reaches the rebuild arm.
-    fn notif(id: u32, body: &str) -> Notification {
+    pub(super) fn notif(id: u32, body: &str) -> Notification {
         Notification {
             id,
             app_name: "Fractal".to_owned(),
@@ -1736,10 +2101,15 @@ mod reentrancy_tests {
         }
     }
 
-    /// No per-app mutes, DND off — every test here is about the borrow
-    /// discipline, not the visibility gates.
-    fn unmuted() -> HashSet<String> {
-        HashSet::new()
+    /// Run `apply_emission` on `view` with every toast in `notifs` as its share.
+    ///
+    /// That is the share these tests have always used: DND off, nothing muted,
+    /// and `view` as the target. Every test here is about the borrow discipline,
+    /// not the gates or the routing. Since #1535 those run in `route_emission`
+    /// before any view is reached, which is why this needs a helper at all.
+    fn apply(view: &ToastView, notifs: &[Notification]) {
+        let share: Vec<&Notification> = notifs.iter().collect();
+        apply_emission(view, &share);
     }
 
     /// `notif(1..=n, "a")`, the shape the overflow test needs on both sides of
@@ -1759,7 +2129,7 @@ mod reentrancy_tests {
     /// stores in production.
     fn seeded(initial: &[Notification]) -> Rc<ToastView> {
         let view = Rc::new(build_toast_view(&test_monitor()));
-        apply_emission(&view, initial, false, &unmuted());
+        apply(&view, initial);
         let ctx = glib::MainContext::default();
         while ctx.iteration(false) {}
         view
@@ -1807,7 +2177,7 @@ mod reentrancy_tests {
                 return;
             }
             recorder.set(Some(in_outer.get()));
-            apply_emission(&view, &reentrant, false, &unmuted());
+            apply(&view, &reentrant);
         });
         fired_inside
     }
@@ -1837,7 +2207,7 @@ mod reentrancy_tests {
         let fired_inside = arm_reentry(&card2, &view, &in_outer, vec![notif(1, "a")]);
 
         in_outer.set(true);
-        apply_emission(&view, &[notif(1, "a")], false, &unmuted());
+        apply(&view, &[notif(1, "a")]);
         in_outer.set(false);
 
         assert_eq!(
@@ -1875,7 +2245,7 @@ mod reentrancy_tests {
         // Same id (so the card is replaced, not removed), different body (so
         // `card_content_eq` fails and the rebuild arm actually runs).
         in_outer.set(true);
-        apply_emission(&view, &[notif(1, "after")], false, &unmuted());
+        apply(&view, &[notif(1, "after")]);
         in_outer.set(false);
 
         assert_eq!(
@@ -1925,7 +2295,7 @@ mod reentrancy_tests {
         // Back under the cap: the tail empties, so the overflow card is retired
         // and not rebuilt.
         in_outer.set(true);
-        apply_emission(&view, &toasts(cap), false, &unmuted());
+        apply(&view, &toasts(cap));
         in_outer.set(false);
 
         assert_eq!(
@@ -1938,5 +2308,175 @@ mod reentrancy_tests {
             view.overflow_card.borrow().is_none(),
             "the outer pass's write-back must still land: with the tail empty the slot ends None"
         );
+    }
+}
+
+// ── Multi-monitor routing tests ───────────────────────────────────────────────
+
+/// #1535's two scenarios, end to end through `route_emission` and the real
+/// `TOAST_WINDOWS` / `SUPPRESSED` cells. The pure `tests` module pins the rules
+/// (`gate`, `target_connector`, `share_for_view`); this pins the wiring between
+/// them, which is where both bugs actually lived.
+///
+/// Every view is built on the same `test_monitor` and keyed under a made-up
+/// connector. `build_toast_view` does not care which output it is given, and
+/// what is under test is the routing by key, not the placement.
+///
+/// The views go into `TOAST_WINDOWS` directly rather than through `install`,
+/// because `install` also wires the module's subscriptions, which reach the
+/// notifications / DND / mute services that no unit test registers.
+/// `route_emission` takes the focused output as an argument for the same
+/// reason.
+///
+/// Both cells are thread-locals, and `#[gtk::test]` runs every test in this
+/// binary on one thread, so each test starts from [`reset`]. Nothing else in
+/// the binary touches either cell.
+///
+/// Needs a real display server (`xvfb-run`), hence the `system-tests` gate.
+#[cfg(all(test, feature = "system-tests"))]
+mod routing_tests {
+    use std::collections::HashSet;
+    use std::rc::Rc;
+
+    use hytte::gtk::{self, prelude::*};
+    use hytte::services::notifications::Notification;
+
+    use super::reentrancy_tests::{notif, test_monitor};
+    use super::{
+        SUPPRESSED, TOAST_WINDOWS, ToastView, build_toast_view, close_all, route_emission,
+    };
+
+    /// No app muted. Every test here gates on DND alone.
+    fn unmuted() -> HashSet<String> {
+        HashSet::new()
+    }
+
+    /// A clean slate: no surfaces and nothing suppressed.
+    fn reset() {
+        close_all();
+        SUPPRESSED.with(|s| s.borrow_mut().clear());
+    }
+
+    /// A hot-plug's rebuild, as `main.rs` runs it: `close_all`, then one fresh
+    /// surface per connector. Does **not** touch `SUPPRESSED` — leaving it alone
+    /// is the very thing the hot-plug test checks.
+    fn plug(connectors: &[&str]) {
+        close_all();
+        for connector in connectors {
+            let view = Rc::new(build_toast_view(&test_monitor()));
+            TOAST_WINDOWS.with(|map| map.borrow_mut().insert((*connector).to_owned(), view));
+        }
+    }
+
+    fn view(connector: &str) -> Rc<ToastView> {
+        TOAST_WINDOWS.with(|map| Rc::clone(&map.borrow()[connector]))
+    }
+
+    /// Sorted ids of the cards mounted on `connector`'s surface.
+    fn shown(connector: &str) -> Vec<u32> {
+        let mut ids: Vec<u32> = view(connector).card_map.borrow().keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    fn route(focused: &str, notifs: &[Notification], dnd_on: bool) {
+        route_emission(Some(focused), notifs, dnd_on, &unmuted());
+    }
+
+    /// Finding 1. A toast shows on A, focus moves to B, and the toast then
+    /// expires. Before #1535 that emission reached B only. A kept the card, and
+    /// kept its window up, until focus came back to A and something else
+    /// emitted.
+    #[gtk::test]
+    fn a_toast_that_ends_after_focus_moves_leaves_the_output_it_was_on() {
+        reset();
+        plug(&["A", "B"]);
+
+        route("A", &[notif(1, "a")], false);
+        assert_eq!(shown("A"), [1]);
+        assert!(shown("B").is_empty());
+        assert!(view("A").window.is_visible());
+
+        route("B", &[], false);
+        assert!(
+            shown("A").is_empty(),
+            "the toast ended while B had focus; A must drop its card all the same"
+        );
+        assert!(
+            !view("A").window.is_visible(),
+            "with nothing left on it, A's surface must hide again"
+        );
+        reset();
+    }
+
+    /// The other half of the rule, so the fix above cannot have been "send
+    /// every surface everything": a surface focus has left keeps its toast for
+    /// as long as the toast lives, updates it on a re-post, and gains nothing.
+    #[gtk::test]
+    fn an_unfocused_output_keeps_its_toast_and_gains_nothing() {
+        reset();
+        plug(&["A", "B"]);
+
+        route("A", &[notif(1, "a")], false);
+        route("B", &[notif(1, "a"), notif(2, "a")], false);
+        assert_eq!(shown("A"), [1], "A keeps 1 and is not handed 2");
+        assert_eq!(
+            shown("B"),
+            [1, 2],
+            "the focused output shows the whole list"
+        );
+
+        // A `replaces_id` re-post of 1 while B still has focus.
+        route("B", &[notif(1, "edited"), notif(2, "a")], false);
+        assert_eq!(
+            view("A").card_map.borrow()[&1].notif.body,
+            "edited",
+            "A's copy of 1 must follow the re-post, not freeze at what it showed"
+        );
+        reset();
+    }
+
+    /// Finding 2, first scenario. A toast held back by DND while A was focused,
+    /// then DND turned off while B is focused. Before #1535, B's own set had
+    /// never seen the toast, so it popped up on B.
+    #[gtk::test]
+    fn turning_dnd_off_on_another_output_does_not_release_the_backlog() {
+        reset();
+        plug(&["A", "B"]);
+
+        route("A", &[notif(1, "a")], true);
+        assert!(shown("A").is_empty() && shown("B").is_empty());
+
+        route("B", &[notif(1, "a")], false);
+        assert!(
+            shown("B").is_empty(),
+            "toast 1 was suppressed during DND; DND going off must not show it on B"
+        );
+        assert!(shown("A").is_empty());
+
+        // A toast that arrives after DND went off is not part of the backlog.
+        route("B", &[notif(1, "a"), notif(2, "a")], false);
+        assert_eq!(shown("B"), [2]);
+        reset();
+    }
+
+    /// Finding 2, second scenario. A hot-plug's `close_all` + rebuild between
+    /// DND going on and going off. Before #1535 the rebuilt surfaces had empty
+    /// sets, so the next DND-off emission released the backlog.
+    #[gtk::test]
+    fn a_hot_plug_does_not_release_the_backlog() {
+        reset();
+        plug(&["A"]);
+
+        route("A", &[notif(1, "a")], true);
+        assert!(shown("A").is_empty());
+
+        plug(&["A", "B"]);
+        route("A", &[notif(1, "a")], false);
+        assert!(
+            shown("A").is_empty() && shown("B").is_empty(),
+            "toast 1 was suppressed during DND; rebuilding the surfaces must not forget that"
+        );
+        reset();
     }
 }

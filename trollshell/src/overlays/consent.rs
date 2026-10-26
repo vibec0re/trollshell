@@ -659,8 +659,7 @@ mod tests {
         for rotation in 0..SCRAMBLED.len() {
             let mut order = SCRAMBLED.to_vec();
             order.rotate_left(rotation);
-            let map: BTreeMap<String, &str> =
-                order.iter().map(|c| ((*c).to_owned(), *c)).collect();
+            let map: BTreeMap<String, &str> = order.iter().map(|c| ((*c).to_owned(), *c)).collect();
             assert_eq!(output_for(&map, None), Some(&"DP-1"));
             assert_eq!(
                 output_for(&map, Some("DP-9")),

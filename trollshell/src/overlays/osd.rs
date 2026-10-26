@@ -1242,7 +1242,8 @@ mod tests {
                 .iter()
                 .map(|c| ((*c).to_owned(), (*c == "DP-1").then_some(Page::Audio)))
                 .collect();
-            let shown = *crate::overlays::consent::output_for(&map, None).expect("a mounted output");
+            let shown =
+                *crate::overlays::consent::output_for(&map, None).expect("a mounted output");
             assert_eq!(shown, Some(Page::Audio), "the OSD must read DP-1's drawer");
             assert!(drawer_shows_control(Kind::Volume, shown));
         }

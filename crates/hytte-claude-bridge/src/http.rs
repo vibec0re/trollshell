@@ -48,6 +48,16 @@ const MAX_BODY: usize = 1024 * 1024;
 /// because the only client sends the whole thing in one shot.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a single connection may take to *accept* its response — the
+/// write-side twin of [`READ_TIMEOUT`], and short for the same reason: the only
+/// client reads the whole reply to EOF the moment it arrives.
+///
+/// Without it a client that never reads, sent a reply larger than the
+/// socket's send buffer, would park its connection task in `write_all` for the
+/// life of the process — the request permit is already released by then, but
+/// the task, the fd and the response buffer are not.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// A request that cannot be answered, as the status and body text the client
 /// will see.
 ///
@@ -194,15 +204,27 @@ pub fn response_bytes(status: u16, body: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Write a response and close the write half.
+/// Write a response and close the write half, bounded by [`WRITE_TIMEOUT`].
+///
+/// Every outcome is the end of the connection — the client gets the reply or
+/// it does not, and there is nobody left to report a failure to — so each is
+/// one debug line, never an error.
 pub async fn write_response(stream: &mut impl Stream, status: u16, body: &[u8]) {
     let bytes = response_bytes(status, body);
-    if let Err(e) = stream.write_all(&bytes).await {
-        tracing::debug!(error = %e, "response write failed");
-        return;
-    }
-    if let Err(e) = stream.shutdown().await {
-        tracing::debug!(error = %e, "response shutdown failed");
+    let write = async {
+        if let Err(e) = stream.write_all(&bytes).await {
+            tracing::debug!(error = %e, "response write failed");
+            return;
+        }
+        if let Err(e) = stream.shutdown().await {
+            tracing::debug!(error = %e, "response shutdown failed");
+        }
+    };
+    if tokio::time::timeout(WRITE_TIMEOUT, write).await.is_err() {
+        tracing::debug!(
+            timeout_s = WRITE_TIMEOUT.as_secs(),
+            "timed out writing the response; dropping the connection",
+        );
     }
 }
 
@@ -226,7 +248,52 @@ fn reason(status: u16) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{ROUTE, parse_head, response_bytes};
+    use super::{ROUTE, WRITE_TIMEOUT, parse_head, response_bytes, write_response};
+
+    /// A client that never reads cannot hold its connection task forever: a
+    /// reply bigger than the pipe's buffer gives up after [`WRITE_TIMEOUT`]
+    /// instead of parking in `write_all`. On a paused clock, so it costs no
+    /// real time — and under an outer timeout, so a regression fails rather
+    /// than hangs the suite.
+    #[tokio::test(start_paused = true)]
+    async fn a_client_that_never_reads_cannot_hold_the_write_forever() {
+        // 64 bytes of buffer and a peer kept alive but never read from, so a
+        // 4 KiB reply can only ever block.
+        let (_client, mut server) = tokio::io::duplex(64);
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            WRITE_TIMEOUT * 2,
+            write_response(&mut server, 200, &[b'x'; 4096]),
+        )
+        .await
+        .expect("the write gave up on its own");
+        let elapsed = started.elapsed();
+        assert!(
+            (WRITE_TIMEOUT..WRITE_TIMEOUT * 2).contains(&elapsed),
+            "gave up after {elapsed:?}, not after the {WRITE_TIMEOUT:?} bound",
+        );
+    }
+
+    /// …while a client that does read gets the whole reply, closed, at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_reading_client_gets_the_whole_reply_and_eof() {
+        use tokio::io::AsyncReadExt as _;
+
+        let (mut client, mut server) = tokio::io::duplex(64);
+        let body = [b'x'; 4096];
+        let started = tokio::time::Instant::now();
+        let mut got = Vec::new();
+        let ((), read) = tokio::join!(
+            write_response(&mut server, 200, &body),
+            client.read_to_end(&mut got),
+        );
+        read.expect("read to EOF");
+        assert_eq!(got, response_bytes(200, &body));
+        assert!(
+            started.elapsed() < WRITE_TIMEOUT,
+            "no timeout on the happy path"
+        );
+    }
 
     /// The exact head `ureq` 3 sends for `chat()` — since #993 over a Unix
     /// socket, which changes only the `Host:` placeholder the client fills in

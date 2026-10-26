@@ -98,6 +98,23 @@
 //! by design: it is *for* people who would rather pay per token, so it loads an
 //! Anthropic API key and refuses to start without one.
 //!
+//! # The `claude` child is a chat model, not an agent
+//!
+//! The same-uid socket decides who may *send* a prompt; it says nothing about
+//! what is *in* one. pet's and caw's prompts carry outside text — caw's
+//! briefing embeds calendar event summaries (anyone who can send the owner an
+//! invite writes one) and transit-API strings — so every turn is fed content
+//! nobody on this box wrote. Until this was closed that content reached a full
+//! Claude Code agent: built-in tools (`Bash`, `Edit`, `WebFetch`, …), the
+//! owner's `~/.claude` allow rules, every user-scope MCP server and claude.ai
+//! connector, and every skill and slash command. A prompt injection in an
+//! invite could have driven any of them, as the owner.
+//!
+//! A chat-completions face needs none of that, so the child runs with **no
+//! tools, no MCP servers and no slash commands** — see
+//! [`Settings::claude_config`] for the three flags and the evidence each one
+//! does what it says.
+//!
 //! # Deliberately unimplemented
 //!
 //! Only what `hytte_ai_providers::chat` sends is accepted, and only what it
@@ -186,6 +203,17 @@ use bridge::Bridge;
 /// prompts was 4–6s; caw's briefing is larger and untested, and a clean failure
 /// there is a good outcome (both consumers degrade to canned output on `Err`).
 const DEFAULT_BUDGET: Duration = Duration::from_secs(8);
+
+/// The `--tools` value that leaves the `claude` child **no** built-in tools:
+/// the empty string, per `claude --help`'s "Use `""` to disable all tools". See
+/// [`Settings::claude_config`].
+const NO_TOOLS: &str = "";
+
+/// Turns off every skill and slash command in the `claude` child, so no prompt
+/// text is ever read as one. Passed through `hive_claude::Config::extra_args`,
+/// which `hive-claude` 0.1.1 appends verbatim — it has no typed field for this
+/// flag. See [`Settings::claude_config`].
+const DISABLE_SLASH_COMMANDS: &str = "--disable-slash-commands";
 
 /// Which conversation implementation to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,18 +310,64 @@ impl Settings {
             .max(Duration::from_secs(1))
     }
 
-    /// The `hive-claude` invocation config.
+    /// The `hive-claude` invocation config — the one place both `claude` modes
+    /// get theirs from.
     ///
     /// `idle_timeout` is [`Settings::inner_budget`], so a stalled turn is
     /// killed and reaped by the driver — yielding a typed `Error::IdleTimeout`
     /// — *before* the outer budget fires. The outer timeout remains as a
     /// backstop for a turn that is streaming but too slow; that path can leave
     /// the child running, which is logged rather than papered over.
+    ///
+    /// # No tools, no MCP servers, no slash commands
+    ///
+    /// The prompt is partly outside text (see the crate docs, "a chat model,
+    /// not an agent"), so the child gets nothing a prompt injection could
+    /// drive. Each restriction is a flag `claude --help` (2.1.303) documents
+    /// and `hive-claude` 0.1.1 emits:
+    ///
+    /// - `tools: Some("")` → `--tools ""`: "Use `""` to disable all tools".
+    ///   An *empty* string, not `None` — `None` omits the flag and leaves the
+    ///   whole built-in set, the [`Settings::model_arg`] trap in reverse. The
+    ///   owner's `~/.claude` allow rules stay loaded but have no tool left to
+    ///   grant.
+    /// - `strict_mcp_config: true` with **no** `mcp_config` →
+    ///   `--strict-mcp-config`: "Only use MCP servers from --mcp-config,
+    ///   ignoring all other MCP configurations" — and there is no
+    ///   `--mcp-config`, so that is none. `--tools` only governs the built-in
+    ///   set, so without this every user-scope MCP server and claude.ai
+    ///   connector still answers.
+    /// - [`DISABLE_SLASH_COMMANDS`] in `extra_args` — `hive-claude` has no
+    ///   typed field for it. On a resumed session the newest `user` message is
+    ///   sent as the bare prompt (`session::prompt_for`), so a client whose
+    ///   message *started* with outside text could otherwise name a skill or a
+    ///   command. pet and caw both lead with their own words, but this socket
+    ///   answers any same-uid client, and the bridge never sends one itself
+    ///   (it retires sessions rather than `/compact`ing them).
+    ///
+    /// Measured against claude 2.1.303's `system`/`init` stream event (which
+    /// lists what the child loaded, before any request): unrestricted, on the
+    /// box it was measured on, it lists 26 tools, a claude.ai MCP connector,
+    /// 69 slash commands and 33 skills;
+    /// with these three flags `tools`, `mcp_servers`, `slash_commands` and
+    /// `skills` are all empty. A real turn still answers — as text, with no
+    /// `tool_use` block.
+    ///
+    /// **Not** restricted: `--setting-sources`. With nothing left to grant,
+    /// what the user settings still reach is the owner's own hooks (commands
+    /// the owner wrote, which the model cannot invoke) and the `env` block —
+    /// and the `env` block is where an owner may keep the auth/endpoint config
+    /// [`envguard`] polices, so dropping it silently is a billing-path change,
+    /// not a hardening one.
     fn claude_config(&self) -> hive_claude::Config {
         hive_claude::Config {
             model: self.model_arg(),
             cwd: Some(self.state_dir.clone()),
             idle_timeout: Some(self.inner_budget()),
+            tools: Some(NO_TOOLS.to_owned()),
+            strict_mcp_config: true,
+            mcp_config: None,
+            extra_args: vec![DISABLE_SLASH_COMMANDS.to_owned()],
             ..hive_claude::Config::default()
         }
     }
@@ -702,6 +776,105 @@ mod tests {
         assert_eq!(settings.model_arg(), None);
         settings.model = "haiku".to_owned();
         assert_eq!(settings.model_arg(), Some("haiku".to_owned()));
+    }
+
+    /// **The child is a chat model, not an agent.** Both `claude` modes build
+    /// their child from [`Settings::claude_config`], and the prompt it is fed
+    /// carries outside text — so the three restrictions there must survive any
+    /// refactor of it. `Some("")` rather than `None` is the load-bearing
+    /// detail: `None` would *omit* `--tools` and hand the child every built-in
+    /// tool, and would still type-check.
+    #[test]
+    fn the_claude_child_gets_no_tools_no_mcp_servers_and_no_slash_commands() {
+        for mode in [Mode::Subscription, Mode::Reprompt] {
+            let config = settings(mode).claude_config();
+            assert_eq!(config.tools.as_deref(), Some(""), "{mode:?}: --tools \"\"");
+            assert!(config.strict_mcp_config, "{mode:?}: --strict-mcp-config");
+            assert_eq!(
+                config.mcp_config, None,
+                "{mode:?}: strict with no --mcp-config is what makes it *no* servers",
+            );
+            assert_eq!(
+                config.extra_args,
+                [super::DISABLE_SLASH_COMMANDS],
+                "{mode:?}: --disable-slash-commands, and nothing else raw",
+            );
+            assert_eq!(
+                config.allowed_tools, None,
+                "{mode:?}: no allow-list to widen it"
+            );
+            assert!(
+                config.add_dirs.is_empty(),
+                "{mode:?}: no extra readable dirs"
+            );
+        }
+    }
+
+    /// The same three restrictions, read off the **argv the child actually
+    /// receives** rather than off the `Config` — because `hive-claude` builds
+    /// that argv privately, and an upstream change that read `Some("")` as
+    /// "omit the flag" — the `is_empty()` rule the pre-#757 driver applied to
+    /// `--model` — would pass the test above and silently hand the child its
+    /// tools back.
+    ///
+    /// A shell-script stand-in for `claude` records its argv one `<arg>` per
+    /// line (so the empty `--tools` value is visible) and exits cleanly.
+    #[tokio::test]
+    async fn the_restrictions_reach_the_child_argv() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let program = dir.path().join("fake-claude");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\ncat > /dev/null\nfor arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done > \"$0.argv\"\n",
+        )
+        .expect("write the stand-in");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod +x");
+
+        let mut config = Settings {
+            state_dir: dir.path().to_path_buf(),
+            ..settings(Mode::Subscription)
+        }
+        .claude_config();
+        config.program = Some(program.clone());
+        hive_claude::Claude::run(
+            &config,
+            &hive_claude::Attach::Resume("hytte-bridge-test".to_owned()),
+            "hi",
+            &hive_claude::NoopSink,
+        )
+        .await
+        .expect("the stand-in exits 0");
+
+        let recorded = std::fs::read_to_string(program.with_extension("argv")).expect("argv");
+        let argv: Vec<&str> = recorded
+            .lines()
+            .map(|l| {
+                l.strip_prefix('<')
+                    .and_then(|l| l.strip_suffix('>'))
+                    .expect("one <arg> per line")
+            })
+            .collect();
+        let tools: Vec<_> = argv
+            .windows(2)
+            .filter(|w| w[0] == "--tools")
+            .map(|w| w[1])
+            .collect();
+        assert_eq!(
+            tools,
+            [""],
+            "exactly one --tools, and it is empty: {argv:?}"
+        );
+        assert!(argv.contains(&"--strict-mcp-config"), "{argv:?}");
+        assert!(argv.contains(&"--disable-slash-commands"), "{argv:?}");
+        for absent in ["--mcp-config", "--allowedTools", "--add-dir"] {
+            assert!(
+                !argv.contains(&absent),
+                "{absent} must not be passed: {argv:?}"
+            );
+        }
     }
 
     /// The inner client's budget must be strictly under the outer one, or the

@@ -40,7 +40,7 @@
 //! for that phase.
 
 use std::cell::{Cell, RefCell};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::time::Duration;
 
 use hytte::gtk::{self, gdk, glib, prelude::*};
@@ -246,6 +246,11 @@ fn build_entries(vbox: &gtk::Box, req: &wifi::PromptRequest) -> Vec<gtk::Passwor
 
 /// The interactive part of one prompt window: the fields plus the widgets whose
 /// state tracks whether a submit is in flight.
+///
+/// Owned by its window, through exactly one `Rc` — see [`build_prompt`]. Every
+/// other holder, including every handler on a widget this struct owns, takes a
+/// [`Weak`], so the form (and the secret its entries hold) goes away with the
+/// window.
 struct Form {
     entries: Vec<gtk::PasswordEntry>,
     connect_btn: gtk::Button,
@@ -283,6 +288,15 @@ impl Form {
         self.refresh_sensitivity();
     }
 
+    /// Clear every field. Run when the window goes off screen: whatever was
+    /// typed has either been handed to the agent already or was abandoned, so
+    /// the entries have no reason to keep holding it until they are freed.
+    fn wipe(&self) {
+        for entry in &self.entries {
+            entry.set_text("");
+        }
+    }
+
     /// Collect every field and hand the whole set to the agent.
     fn submit(self: &Rc<Self>, id: u64) {
         if self.busy.get() {
@@ -305,8 +319,13 @@ impl Form {
         // remainder (a handshake that never resolves, or a `submit_prompt` that
         // silently no-ops because the service was never registered): it
         // un-busies the form in place so the user can edit and retry.
-        let form = Rc::clone(self);
+        //
+        // Held weakly: a strong `Rc` here kept the form — and every entry with
+        // its secret — alive for up to `SUBMIT_TIMEOUT` after the window was
+        // destroyed. A form that is gone has nothing to re-enable.
+        let form = Rc::downgrade(self);
         glib::timeout_add_local_once(SUBMIT_TIMEOUT, move || {
+            let Some(form) = form.upgrade() else { return };
             if form.busy.get() {
                 tracing::warn!(
                     id,
@@ -349,6 +368,45 @@ fn show_prompt(monitor: &Monitor, req: wifi::PromptRequest) {
     // this minimum.
     window.set_size_request(460, 260);
 
+    let form = build_prompt(&window, &req);
+
+    // ── Show ──────────────────────────────────────────────────────────────────
+
+    window.set_visible(true);
+    window.present();
+    if let Some(first) = form
+        .upgrade()
+        .and_then(|form| form.entries.first().cloned())
+    {
+        first.grab_focus();
+    }
+
+    PROMPT_WINDOW.with(|slot: &RefCell<Option<gtk::Window>>| {
+        *slot.borrow_mut() = Some(window);
+    });
+}
+
+/// Lay out `req`'s prompt as `window`'s content and wire it, returning the form
+/// **weakly** — the window is what keeps it alive.
+///
+/// # Who owns the form
+///
+/// Exactly one strong reference, held by the window's `unmap` handler. A window
+/// keeps its handlers until it is disposed — which [`close_prompt`] causes by
+/// closing it and dropping the `PROMPT_WINDOW` slot's reference, the last one
+/// — so the form lives exactly as long as the window. Everything else — each
+/// entry's `changed`/`activate` handler, Connect's `clicked`, the submit timer
+/// — holds a [`Weak`].
+///
+/// That split is what lets the entries, and the secret typed into them, be
+/// freed. Disposing a GTK 4 window does not dispose its children: it unparents
+/// them, and a child is disposed only when its last reference goes. A handler
+/// on an entry holding an `Rc<Form>` is a reference cycle through that entry's
+/// own signal handler (entry → handler → form → entry), so the old wiring kept
+/// every prompt's `PasswordEntry`s alive for the rest of the session — and the
+/// submit timer's `Rc` kept the form for at least `SUBMIT_TIMEOUT` even
+/// without it.
+fn build_prompt(window: &gtk::Window, req: &wifi::PromptRequest) -> Weak<Form> {
     // ── Layout ────────────────────────────────────────────────────────────────
 
     let vbox = gtk::Box::new(gtk::Orientation::Vertical, 8);
@@ -358,8 +416,8 @@ fn show_prompt(monitor: &Monitor, req: wifi::PromptRequest) {
     vbox.set_margin_top(18);
     vbox.set_margin_bottom(18);
 
-    build_header(&vbox, &req);
-    let entries = build_entries(&vbox, &req);
+    build_header(&vbox, req);
+    let entries = build_entries(&vbox, req);
 
     let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     buttons.set_halign(gtk::Align::End);
@@ -391,18 +449,7 @@ fn show_prompt(monitor: &Monitor, req: wifi::PromptRequest) {
         spinner,
         busy: Cell::new(false),
     });
-
-    // ── Teardown clears the latch ─────────────────────────────────────────────
-    //
-    // Every normal exit from the in-flight state is this window going away, and
-    // the window going away does *not* by itself touch the form. Without this,
-    // `Form::submit`'s safety timer would fire 20 s after every **successful**
-    // submit, find `busy` still set, and warn about a prompt that resolved
-    // perfectly — so the one path that is supposed to be silent would be the
-    // noisiest. Clearing the flag on unmap (the `panels::power_menu` idiom)
-    // leaves the timer for the genuinely-stuck case it exists for.
-    let form_for_unmap = Rc::clone(&form);
-    window.connect_unmap(move |_| form_for_unmap.busy.set(false));
+    let weak_form = Rc::downgrade(&form);
 
     // ── ESC → cancel ──────────────────────────────────────────────────────────
 
@@ -420,31 +467,151 @@ fn show_prompt(monitor: &Monitor, req: wifi::PromptRequest) {
     // ── Per-entry wiring: text → Connect sensitivity, Enter → submit ─────────
 
     for entry in &form.entries {
-        let form_for_guard = Rc::clone(&form);
-        entry.connect_changed(move |_| form_for_guard.refresh_sensitivity());
+        let form_for_guard = Rc::downgrade(&form);
+        entry.connect_changed(move |_| {
+            if let Some(form) = form_for_guard.upgrade() {
+                form.refresh_sensitivity();
+            }
+        });
 
-        let form_for_activate = Rc::clone(&form);
-        entry.connect_activate(move |_| form_for_activate.submit(id));
+        let form_for_activate = Rc::downgrade(&form);
+        entry.connect_activate(move |_| {
+            if let Some(form) = form_for_activate.upgrade() {
+                form.submit(id);
+            }
+        });
     }
 
     // ── Buttons ───────────────────────────────────────────────────────────────
 
     cancel_btn.connect_clicked(move |_| dismiss(id));
 
-    let form_for_connect = Rc::clone(&form);
-    connect_btn.connect_clicked(move |_| form_for_connect.submit(id));
+    let form_for_connect = Rc::downgrade(&form);
+    connect_btn.connect_clicked(move |_| {
+        if let Some(form) = form_for_connect.upgrade() {
+            form.submit(id);
+        }
+    });
 
-    // ── Show ──────────────────────────────────────────────────────────────────
+    // ── Teardown: clear the latch and the fields, and own the form ───────────
+    //
+    // Every normal exit from the in-flight state is this window going away, and
+    // the window going away does *not* by itself touch the form. Without
+    // clearing `busy`, `Form::submit`'s safety timer would fire 20 s after
+    // every **successful** submit, find it still set, and warn about a prompt
+    // that resolved perfectly — so the one path that is supposed to be silent
+    // would be the noisiest. Clearing the flag on unmap (the
+    // `panels::power_menu` idiom) leaves the timer for the genuinely-stuck case
+    // it exists for.
+    //
+    // Unmap is also the moment the prompt stops being up, so the fields are
+    // wiped here rather than whenever the entries happen to be freed. And this
+    // handler is the form's one owner — see this function's doc.
+    window.connect_unmap(move |_| {
+        form.busy.set(false);
+        form.wipe();
+    });
 
-    window.set_visible(true);
-    window.present();
-    if let Some(first) = form.entries.first() {
-        first.grab_focus();
+    weak_form
+}
+
+/// The form's lifetime against real GTK widgets: [`build_prompt`] is given a
+/// plain `gtk::Window` in place of the layer-shell one `show_prompt` builds,
+/// which is all the difference there is between the two. Needs a display
+/// server, hence the `system-tests` gate.
+#[cfg(all(test, feature = "system-tests"))]
+mod form_lifetime_tests {
+    use std::time::{Duration, Instant};
+
+    use hytte::gtk::{self, glib, prelude::*};
+    use hytte::services::wifi;
+
+    use super::build_prompt;
+
+    const ID: u64 = 7;
+
+    fn request(keys: &[&str]) -> wifi::PromptRequest {
+        wifi::PromptRequest {
+            id: ID,
+            network_path: "/test/network".to_owned(),
+            ssid: "test-net".to_owned(),
+            security: "psk".to_owned(),
+            kind: wifi::PromptKind::WifiPassphrase,
+            secret_keys: keys.iter().map(|key| (*key).to_owned()).collect(),
+            prior_failure: false,
+        }
     }
 
-    PROMPT_WINDOW.with(|slot: &RefCell<Option<gtk::Window>>| {
-        *slot.borrow_mut() = Some(window);
-    });
+    fn pump() {
+        while glib::MainContext::default().iteration(false) {}
+    }
+
+    /// Show `window` and wait until it is mapped.
+    fn map(window: &gtk::Window) {
+        window.present();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !window.is_mapped() {
+            assert!(Instant::now() < deadline, "the window did not map");
+            pump();
+        }
+    }
+
+    /// A closed prompt frees its form and its entries, secret and all — after
+    /// a submit, too, whose 20 s timer used to hold the form strongly.
+    /// Falsified by giving the entries' handlers (or the timer) an `Rc<Form>`
+    /// again: each entry is then kept alive by its own handler.
+    #[gtk::test]
+    fn a_closed_prompt_frees_its_form_and_entries() {
+        let window = gtk::Window::new();
+        let form = build_prompt(&window, &request(&["password", "otp"]));
+        let entries: Vec<_> = form
+            .upgrade()
+            .expect("the window owns the form")
+            .entries
+            .iter()
+            .map(ObjectExt::downgrade)
+            .collect();
+        map(&window);
+        for entry in &entries {
+            entry.upgrade().expect("a live entry").set_text("hunter2");
+        }
+
+        // `submit_prompt` is a no-op with no Wi-Fi service registered; the
+        // submit still latches the form busy and arms its timeout.
+        form.upgrade().expect("the window owns the form").submit(ID);
+        // What `close_prompt` does: close the window, then drop the last
+        // reference to it (the `PROMPT_WINDOW` slot's), which is what disposes
+        // it and releases its handlers.
+        window.close();
+        drop(window);
+        pump();
+
+        assert!(
+            form.upgrade().is_none(),
+            "the form must go with its window, not when the submit timer fires",
+        );
+        for entry in &entries {
+            assert!(
+                entry.upgrade().is_none(),
+                "a closed prompt's PasswordEntry must be freed, not kept alive by its own handler",
+            );
+        }
+    }
+
+    /// Taking the prompt off screen clears what was typed, without waiting for
+    /// the entries to be freed.
+    #[gtk::test]
+    fn hiding_the_prompt_wipes_its_fields() {
+        let window = gtk::Window::new();
+        let form = build_prompt(&window, &request(&["password"]));
+        let entry = form.upgrade().expect("the window owns the form").entries[0].clone();
+        map(&window);
+        entry.set_text("hunter2");
+
+        window.set_visible(false);
+        assert_eq!(entry.text(), "", "unmapping the prompt wipes the field");
+        window.destroy();
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

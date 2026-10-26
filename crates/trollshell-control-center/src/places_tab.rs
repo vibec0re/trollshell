@@ -340,7 +340,7 @@ impl Editor {
     /// a bare complaint — it is the one failure the user can clear with one
     /// click, and the only one where *this* window is holding the stale copy.
     fn report(&self, err: &PlacesError) {
-        let toast = adw::Toast::new(&err.to_string());
+        let toast = crate::markup::toast(&err.to_string());
         toast.set_timeout(if matches!(err, PlacesError::ChangedOnDisk) {
             0
         } else {
@@ -480,8 +480,7 @@ impl Editor {
     /// ([`override_failure`]'s sentence).
     fn report_override_failure(&self, action: &str, err: &hytte_bus::BusError) {
         // Toast titles are Pango markup, and a bus error's text is not ours.
-        let text = glib::markup_escape_text(&override_failure(action, err));
-        let toast = adw::Toast::new(&text);
+        let toast = crate::markup::toast(&override_failure(action, err));
         toast.set_timeout(6);
         self.toasts.add_toast(toast);
     }
@@ -1749,6 +1748,21 @@ mod gtk_tests {
     /// queued push/allocation actually happens.
     fn pump() {
         while glib::MainContext::default().iteration(false) {}
+    }
+
+    /// #1564: a rejected save's toast quotes what the user typed, and toast
+    /// titles are Pango markup. `Tom & <b>Jerry</b>` must display literally,
+    /// not blank the "already exists" message.
+    ///
+    /// Falsified by making `markup::toast` pass its text through unescaped.
+    #[gtk::test]
+    fn a_rejected_save_toast_shows_a_typed_name_literally() {
+        adw::init().expect("libadwaita init");
+        let (overlay, editor) = build_editor();
+        let err = hytte_config::places::PlacesError::DuplicateName("Tom & <b>Jerry</b>".into());
+        editor.report(&err);
+        pump();
+        crate::markup::test_support::assert_shows(&overlay, &err.to_string());
     }
 
     /// [`build_editor_with`] with nothing locked — the ordinary case, and what

@@ -49,6 +49,7 @@ use hytte_bus::RetryPolicy;
 mod agents_tab;
 mod ai_keys_tab;
 mod config_form;
+mod markup;
 mod places_tab;
 mod plugin_settings;
 mod plugins_tab;
@@ -1059,6 +1060,30 @@ mod gtk_tests {
         let (_bar, label) = build_revision_footer();
         let ui = ShellProbeUi::new(&banner, &label);
         (banner, label, ui)
+    }
+
+    /// #1564: the banner's text is a `BusError`'s, which can quote anything the
+    /// bus said. `AdwBanner:use-markup` is opt-in (measured: a banner shows
+    /// `Tom & <b>Jerry</b>` as is), so the title is set raw; escaping it would
+    /// show `&amp;`. This pins that, so nobody "fixes" the banner the way the
+    /// toast needs it.
+    ///
+    /// Falsified by escaping the title in `ShellProbeUi::apply`.
+    #[gtk::test]
+    fn a_connection_error_banner_shows_the_error_literally() {
+        adw::init().expect("libadwaita init");
+        let (banner, _label, ui) = probe_ui();
+        let probe = ShellProbe {
+            connection: Err(hytte_bus::BusError::Permanent {
+                reason: "Tom & <b>Jerry</b>".to_owned(),
+                dbus_name: Some("org.freedesktop.DBus.Error.AccessDenied".to_owned()),
+            }),
+            revision: None,
+        };
+        let expected = super::format_banner_message(&probe.connection).expect("an error message");
+        assert!(expected.contains("Tom & <b>Jerry</b>"), "{expected:?}");
+        ui.apply(&probe);
+        crate::markup::test_support::assert_shows(&banner, &expected);
     }
 
     /// #989 in one sequence: launched before the shell, then the shell starts,

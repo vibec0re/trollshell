@@ -1334,8 +1334,12 @@ fn build_detail(env: &Rc<hytte_config::xdg::Env>) -> (PluginDetail, Vec<crate::c
     let controls = adw::PreferencesGroup::new();
     controls.add(&switch);
 
-    let unit_row = adw::ActionRow::builder().title("Unit").build();
-    let conn_row = adw::ActionRow::builder().title("Host connection").build();
+    let unit_row = adw::ActionRow::new();
+    crate::markup::plain_text(&unit_row);
+    unit_row.set_title("Unit");
+    let conn_row = adw::ActionRow::new();
+    crate::markup::plain_text(&conn_row);
+    conn_row.set_title("Host connection");
     let conn_badge = gtk::Image::new();
     conn_badge.set_valign(gtk::Align::Center);
     conn_row.add_prefix(&conn_badge);
@@ -3221,11 +3225,12 @@ fn set_placeholder(state: &PluginsState, view: PluginsView, title: &str, subtitl
     state.snapshot.borrow_mut().clear();
     clear_selection(state);
     let row = adw::ActionRow::builder()
-        .title(title)
-        .subtitle(subtitle)
         .activatable(false)
         .selectable(false)
         .build();
+    crate::markup::plain_text(&row);
+    row.set_title(title);
+    row.set_subtitle(subtitle);
     state.list.append(&row);
     state.rows.borrow_mut().push(row.upcast());
     state.view.set(view);
@@ -3245,10 +3250,9 @@ fn build_plugin_row(
     enabled: bool,
     rt: Option<&PluginRuntime>,
 ) -> PluginRow {
-    let row = adw::ActionRow::builder()
-        .title(id)
-        .activatable(true)
-        .build();
+    let row = adw::ActionRow::builder().activatable(true).build();
+    crate::markup::plain_text(&row);
+    row.set_title(id);
 
     let badge = gtk::Image::new();
     badge.set_valign(gtk::Align::Center);
@@ -7059,6 +7063,39 @@ mod gtk_tests {
              {BIN_MIN_WIDTH_PX}px — AdwBreakpointBin would warn on every allocation (#856)"
         );
 
+        dismiss(&window);
+    }
+
+    /// #1564: the host-connection row's subtitle carries the mount a plugin's
+    /// `plugins.json` declared, which is nobody's validated text. `&` and `<`
+    /// in it must display literally rather than blank the row.
+    ///
+    /// Falsified by dropping `plain_text` from `conn_row` in `build_detail`.
+    #[gtk::test]
+    fn the_host_connection_row_shows_a_hostile_declared_mount_literally() {
+        adw::init().expect("libadwaita init");
+        let (bin, state) = build_tab();
+        let hostile = "Tom & <b>Jerry</b>";
+        let units = vec![("clock".to_owned(), "active".to_owned(), true)];
+        let mut rt = HashMap::new();
+        rt.insert(
+            "clock".to_owned(),
+            PluginRuntime {
+                rendering: true,
+                mount: hostile.to_owned(),
+                declared_mount: None,
+                last_seen_secs: 1,
+                violations: 0,
+                version: None,
+            },
+        );
+        apply_plugins(&state, &units, &rt);
+        pump();
+        click(&state, "clock");
+        let window = present(&bin, 640);
+        let shown = state.detail.conn_row.subtitle().expect("a subtitle");
+        assert!(shown.contains(hostile), "{shown:?}");
+        crate::markup::test_support::assert_shows(&state.detail.conn_row, shown.as_str());
         dismiss(&window);
     }
 

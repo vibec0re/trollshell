@@ -73,8 +73,14 @@
 //!
 //! - Every row built here is an `AdwPreferencesRow` subclass, whose title and
 //!   subtitle labels bind `use-markup` from the row itself
-//!   (`adw-action-row.ui`) — so every one of them is built with
-//!   **`use_markup(false)`**, and that one flag covers both lines.
+//!   (`adw-action-row.ui`) — so every one of them has **`use-markup` off**,
+//!   and that one flag covers both lines. It goes off **before** the row is
+//!   handed any wire text: a label parses markup the moment it gets text, so
+//!   a builder carrying the hive's string logs a `Gtk-WARNING` per build even
+//!   with `.use_markup(false)` in the same builder (#1564). Rows whose builder
+//!   text is a literal keep `.use_markup(false)` there; the two that are
+//!   built around wire text (the unassigned approvals and the placeholder)
+//!   are built empty, then `crate::markup::plain_text`, then the text.
 //! - `AdwStatusPage:description` has no such switch (its label is
 //!   `use-markup: True` in `adw-status-page.ui`, unlike its title label, which
 //!   is plain), so the one wire string that reaches it — the placeholder's
@@ -85,11 +91,13 @@
 //! `AdwNavigationPage:title` needs neither: it renders through `AdwWindowTitle`,
 //! whose labels declare no `use-markup` and so are plain text.
 //!
-//! `adw::Toast:title` is the odd one out in this census, not because it needs
-//! a third mechanism but because it needs **none**: Adw-1.gir documents that
-//! toast titles use Pango markup by default, but the one caller
-//! ([`toast`]) never puts wire text there — its argument is a GIO error's own
-//! message, not a string the hive or an agent wrote (#1147 review, NIT N4).
+//! `adw::Toast:title` uses Pango markup by default. A toast could switch it
+//! off (its label is only created when the toast is shown, with `use-markup`
+//! bound first), but the crate's one rule for toasts is to escape, so the one
+//! caller ([`toast`]) goes through `crate::markup::toast` (#1564). Its
+//! argument is **not** only a GIO message: `launch_detached` returns
+//! `systemd-run`'s stderr when the helper starts but the unit fails, and #1147
+//! review NIT N4 wrongly called that safe.
 //!
 //! # Why the poll is a `glib` timer and not a task
 //!
@@ -1447,7 +1455,7 @@ fn open_agent_page(state: &AgentsState) {
 /// over the tab that launched it, and the tab is built (and tested) without a
 /// window at all.
 fn toast(state: &AgentsState, text: &str) {
-    state.toasts.add_toast(adw::Toast::new(text));
+    state.toasts.add_toast(crate::markup::toast(text));
 }
 
 /// How the tab reaches the world outside this process — injected so a GTK test
@@ -1899,15 +1907,16 @@ fn render_unassigned(state: &AgentsState, rows: &[Approval]) {
 
     let mut tracked = state.unassigned_rows.borrow_mut();
     for a in rows {
-        let row = adw::ActionRow::builder()
-            .title(a.kind.human())
-            .subtitle(unassigned_subtitle(a))
-            // The subtitle carries the manager's own free text
-            // (`detail_line`) plus this tab's own sentence — never markup,
-            // the module doc's rule for every hive-sourced string.
-            .use_markup(false)
-            .subtitle_selectable(true)
-            .build();
+        // The subtitle carries the manager's own free text (`detail_line`)
+        // plus this tab's own sentence — never markup, the module doc's rule
+        // for every hive-sourced string. Markup goes off before the row holds
+        // any text: this group is rebuilt every poll, and a label handed a
+        // hostile string while markup is still on logs a warning each time
+        // (#1564).
+        let row = adw::ActionRow::builder().subtitle_selectable(true).build();
+        crate::markup::plain_text(&row);
+        row.set_title(&a.kind.human());
+        row.set_subtitle(&unassigned_subtitle(a));
         row.set_subtitle_lines(3);
         state.unassigned_group.add(&row);
         tracked.push(row);
@@ -2131,14 +2140,14 @@ fn set_placeholder(state: &AgentsState, title: &str, detail: &str) {
     clear_rows(state);
     clear_selection(state);
     let row = adw::ActionRow::builder()
-        .title(title)
-        .subtitle(detail)
         .activatable(false)
         .selectable(false)
-        // The subtitle is the client's reason plus the socket path. See the
-        // module doc's rule.
-        .use_markup(false)
         .build();
+    // The subtitle is the client's reason plus the socket path. See the
+    // module doc's rule: markup off before the text is set (#1564).
+    crate::markup::plain_text(&row);
+    row.set_title(title);
+    row.set_subtitle(detail);
     row.set_subtitle_lines(3);
     state.list.append(&row);
     state.rows.borrow_mut().push(row.upcast());
@@ -3830,10 +3839,10 @@ mod gtk_tests {
     ///
     /// Mutations (run, verified red): drop `.use_markup(false)` from
     /// `build_agent_row` (the sidebar assertion reds), from the fact rows (the
-    /// fact assertion reds), from `link_row` (the link assertion reds), from
-    /// the placeholder row (its assertion reds), and drop the
-    /// `markup_escape_text` in `set_placeholder` (the status-page assertion
-    /// reds).
+    /// fact assertion reds), from `link_row` (the link assertion reds), drop
+    /// the `plain_text` call on the placeholder row (its assertion reds), and
+    /// drop the `markup_escape_text` in `set_placeholder` (the status-page
+    /// assertion reds).
     #[gtk::test]
     fn wire_text_is_never_parsed_as_markup() {
         let (bin, state) = build_tab(cfg());
@@ -3903,6 +3912,77 @@ mod gtk_tests {
             .expect("the placeholder is an ActionRow");
         assert!(!placeholder.uses_markup());
         assert_eq!(placeholder.subtitle().as_deref(), Some(expected.as_str()));
+        dismiss(&window);
+    }
+
+    /// **…and none of it is parsed even once on the way in.** A label parses
+    /// markup the moment it is handed text, so a row whose builder carried the
+    /// hive's string and switched markup off afterwards still logged `Gtk-WARNING
+    /// … from markup` per build — once per poll for the unassigned approvals,
+    /// which are rebuilt every tick (#1564). The child drives every row
+    /// [`wire_text_is_never_parsed_as_markup`] does plus an unassigned
+    /// approval, all with a hostile string, and the parent asserts the child's
+    /// stderr carries no such warning (`crate::markup::gtk_tests` proves the
+    /// capture sees one when it is there).
+    ///
+    /// Falsified by putting the text back on the builder of either the
+    /// unassigned row (`render_unassigned`) or the placeholder row
+    /// (`set_placeholder`).
+    #[gtk::test]
+    fn hostile_wire_text_logs_no_markup_warning() {
+        use crate::markup::test_support::{MARKUP_WARNING, child_output, in_child};
+        if in_child() {
+            return;
+        }
+        let out = child_output("agents_tab::gtk_tests::hostile_wire_text_child");
+        assert!(
+            !out.contains(MARKUP_WARNING),
+            "building the tab's rows logged a markup warning: {out}"
+        );
+    }
+
+    /// Child body of [`hostile_wire_text_logs_no_markup_warning`]: only runs
+    /// when that test re-executes the binary on it.
+    #[gtk::test]
+    fn hostile_wire_text_child() {
+        if !crate::markup::test_support::in_child() {
+            return;
+        }
+        let (bin, state) = build_tab(cfg());
+        let window = present(&bin, 900);
+        let hostile = "R&D <b>done</b>";
+        on_status(
+            &state,
+            &Ok(Response {
+                version: HOST_SOCK_VERSION,
+                ok: true,
+                agent_statuses: Some(vec![AgentStatusRow {
+                    status_text: Some(hostile.to_owned()),
+                    url: Some("https://hive.example/a/argus?tab=turns&full=1".to_owned()),
+                    ..row("argus")
+                }]),
+                ..Response::default()
+            }),
+        );
+        pump();
+        apply_unassigned(
+            &state,
+            Some(Ok(vec![approval(1, hostile, ApprovalStatus::Pending)])),
+        );
+        pump();
+        assert_eq!(
+            unassigned_row_text(&state).len(),
+            1,
+            "the hostile approval must have been built as a row"
+        );
+        on_status(
+            &state,
+            &Err(HiveError::Unreachable {
+                reason: hostile.to_owned(),
+            }),
+        );
+        pump();
+        assert_eq!(state.view.get(), AgentsView::Placeholder);
         dismiss(&window);
     }
 
@@ -4084,6 +4164,40 @@ mod gtk_tests {
             state.probe.borrow_mut().available(),
             agent_window::on_path(),
             "the pinned probe survived a launch that proved it wrong"
+        );
+        dismiss(&window);
+    }
+
+    /// #1564: the launch-failure toast carries the launcher's own error text
+    /// (possibly `systemd-run`'s stderr), and toast titles are Pango markup,
+    /// so an `&` or `<` in it must display literally rather than blank it.
+    ///
+    /// Falsified by making `toast` build `adw::Toast::new(text)` unescaped.
+    #[gtk::test]
+    fn a_failed_launch_toast_shows_the_error_literally() {
+        let (bin, state) = build_tab(cfg());
+        let window = present(&bin, 900);
+        let hostile = "Tom & <b>Jerry</b>";
+        let _seen = record(&state, Err(hostile.to_owned()));
+        *state.probe.borrow_mut() = agent_window::Probe::fixed(true);
+        on_status(
+            &state,
+            &Ok(Response {
+                version: HOST_SOCK_VERSION,
+                ok: true,
+                agent_statuses: Some(vec![AgentStatusRow {
+                    url: Some("https://hive.example/a/argus".to_owned()),
+                    ..row("argus")
+                }]),
+                ..Response::default()
+            }),
+        );
+        pump();
+        adw::prelude::ActionRowExt::activate(&state.detail.agent_page);
+        pump();
+        crate::markup::test_support::assert_shows(
+            &state.toasts,
+            &format!("Could not open the agent window: {hostile}"),
         );
         dismiss(&window);
     }

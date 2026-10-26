@@ -590,8 +590,8 @@ fn build_form(ops: FamilyOps, env: &Rc<xdg::Env>, spec: Spec) -> Form {
     let mut table_of_group: Option<Option<&str>> = None;
     if let Some((title, description)) = &spec.single_group {
         let group = adw::PreferencesGroup::builder()
-            .title(title.as_str())
-            .description(description.as_str())
+            .title(crate::markup::escape(title))
+            .description(crate::markup::escape(description))
             .build();
         group.add(&banner);
         groups.push(group);
@@ -1519,7 +1519,9 @@ fn widgets_for(
                 )
             }
             Kind::List(_) | Kind::Map(_) => {
-                let row = adw::ActionRow::builder().title(title).build();
+                let row = adw::ActionRow::new();
+                crate::markup::plain_text(&row);
+                row.set_title(title);
                 // Activatable since #888 P2: the row is the way into the
                 // entries, so it pushes a sub-page (`collection::activate`).
                 row.set_activatable(true);
@@ -3703,6 +3705,92 @@ mod gtk_tests {
             form.inner.banner.subtitle()
         );
         assert!(!sensitive(&form, "flag"), "nothing is offered for editing");
+    }
+
+    /// #1564: a sub-page's group title is a map key or record title from
+    /// config, and `AdwPreferencesGroup`'s title label is hardcoded markup.
+    ///
+    /// Falsified by passing `title` unescaped to the group builder.
+    #[gtk::test]
+    fn a_group_title_from_config_shows_literally() {
+        let scratch = Scratch::new();
+        let ops = fixture_ops();
+        let form = build_form(
+            ops,
+            &scratch.env(),
+            Spec {
+                subject: Subject::Leaves {
+                    prefix: String::new(),
+                },
+                fields: ops.family.schema.fields,
+                single_group: Some(("Tom & <b>Jerry</b>".to_owned(), "Mail & Chat".to_owned())),
+                polls: false,
+            },
+        );
+        let group = &form.groups()[0];
+        crate::markup::test_support::assert_shows(group, "Tom & <b>Jerry</b>");
+        crate::markup::test_support::assert_shows(group, "Mail & Chat");
+    }
+
+    /// #1564: a List/Map row's subtitle is `summarise(...)` over config
+    /// values; an `&` in one blanked it.
+    ///
+    /// Falsified by dropping `plain_text` from the Collection row.
+    #[gtk::test]
+    fn a_collection_summary_with_markup_characters_shows_literally() {
+        let scratch = Scratch::new();
+        let form = fixture_form(&scratch, Some("order = [\"Mail & Chat\", \"<b>x</b>\"]\n"));
+        let Control::Collection(row) = &row_of(&form, "order").control else {
+            panic!("a list is a collection row");
+        };
+        let shown = row.subtitle().expect("a summary").to_string();
+        assert!(shown.contains("Mail & Chat"), "{shown:?}");
+        crate::markup::test_support::assert_shows(row, &shown);
+    }
+
+    /// #1564 end to end: a map key and a record's name come from the config
+    /// file, travel through the drill-down (`collection.rs`'s map/records
+    /// rows, then `entry_page`/`record_page`'s `single_group`) and land in a
+    /// group title, which is hardcoded markup. Both hops must show them
+    /// literally.
+    ///
+    /// Falsified by passing `title` unescaped at `build_form`'s single-group
+    /// builder.
+    #[gtk::test]
+    fn a_hostile_map_key_and_record_name_show_literally_through_the_drill_down() {
+        let hostile = "Tom & <b>Jerry</b>";
+        let escaped = crate::markup::escape(hostile);
+
+        let scratch = Scratch::new();
+        let page = mounted(
+            &scratch,
+            Some(
+                "items = [{ id = \"Tom & <b>Jerry</b>\", exec = \"a && b\" }]\n\n\
+                 [entry.\"Tom & <b>Jerry</b>\"]\nname = \"x\"\n",
+            ),
+        );
+
+        page.open("entry");
+        let row: adw::ActionRow = page.find(&escaped).expect("the entry is listed");
+        crate::markup::test_support::assert_shows(&row, hostile);
+        page.activate_row(&escaped);
+        assert_eq!(
+            page.title(),
+            hostile,
+            "the entry page is titled for the entry"
+        );
+        let group = page.widgets::<adw::PreferencesGroup>().remove(0);
+        crate::markup::test_support::assert_shows(&group, hostile);
+        page.back();
+        page.back();
+
+        page.open("items");
+        let row: adw::ActionRow = page.find(&escaped).expect("the record is listed");
+        crate::markup::test_support::assert_shows(&row, hostile);
+        crate::markup::test_support::assert_shows(&row, "id = Tom & <b>Jerry</b>, exec = a && b");
+        page.activate_row(&escaped);
+        let group = page.widgets::<adw::PreferencesGroup>().remove(0);
+        crate::markup::test_support::assert_shows(&group, hostile);
     }
 
     // ── The real families, as the tab mounts them ───────────────────────────

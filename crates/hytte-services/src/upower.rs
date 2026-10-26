@@ -359,8 +359,10 @@ fn warning_toast(baseline: Option<WarningLevel>, next: WarningLevel) -> Option<U
 #[derive(Debug, PartialEq)]
 struct WarningToast {
     summary: &'static str,
-    /// `"N% remaining"`, or empty when `Percentage` has not loaded yet — the
-    /// toast renders a summary-only card rather than claiming `0%`.
+    /// `"N% remaining"`, or empty when the toast was held for
+    /// [`PERCENTAGE_HOLD`] and `Percentage` still had not loaded. An empty
+    /// body gives a summary-only card (the toast overlay draws no body line
+    /// for it), so it reads "Battery low" rather than claiming a figure.
     body: String,
     urgency: Urgency,
 }
@@ -388,9 +390,62 @@ struct WarningToast {
 struct WarningWatch {
     /// The last level `UPower` reported; `None` until it has reported one.
     baseline: Option<WarningLevel>,
+    /// A rising edge seen while `Percentage` was still `Loading`: the toast is
+    /// held here and posted by the first `observe` that has the number
+    /// (#1559), because a card that says "Battery low" with no figure is
+    /// never revised once the figure arrives. The hold is bounded:
+    /// [`run_warning_watch`] posts it without a body through [`Self::expire`]
+    /// once [`PERCENTAGE_HOLD`] has passed, since a `Percentage` whose `Get`
+    /// keeps failing stays `Loading` for as long as it fails.
+    pending: Option<Held>,
+}
+
+/// A toast [`WarningWatch`] is holding for `Percentage`.
+#[derive(Clone, Copy, Debug)]
+struct Held {
+    /// The level the toast will announce: the latest one, raised by a further
+    /// rise and lowered by a partial fall.
+    level: WarningLevel,
+    /// The tier the level stood at just before the edge that started the
+    /// hold. Nobody has been told about anything above it, so a fall that
+    /// stays above it still owes a toast and only a fall to it ends the hold.
+    floor: u8,
+}
+
+/// How long a held low-battery toast waits for `Percentage` before it is
+/// posted without one.
+///
+/// When both `Get`s work they land one system-bus round trip apart, so a held
+/// toast normally waits milliseconds. When `Percentage`'s first `Get` fails,
+/// `hytte_bus` retries it on its ramp (250 ms, 500 ms, 1 s, 2 s, …, capped at
+/// 30 s) and never gives up, leaving it `Loading` the whole time. Five seconds
+/// covers the first four retries (3.75 s of waiting plus their round trips),
+/// and it matches `hytte_bus`'s own line between a blip and an outage
+/// (`STREAK_IS_NO_LONGER_A_BLIP`, about 4 s of failures). Past that the figure
+/// is not coming soon, and a low-battery warning must not wait on it: five
+/// seconds is nothing against the minutes between `UPower`'s warning levels.
+const PERCENTAGE_HOLD: Duration = Duration::from_secs(5);
+
+/// The toast for a held level, or `None` for a level that is not a warning.
+fn toast_for(held: WarningLevel, body: String) -> Option<WarningToast> {
+    let urgency = warning_toast(Some(WarningLevel::Unknown), held)?;
+    let summary = match held {
+        WarningLevel::Critical | WarningLevel::Action => "Battery critical",
+        _ => "Battery low",
+    };
+    Some(WarningToast {
+        summary,
+        body,
+        urgency,
+    })
 }
 
 impl WarningWatch {
+    /// The hold ran out: post the held toast without a body, if one is held.
+    fn expire(&mut self) -> Option<WarningToast> {
+        toast_for(self.pending.take()?.level, String::new())
+    }
+
     /// Feed one combined emission; returns the toast to post, if any.
     ///
     /// `percentage` only shapes the body. It is read as its own state rather
@@ -406,49 +461,89 @@ impl WarningWatch {
             return None;
         };
         let level = WarningLevel::from_u32(*raw);
-        let urgency = warning_toast(self.baseline, level);
+        let prev = self.baseline;
+        let edge = warning_toast(prev, level);
         self.baseline = Some(level);
-        let urgency = urgency?;
-        let summary = match level {
-            WarningLevel::Critical | WarningLevel::Action => "Battery critical",
-            _ => "Battery low",
+        if edge.is_some() {
+            // A further rise keeps the floor the hold started from.
+            let floor = self
+                .pending
+                .map_or_else(|| prev.map_or(0, warning_tier), |held| held.floor);
+            self.pending = Some(Held { level, floor });
+        } else if let Some(held) = self.pending
+            && warning_tier(level) < warning_tier(held.level)
+        {
+            // The level fell back before the percentage arrived. A fall to
+            // where the hold started (charger plugged in) ends the condition
+            // it announced; a partial fall, Critical easing back to Low, still
+            // leaves a warning nobody has been told about, at the lower level.
+            self.pending = (warning_tier(level) > held.floor).then_some(Held {
+                level,
+                floor: held.floor,
+            });
+        }
+        let (PropState::Loaded(p) | PropState::Stale(p)) = percentage else {
+            return None;
         };
-        let body = match percentage {
-            PropState::Loaded(p) | PropState::Stale(p) => format!("{p:.0}% remaining"),
-            PropState::Loading => String::new(),
-        };
-        Some(WarningToast {
-            summary,
-            body,
-            urgency,
-        })
+        toast_for(self.pending.take()?.level, format!("{p:.0}% remaining"))
     }
 }
 
 /// Drive a [`WarningWatch`] off the two property signals and hand each toast
 /// it decides on to `post`. Returns when either signal ends.
 ///
+/// It also owns the hold's clock: a toast [`WarningWatch`] is holding for
+/// `Percentage` is posted without a body once [`PERCENTAGE_HOLD`] has passed
+/// since the edge, unless an emission posted or dropped it first.
+///
 /// The signals and the sink are injected so the tests run the production
-/// fold — the combination, the ordering, the seed — without a bus or the
-/// notifications daemon.
+/// fold — the combination, the ordering, the seed, the hold — without a bus
+/// or the notifications daemon.
 async fn run_warning_watch<L, P, Post>(level: L, percentage: P, mut post: Post)
 where
     L: Signal<Item = PropState<u32>>,
     P: Signal<Item = PropState<f64>>,
     Post: FnMut(WarningToast),
 {
+    use futures_util::StreamExt;
+
     let mut watch = WarningWatch::default();
-    map_ref! {
+    let states = map_ref! {
         let level = level,
         let percentage = percentage => (level.clone(), percentage.clone())
     }
-    .for_each(move |(level, percentage)| {
+    .to_stream();
+    let mut states = std::pin::pin!(states);
+    let mut deadline: Option<tokio::time::Instant> = None;
+    loop {
+        let next = match deadline {
+            Some(at) => {
+                if let Ok(next) = tokio::time::timeout_at(at, states.next()).await {
+                    next
+                } else {
+                    deadline = None;
+                    if let Some(toast) = watch.expire() {
+                        post(toast);
+                    }
+                    continue;
+                }
+            }
+            None => states.next().await,
+        };
+        let Some((level, percentage)) = next else {
+            return;
+        };
         if let Some(toast) = watch.observe(&level, &percentage) {
             post(toast);
         }
-        std::future::ready(())
-    })
-    .await;
+        // Armed by the edge that starts a hold and kept while the held level
+        // is raised or lowered, so the bound runs from the first edge.
+        if watch.pending.is_none() {
+            deadline = None;
+        } else if deadline.is_none() {
+            deadline = Some(tokio::time::Instant::now() + PERCENTAGE_HOLD);
+        }
+    }
 }
 
 /// Watch `UPower`'s `WarningLevel` for rising edges and self-post a toast via
@@ -563,14 +658,15 @@ pub fn on_battery_now() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        UpowerShared, Urgency, WarningLevel, WarningToast, WarningWatch, is_critical,
-        on_battery_snapshot, run_warning_watch, warning_toast,
+        PERCENTAGE_HOLD, UpowerShared, Urgency, WarningLevel, WarningToast, WarningWatch,
+        is_critical, on_battery_snapshot, run_warning_watch, warning_toast,
     };
     use futures_signals::signal::Mutable;
     use hytte_bus::PropState;
     use hytte_reactive::test_lock::TEST_LOCK;
     use hytte_reactive::{registry, shared};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     /// Everything about the battery-aware cadence snapshot (#505), in **one**
     /// test on purpose: `hytte_reactive::shared` is a process-global map, so
@@ -802,10 +898,14 @@ mod tests {
         assert_eq!(watch.observe(&PropState::Loaded(LOW), &pct), None);
     }
 
-    /// `WarningLevel` can land before `Percentage`; the body must not then
-    /// claim `0% remaining` off the unloaded default.
+    /// `WarningLevel` can land before `Percentage`: the toast is held until
+    /// the percentage loads, then posted once with its body (#1559). Before,
+    /// it went out with an empty body and was never filled in.
+    ///
+    /// Falsifiable: posting on the edge (the old behaviour) fails the first
+    /// `None`; dropping the held edge fails the `Some`.
     #[test]
-    fn the_body_omits_a_percentage_that_has_not_loaded() {
+    fn a_toast_waits_for_a_percentage_that_has_not_loaded() {
         let mut watch = WarningWatch::default();
         assert_eq!(
             watch.observe(&PropState::Loaded(NONE), &PropState::Loading),
@@ -813,13 +913,157 @@ mod tests {
         );
         assert_eq!(
             watch.observe(&PropState::Loaded(LOW), &PropState::Loading),
+            None,
+            "held, not posted bodiless"
+        );
+        assert_eq!(
+            watch.observe(&PropState::Loaded(LOW), &PropState::Loaded(14.4)),
             Some(WarningToast {
                 summary: "Battery low",
-                body: String::new(),
+                body: "14% remaining".to_string(),
                 urgency: Urgency::Normal,
             })
         );
+        assert_eq!(
+            watch.observe(&PropState::Loaded(LOW), &PropState::Loaded(14.0)),
+            None,
+            "posted once"
+        );
+    }
 
+    /// A held toast whose condition ended before the percentage arrived is
+    /// dropped, not posted late.
+    #[test]
+    fn a_held_toast_is_dropped_if_the_level_recovers() {
+        let mut watch = WarningWatch::default();
+        watch.observe(&PropState::Loaded(NONE), &PropState::Loading);
+        assert_eq!(
+            watch.observe(&PropState::Loaded(LOW), &PropState::Loading),
+            None
+        );
+        assert_eq!(
+            watch.observe(&PropState::Loaded(NONE), &PropState::Loading),
+            None
+        );
+        assert_eq!(
+            watch.observe(&PropState::Loaded(NONE), &PropState::Loaded(80.0)),
+            None
+        );
+    }
+
+    /// A held Critical that eases back to Low before the percentage lands: the
+    /// battery is still Low and nobody has been told, so a Low toast is still
+    /// owed. Only a fall to where the hold started ends the condition (#1574
+    /// review).
+    ///
+    /// Falsifiable: dropping the hold on any fall posts nothing in the first
+    /// half; downgrading without the floor posts a repeat Low in the second.
+    #[test]
+    fn a_held_critical_that_eases_to_low_still_warns_low() {
+        let mut watch = WarningWatch::default();
+        watch.observe(&PropState::Loaded(NONE), &PropState::Loading);
+        watch.observe(&PropState::Loaded(CRITICAL), &PropState::Loading);
+        watch.observe(&PropState::Loaded(LOW), &PropState::Loading);
+        assert_eq!(
+            watch
+                .observe(&PropState::Loaded(LOW), &PropState::Loaded(6.0))
+                .map(|t| (t.summary, t.urgency)),
+            Some(("Battery low", Urgency::Normal))
+        );
+
+        // A hold that started from Low owes nothing once it is back at Low:
+        // the user already lives with Low (a silent seed, or an earlier toast).
+        let mut watch = WarningWatch::default();
+        watch.observe(&PropState::Loaded(LOW), &PropState::Loading);
+        watch.observe(&PropState::Loaded(CRITICAL), &PropState::Loading);
+        watch.observe(&PropState::Loaded(LOW), &PropState::Loading);
+        assert_eq!(
+            watch.observe(&PropState::Loaded(LOW), &PropState::Loaded(6.0)),
+            None
+        );
+    }
+
+    /// The held level is the toast's severity: Low held, then Critical before
+    /// the percentage arrives, posts one critical toast.
+    #[test]
+    fn a_held_toast_posts_at_the_latest_severity() {
+        let mut watch = WarningWatch::default();
+        watch.observe(&PropState::Loaded(NONE), &PropState::Loading);
+        watch.observe(&PropState::Loaded(LOW), &PropState::Loading);
+        watch.observe(&PropState::Loaded(CRITICAL), &PropState::Loading);
+        assert_eq!(
+            watch
+                .observe(&PropState::Loaded(CRITICAL), &PropState::Loaded(4.0))
+                .map(|t| (t.summary, t.urgency)),
+            Some(("Battery critical", Urgency::Critical))
+        );
+    }
+
+    /// A held toast must not wait for ever. `Percentage` stays `Loading` for
+    /// as long as its `Get` keeps failing (`hytte_bus` retries it on a ramp and
+    /// never gives up), and that is the one realistic way to reach the hold:
+    /// when both `Get`s work they land milliseconds apart, too soon for the
+    /// level to rise in between. The warning must still go out, without the
+    /// figure, once the hold runs out (#1574 review).
+    ///
+    /// Falsifiable: an unbounded hold posts nothing; a bound shorter than
+    /// `PERCENTAGE_HOLD` posts before the first check.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_held_toast_still_posts_when_the_percentage_never_loads() {
+        let level = Mutable::new(PropState::<u32>::Loading);
+        let pct = Mutable::new(PropState::<f64>::Loading);
+        let posted: Arc<Mutex<Vec<WarningToast>>> = Arc::new(Mutex::new(Vec::new()));
+        let task = {
+            let posted = posted.clone();
+            tokio::spawn(run_warning_watch(
+                level.signal_cloned(),
+                pct.signal_cloned(),
+                move |toast| posted.lock().unwrap().push(toast),
+            ))
+        };
+        let settle = || async {
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+        };
+        level.set(PropState::Loaded(NONE));
+        settle().await;
+        level.set(PropState::Loaded(LOW));
+        settle().await;
+
+        // The test's own sleeps let the paused clock auto-advance; each one
+        // ends at its own deadline, so the watcher's timer fires only once it
+        // is due, and `settle` lets it run before anything is asserted.
+        tokio::time::sleep(PERCENTAGE_HOLD.saturating_sub(Duration::from_millis(1))).await;
+        settle().await;
+        assert!(
+            posted.lock().unwrap().is_empty(),
+            "still holding for the figure just before the bound"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        settle().await;
+        assert_eq!(
+            *posted.lock().unwrap(),
+            vec![WarningToast {
+                summary: "Battery low",
+                body: String::new(),
+                urgency: Urgency::Normal,
+            }],
+            "past the bound the warning goes out without a figure rather than not at all"
+        );
+
+        // A percentage that lands later does not post a second card.
+        pct.set(PropState::Loaded(9.0));
+        settle().await;
+        assert_eq!(posted.lock().unwrap().len(), 1);
+
+        drop(level);
+        drop(pct);
+        task.await.expect("watcher task panicked");
+    }
+
+    #[test]
+    fn the_body_carries_a_loaded_percentage() {
         let mut watch = WarningWatch::default();
         assert_eq!(
             watch.observe(&PropState::Loaded(NONE), &PropState::Loaded(9.6)),

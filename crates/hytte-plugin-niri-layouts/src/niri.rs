@@ -321,9 +321,11 @@ pub(crate) fn apply(
 /// would act on a workspace that never lost focus (see [`restore_focus`] for why
 /// that is not harmless).
 ///
-/// Mirrored in `hytte-services`' `niri.rs` as `reflow_plan` (#1517), which
-/// cannot share this code: the shell never links this plugin crate. Keep the
-/// two in step.
+/// Mirrored in `hytte-services`' `niri.rs` as `reflow_over` (#1516, #1517),
+/// which sends the same chain and puts back the same two things, and cannot
+/// share this code: the shell never links this plugin crate. Keep the two in
+/// step. (The target, the first tiled column, is picked there by
+/// `reflow_plan` and here by `apply`'s `plan.first()`.)
 fn reflow(
     transport: &mut impl Transport,
     first_id: u64,
@@ -1350,7 +1352,7 @@ mod tests {
     // ── Post-resize niri reflow nudge (#1129) ───────────────────────────────
 
     /// The chain `apply` sends after resizing columns, mirroring
-    /// `hytte_services::niri::reflow_plan`'s verified sequence: focus the
+    /// `hytte_services::niri::reflow_over`'s verified sequence: focus the
     /// leftmost column, move it to the end and back to the start twice, then
     /// restore whatever window was actually focused before `apply` ran — not
     /// the window the nudge itself focused.

@@ -16,7 +16,7 @@ use hytte::services::{dnd, notifications, notifications_mute};
 
 use crate::components::format::truncate_for_row;
 use crate::components::layout::{finish_page, page_box};
-use crate::components::notif_actions;
+use crate::components::{markup, notif_actions};
 
 pub fn panel_notifications() -> gtk::Widget {
     let column = page_box();
@@ -202,9 +202,18 @@ fn build_history_app_row_shell(
     app: &str,
     entries: &[&notifications::HistoryEntry],
 ) -> adw::ExpanderRow {
-    let row = adw::ExpanderRow::builder()
-        .title(truncate_for_row(app))
-        .build();
+    let row = adw::ExpanderRow::new();
+    // Title and subtitle are both sender text — the `app_name` and the latest
+    // `summary` straight off a `Notify` call — and `AdwExpanderRow` parses
+    // them as Pango markup by default: `notify-send "Tom & Jerry" x` rendered
+    // a blank row, `notify-send "<b>hi</b>" x` a bold one. The spec's summary
+    // is plain text, and this daemon advertises no `body-markup`, so markup
+    // goes off for the whole row (#753's idiom, `components::markup`) —
+    // *before* the title is set: the result is the same either way, but a
+    // label handed `Tom & Jerry` while markup is still on logs a Gtk-WARNING
+    // for the failed parse, once per row per history rebuild.
+    markup::plain_text(&row);
+    row.set_title(&truncate_for_row(app));
     // The freedesktop `app_name` is free text sent by whatever is posting
     // notifications — capped (see `truncate_for_row`) rather than letting it
     // push the whole drawer wider (#1302); `title_lines(1)` is a second line
@@ -232,9 +241,13 @@ fn build_history_app_row_shell(
 }
 
 fn build_history_action_row(entry: &notifications::HistoryEntry) -> adw::ActionRow {
-    let row = adw::ActionRow::builder()
-        .title(truncate_for_row(&entry.summary))
-        .build();
+    let row = adw::ActionRow::new();
+    // Summary (title) and stripped body (subtitle) are sender text, rendered
+    // literally — same reason, and same before-the-title order, as
+    // `build_history_app_row_shell`'s row: an `&` anywhere blanked the field,
+    // a tag was obeyed (#753).
+    markup::plain_text(&row);
+    row.set_title(&truncate_for_row(&entry.summary));
     // The summary is a single-line freedesktop field with no bound — capped
     // (see `truncate_for_row`) rather than letting it push the whole drawer
     // wider (#1302); `title_lines(1)` is a second line of defense. The body
@@ -591,5 +604,97 @@ mod width_tests {
             tooltip.contains(&far_over),
             "tooltip must carry the full, untruncated body, got {tooltip:?}"
         );
+    }
+}
+
+/// The history rows render sender text **literally** (#753's rule, applied to
+/// the one surface it had missed). Asserted on what the row's own `GtkLabel`s
+/// actually display — `Label::text()` is the text after Pango has parsed the
+/// markup — rather than on the `use-markup` flag, so the test pins the user-
+/// visible symptom: with markup on, `"Tom & Jerry"` fails to parse and the
+/// label shows nothing, and `"<b>hi</b>"` shows `hi`.
+///
+/// Falsified by deleting either `markup::plain_text` call in this file.
+/// Needs a display server to construct the rows, hence the `system-tests`
+/// gate.
+#[cfg(all(test, feature = "system-tests"))]
+mod markup_tests {
+    use hytte::adw::{self, prelude::*};
+    use hytte::gtk;
+    use hytte::services::notifications::{HistoryEntry, Urgency};
+
+    use super::{build_history_action_row, build_history_app_row_shell};
+
+    fn entry(summary: &str, body: &str) -> HistoryEntry {
+        HistoryEntry {
+            id: 1,
+            app_name: "Firefox".to_string(),
+            app_icon: String::new(),
+            summary: summary.to_string(),
+            body: body.to_string(),
+            urgency: Urgency::Normal,
+            image: None,
+            actions: Vec::new(),
+            reason: 2,
+            created_at: 0,
+            dismissed_at: 0,
+        }
+    }
+
+    /// Every `GtkLabel` under `root` — the row's title/subtitle labels live in
+    /// libadwaita's template, so walk for them rather than name them.
+    fn label_texts(root: &gtk::Widget) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(w) = stack.pop() {
+            if let Some(label) = w.downcast_ref::<gtk::Label>() {
+                out.push(label.text().to_string());
+            }
+            let mut child = w.first_child();
+            while let Some(c) = child {
+                child = c.next_sibling();
+                stack.push(c);
+            }
+        }
+        out
+    }
+
+    fn assert_shows(root: &impl IsA<gtk::Widget>, literal: &str) {
+        let texts = label_texts(root.upcast_ref());
+        assert!(
+            texts.iter().any(|t| t == literal),
+            "no label displays {literal:?} literally — the row parsed it as Pango markup; \
+             labels show {texts:?}"
+        );
+    }
+
+    /// `notify-send "Tom & Jerry" "Fish & Chips"`: an unescaped `&` is a
+    /// markup parse error, which blanked both fields of the entry row.
+    #[gtk::test]
+    fn history_entry_row_shows_an_ampersand_literally() {
+        adw::init().expect("libadwaita init");
+        let row = build_history_action_row(&entry("Tom & Jerry", "Fish & Chips"));
+        assert_shows(&row, "Tom & Jerry");
+        assert_shows(&row, "Fish & Chips");
+    }
+
+    /// `notify-send "<b>hi</b>" "<i>there</i>"`: a tag is shown, not obeyed.
+    #[gtk::test]
+    fn history_entry_row_shows_a_tag_as_text() {
+        adw::init().expect("libadwaita init");
+        let row = build_history_action_row(&entry("<b>hi</b>", "<i>there</i>"));
+        assert_shows(&row, "<b>hi</b>");
+        assert_shows(&row, "<i>there</i>");
+    }
+
+    /// The per-app expander: its title is the sender's `app_name`, its
+    /// subtitle the latest `summary` — both sender text, both literal.
+    #[gtk::test]
+    fn history_app_row_shows_app_name_and_summary_literally() {
+        adw::init().expect("libadwaita init");
+        let e = entry("<b>Fish & Chips</b>", "");
+        let row = build_history_app_row_shell("Tom & Jerry", &[&e]);
+        assert_shows(&row, "Tom & Jerry");
+        assert_shows(&row, "<b>Fish & Chips</b>");
     }
 }

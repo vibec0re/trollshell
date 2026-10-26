@@ -326,15 +326,16 @@ mod markup_tests {
 /// fed by the pointer. Its input type is private to `hytte-reactive`, so a test
 /// in this crate cannot hand it a press the way `hytte-reactive`'s own display
 /// tests do. These send one instead: `XTest` input into the `xvfb-run` display
-/// through `xdotool`, the route `plugins::region`'s press-tracker tests take
-/// (#1413), so the press, the drag and the release go down GTK's own dispatch
-/// to the controller the binding installed, as a user's would.
+/// through `xdotool`, with `test_support::real_pointer`, the helpers
+/// `plugins::region`'s press-tracker tests use too (#1413), so the press, the
+/// drag and the release go down GTK's own dispatch to the controller the
+/// binding installed, as a user's would.
 ///
-/// They need a display and `xdotool`; see `real_pointer_or_skip` for when a
-/// missing `xdotool` fails rather than skips.
+/// They need a display and `xdotool`; see `real_pointer::available_or_skip` for
+/// when a missing `xdotool` fails rather than skips.
 #[cfg(all(test, feature = "system-tests"))]
 mod slider_tests {
-    use std::cell::{Cell, RefCell};
+    use std::cell::RefCell;
     use std::rc::Rc;
     use std::time::{Duration, Instant};
 
@@ -344,50 +345,7 @@ mod slider_tests {
     use hytte::services::brightness::Brightness;
 
     use super::brightness_slider_from;
-
-    /// Whether this test can drive real pointer input: `xdotool` on `PATH` and
-    /// GTK on an X11 display. A copy of `plugins::region`'s gate, honouring the
-    /// same `TROLLSHELL_REQUIRE_XDOTOOL`: CI's `system-tests` check carries
-    /// `xdotool` and exports the variable, so a skip there is a failure, while a
-    /// bare local run without `xdotool` skips.
-    fn real_pointer_or_skip(test_name: &str) -> bool {
-        use std::process::{Command, Stdio};
-
-        let xdotool = Command::new("xdotool")
-            .arg("version")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success());
-        let on_x11 = gtk::gdk::Display::default()
-            .is_some_and(|display| display.type_().name() == "GdkX11Display");
-        if xdotool && on_x11 {
-            return true;
-        }
-        let reason = if xdotool {
-            "GTK is not on an X11 display, and xdotool drives X11 only"
-        } else {
-            "xdotool is not on PATH"
-        };
-        let required =
-            std::env::var_os("TROLLSHELL_REQUIRE_XDOTOOL").is_some_and(|want| want == "1");
-        assert!(
-            !required,
-            "TROLLSHELL_REQUIRE_XDOTOOL=1, but {reason} for {test_name}",
-        );
-        eprintln!("SKIPPED {test_name}: {reason}");
-        false
-    }
-
-    /// How long a wait below may take before it fails. A bound on a failure,
-    /// never a delay on a pass: every wait returns as soon as its condition
-    /// holds.
-    const DEADLINE: Duration = Duration::from_secs(10);
-
-    fn pump() {
-        while glib::MainContext::default().iteration(false) {}
-    }
+    use crate::test_support::real_pointer::{RealPointer, available_or_skip, wait_for};
 
     /// Iterate the main context for `span`, so a binding that would apply a
     /// value has had every chance to.
@@ -401,171 +359,23 @@ mod slider_tests {
         }
     }
 
-    /// Iterate the main context until `done`; panic naming `what` and
-    /// `report()` past [`DEADLINE`].
-    fn wait_for(what: &str, done: impl Fn() -> bool, report: impl Fn() -> String) {
-        let deadline = Instant::now() + DEADLINE;
-        let context = glib::MainContext::default();
-        while !done() {
-            assert!(
-                Instant::now() < deadline,
-                "{what} did not happen within {DEADLINE:?}: {}",
-                report(),
-            );
-            if !context.iteration(false) {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        }
-        pump();
-    }
-
-    fn xdotool(args: &[&str]) {
-        let status = std::process::Command::new("xdotool")
-            .args(args)
-            .status()
-            .expect("xdotool runs");
-        assert!(status.success(), "xdotool {args:?} failed: {status}");
-    }
-
-    /// Run `xdotool` for cleanup: no output, no status check, no panic.
-    fn xdotool_quiet(args: &[&str]) {
-        let _ = std::process::Command::new("xdotool")
-            .args(args)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    }
-
     fn close(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-6
     }
 
-    /// A slider on screen in its own window, and that window as `xdotool`
-    /// names it.
-    struct OnScreen {
-        window: gtk::Window,
-        slider: gtk::Scale,
-        xid: String,
-        /// The button presses and releases GTK has dispatched to the window.
-        presses: Rc<Cell<u32>>,
-        releases: Rc<Cell<u32>>,
-    }
-
-    impl OnScreen {
-        fn mount(slider: gtk::Scale) -> Self {
-            let title = format!("trollshell-brightness-slider-{}", std::process::id());
-            let window = gtk::Window::new();
-            window.set_title(Some(&title));
-            window.set_default_size(400, 60);
-            window.set_child(Some(&slider));
-
-            // Count presses and releases in the capture phase, so a step can
-            // wait for the input it sent rather than for a clock.
-            let presses = Rc::new(Cell::new(0_u32));
-            let releases = Rc::new(Cell::new(0_u32));
-            let counter = gtk::EventControllerLegacy::new();
-            counter.set_propagation_phase(gtk::PropagationPhase::Capture);
-            let counts = (Rc::clone(&presses), Rc::clone(&releases));
-            counter.connect_event(move |_, event| {
-                match event.event_type() {
-                    gtk::gdk::EventType::ButtonPress => counts.0.set(counts.0.get() + 1),
-                    gtk::gdk::EventType::ButtonRelease => counts.1.set(counts.1.get() + 1),
-                    _ => {}
-                }
-                glib::Propagation::Proceed
-            });
-            window.add_controller(counter);
-            window.present();
-
-            wait_for(
-                "the slider's layout",
-                || window.is_mapped() && slider.width() > 100,
-                || format!("mapped {}, width {}", window.is_mapped(), slider.width()),
-            );
-
-            let pattern = format!("^{title}$");
-            let found = RefCell::new(None);
-            wait_for(
-                "the slider's X window",
-                || {
-                    let out = std::process::Command::new("xdotool")
-                        .args(["search", "--onlyvisible", "--name", &pattern])
-                        .output()
-                        .expect("xdotool runs");
-                    *found.borrow_mut() = String::from_utf8_lossy(&out.stdout)
-                        .lines()
-                        .next()
-                        .map(|line| line.trim().to_owned())
-                        .filter(|line| !line.is_empty());
-                    found.borrow().is_some()
-                },
-                || format!("no mapped window titled {title}"),
-            );
-            let xid = found.into_inner().expect("found above");
-            xdotool(&["windowraise", &xid]);
-            pump();
-            Self {
-                window,
-                slider,
-                xid,
-                presses,
-                releases,
-            }
-        }
-
-        /// Run one `xdotool` command line, then wait until the window has seen
-        /// `presses` more presses and `releases` more releases than before it.
-        fn send(&self, args: &[&str], presses: u32, releases: u32) {
-            let want_presses = self.presses.get() + presses;
-            let want_releases = self.releases.get() + releases;
-            xdotool(args);
-            wait_for(
-                &format!("the input `xdotool {}` sent", args.join(" ")),
-                || self.presses.get() >= want_presses && self.releases.get() >= want_releases,
-                || {
-                    format!(
-                        "{} of {want_presses} presses, {} of {want_releases} releases",
-                        self.presses.get(),
-                        self.releases.get(),
-                    )
-                },
-            );
-        }
-
-        /// Move the pointer `fraction` of the way along the slider, at its
-        /// vertical centre, then run `then` there.
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_precision_loss,
-            reason = "a slider's size and position are small pixel counts"
-        )]
-        fn at(&self, fraction: f64, then: &[&str], presses: u32, releases: u32) {
-            let (w, h) = (self.slider.width(), self.slider.height());
-            let point = gtk::graphene::Point::new((f64::from(w) * fraction) as f32, h as f32 / 2.0);
-            let at = self
-                .slider
-                .compute_point(&self.window, &point)
-                .expect("the slider is inside its window");
-            let (dx, dy) = self.window.surface_transform();
-            let scale = f64::from(self.window.scale_factor());
-            let x = (((f64::from(at.x()) + dx) * scale).round() as i32).to_string();
-            let y = (((f64::from(at.y()) + dy) * scale).round() as i32).to_string();
-            let mut args = vec!["mousemove", "--window", self.xid.as_str(), &x, &y];
-            args.extend_from_slice(then);
-            self.send(&args, presses, releases);
-        }
-    }
-
-    /// Leave the display as the next test expects it, pass or fail: no button
-    /// held, the window gone, the pointer off it. Nothing here may panic, since
-    /// this runs while a failed test unwinds.
-    impl Drop for OnScreen {
-        fn drop(&mut self) {
-            xdotool_quiet(&["mouseup", "1"]);
-            self.window.destroy();
-            xdotool_quiet(&["mousemove", "0", "0"]);
-            pump();
-        }
+    /// A slider on screen in its own window, laid out and under real pointer
+    /// control.
+    fn mount(slider: &gtk::Scale) -> RealPointer {
+        let window = gtk::Window::new();
+        window.set_default_size(400, 60);
+        window.set_child(Some(slider));
+        let pointer = RealPointer::attach(&window, "brightness-slider");
+        wait_for(
+            "the slider's layout",
+            || slider.width() > 100,
+            || format!("width {}", slider.width()),
+        );
+        pointer
     }
 
     /// A brightness reading that arrives while the user drags the slider does
@@ -583,15 +393,14 @@ mod slider_tests {
     #[gtk::test]
     fn a_reading_that_arrives_mid_drag_lands_after_the_release() {
         adw::init().expect("libadwaita init");
-        if !real_pointer_or_skip("a_reading_that_arrives_mid_drag_lands_after_the_release") {
+        if !available_or_skip("a_reading_that_arrives_mid_drag_lands_after_the_release") {
             return;
         }
         let level = Mutable::new(Some(Brightness { level: 0.5 }));
         let writes: Rc<RefCell<Vec<f64>>> = Rc::default();
         let sink = Rc::clone(&writes);
         let slider = brightness_slider_from(level.signal(), move |v| sink.borrow_mut().push(v));
-        let screen = OnScreen::mount(slider);
-        let slider = screen.slider.clone();
+        let pointer = mount(&slider);
         wait_for(
             "the first reading",
             || close(slider.value(), 0.5),
@@ -599,8 +408,8 @@ mod slider_tests {
         );
 
         // Grab the slider and drag it towards the top.
-        screen.at(0.5, &["mousedown", "1"], 1, 0);
-        screen.at(0.8, &[], 0, 0);
+        pointer.at(&slider, (0.5, 0.5), &["mousedown", "1"], 1, 0);
+        pointer.at(&slider, (0.8, 0.5), &[], 0, 0);
         wait_for(
             "the drag",
             || slider.value() > 0.65,
@@ -624,7 +433,7 @@ mod slider_tests {
 
         // Let go. Inside the settle window the thumb stays put; after it, the
         // held reading lands.
-        screen.send(&["mouseup", "1"], 0, 1);
+        pointer.send(&["mouseup", "1"], 0, 1);
         assert!(
             close(slider.value(), dragged),
             "the reading landed the instant the drag ended: {}",

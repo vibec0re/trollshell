@@ -329,9 +329,13 @@ enum DecodeVerdict {
     /// Decode exited cleanly but produced nothing; copying would blank
     /// the live clipboard.
     Empty,
-    /// Decode failed (non-zero exit, or killed on timeout).
+    /// Decode failed: a non-zero exit, or a signal it was not killed by for
+    /// overflowing.
     Failed,
-    /// Output hit [`DECODE_MAX_BYTES`]; it is truncated, so do not copy.
+    /// Output went past the cap ([`DECODE_MAX_BYTES`]); it is truncated, so do
+    /// not copy. Whatever the decoder's exit status says: the paste path stops
+    /// reading and kills a decoder that overflows, so its status is then a
+    /// signal of ours, not a failure of its own.
     TooLarge,
 }
 
@@ -339,11 +343,18 @@ enum DecodeVerdict {
 /// untruncated decode may reach `wl-copy`. A stale or pruned id makes
 /// `cliphist decode` exit non-zero with empty stdout, and `wl-copy` on
 /// empty stdin would replace the user's live clipboard with nothing.
-fn decode_verdict(success: bool, output_len: usize) -> DecodeVerdict {
-    if !success {
-        DecodeVerdict::Failed
-    } else if output_len as u64 > DECODE_MAX_BYTES {
+///
+/// Overflow is checked **before** the exit status. Once a decoder writes past
+/// `max_bytes`, [`run_decode_to_wlcopy_with`] stops reading (closing the pipe)
+/// and kills it, so its status is a `SIGPIPE` or a `SIGKILL` of ours, not a
+/// verdict of its own. Checked after it, that overflow was reported as
+/// "exited" (`Failed`), and `TooLarge` was reachable only by a decoder that
+/// had finished before either landed (#1559).
+fn decode_verdict(success: bool, output_len: usize, max_bytes: u64) -> DecodeVerdict {
+    if output_len as u64 > max_bytes {
         DecodeVerdict::TooLarge
+    } else if !success {
+        DecodeVerdict::Failed
     } else if output_len == 0 {
         DecodeVerdict::Empty
     } else {
@@ -351,12 +362,38 @@ fn decode_verdict(success: bool, output_len: usize) -> DecodeVerdict {
     }
 }
 
+/// The two programs the paste path runs, and the bounds it runs the first
+/// under. A parameter so the orchestration is testable against stand-in
+/// scripts and with small bounds; [`PASTE`] is the real set.
+struct PasteTools<'a> {
+    cliphist: &'a str,
+    wl_copy: &'a str,
+    /// The most bytes `cliphist decode` may write before it is killed.
+    max_bytes: u64,
+    /// How long `cliphist decode` may run before it is killed.
+    timeout: std::time::Duration,
+}
+
+/// The programs on `PATH`, under [`DECODE_MAX_BYTES`] and [`DECODE_TIMEOUT`].
+const PASTE: PasteTools<'static> = PasteTools {
+    cliphist: "cliphist",
+    wl_copy: "wl-copy",
+    max_bytes: DECODE_MAX_BYTES,
+    timeout: DECODE_TIMEOUT,
+};
+
 /// Run `cliphist decode <id>` to completion (bounded in size and time),
 /// then, only if it produced a payload, feed that to `wl-copy` on stdin.
 fn run_decode_to_wlcopy(id: u64) -> anyhow::Result<()> {
+    run_decode_to_wlcopy_with(&PASTE, id)
+}
+
+/// [`run_decode_to_wlcopy`] with the programs and bounds as a parameter.
+fn run_decode_to_wlcopy_with(tools: &PasteTools<'_>, id: u64) -> anyhow::Result<()> {
     use std::io::{Read, Write};
 
-    let mut decoder = std::process::Command::new("cliphist")
+    let max_bytes = tools.max_bytes;
+    let mut decoder = std::process::Command::new(tools.cliphist)
         .arg("decode")
         .arg(id.to_string())
         .stdin(Stdio::null())
@@ -376,11 +413,11 @@ fn run_decode_to_wlcopy(id: u64) -> anyhow::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut buf = Vec::new();
-        let r = stdout.take(DECODE_MAX_BYTES + 1).read_to_end(&mut buf);
+        let r = stdout.take(max_bytes + 1).read_to_end(&mut buf);
         let _ = tx.send(r.map(|_| buf));
     });
-    let read = rx.recv_timeout(DECODE_TIMEOUT);
-    if read.is_err() || matches!(&read, Ok(Ok(b)) if b.len() as u64 > DECODE_MAX_BYTES) {
+    let read = rx.recv_timeout(tools.timeout);
+    if read.is_err() || matches!(&read, Ok(Ok(b)) if b.len() as u64 > max_bytes) {
         let _ = decoder.kill();
     }
     let dec_status = decoder
@@ -392,7 +429,7 @@ fn run_decode_to_wlcopy(id: u64) -> anyhow::Result<()> {
         Err(_) => return Err(anyhow::anyhow!("cliphist decode timed out")),
     };
 
-    match decode_verdict(dec_status.success(), payload.len()) {
+    match decode_verdict(dec_status.success(), payload.len(), max_bytes) {
         DecodeVerdict::Copy => {}
         DecodeVerdict::Empty => {
             return Err(anyhow::anyhow!(
@@ -404,12 +441,12 @@ fn run_decode_to_wlcopy(id: u64) -> anyhow::Result<()> {
         }
         DecodeVerdict::TooLarge => {
             return Err(anyhow::anyhow!(
-                "cliphist decode output exceeds {DECODE_MAX_BYTES} bytes"
+                "cliphist decode output exceeds {max_bytes} bytes; clipboard left untouched"
             ));
         }
     }
 
-    let mut copier = std::process::Command::new("wl-copy")
+    let mut copier = std::process::Command::new(tools.wl_copy)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -518,16 +555,202 @@ fn delete_stdin_payload(id: u64) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn decode_verdict_copies_only_successful_nonempty() {
-        assert_eq!(decode_verdict(true, 5), DecodeVerdict::Copy);
+        let max = DECODE_MAX_BYTES;
+        assert_eq!(decode_verdict(true, 5, max), DecodeVerdict::Copy);
         // Stale id: non-zero exit, empty stdout.
-        assert_eq!(decode_verdict(false, 0), DecodeVerdict::Failed);
-        assert_eq!(decode_verdict(false, 5), DecodeVerdict::Failed);
-        assert_eq!(decode_verdict(true, 0), DecodeVerdict::Empty);
+        assert_eq!(decode_verdict(false, 0, max), DecodeVerdict::Failed);
+        assert_eq!(decode_verdict(false, 5, max), DecodeVerdict::Failed);
+        assert_eq!(decode_verdict(true, 0, max), DecodeVerdict::Empty);
         let over = usize::try_from(DECODE_MAX_BYTES).unwrap() + 1;
-        assert_eq!(decode_verdict(true, over), DecodeVerdict::TooLarge);
+        assert_eq!(decode_verdict(true, over, max), DecodeVerdict::TooLarge);
+        // The overflow case as it actually arrives: killed for it (#1559).
+        assert_eq!(decode_verdict(false, over, max), DecodeVerdict::TooLarge);
+        let at_cap = usize::try_from(DECODE_MAX_BYTES).unwrap();
+        assert_eq!(decode_verdict(true, at_cap, max), DecodeVerdict::Copy);
+    }
+
+    // ── run_decode_to_wlcopy (real child processes, stand-in scripts) ───────
+    //
+    // `decode_verdict` above is the decision; these run the orchestration
+    // around it — the spawn, the bounded read, the kill, the reap and the
+    // hand-off to `wl-copy` — against `#!/bin/sh` stand-ins for both programs,
+    // in a scratch directory (#1559).
+
+    /// Install a `#!/bin/sh` stand-in at `dir/name`, written by a `sh` child
+    /// and **never by this process**.
+    ///
+    /// Not `std::fs::write` plus a chmod, because of `ETXTBSY`: a sibling test
+    /// that forks hands its child a copy of every fd this process has open at
+    /// that instant (`O_CLOEXEC` closes them only at the child's `exec`), and
+    /// `execve` refuses a file anyone holds open for writing. Same fix as
+    /// `hytte-sensors`' `gpu::tests::script` (#1567).
+    fn script(dir: &std::path::Path, name: &str, body: &str) -> String {
+        use std::io::Write as _;
+        use std::process::Command;
+        let path = dir.join(name);
+        let mut writer = Command::new("/bin/sh")
+            .args(["-c", r#"cat > "$1" && chmod 755 "$1""#, "sh"])
+            .arg(&path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn the script writer");
+        writer
+            .stdin
+            .take()
+            .expect("piped")
+            .write_all(format!("#!/bin/sh\n{body}\n").as_bytes())
+            .expect("hand the script over");
+        assert!(
+            writer.wait().expect("reap the script writer").success(),
+            "could not install {}",
+            path.display()
+        );
+        path.to_str().expect("a UTF-8 scratch path").to_owned()
+    }
+
+    /// A scratch directory holding a `cliphist` stand-in with `decode_body` as
+    /// its script and a `wl-copy` stand-in with `copy_body`.
+    struct Stand {
+        dir: tempfile::TempDir,
+        cliphist: String,
+        wl_copy: String,
+    }
+
+    impl Stand {
+        fn new(decode_body: &str, copy_body: &str) -> Self {
+            let dir = tempfile::tempdir().expect("a scratch dir");
+            let cliphist = script(dir.path(), "cliphist", decode_body);
+            let wl_copy = script(dir.path(), "wl-copy", copy_body);
+            Self {
+                dir,
+                cliphist,
+                wl_copy,
+            }
+        }
+
+        /// `wl-copy` as a stand-in that keeps what it was given in `copied`.
+        fn copying(decode_body: &str) -> Self {
+            Self::new(decode_body, r#"cat > "$(dirname "$0")/copied""#)
+        }
+
+        fn paste(&self, id: u64, max_bytes: u64, timeout: Duration) -> anyhow::Result<()> {
+            run_decode_to_wlcopy_with(
+                &PasteTools {
+                    cliphist: &self.cliphist,
+                    wl_copy: &self.wl_copy,
+                    max_bytes,
+                    timeout,
+                },
+                id,
+            )
+        }
+
+        fn path(&self, name: &str) -> std::path::PathBuf {
+            self.dir.path().join(name)
+        }
+
+        /// What `wl-copy` was handed, or `None` if it never ran.
+        fn copied(&self) -> Option<Vec<u8>> {
+            std::fs::read(self.path("copied")).ok()
+        }
+    }
+
+    const GENEROUS: Duration = Duration::from_secs(10);
+
+    fn message(result: anyhow::Result<()>) -> String {
+        result.expect_err("the paste must fail").to_string()
+    }
+
+    /// A decoded entry reaches `wl-copy` byte for byte, asked for by its id.
+    #[test]
+    fn a_decoded_entry_reaches_wl_copy_byte_for_byte() {
+        let stand =
+            Stand::copying(r#"printf '%s' "$*" > "$(dirname "$0")/args"; printf 'hello\tclip\n'"#);
+        stand.paste(42, 1024, GENEROUS).expect("the paste");
+        assert_eq!(stand.copied().as_deref(), Some(&b"hello\tclip\n"[..]));
+        assert_eq!(
+            std::fs::read_to_string(stand.path("args")).expect("cliphist ran"),
+            "decode 42"
+        );
+    }
+
+    /// A stale id: `cliphist decode` fails with nothing on stdout. `wl-copy`
+    /// never runs, so the live clipboard is not blanked (#1497).
+    #[test]
+    fn a_failed_decode_leaves_the_clipboard_alone() {
+        let stand = Stand::copying("exit 1");
+        let error = message(stand.paste(7, 1024, GENEROUS));
+        assert!(error.contains("exited"), "{error}");
+        assert_eq!(stand.copied(), None, "wl-copy ran for a failed decode");
+    }
+
+    /// A clean exit with nothing decoded copies nothing either.
+    #[test]
+    fn an_empty_decode_leaves_the_clipboard_alone() {
+        let stand = Stand::copying("exit 0");
+        let error = message(stand.paste(7, 1024, GENEROUS));
+        assert!(error.contains("no data"), "{error}");
+        assert_eq!(stand.copied(), None, "wl-copy ran for an empty decode");
+    }
+
+    /// A decoder that writes past the cap is stopped, and the paste says it
+    /// was **too large**, not that the decoder "exited" (#1559). The decoder
+    /// never stops writing on its own, so what ends it is ours — `SIGPIPE`
+    /// once the read side closes, or the kill — and its status is always a
+    /// signal.
+    ///
+    /// **Mutation:** check the exit status before the size in
+    /// `decode_verdict` (the old order) → this reds, the message reading
+    /// `cliphist decode exited ExitStatus(unix_wait_status(13))`.
+    #[test]
+    fn a_decode_past_the_cap_is_killed_and_reported_too_large() {
+        let stand = Stand::copying("while :; do printf '%s' 0123456789abcdef; done");
+        let error = message(stand.paste(7, 1024, GENEROUS));
+        assert!(error.contains("exceeds 1024 bytes"), "{error}");
+        assert_eq!(stand.copied(), None, "wl-copy ran for a truncated decode");
+    }
+
+    /// Exactly the cap is not past it: the whole payload is copied.
+    #[test]
+    fn a_decode_of_exactly_the_cap_is_copied() {
+        let stand = Stand::copying("printf '%s' 0123456789abcdef");
+        stand.paste(7, 16, GENEROUS).expect("the paste");
+        assert_eq!(stand.copied().as_deref(), Some(&b"0123456789abcdef"[..]));
+    }
+
+    /// A decoder that stalls is killed at the timeout and reaped: the call
+    /// returns long before the decoder would have, and leaves no zombie.
+    #[test]
+    fn a_stalled_decode_is_killed_and_reaped_at_the_timeout() {
+        let stand = Stand::copying(r#"echo $$ > "$(dirname "$0")/pid"; exec sleep 30"#);
+        let started = std::time::Instant::now();
+        let error = message(stand.paste(7, 1024, Duration::from_millis(300)));
+        assert!(error.contains("timed out"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the timeout did not end the decode: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(stand.copied(), None, "wl-copy ran for a stalled decode");
+        let pid = std::fs::read_to_string(stand.path("pid")).expect("the decoder ran");
+        let proc_dir = std::path::PathBuf::from(format!("/proc/{}", pid.trim()));
+        assert!(
+            !proc_dir.exists(),
+            "the killed decoder {} is still in /proc (a zombie)",
+            pid.trim()
+        );
+    }
+
+    /// A `wl-copy` that fails is reported.
+    #[test]
+    fn a_failing_wl_copy_is_reported() {
+        let stand = Stand::new("printf 'payload'", "cat > /dev/null; exit 3");
+        let error = message(stand.paste(7, 1024, GENEROUS));
+        assert!(error.contains("wl-copy exited"), "{error}");
     }
 
     #[test]

@@ -82,6 +82,26 @@ const STARTING_CEILING: Duration = Duration::from_secs(90);
 /// life of the shell.
 const APP_STARTING_CEILING: Duration = Duration::from_secs(20);
 
+/// The ceiling on an ephemeral card's Save ([`run_save`], #1559).
+///
+/// A Save holds [`PLAN_AND_NAME`] across three niri round trips (the name
+/// check, the `SetName` batch and the read-back) and a file write, and none of
+/// those round trips has a read timeout, for [`STARTING_CEILING`]'s reason. A
+/// Save that niri never answered would otherwise keep the lock for the life of
+/// the shell: every later Start would sit behind it until its own ceiling, and
+/// every later Save would show "Saving…" for good. Past this, the Save's future
+/// is dropped, its guard with it, and the form is told the Save failed.
+///
+/// Much shorter than [`STARTING_CEILING`] on purpose. That one has to outlast a
+/// whole Start, [`GRACE`] and every app launch included; a Save launches
+/// nothing and waits on nothing but those round trips, which take milliseconds
+/// on a live compositor. It is also how long every Start and Save queued behind
+/// a stuck Save waits, and a Start's own 90 s ceiling runs while it waits: at
+/// 20 s, a Start queued behind a stuck Save still has 70 s for its own
+/// transaction once the lock comes back. The same value as
+/// [`APP_STARTING_CEILING`], which bounds one launch rather than a whole Start.
+const SAVE_CEILING: Duration = Duration::from_secs(20);
+
 /// A card's state (#1071 §3.3).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum StackState {
@@ -111,7 +131,9 @@ pub(crate) fn starting() -> impl Signal<Item = BTreeSet<String>> {
 
 /// Serializes the **plan-and-name** phase of every Start in this process: from
 /// the housekeeping's first snapshot to the read-back that shows the name
-/// landed ([`start`]'s steps 1–4).
+/// landed ([`start`]'s steps 1–4). An ephemeral card's Save ([`save`]) names a
+/// workspace too, and holds it for the whole of its check, write, name and
+/// read-back, for at most [`SAVE_CEILING`].
 ///
 /// [`plan_start`] decides from a snapshot, and only a name that has landed makes
 /// a workspace unavailable to the next plan. So two Starts of different stacks
@@ -2102,6 +2124,21 @@ pub(crate) fn spawn_move_to_monitor(name: String, monitor: String, workspace: Op
 /// **before** the file is written. Getting that order wrong would leave a stack
 /// in the file that can never be this workspace.
 ///
+/// All of it runs under [`PLAN_AND_NAME`], the lock a Start's plan-and-name
+/// phase holds, from the name check to the read-back (#1559, left open by
+/// #1576). The file write is what puts `name`'s Inactive card on the page, so a
+/// ▶ on it can start a Start of `name` while this Save's `SetName` is still on
+/// its way. Without the lock that Start planned from a niri where the name was
+/// still free, took the spare workspace, and sent a batch whose `SetName` niri
+/// then ignored but whose `Focus` landed: the user's focus jumped to an empty
+/// workspace and the card reported "niri did not take the name". Under it, the
+/// Start's snapshot is read after this Save's name is on its workspace, so its
+/// plan refuses with [`StartError::NameTaken`] and sends nothing. Neither this
+/// function nor anything it calls takes the lock again: `Ops::save_stack` takes
+/// only the config file's own write lock. The hold is bounded by
+/// [`SAVE_CEILING`], through [`run_save`]: call that, not this, from anything
+/// that talks to a real niri.
+///
 /// # Errors
 /// A name niri already holds, a file the writer refused, or a naming that did
 /// not land — each as a line for the user.
@@ -2111,6 +2148,7 @@ pub(crate) async fn save(
     name: &str,
     stack: &Stack,
 ) -> Result<(), String> {
+    let _naming = PLAN_AND_NAME.lock().await;
     let workspaces = ops.workspaces().await?;
     if named(&workspaces, name).is_some() {
         return Err(StartError::NameTaken.to_string());
@@ -2138,10 +2176,29 @@ pub(crate) async fn save(
     }
 }
 
+/// [`save`], bounded by [`SAVE_CEILING`].
+///
+/// Past the ceiling the Save's future is dropped, and its [`PLAN_AND_NAME`]
+/// guard with it, so the next Start or Save can run; the `spawn_blocking` niri
+/// call it was waiting on cannot be cancelled and finishes, or not, on its own.
+/// The error says the stack may already be in the file, because the ceiling can
+/// fire after the write and before the naming.
+async fn run_save(ops: &impl Ops, workspace: u64, name: &str, stack: &Stack) -> Result<(), String> {
+    tokio::time::timeout(SAVE_CEILING, save(ops, workspace, name, stack))
+        .await
+        .unwrap_or_else(|_| {
+            Err(format!(
+                "niri did not answer within {}s — the stack may already be in the file, \
+                 but its workspace was not named",
+                SAVE_CEILING.as_secs()
+            ))
+        })
+}
+
 /// Run a Save on the runtime, answering `reply` when it ends.
 pub(crate) fn spawn_save(reply: SaveReply, workspace: u64, name: String, stack: Stack) {
     hytte::reactive::runtime::handle().spawn(async move {
-        let result = save(&Live, workspace, &name, &stack).await;
+        let result = run_save(&Live, workspace, &name, &stack).await;
         if result.is_ok() {
             tracing::info!(workspace = name, apps = stack.apps.len(), "workspace saved");
         }

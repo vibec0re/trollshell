@@ -623,15 +623,15 @@ impl DenyToastLimiter {
             return false;
         }
         self.window_count += 1;
-        if !self.last.contains_key(&key) && self.last.len() >= DENY_TOAST_KEYS_CAP {
-            if let Some(oldest) = self
+        if !self.last.contains_key(&key)
+            && self.last.len() >= DENY_TOAST_KEYS_CAP
+            && let Some(oldest) = self
                 .last
                 .iter()
                 .min_by_key(|(_, at)| **at)
                 .map(|(k, _)| k.clone())
-            {
-                self.last.remove(&oldest);
-            }
+        {
+            self.last.remove(&oldest);
         }
         self.last.insert(key, now);
         true
@@ -3445,8 +3445,14 @@ mod tests {
         let now = t0 + i64::try_from(DENY_TOAST_KEYS_CAP).unwrap() * DENY_TOAST_WINDOW_SECS;
         assert!(l.admit("fresh", "departures", now));
         assert_eq!(l.last.len(), DENY_TOAST_KEYS_CAP);
-        assert!(!l.last.contains_key(&("a0".to_owned(), "departures".to_owned())));
-        assert!(l.last.contains_key(&("fresh".to_owned(), "departures".to_owned())));
+        assert!(
+            !l.last
+                .contains_key(&("a0".to_owned(), "departures".to_owned()))
+        );
+        assert!(
+            l.last
+                .contains_key(&("fresh".to_owned(), "departures".to_owned()))
+        );
     }
 
     #[test]

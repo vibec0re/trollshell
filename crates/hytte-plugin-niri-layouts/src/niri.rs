@@ -805,6 +805,59 @@ mod tests {
         drop(peer.join());
     }
 
+    /// A niri whose listen backlog is full (it stopped accepting) must not
+    /// park the connect: `UnixStream::connect` blocks there until a slot
+    /// frees, so only the deadline on the connect itself can end it.
+    #[test]
+    fn a_full_listen_backlog_times_out_the_connect() {
+        use super::SocketTransport;
+        use std::os::unix::net::{UnixListener, UnixStream};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("niri.sock");
+        // Bound and never accepted from, like a wedged niri.
+        let listener = UnixListener::bind(&path).expect("bind");
+        // Fill the backlog. A closed client keeps its slot until it is
+        // accepted, so nothing has to stay open; the filler's last connect
+        // parks, and ends with ECONNREFUSED once the listener is dropped.
+        let (slot_taken, slots) = mpsc::channel();
+        let filler_path = path.clone();
+        let filler = std::thread::spawn(move || {
+            while UnixStream::connect(&filler_path).is_ok() {
+                if slot_taken.send(()).is_err() {
+                    break;
+                }
+            }
+        });
+        // Full once no connect has completed for 200 ms.
+        while slots.recv_timeout(Duration::from_millis(200)).is_ok() {}
+
+        let (done, outcome) = mpsc::channel();
+        let request_path = path.clone();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = SocketTransport::with_timeout(Duration::from_millis(300))
+                .send_to(&request_path, &Request::Version);
+            drop(done.send((result, started.elapsed())));
+        });
+        let outcome = outcome.recv_timeout(Duration::from_secs(3));
+        // Frees the filler's parked connect (and an unbounded one, so a
+        // failing run still ends).
+        drop(listener);
+        filler.join().expect("filler");
+        let (result, took) = outcome.expect("the connect was not bounded by the deadline");
+        let err = result.expect_err("no backlog slot, no reply");
+        // The connect's own timeout, not the read's: a connect that got a
+        // slot would time out on the reply instead and prove nothing here.
+        assert!(
+            err.starts_with("cannot reach niri") && err.contains("timed out"),
+            "got {err:?}"
+        );
+        assert!(took < Duration::from_secs(2), "not bounded: {took:?}");
+    }
+
     use super::fake::{self, Fake, tile};
     use super::{Transport, apply, missing_width_diagnostic};
     use crate::layout::Layout;

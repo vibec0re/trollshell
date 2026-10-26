@@ -172,7 +172,7 @@ pub struct TopApps {
 
 /// What [`Walker`] calls to read `/proc` — [`sample_proc`]'s own signature, so
 /// the real walker is a plain function pointer and a test's fake is a closure.
-pub type Walk = fn(&HashMap<u32, u64>, u64) -> app_usage::Sample;
+pub type Walk = fn(&HashMap<app_usage::PidKey, u64>, u64) -> app_usage::Sample;
 
 /// The walker and the state it threads between two walks.
 pub struct Walker<F = Walk> {
@@ -180,7 +180,7 @@ pub struct Walker<F = Walk> {
     walk: F,
     /// Per-PID CPU jiffies as of the previous walk — the baseline each PID's
     /// share is a delta from.
-    prev_pid: HashMap<u32, u64>,
+    prev_pid: HashMap<app_usage::PidKey, u64>,
     /// The aggregate `/proc/stat` total as of the previous walk; `0` is "no
     /// baseline yet".
     prev_total: u64,
@@ -196,7 +196,7 @@ impl Default for Walker {
     }
 }
 
-impl<F: FnMut(&HashMap<u32, u64>, u64) -> app_usage::Sample> Walker<F> {
+impl<F: FnMut(&HashMap<app_usage::PidKey, u64>, u64) -> app_usage::Sample> Walker<F> {
     /// A walker over `walk`, with no baseline, that **names nothing**: its
     /// resolver has an empty search path, so every row keeps its raw key and
     /// no desktop entry is ever read. [`Walker::naming_with`] gives it one.
@@ -265,7 +265,7 @@ impl<F: FnMut(&HashMap<u32, u64>, u64) -> app_usage::Sample> Walker<F> {
 
 impl<F> Sample for Walker<F>
 where
-    F: FnMut(&HashMap<u32, u64>, u64) -> app_usage::Sample + Send + 'static,
+    F: FnMut(&HashMap<app_usage::PidKey, u64>, u64) -> app_usage::Sample + Send + 'static,
 {
     type Reading = TopApps;
 
@@ -308,24 +308,24 @@ pub(crate) type Handed = std::sync::Arc<std::sync::Mutex<Vec<(Option<u64>, u64)>
 /// [`Walker`] over it through the gated task.
 #[cfg(test)]
 pub(crate) fn fake_proc() -> (
-    impl FnMut(&HashMap<u32, u64>, u64) -> app_usage::Sample + Send + 'static,
+    impl FnMut(&HashMap<app_usage::PidKey, u64>, u64) -> app_usage::Sample + Send + 'static,
     Handed,
 ) {
     let seen: Handed = std::sync::Arc::default();
     let log = std::sync::Arc::clone(&seen);
     let mut n = 0_u64;
-    let walk = move |prev_pid: &HashMap<u32, u64>, prev_total: u64| {
+    let walk = move |prev_pid: &HashMap<app_usage::PidKey, u64>, prev_total: u64| {
         n += 1;
         log.lock()
             .expect("not poisoned")
-            .push((prev_pid.get(&7).copied(), prev_total));
+            .push((prev_pid.get(&(7, 0)).copied(), prev_total));
         let total_now = 1_000 * n;
         let jiffies = 250 * n;
-        let delta = jiffies - prev_pid.get(&7).copied().unwrap_or(jiffies);
+        let delta = jiffies - prev_pid.get(&(7, 0)).copied().unwrap_or(jiffies);
         #[allow(clippy::cast_precision_loss)]
         let share = delta as f64 / total_now.saturating_sub(prev_total) as f64;
         app_usage::Sample {
-            cur_pid: HashMap::from([(7, jiffies)]),
+            cur_pid: HashMap::from([((7, 0), jiffies)]),
             total_now,
             by_cpu: vec![app("firefox", share, 1 << 30)],
             by_mem: vec![app("firefox", share, 1 << 30)],
@@ -373,9 +373,11 @@ mod tests {
     /// `System` bucket and an app no entry matches — with a `/proc/stat`
     /// total that advances, so every walk after the first publishes its CPU
     /// list.
-    fn mixed_walk() -> impl FnMut(&HashMap<u32, u64>, u64) -> ProcWalk + Send + 'static {
+    fn mixed_walk()
+    -> impl FnMut(&HashMap<hytte_sensors::app_usage::PidKey, u64>, u64) -> ProcWalk + Send + 'static
+    {
         let mut n = 0_u64;
-        move |_: &HashMap<u32, u64>, _: u64| {
+        move |_: &HashMap<hytte_sensors::app_usage::PidKey, u64>, _: u64| {
             n += 1;
             let rows = vec![
                 app("niri-firefox", 0.5, 3 << 30),
@@ -612,16 +614,18 @@ mod tests {
     #[test]
     fn a_total_that_did_not_advance_withholds_the_cpu_list() {
         let mut calls = 0_u32;
-        let mut walker = Walker::over(move |_: &HashMap<u32, u64>, _: u64| {
-            calls += 1;
-            ProcWalk {
-                cur_pid: HashMap::new(),
-                // A failed `/proc/stat` read answers `0` every time.
-                total_now: if calls == 1 { 1_000 } else { 0 },
-                by_cpu: vec![app("x", 0.0, 1)],
-                by_mem: vec![app("x", 0.0, 1)],
-            }
-        });
+        let mut walker = Walker::over(
+            move |_: &HashMap<hytte_sensors::app_usage::PidKey, u64>, _: u64| {
+                calls += 1;
+                ProcWalk {
+                    cur_pid: HashMap::new(),
+                    // A failed `/proc/stat` read answers `0` every time.
+                    total_now: if calls == 1 { 1_000 } else { 0 },
+                    by_cpu: vec![app("x", 0.0, 1)],
+                    by_mem: vec![app("x", 0.0, 1)],
+                }
+            },
+        );
         let _ = walker.walk();
         let failed = walker.walk();
         assert!(failed.by_cpu.is_empty(), "{failed:?}");
@@ -636,12 +640,14 @@ mod tests {
     /// **Falsified** by `sample.total_now >= self.prev_total` in `walk`.
     #[test]
     fn an_unchanged_total_withholds_the_cpu_list() {
-        let mut walker = Walker::over(|_: &HashMap<u32, u64>, _: u64| ProcWalk {
-            cur_pid: HashMap::new(),
-            total_now: 1_000,
-            by_cpu: vec![app("x", 0.0, 1)],
-            by_mem: vec![app("x", 0.0, 1)],
-        });
+        let mut walker = Walker::over(
+            |_: &HashMap<hytte_sensors::app_usage::PidKey, u64>, _: u64| ProcWalk {
+                cur_pid: HashMap::new(),
+                total_now: 1_000,
+                by_cpu: vec![app("x", 0.0, 1)],
+                by_mem: vec![app("x", 0.0, 1)],
+            },
+        );
         let _ = walker.walk();
         let same = walker.walk();
         assert!(same.by_cpu.is_empty(), "{same:?}");

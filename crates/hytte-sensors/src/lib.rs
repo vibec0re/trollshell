@@ -58,7 +58,10 @@ mod proc_stat;
 pub use cpufreq::read_cpu_freq;
 pub use disk::{read_disk_for_specs, read_mountlist, read_process_count};
 pub use diskio::{compute_disk_io, read_proc_diskstats};
-pub use gpu::{GpuCache, NVIDIA_READING_TTL, read_gpu_with_cache};
+pub use gpu::{
+    GpuCache, NVIDIA_BACKOFF_INITIAL, NVIDIA_BACKOFF_MAX, NVIDIA_READING_TTL, NVIDIA_SMI_DEADLINE,
+    read_gpu_with_cache,
+};
 pub use hwmon::read_cpu_temp;
 pub use meminfo::read_proc_meminfo;
 pub use net::{read_net_connections, read_proc_net_dev};
@@ -221,6 +224,7 @@ pub struct MountSpec {
     pub(crate) path: String,
     /// `(major, minor)` from mountinfo field 3 — used for dedup.
     pub(crate) dev_id: (u32, u32),
-    /// fstype (right-half token 1) — diagnostic only.
+    /// fstype (right-half token 1) — decides whether `statvfs` on this mount
+    /// runs on a side thread under a deadline (`disk::may_block`).
     pub(crate) fstype: String,
 }

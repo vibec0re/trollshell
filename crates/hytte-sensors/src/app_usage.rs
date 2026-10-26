@@ -26,10 +26,31 @@
 use std::cmp::Reverse;
 use std::collections::HashMap;
 
-/// Resident page size assumed when converting `/proc/<pid>/statm` pages to
-/// bytes. 4 KiB on every platform trollshell targets; reading the real value
-/// needs `sysconf` (FFI/`unsafe`), which this crate forbids.
-const PAGE_SIZE: u64 = 4096;
+/// Page size assumed when `sysconf(_SC_PAGESIZE)` cannot be read.
+const FALLBACK_PAGE_SIZE: u64 = 4096;
+
+/// The kernel's page size, for converting `/proc/<pid>/statm` pages to bytes.
+/// Read once through `nix`'s safe `sysconf` wrapper (so the crate stays
+/// `unsafe`-free): it is 4 KiB on x86, but 16 KiB on Apple Silicon (Asahi)
+/// and 64 KiB on some aarch64/ppc64 kernels, where a hard-coded 4096
+/// under-reports every RSS by the ratio.
+fn page_size() -> u64 {
+    static PAGE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PAGE.get_or_init(|| {
+        nix::unistd::sysconf(nix::unistd::SysconfVar::PAGE_SIZE)
+            .ok()
+            .flatten()
+            .and_then(|n| u64::try_from(n).ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(FALLBACK_PAGE_SIZE)
+    })
+}
+
+/// Identity of a process across PID reuse: `(pid, starttime)`, where
+/// `starttime` is field 22 of `/proc/<pid>/stat` (clock ticks after boot).
+/// A recycled PID has a different start time, so it cannot inherit the CPU
+/// baseline of the process that used to hold the number.
+pub type PidKey = (u32, u64);
 
 /// Rows kept in each list.
 ///
@@ -100,7 +121,7 @@ struct Agg {
 pub struct Sample {
     /// Per-PID CPU jiffies as of this sample, fed back as next tick's
     /// baseline for the jiffy-delta computation.
-    pub cur_pid: HashMap<u32, u64>,
+    pub cur_pid: HashMap<PidKey, u64>,
     /// Aggregate `/proc/stat` total jiffies as of this sample.
     pub total_now: u64,
     /// Top `TOP_N` groups by CPU share, descending.
@@ -120,22 +141,25 @@ pub struct Sample {
 /// crate has no consumer that would ever plug in a different hasher.
 #[allow(clippy::implicit_hasher)]
 #[must_use]
-pub fn sample_proc(prev_pid: &HashMap<u32, u64>, prev_total: u64) -> Sample {
+pub fn sample_proc(prev_pid: &HashMap<PidKey, u64>, prev_total: u64) -> Sample {
     let total_now = read_total_cpu_jiffies();
     let d_total = total_now.saturating_sub(prev_total);
 
-    let mut cur_pid: HashMap<u32, u64> = HashMap::new();
+    let mut cur_pid: HashMap<PidKey, u64> = HashMap::new();
     // Key: group name (app-id or SYSTEM_BUCKET).
     let mut groups: HashMap<String, Agg> = HashMap::new();
 
     for pid in pids() {
-        let Some((cpu_jiffies, rss)) = read_pid_stats(pid) else {
+        let Some((cpu_jiffies, rss, starttime)) = read_pid_stats(pid) else {
             continue;
         };
-        cur_pid.insert(pid, cpu_jiffies);
-        // Unseen PIDs delta to themselves → 0, so a freshly-spawned process
-        // doesn't spike on its first appearance.
-        let delta = cpu_jiffies.saturating_sub(prev_pid.get(&pid).copied().unwrap_or(cpu_jiffies));
+        let key = (pid, starttime);
+        cur_pid.insert(key, cpu_jiffies);
+        // Unseen processes delta to themselves → 0, so a freshly-spawned
+        // process doesn't spike on its first appearance. Keyed on
+        // `(pid, starttime)`, a recycled PID is "unseen" too instead of
+        // inheriting the previous holder's baseline.
+        let delta = jiffy_delta(prev_pid, key, cpu_jiffies);
 
         // Determine the group key from the cgroup leaf; fall back to System.
         // A pid that exits between the stat read and the cgroup read returns
@@ -163,6 +187,13 @@ pub fn sample_proc(prev_pid: &HashMap<u32, u64>, prev_total: u64) -> Sample {
         cur_pid,
         total_now,
     }
+}
+
+/// CPU jiffies a process used since the previous walk; 0 for a process the
+/// previous walk did not see (including a PID reused by a new process, whose
+/// `(pid, starttime)` key differs).
+fn jiffy_delta(prev: &HashMap<PidKey, u64>, key: PidKey, now: u64) -> u64 {
+    now.saturating_sub(prev.get(&key).copied().unwrap_or(now))
 }
 
 /// `f64` newtype giving a total order for sorting (the values are finite
@@ -219,16 +250,17 @@ fn pids() -> Vec<u32> {
         .collect()
 }
 
-/// Read both CPU jiffies and RSS for a PID in one call, returning `None` if
-/// either `/proc/<pid>/stat` or `/proc/<pid>/statm` is unreadable.
-fn read_pid_stats(pid: u32) -> Option<(u64, u64)> {
+/// Read CPU jiffies, RSS and start time for a PID in one call, returning
+/// `None` if `/proc/<pid>/stat` is unreadable or malformed.
+fn read_pid_stats(pid: u32) -> Option<(u64, u64, u64)> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let (_, jiffies) = parse_pid_cpu(&stat)?;
+    let starttime = parse_pid_starttime(&stat)?;
     let rss = std::fs::read_to_string(format!("/proc/{pid}/statm"))
         .ok()
         .and_then(|t| parse_rss_pages(&t))
-        .map_or(0, |pages| pages.saturating_mul(PAGE_SIZE));
-    Some((jiffies, rss))
+        .map_or(0, |pages| pages.saturating_mul(page_size()));
+    Some((jiffies, rss, starttime))
 }
 
 /// Read `/proc/<pid>/cgroup` and resolve the group for this PID.
@@ -463,6 +495,19 @@ fn parse_pid_cpu(text: &str) -> Option<(String, u64)> {
     let utime: u64 = fields.get(11)?.parse().ok()?;
     let stime: u64 = fields.get(12)?.parse().ok()?;
     Some((name, utime.saturating_add(stime)))
+}
+
+/// `starttime` (field 22) of a `/proc/<pid>/stat` line. Parsed after the
+/// **last** `)`, like [`parse_pid_cpu`]: `comm` may itself contain spaces and
+/// parentheses. Field 3 (`state`) is the first token after it, so field 22 is
+/// token index 19.
+fn parse_pid_starttime(text: &str) -> Option<u64> {
+    let close = text.rfind(')')?;
+    text.get(close + 1..)?
+        .split_ascii_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
 }
 
 /// Resident pages from `/proc/<pid>/statm` (`size resident shared …` — field 1).
@@ -824,6 +869,38 @@ mod tests {
     fn parse_pid_cpu_rejects_garbage() {
         assert_eq!(parse_pid_cpu("not a stat line"), None);
         assert_eq!(parse_pid_cpu("1 (init) R 0 0"), None); // too few fields
+    }
+
+    #[test]
+    fn parses_starttime_after_a_hostile_comm() {
+        // 52 fields; starttime (22nd) is 987654. comm has spaces and parens.
+        let tail = "S 1 1 1 0 -1 4194304 100 0 0 0 5 6 0 0 20 0 1 0 987654 1000 10 0";
+        let line = format!("42 (we ird) (name) {tail}");
+        assert_eq!(parse_pid_starttime(&line), Some(987_654));
+        assert_eq!(
+            parse_pid_cpu(&line),
+            Some(("we ird) (name".to_string(), 11))
+        );
+        assert_eq!(parse_pid_starttime("1 (init) S 0 0"), None);
+        assert_eq!(parse_pid_starttime("garbage"), None);
+    }
+
+    #[test]
+    fn a_reused_pid_does_not_inherit_the_old_baseline() {
+        let prev = HashMap::from([((100, 5_000), 900)]);
+        // Same process: 50 jiffies since the last walk.
+        assert_eq!(jiffy_delta(&prev, (100, 5_000), 950), 50);
+        // PID 100 recycled by a new process with 10 jiffies of its own: it is
+        // a newcomer (delta 0), not -890 saturated or a bogus spike.
+        assert_eq!(jiffy_delta(&prev, (100, 9_000), 10), 0);
+        // And one that already burned a lot before our first look.
+        assert_eq!(jiffy_delta(&prev, (100, 9_000), 1_000_000), 0);
+    }
+
+    #[test]
+    fn page_size_is_a_sane_power_of_two() {
+        let p = page_size();
+        assert!(p >= 4096 && p.is_power_of_two(), "{p}");
     }
 
     #[test]

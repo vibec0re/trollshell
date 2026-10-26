@@ -99,14 +99,16 @@ pub(crate) fn action_indicator(class: &str, on_click: impl Fn() + 'static) -> gt
 /// Attach a vertical-scroll controller to `widget` that accumulates
 /// smooth-scroll deltas into whole "notches" before firing `on_step`.
 ///
-/// Trackpads and high-resolution mice report `scroll` events as fractional
-/// pixel deltas (libinput smooth scrolling) rather than a wheel's integral
-/// clicks, so a naive `dy.round()` per event either fires on every
-/// sub-pixel tick or misses slow scrolls entirely. Accumulating the raw
-/// deltas in a `Cell<f64>` and only firing once the running total crosses a
-/// whole unit reproduces the one-notch-per-click feel of a physical wheel
-/// for both input types, and lets a fast flick fire `on_step` more than
-/// once per event.
+/// A wheel reports `±1.0` per detent (a high-resolution one, fractions of
+/// it), but a touchpad reports raw surface **pixels**
+/// ([`gtk::gdk::ScrollUnit::Surface`]), which this controller passes through
+/// unscaled because it does not set `DISCRETE`. So each delta is first put in
+/// notches ([`in_notches`]), then summed, and `on_step` fires only once the
+/// running total crosses a whole notch. A naive `dy.round()` per event would
+/// either fire on every sub-notch tick or miss slow scrolls entirely; summing
+/// gives both input types the one-notch-per-click feel of a physical wheel,
+/// and lets a fast flick fire `on_step` more than once per event. Without the
+/// unit scaling, a touchpad fired one step per pixel.
 ///
 /// `on_step` is called with `1.0` for a scroll down and `-1.0` for a scroll
 /// up (matching raw GDK `dy` sign — down is positive); callers map that to
@@ -118,9 +120,9 @@ pub(crate) fn action_indicator(class: &str, on_click: impl Fn() + 'static) -> gt
 pub(crate) fn wire_scroll<W: IsA<gtk::Widget>>(widget: &W, on_step: impl Fn(f64) + 'static) {
     let controller = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
     let notches = std::cell::Cell::new(Notches::default());
-    controller.connect_scroll(move |_, _dx, dy| {
+    controller.connect_scroll(move |controller, _dx, dy| {
         let mut acc = notches.get();
-        let steps = acc.feed(dy, std::time::Instant::now());
+        let steps = acc.feed(in_notches(dy, controller.unit()), std::time::Instant::now());
         notches.set(acc);
         // Fire after the state is stored, so an `on_step` that re-enters this
         // handler (a synchronous emission) reads the settled remainder.
@@ -130,6 +132,22 @@ pub(crate) fn wire_scroll<W: IsA<gtk::Widget>>(widget: &W, on_step: impl Fn(f64)
         gtk::glib::Propagation::Stop
     });
     widget.add_controller(controller);
+}
+
+/// Surface pixels per notch for a [`gtk::gdk::ScrollUnit::Surface`] delta —
+/// a touchpad's two-finger scroll, which GDK reports in raw surface pixels
+/// and `EventControllerScroll` passes through unscaled unless `DISCRETE` is
+/// set. GTK's own `SURFACE_UNIT_DISCRETE_MAPPING`, the divisor its
+/// `DISCRETE` mode applies to the same deltas.
+const SURFACE_PX_PER_NOTCH: f64 = 10.0;
+
+/// `dy` in notches, whatever unit GDK delivered it in.
+fn in_notches(dy: f64, unit: gtk::gdk::ScrollUnit) -> f64 {
+    if unit == gtk::gdk::ScrollUnit::Surface {
+        dy / SURFACE_PX_PER_NOTCH
+    } else {
+        dy
+    }
 }
 
 /// How long a scroll may pause before its unspent fraction of a notch is
@@ -284,6 +302,16 @@ mod notch_tests {
             ),
             1
         );
+    }
+
+    /// A touchpad's surface-pixel delta is scaled to notches; a wheel's is not.
+    ///
+    /// **Falsification:** drop the `Surface` arm → 25 px reads as 25 notches.
+    #[test]
+    fn a_touchpad_delta_is_scaled_to_notches() {
+        use hytte::gtk::gdk::ScrollUnit;
+        assert!((super::in_notches(25.0, ScrollUnit::Surface) - 2.5).abs() < f64::EPSILON);
+        assert!((super::in_notches(1.0, ScrollUnit::Wheel) - 1.0).abs() < f64::EPSILON);
     }
 
     /// A non-finite delta is ignored, and does not poison what follows.

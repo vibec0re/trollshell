@@ -230,7 +230,7 @@ pub(super) enum ListenEnd {
 /// A subscription to the bus's `NameOwnerChanged`, every name. Filtered in
 /// code by [`bluez_owner_change`]. The pairing agent watches the same signal
 /// the same way (`agent::run_agent`).
-fn name_owner_changed() -> SignalSubscription {
+pub(super) fn name_owner_changed() -> SignalSubscription {
     hytte_bus::signals(BusKind::System, "org.freedesktop.DBus")
         .at_path("/org/freedesktop/DBus")
         .iface("org.freedesktop.DBus")
@@ -327,7 +327,7 @@ where
 
 /// Ask the bus whether anyone owns `org.bluez`. This is answered by the bus
 /// itself, so it activates nothing.
-async fn bluez_has_owner() -> Result<bool, hytte_bus::BusError> {
+pub(super) async fn bluez_has_owner() -> Result<bool, hytte_bus::BusError> {
     hytte_bus::call(BusKind::System, "org.freedesktop.DBus")
         .at_path("/org/freedesktop/DBus")
         .iface("org.freedesktop.DBus")

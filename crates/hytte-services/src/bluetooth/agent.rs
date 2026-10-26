@@ -15,10 +15,11 @@
 //! agent + anchor name both on the system bus.
 
 use super::shared_state;
+use crate::retry;
 use super::types::{AgentReply, PairPrompt, PromptKind};
 use futures_signals::signal::Mutable;
-use futures_util::StreamExt;
-use hytte_bus::BusKind;
+use futures_util::{Stream, StreamExt};
+use hytte_bus::{BusKind, SignalItem};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::oneshot;
@@ -334,64 +335,234 @@ fn clear_banner_if(banner: &Mutable<Option<PairPrompt>>, id: u64) {
 /// `RequestName` succeeds, so `BlueZ` never races a missing object.
 ///
 /// After the name is owned, we call `RegisterAgent` and
-/// `RequestDefaultAgent` once via `bus::call`. On bluetoothd restart the
-/// `NameOwnerChanged` stream for `org.bluez` wakes us to re-register.
+/// `RequestDefaultAgent` via `bus::call`, retrying a failure
+/// ([`register_until_accepted`]), and register again on every [`AgentWake`]:
+/// bluetoothd gaining a new owner, or a hole in the owner stream.
 ///
 /// The `ownership` handle is passed in (created in `Service::start` and also
 /// stored in `BluetoothHandles`) to keep the interface alive for the duration
 /// of this task.
 pub(super) async fn run_agent(_ownership: hytte_bus::OwnNameSignal) {
-    // Watch for org.bluez owner changes. When bluetoothd restarts (loses
-    // its name), our registration is gone and we must re-register.
-    // We re-register once the owner comes back.
-    let bluez_gone_sub = hytte_bus::signals(BusKind::System, "org.freedesktop.DBus")
-        .at_path("/org/freedesktop/DBus")
-        .iface("org.freedesktop.DBus")
-        .signal("NameOwnerChanged")
-        .start();
+    // The receiver is taken before the start-up registration, so an owner
+    // change made while that registration runs is not missed.
+    let owner_sub = super::devices::name_owner_changed();
+    let mut owner_items = owner_sub.items();
+    agent_loop(
+        &mut owner_items,
+        register_agent_once,
+        super::devices::bluez_has_owner,
+        crate::wifi::nm_registrar::REGISTER_RETRY,
+    )
+    .await;
+}
 
-    // Initial registration attempt.
-    try_register_agent().await;
+/// What one item of the bus's `NameOwnerChanged` stream means for the
+/// pairing agent's registration with bluetoothd.
+#[derive(Debug, PartialEq, Eq)]
+enum AgentWake {
+    /// Register again. Either `org.bluez` has a new owner, a bluetoothd that
+    /// knows no agent, or the stream reported a hole (`Resubscribed` /
+    /// `Lagged`). A `Resubscribed` is also how a reconnect of this process's
+    /// own system-bus connection shows up, and that reconnect gives it a new
+    /// unique name: bluetoothd keys agents by the caller's unique name and
+    /// drops one whose owner disconnects (`agent_disconnect`, `src/agent.c`),
+    /// so the agent is gone although bluetoothd never changed hands (#1551).
+    Register,
+    /// `org.bluez` has no owner: bluetoothd exited. Stop trying to register
+    /// until it is back, since a call to `org.bluez` would D-Bus-activate a
+    /// bluetoothd stopped on purpose.
+    Gone,
+}
 
-    // Re-register whenever BlueZ (org.bluez) gains a new owner, which
-    // indicates bluetoothd has restarted.
-    let mut noc_events = bluez_gone_sub.events();
-    while let Some(evt) = noc_events.next().await {
-        let Ok((name, _old_owner, new_owner)) =
-            evt.body.body().deserialize::<(String, String, String)>()
-        else {
-            continue;
-        };
-        if name != "org.bluez" {
-            continue;
+/// Classify one owner-stream item. `None` for any name other than
+/// `org.bluez`, and for a body that does not parse.
+fn agent_wake(item: &SignalItem) -> Option<AgentWake> {
+    match item {
+        SignalItem::Event(evt) => {
+            let (name, _old, new) = evt
+                .body
+                .body()
+                .deserialize::<(String, String, String)>()
+                .ok()?;
+            if name != "org.bluez" {
+                return None;
+            }
+            Some(if new.is_empty() {
+                AgentWake::Gone
+            } else {
+                AgentWake::Register
+            })
         }
-        if new_owner.is_empty() {
-            // bluetoothd died — our registration is gone. Wait for it to
-            // come back (the next NameOwnerChanged with a non-empty
-            // new_owner will trigger re-registration).
-            tracing::warn!("org.bluez lost — will re-register agent on restart");
-            continue;
-        }
-        // bluetoothd restarted: re-register.
-        tracing::info!("org.bluez new owner — re-registering pairing agent");
-        try_register_agent().await;
+        SignalItem::Resubscribed | SignalItem::Lagged { .. } => Some(AgentWake::Register),
     }
 }
 
-/// Attempt to register the pairing agent with `BlueZ` once. Logs any failure
-/// and returns (caller decides whether to retry or wait for `NameOwnerChanged`).
-async fn try_register_agent() {
-    let agent_op = match zbus::zvariant::ObjectPath::try_from(AGENT_PATH) {
-        Ok(p) => p.to_owned(),
-        Err(e) => {
-            tracing::error!(error = %e, "bluetooth agent: bad agent path");
-            return;
+/// [`run_agent`]'s body, with the registration, the bus question and the
+/// retry ramp injected so a test can drive it under paused time.
+///
+/// Registers once at start-up, then on every [`AgentWake::Register`]. A wake
+/// that lands while a registration is still retrying starts it over;
+/// [`AgentWake::Gone`] stops it. Until #1551 only an `org.bluez` owner change
+/// woke this, and the stream's markers were dropped (`events()`), so after a
+/// reconnect of the shell's own bus connection bluetoothd had no agent until
+/// it next restarted, and a pairing that needed a confirmation failed with no
+/// prompt.
+async fn agent_loop<S, R, RF, H, HF>(
+    owner_items: &mut S,
+    register: R,
+    has_owner: H,
+    policy: retry::Policy,
+) where
+    S: Stream<Item = SignalItem> + Unpin,
+    R: Fn() -> RF,
+    RF: Future<Output = Result<(), hytte_bus::BusError>>,
+    H: Fn() -> HF,
+    HF: Future<Output = Result<bool, hytte_bus::BusError>>,
+{
+    // The start-up registration, unasked, as before: it is what starts an
+    // activatable bluetoothd that is not running yet.
+    let mut want = true;
+    loop {
+        if !want {
+            let Some(item) = owner_items.next().await else {
+                return;
+            };
+            match agent_wake(&item) {
+                Some(AgentWake::Register) => want = true,
+                Some(AgentWake::Gone) => {
+                    tracing::warn!("org.bluez lost — will re-register agent on restart");
+                }
+                None => {}
+            }
+            continue;
         }
+        want = false;
+        tracing::debug!("bluetooth agent: registering with bluetoothd");
+        let mut registering = std::pin::pin!(register_until_accepted(&register, &has_owner, policy));
+        loop {
+            tokio::select! {
+                () = &mut registering => break,
+                item = owner_items.next() => {
+                    let Some(item) = item else { return };
+                    match agent_wake(&item) {
+                        Some(AgentWake::Register) => {
+                            want = true;
+                            break;
+                        }
+                        Some(AgentWake::Gone) => {
+                            tracing::warn!("org.bluez lost — will re-register agent on restart");
+                            break;
+                        }
+                        None => {}
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Register the agent, retrying a failure on `policy` while bluetoothd is
+/// running (#1551). Returns once bluetoothd took it, or once it is not
+/// running any more: its return is an [`AgentWake::Register`].
+///
+/// Until #1551 a failed registration was one `warn!` and nothing more, and
+/// bluetoothd had no agent until it next changed hands. The ramp is the iwd
+/// watcher's and the `NetworkManager` agent's (`REGISTER_RETRY`): unbounded
+/// attempts, a bounded delay. A refusal that persists is one `warn!`, then
+/// `debug!` ([`retry::FailureLatch`]). Each retry first asks the bus whether
+/// bluetoothd is running (`has_owner`), never bluetoothd itself, so a retry
+/// never starts one that was stopped.
+async fn register_until_accepted<R, RF, H, HF>(register: &R, has_owner: &H, policy: retry::Policy)
+where
+    R: Fn() -> RF,
+    RF: Future<Output = Result<(), hytte_bus::BusError>>,
+    H: Fn() -> HF,
+    HF: Future<Output = Result<bool, hytte_bus::BusError>>,
+{
+    let mut latch = retry::FailureLatch::new();
+    // 1-based, and counts the attempt that produced the outcome being
+    // weighed, per `retry::Policy::step`.
+    let mut attempt: u32 = 1;
+    loop {
+        let outcome = register().await;
+        let verdict = policy.step(&outcome, attempt);
+        log_registration(&outcome, latch.record(outcome.is_ok()), attempt, verdict);
+        match verdict {
+            retry::Step::Retry { after } => {
+                tokio::time::sleep(after).await;
+                if matches!(has_owner().await, Ok(false)) {
+                    tracing::debug!(
+                        "bluetooth agent: bluetoothd is not running; registering when it returns"
+                    );
+                    return;
+                }
+                attempt = attempt.saturating_add(1);
+            }
+            // `GiveUp` is unreachable under the unbounded ramp.
+            retry::Step::Proceed | retry::Step::GiveUp => return,
+        }
+    }
+}
+
+/// What one registration attempt is worth saying, given the ones before it.
+/// The iwd watcher's `log_registration` is the same cadence for its agent.
+fn log_registration(
+    outcome: &Result<(), hytte_bus::BusError>,
+    report: retry::Report,
+    attempt: u32,
+    verdict: retry::Step,
+) {
+    let error = outcome
+        .as_ref()
+        .err()
+        .map_or_else(String::new, ToString::to_string);
+    let retry_in_secs = match verdict {
+        retry::Step::Retry { after } => after.as_secs_f64(),
+        retry::Step::Proceed | retry::Step::GiveUp => 0.0,
     };
+    match report {
+        retry::Report::Quiet => tracing::info!("bluetooth pairing agent registered"),
+        retry::Report::Recovered => tracing::info!(
+            failed_attempts = attempt.saturating_sub(1),
+            "bluetooth pairing agent registered after earlier attempts failed"
+        ),
+        retry::Report::Opened => tracing::warn!(
+            attempt,
+            retry_in_secs,
+            %error,
+            "bluetooth agent registration failed — bluetoothd cannot ask this shell to \
+             confirm a pairing until it succeeds. Retrying with backoff while bluetoothd \
+             runs, and again whenever it changes hands; this line does not repeat while \
+             the failure does"
+        ),
+        retry::Report::Repeating => tracing::debug!(
+            attempt,
+            retry_in_secs,
+            %error,
+            "bluetooth agent registration still failing"
+        ),
+    }
+}
+
+/// Register the pairing agent with bluetoothd once: `RegisterAgent`, then
+/// `RequestDefaultAgent`.
+///
+/// bluetoothd's `AlreadyExists` for `RegisterAgent` counts as registered: it
+/// keys agents by the caller's unique name and answers that only when this
+/// connection already has one (`register_agent`, `src/agent.c`), which is what
+/// a re-registration after a `Lagged` hole meets when nothing was lost.
+/// `RequestDefaultAgent` still follows, so the agent is the default either way.
+async fn register_agent_once() -> Result<(), hytte_bus::BusError> {
+    let agent_op = zbus::zvariant::ObjectPath::try_from(AGENT_PATH)
+        .map_err(|e| hytte_bus::BusError::Permanent {
+            reason: format!("bad agent path: {e}"),
+            dbus_name: None,
+        })?
+        .to_owned();
 
     // RegisterAgent — capability "DisplayYesNo": we can show a code and
     // accept yes/no, which is what RequestConfirmation needs.
-    if let Err(e) = hytte_bus::call(BusKind::System, "org.bluez")
+    match hytte_bus::call(BusKind::System, "org.bluez")
         .at_path("/org/bluez")
         .iface("org.bluez.AgentManager1")
         .method("RegisterAgent")
@@ -399,26 +570,23 @@ async fn try_register_agent() {
         .send::<()>()
         .await
     {
-        tracing::warn!(error = %e, "bluetooth agent: RegisterAgent failed");
-        return;
+        Ok(()) => {}
+        Err(e) if super::is_already_exists(&e) => {
+            tracing::debug!("bluetoothd already holds this connection's agent");
+        }
+        Err(e) => return Err(e),
     }
 
     // RequestDefaultAgent — make us the system-wide default. Without this
     // BlueZ may use whichever Agent it sees first, including stale ones
     // from a previous trollshell run if any.
-    if let Err(e) = hytte_bus::call(BusKind::System, "org.bluez")
+    hytte_bus::call(BusKind::System, "org.bluez")
         .at_path("/org/bluez")
         .iface("org.bluez.AgentManager1")
         .method("RequestDefaultAgent")
         .args((agent_op,))
         .send::<()>()
         .await
-    {
-        tracing::warn!(error = %e, "bluetooth agent: RequestDefaultAgent failed");
-        return;
-    }
-
-    tracing::info!("bluetooth pairing agent registered");
 }
 
 #[cfg(test)]
@@ -742,5 +910,215 @@ mod tests {
         assert_eq!(shown(&banner), None);
         clear_banner_if(&banner, 2);
         assert_eq!(shown(&banner), None, "clearing an empty banner is a no-op");
+    }
+}
+
+/// The registration loop (#1551): what wakes it, the retry, and when the
+/// retry stops. All under paused time, with the registration, the bus
+/// question and the owner stream scripted.
+#[cfg(test)]
+mod registration_tests {
+    use super::{AgentWake, agent_loop, agent_wake, register_until_accepted};
+    use crate::retry;
+    use futures_util::StreamExt;
+    use hytte_bus::{BusError, SignalEvent, SignalItem};
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
+    use std::time::Duration;
+
+    /// A ramp of the shipped policy's shape with its own numbers, so tuning
+    /// `REGISTER_RETRY` cannot redden these tests.
+    const TEST_RAMP: retry::Policy = retry::Policy {
+        max_attempts: None,
+        initial: Duration::from_secs(1),
+        max_backoff: Duration::from_secs(4),
+    };
+
+    fn refused(name: &str) -> BusError {
+        BusError::Permanent {
+            reason: name.rsplit('.').next().unwrap_or(name).to_owned(),
+            dbus_name: Some(name.to_owned()),
+        }
+    }
+
+    fn noc_item(name: &str, old: &str, new: &str) -> SignalItem {
+        let body = zbus::Message::signal(
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "NameOwnerChanged",
+        )
+        .expect("signal builder")
+        .build(&(name, old, new))
+        .expect("build NameOwnerChanged");
+        SignalItem::Event(SignalEvent {
+            body,
+            sender: None,
+            timestamp: std::time::SystemTime::now(),
+        })
+    }
+
+    /// bluetoothd changing hands, bluetoothd going away and a hole in the
+    /// stream are told apart; any other name is not the agent's business.
+    #[test]
+    fn owner_items_are_classified() {
+        assert_eq!(
+            agent_wake(&noc_item("org.bluez", "", ":1.7")),
+            Some(AgentWake::Register)
+        );
+        assert_eq!(
+            agent_wake(&noc_item("org.bluez", ":1.6", ":1.7")),
+            Some(AgentWake::Register)
+        );
+        assert_eq!(
+            agent_wake(&noc_item("org.bluez", ":1.7", "")),
+            Some(AgentWake::Gone)
+        );
+        assert_eq!(agent_wake(&noc_item("net.connman.iwd", "", ":1.8")), None);
+        assert_eq!(agent_wake(&noc_item(":1.9", ":1.9", "")), None);
+        assert_eq!(
+            agent_wake(&SignalItem::Resubscribed),
+            Some(AgentWake::Register)
+        );
+        assert_eq!(
+            agent_wake(&SignalItem::Lagged { skipped: 3 }),
+            Some(AgentWake::Register)
+        );
+    }
+
+    /// A reconnect of the shell's own bus connection registers the agent
+    /// again (#1551): it shows up as a `Resubscribed` marker, not as an
+    /// `org.bluez` owner change, and bluetoothd dropped the agent with the
+    /// old unique name.
+    ///
+    /// **Falsification:** ignore the stream's markers (the pre-#1551
+    /// `events()`, or a `Resubscribed` arm answering `None`) and only the
+    /// start-up registration is made.
+    #[tokio::test(start_paused = true)]
+    async fn a_reconnect_of_our_own_connection_registers_again() {
+        let registrations = Cell::new(0_u32);
+        let mut items = futures_util::stream::iter([SignalItem::Resubscribed])
+            .chain(futures_util::stream::pending());
+
+        let _ = tokio::time::timeout(
+            Duration::from_mins(1),
+            agent_loop(
+                &mut items,
+                || {
+                    registrations.set(registrations.get() + 1);
+                    async { Ok(()) }
+                },
+                || async { Ok(true) },
+                TEST_RAMP,
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            registrations.get(),
+            2,
+            "the start-up registration, then one for the reconnect"
+        );
+    }
+
+    /// A refused registration is tried again on the ramp until bluetoothd
+    /// takes it, rather than once (#1551).
+    ///
+    /// **Falsification:** return after the first attempt whatever its
+    /// outcome (the pre-#1551 single `warn!`) and only one attempt is made.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_registration_is_retried_until_bluetoothd_takes_it() {
+        let answers = RefCell::new(VecDeque::from([
+            Err(refused("org.freedesktop.DBus.Error.NoReply")),
+            Err(refused("org.bluez.Error.Failed")),
+            Ok(()),
+        ]));
+        let attempts = Cell::new(0_u32);
+        let started = tokio::time::Instant::now();
+
+        tokio::time::timeout(
+            Duration::from_mins(1),
+            register_until_accepted(
+                &|| {
+                    attempts.set(attempts.get() + 1);
+                    let answer = answers.borrow_mut().pop_front().expect("scripted");
+                    async move { answer }
+                },
+                &|| async { Ok(true) },
+                TEST_RAMP,
+            ),
+        )
+        .await
+        .expect("the registration must end once bluetoothd takes it");
+
+        assert_eq!(attempts.get(), 3, "two refusals, then the one it took");
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(1 + 2),
+            "the retries wait on the ramp"
+        );
+    }
+
+    /// A retry asks the bus first, and stops while bluetoothd is not running,
+    /// so it never D-Bus-activates a bluetoothd that was stopped on purpose.
+    /// Its return is the wake that registers again.
+    ///
+    /// **Falsification:** drop the `has_owner` check and the registration
+    /// keeps calling `org.bluez` for the whole minute.
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_waits_for_bluetoothd_to_be_running() {
+        let attempts = Cell::new(0_u32);
+        tokio::time::timeout(
+            Duration::from_mins(1),
+            register_until_accepted(
+                &|| {
+                    attempts.set(attempts.get() + 1);
+                    async { Err(refused("org.freedesktop.DBus.Error.ServiceUnknown")) }
+                },
+                &|| async { Ok(false) },
+                TEST_RAMP,
+            ),
+        )
+        .await
+        .expect("no owner must end the retry");
+        assert_eq!(attempts.get(), 1, "only the attempt before the question");
+    }
+
+    /// bluetoothd going away while a registration is retrying stops it, and
+    /// its return registers again.
+    ///
+    /// **Falsification:** let `Gone` leave the retry running and it keeps
+    /// calling `org.bluez` after bluetoothd is gone.
+    #[tokio::test(start_paused = true)]
+    async fn bluetoothd_going_away_stops_the_retry() {
+        let attempts = Cell::new(0_u32);
+        let (tx, mut items) = futures_channel::mpsc::unbounded::<SignalItem>();
+
+        let looping = agent_loop(
+            &mut items,
+            || {
+                attempts.set(attempts.get() + 1);
+                async { Err(refused("org.bluez.Error.Failed")) }
+            },
+            || async { Ok(true) },
+            TEST_RAMP,
+        );
+        let script = async {
+            // Let the start-up registration fail and retry for a while.
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let before = attempts.get();
+            assert!(before > 1, "the refusal is retried, got {before}");
+            tx.unbounded_send(noc_item("org.bluez", ":1.6", ""))
+                .expect("loop is listening");
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            assert_eq!(attempts.get(), before, "no attempt while bluetoothd is gone");
+            tx.unbounded_send(noc_item("org.bluez", "", ":1.7"))
+                .expect("loop is listening");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            assert_eq!(attempts.get(), before + 1, "its return registers again");
+        };
+        tokio::select! {
+            () = looping => panic!("the loop never ends while its stream is open"),
+            () = script => {}
+        }
     }
 }

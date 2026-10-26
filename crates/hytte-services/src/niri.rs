@@ -985,6 +985,13 @@ struct ReflowPlan {
 /// column, so there is nothing to reflow it into. The **first** tiled window
 /// in that order is the nudge's target; if `workspace` has none (empty, or
 /// floating-only), the plan is `None` and [`reflow_workspace`] sends nothing.
+///
+/// The target choice is mirrored in `hytte-plugin-niri-layouts`' `niri.rs`
+/// by `apply`'s `plan.first()` (the leftmost tiled column), and the chain this
+/// plan feeds by that crate's `reflow`, whose twin here is [`reflow_over`]
+/// (#1516, #1517). Neither can share code: a plugin never links
+/// `hytte-services`. Keep them in step (`reflow_over` and
+/// `restore_focus_action` below carry their own pointers).
 #[must_use]
 fn reflow_plan(workspace: u64, windows: &[Window], workspaces: &[Workspace]) -> Option<ReflowPlan> {
     let first = windows

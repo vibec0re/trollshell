@@ -531,7 +531,8 @@ pub(crate) enum Incoming {
     Ended(String),
     /// A **known** state-bearing event failed to decode, so the window model
     /// can no longer be trusted for the rest of this connection: [`drive`]
-    /// logs the line and hides the chip via [`Watch::poison`].
+    /// hides the chip via [`Watch::poison`] on every one, and logs the line
+    /// only for the first of the connection.
     Poisoned(String),
 }
 
@@ -677,7 +678,16 @@ fn stream_once<B: Backend>(watch: &mut Watch, backend: &mut B) -> Stopped {
             Incoming::Idle => {}
             Incoming::Ended(why) => return Stopped::StreamEnded(why),
             Incoming::Poisoned(why) => {
-                backend.log(&why);
+                // One line per connection, on the move into poisoned. Every
+                // failure poisons, but a skewed niri can fail a state event on
+                // each window-title change (`WindowOpenedOrChanged`), and a
+                // line for each would flood the journal until niri restarts.
+                // Deduped here rather than on the source's `fresh`, which is
+                // always false past `MAX_REPORTED_SHAPES` and would make a
+                // poison that arrives there silent.
+                if !watch.poisoned {
+                    backend.log(&why);
+                }
                 if let Some(verdict) = watch.poison()
                     && !backend.emit(verdict)
                 {
@@ -761,8 +771,11 @@ pub(crate) struct SocketEvents {
 /// Cap on [`SocketEvents::reported`]; past it a skip is silent.
 const MAX_REPORTED_SHAPES: usize = 32;
 
-/// Every `Event` variant the pinned `niri-ipc` (`=26.4.0`) knows. A bump of
-/// that pin must update this list; the test below checks each name decodes.
+/// Event variants of the pinned `niri-ipc` (`=26.4.0`) this plugin names. A
+/// bump of that pin should update this list. The test below checks only that
+/// every name here is a real variant of the pinned crate (a subset check), not
+/// that every variant of the pin is listed: a variant missing here is logged as
+/// "unknown" but still decodes.
 const KNOWN_EVENTS: &[&str] = &[
     "WorkspacesChanged",
     "WorkspaceUrgencyChanged",
@@ -982,15 +995,18 @@ impl EventSource for SocketEvents {
                         let fresh = self.reported.len() < MAX_REPORTED_SHAPES
                             && self.reported.insert(shape.clone());
                         if STATE_EVENTS.contains(&shape.as_str()) {
-                            if fresh {
-                                return Incoming::Poisoned(skip_message(
-                                    "a known niri event no longer decodes; the window \
-                                     model cannot be trusted, hiding the chip until \
-                                     the next connection",
-                                    &shape,
-                                    &e,
-                                ));
-                            }
+                            // Poison on EVERY such failure, whatever `fresh`
+                            // says: past `MAX_REPORTED_SHAPES` it is always
+                            // false, and a skipped state event would drift the
+                            // model. `fresh` plays no part here; `stream_once`
+                            // logs one line per connection instead.
+                            return Incoming::Poisoned(skip_message(
+                                "a known niri event no longer decodes; the window \
+                                 model cannot be trusted, hiding the chip until \
+                                 the next connection",
+                                &shape,
+                                &e,
+                            ));
                         } else if fresh {
                             let what = if known {
                                 "a known niri event no longer decodes, skipping it \
@@ -2054,6 +2070,27 @@ mod tests {
         );
     }
 
+    /// A state event that keeps failing is logged once per connection, not
+    /// once per event: `WindowOpenedOrChanged` fires on every title change, so
+    /// a line each would flood the journal for the rest of the niri session.
+    #[test]
+    fn a_repeating_poison_is_logged_once_per_connection() {
+        let poison = || Incoming::Poisoned("poisoned: WindowOpenedOrChanged".to_owned());
+        let mut first = opening_snapshot(1, 10, 20);
+        first.extend([poison(), poison(), poison()]);
+        let mut script = Script::of(vec![Ok(first), Ok(vec![poison()])]);
+
+        drive("test", &mut script);
+
+        let lines = script
+            .logs
+            .iter()
+            .filter(|l| l.starts_with("poisoned"))
+            .count();
+        assert_eq!(lines, 2, "one per connection: {:?}", script.logs);
+        assert_eq!(script.emitted, vec![up(), Verdict::default()]);
+    }
+
     /// The backoff policy `drive` owns: absence grows the delay, a stream that
     /// actually lived resets it — and the **first** retry is one second, which
     /// is what the doc comment has always claimed (#1038 review, LOW-7).
@@ -2369,9 +2406,11 @@ mod tests {
         niri.join().expect("fake niri");
     }
 
-    /// Every name in `KNOWN_EVENTS` is a real variant of the pinned crate: an
-    /// event of that shape either decodes or fails with a payload error, but
-    /// a bare unit-ish probe of a bogus name is "unknown variant".
+    /// Proves only that `KNOWN_EVENTS` is a subset of the pinned crate's
+    /// variants (and `STATE_EVENTS` a subset of `KNOWN_EVENTS`): a probe of a
+    /// real name decodes or fails with a payload error, a bogus name is
+    /// "unknown variant". It does not prove the list is complete: a variant the
+    /// pin gains but the list lacks still decodes.
     #[test]
     fn known_events_list_matches_the_pinned_crate() {
         for name in super::KNOWN_EVENTS {
@@ -2437,6 +2476,46 @@ mod tests {
         assert!(
             watch.observe(Event::WindowClosed { id: 2 }).is_none(),
             "poisoned model emits nothing"
+        );
+        niri.join().expect("fake niri");
+    }
+
+    /// The poison decision is not tied to the log dedupe: after
+    /// `MAX_REPORTED_SHAPES` distinct undecodable shapes have filled the
+    /// reported set, a state-bearing decode failure still poisons the model.
+    #[test]
+    fn a_state_event_failure_poisons_even_after_the_reported_cap_is_spent() {
+        let (ours, theirs) = UnixStream::pair().expect("socketpair");
+        let distinct = super::MAX_REPORTED_SHAPES + 1;
+        let niri = std::thread::spawn(move || {
+            let mut reader = BufReader::new(theirs.try_clone().expect("clone"));
+            let mut request = String::new();
+            reader.read_line(&mut request).expect("a request line");
+            let mut writer = &theirs;
+            writer.write_all(b"{\"Ok\":\"Handled\"}\n").expect("reply");
+            for i in 0..distinct {
+                writer
+                    .write_all(format!("{{\"FutureThing{i}\":{{}}}}\n").as_bytes())
+                    .expect("unknown shape");
+            }
+            writer
+                .write_all(b"{\"WindowClosed\":{\"id\":\"not-a-number\"}}\n")
+                .expect("bad state payload");
+            std::thread::sleep(POLL_INTERVAL);
+        });
+        let mut events = SocketEvents::over(ours).expect("handshake");
+        let msg = loop {
+            match events.next_event() {
+                Incoming::Poisoned(msg) => break msg,
+                Incoming::Idle => {}
+                other => panic!("expected Poisoned: {other:?}"),
+            }
+        };
+        assert!(msg.contains("WindowClosed"), "{msg}");
+        assert_eq!(
+            events.reported.len(),
+            super::MAX_REPORTED_SHAPES,
+            "the cap really was spent before the state event arrived"
         );
         niri.join().expect("fake niri");
     }

@@ -24,10 +24,10 @@ use niri_ipc::{
     Action, Output, Reply, Request, Response, SizeChange, Window, Workspace, WorkspaceReferenceArg,
 };
 use std::collections::HashMap;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// One niri request, one niri reply.
 ///
@@ -48,7 +48,9 @@ pub(crate) trait Transport {
     fn log(&mut self, line: &str);
 }
 
-/// How long one request may wait on niri, per read and per write.
+/// How long one request may take against niri, connect, write and the whole
+/// reply together (one deadline, not a timeout per read: a peer dribbling bytes
+/// must not stretch it).
 ///
 /// `niri_ipc::socket::Socket` arms no timeouts and hides its stream, so a niri
 /// that accepted the connection and then wedged (or never answers) parked the
@@ -87,25 +89,86 @@ impl SocketTransport {
         Self { timeout }
     }
 
-    /// One request/reply over an already-connected stream.
-    fn exchange(&self, stream: &UnixStream, request: &Request) -> Result<Reply, String> {
-        stream
-            .set_read_timeout(Some(self.timeout))
-            .and_then(|()| stream.set_write_timeout(Some(self.timeout)))
-            .map_err(|e| format!("cannot arm the niri ipc timeouts: {e}"))?;
+    /// One request/reply over an already-connected stream, all of it within
+    /// one `deadline`: the write, and every read of the reply. A per-read
+    /// timeout alone lets a peer that dribbles a byte at a time stretch one
+    /// reply indefinitely, so each read is re-armed with only the time left.
+    fn exchange(
+        &self,
+        stream: &UnixStream,
+        request: &Request,
+        deadline: Instant,
+    ) -> Result<Reply, String> {
         let mut line = serde_json::to_string(request)
             .map_err(|e| format!("cannot encode the niri request: {e}"))?;
         line.push('\n');
+        stream
+            .set_write_timeout(Some(self.remaining(deadline)?))
+            .map_err(|e| format!("cannot arm the niri ipc timeouts: {e}"))?;
         let mut writer = stream;
         writer
             .write_all(line.as_bytes())
             .map_err(|e| self.describe(&e, "niri ipc write failed"))?;
 
-        let mut reply = String::new();
-        BufReader::new(stream)
-            .read_line(&mut reply)
-            .map_err(|e| self.describe(&e, "niri ipc failed"))?;
-        serde_json::from_str(&reply).map_err(|e| format!("niri ipc failed: bad reply: {e}"))
+        let mut reply = Vec::new();
+        let mut reader = stream;
+        let mut chunk = [0_u8; 4096];
+        loop {
+            stream
+                .set_read_timeout(Some(self.remaining(deadline)?))
+                .map_err(|e| format!("cannot arm the niri ipc timeouts: {e}"))?;
+            match reader.read(&mut chunk) {
+                // EOF: take what arrived, as `read_line` would have.
+                Ok(0) => break,
+                Ok(n) => {
+                    if let Some(pos) = chunk[..n].iter().position(|&b| b == b'\n') {
+                        reply.extend_from_slice(&chunk[..=pos]);
+                        break;
+                    }
+                    reply.extend_from_slice(&chunk[..n]);
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(self.describe(&e, "niri ipc failed")),
+            }
+        }
+        serde_json::from_slice(&reply).map_err(|e| format!("niri ipc failed: bad reply: {e}"))
+    }
+
+    /// The time left before `deadline`, or the timeout error once it is spent
+    /// (a zero socket timeout means "block forever", so it never reaches the
+    /// socket).
+    fn remaining(&self, deadline: Instant) -> Result<Duration, String> {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            Err(format!("niri ipc timed out after {:?}", self.timeout))
+        } else {
+            Ok(left)
+        }
+    }
+
+    /// Dial `path` within `deadline`. `UnixStream::connect` has no timeout and
+    /// blocks while niri's listen backlog is full, so it runs on a helper
+    /// thread the caller stops waiting for at the deadline (the thread ends
+    /// when the connect does). A thread that cannot be created (the unit at
+    /// its tasks limit) is this request's error, not a panic.
+    fn connect(&self, path: &Path, deadline: Instant) -> Result<UnixStream, String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = path.to_owned();
+        std::thread::Builder::new()
+            .name("niri-layouts-connect".to_owned())
+            .spawn(move || {
+                // The receiver may be gone after a timeout; the stream just drops.
+                drop(tx.send(UnixStream::connect(path)));
+            })
+            .map_err(|e| format!("cannot reach niri over $NIRI_SOCKET: no connect thread: {e}"))?;
+        match rx.recv_timeout(self.remaining(deadline)?) {
+            Ok(Ok(stream)) => Ok(stream),
+            Ok(Err(e)) => Err(format!("cannot reach niri over $NIRI_SOCKET: {e}")),
+            Err(_) => Err(format!(
+                "cannot reach niri over $NIRI_SOCKET: timed out after {:?}",
+                self.timeout
+            )),
+        }
     }
 
     fn describe(&self, e: &io::Error, what: &str) -> String {
@@ -120,9 +183,9 @@ impl SocketTransport {
     }
 
     fn send_to(&self, path: &Path, request: &Request) -> Result<Reply, String> {
-        let stream = UnixStream::connect(path)
-            .map_err(|e| format!("cannot reach niri over $NIRI_SOCKET: {e}"))?;
-        self.exchange(&stream, request)
+        let deadline = Instant::now() + self.timeout;
+        let stream = self.connect(path, deadline)?;
+        self.exchange(&stream, request, deadline)
     }
 }
 
@@ -261,6 +324,12 @@ pub(crate) fn apply(
 /// included, so there is nothing to put back, and a focus "restore" sent then
 /// would act on a workspace that never lost focus (see [`restore_focus`] for why
 /// that is not harmless).
+///
+/// Mirrored in `hytte-services`' `niri.rs` as `reflow_over` (#1516, #1517),
+/// which sends the same chain and puts back the same two things, and cannot
+/// share this code: the shell never links this plugin crate. Keep the two in
+/// step. (The target, the first tiled column, is picked there by
+/// `reflow_plan` and here by `apply`'s `plan.first()`.)
 fn reflow(
     transport: &mut impl Transport,
     first_id: u64,
@@ -327,6 +396,9 @@ fn reflow(
 ///
 /// With none of the three (niri reported no focused workspace at all), there
 /// is nothing to restore to and nothing is sent.
+///
+/// Mirrored in `hytte-services`' `niri.rs` as `restore_focus_action` (#1516).
+/// Keep the two in step.
 fn restore_focus(
     transport: &mut impl Transport,
     windows: &[Window],
@@ -701,6 +773,95 @@ mod tests {
         assert!(err.contains("timed out"), "got {err:?}");
         assert!(started.elapsed() < Duration::from_secs(3), "not bounded");
         drop(holder.join());
+    }
+
+    /// A peer that dribbles one byte every ~100 ms and never sends the newline
+    /// must still hit the one whole-reply deadline: every read succeeds in
+    /// time, so only a deadline tracked across reads can stop it.
+    #[test]
+    fn a_dribbling_niri_hits_the_whole_reply_deadline() {
+        use super::SocketTransport;
+        use std::io::Write;
+        use std::os::unix::net::UnixListener;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("niri.sock");
+        let listener = UnixListener::bind(&path).expect("bind");
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            // Dribble for far longer than the deadline; stop on a broken pipe
+            // once the client gives up.
+            for _ in 0..50 {
+                std::thread::sleep(Duration::from_millis(100));
+                if stream.write_all(b" ").is_err() {
+                    break;
+                }
+            }
+        });
+
+        let transport = SocketTransport::with_timeout(Duration::from_millis(500));
+        let started = Instant::now();
+        let err = transport
+            .send_to(&path, &Request::Version)
+            .expect_err("a dribbled reply must not complete");
+        let took = started.elapsed();
+        assert!(err.contains("timed out"), "got {err:?}");
+        assert!(took < Duration::from_millis(2500), "not bounded: {took:?}");
+        drop(peer.join());
+    }
+
+    /// A niri whose listen backlog is full (it stopped accepting) must not
+    /// park the connect: `UnixStream::connect` blocks there until a slot
+    /// frees, so only the deadline on the connect itself can end it.
+    #[test]
+    fn a_full_listen_backlog_times_out_the_connect() {
+        use super::SocketTransport;
+        use std::os::unix::net::{UnixListener, UnixStream};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("niri.sock");
+        // Bound and never accepted from, like a wedged niri.
+        let listener = UnixListener::bind(&path).expect("bind");
+        // Fill the backlog. A closed client keeps its slot until it is
+        // accepted, so nothing has to stay open; the filler's last connect
+        // parks, and ends with ECONNREFUSED once the listener is dropped.
+        let (slot_taken, slots) = mpsc::channel();
+        let filler_path = path.clone();
+        let filler = std::thread::spawn(move || {
+            while UnixStream::connect(&filler_path).is_ok() {
+                if slot_taken.send(()).is_err() {
+                    break;
+                }
+            }
+        });
+        // Full once no connect has completed for 200 ms.
+        while slots.recv_timeout(Duration::from_millis(200)).is_ok() {}
+
+        let (done, outcome) = mpsc::channel();
+        let request_path = path.clone();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = SocketTransport::with_timeout(Duration::from_millis(300))
+                .send_to(&request_path, &Request::Version);
+            drop(done.send((result, started.elapsed())));
+        });
+        let outcome = outcome.recv_timeout(Duration::from_secs(3));
+        // Frees the filler's parked connect (and an unbounded one, so a
+        // failing run still ends).
+        drop(listener);
+        filler.join().expect("filler");
+        let (result, took) = outcome.expect("the connect was not bounded by the deadline");
+        let err = result.expect_err("no backlog slot, no reply");
+        // The connect's own timeout, not the read's: a connect that got a
+        // slot would time out on the reply instead and prove nothing here.
+        assert!(
+            err.starts_with("cannot reach niri") && err.contains("timed out"),
+            "got {err:?}"
+        );
+        assert!(took < Duration::from_secs(2), "not bounded: {took:?}");
     }
 
     use super::fake::{self, Fake, tile};
@@ -1195,7 +1356,7 @@ mod tests {
     // ── Post-resize niri reflow nudge (#1129) ───────────────────────────────
 
     /// The chain `apply` sends after resizing columns, mirroring
-    /// `hytte_services::niri::reflow_batch`'s verified sequence: focus the
+    /// `hytte_services::niri::reflow_over`'s verified sequence: focus the
     /// leftmost column, move it to the end and back to the start twice, then
     /// restore whatever window was actually focused before `apply` ran — not
     /// the window the nudge itself focused.

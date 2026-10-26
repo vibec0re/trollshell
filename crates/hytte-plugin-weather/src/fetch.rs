@@ -138,19 +138,44 @@ fn daily_min_max(f: &ForecastResponse) -> Option<(f64, f64)> {
     ))
 }
 
-/// One blocking open-meteo fetch + parse for `loc`. For a `GeoClue`-sourced
-/// location (no name) it also reverse-geocodes a friendly place name.
-fn fetch_weather(loc: &LocationSnapshot) -> Result<Snapshot, String> {
-    let agent = http_agent();
-    let url = format!(
+/// Round a coordinate to two decimals (about 1 km) before it leaves the
+/// machine. Third-party weather and geocoding services need no more, and
+/// [`cache_key`] already treats 0.01 degrees as the same place. Negative
+/// zero is normalised so it never renders as `-0`. (Duplicated in
+/// `hytte-services`' weather module; the crates do not depend on each other.)
+fn coarse(v: f64) -> f64 {
+    let r = (v * 100.0).round() / 100.0;
+    if r.abs() < 0.005 { 0.0 } else { r }
+}
+
+/// The open-meteo forecast URL for a (coarsened) location.
+fn forecast_url(lat: f64, lon: f64) -> String {
+    format!(
         "https://api.open-meteo.com/v1/forecast\
          ?latitude={lat}&longitude={lon}\
          &current=temperature_2m,apparent_temperature,relative_humidity_2m,wind_speed_10m,weather_code\
          &daily=temperature_2m_max,temperature_2m_min&forecast_days=1\
          &timezone=auto",
-        lat = loc.lat,
-        lon = loc.lon,
-    );
+        lat = coarse(lat),
+        lon = coarse(lon),
+    )
+}
+
+/// The Nominatim reverse-geocode URL for a (coarsened) location.
+fn nominatim_url(lat: f64, lon: f64) -> String {
+    format!(
+        "https://nominatim.openstreetmap.org/reverse\
+         ?lat={lat}&lon={lon}&format=jsonv2&zoom=14&accept-language=en",
+        lat = coarse(lat),
+        lon = coarse(lon),
+    )
+}
+
+/// One blocking open-meteo fetch + parse for `loc`. For a `GeoClue`-sourced
+/// location (no name) it also reverse-geocodes a friendly place name.
+fn fetch_weather(loc: &LocationSnapshot) -> Result<Snapshot, String> {
+    let agent = http_agent();
+    let url = forecast_url(loc.lat, loc.lon);
 
     let mut resp = agent.get(&url).call().map_err(|e| format!("http: {e}"))?;
     let body = resp
@@ -240,10 +265,7 @@ fn reverse_geocode(agent: &ureq::Agent, lat: f64, lon: f64) -> Option<String> {
 
     // zoom=14 ≈ suburb/district granularity; accept-language=en matches the
     // forward-geocode path.
-    let url = format!(
-        "https://nominatim.openstreetmap.org/reverse\
-         ?lat={lat}&lon={lon}&format=jsonv2&zoom=14&accept-language=en"
-    );
+    let url = nominatim_url(lat, lon);
     let mut resp = agent
         .get(&url)
         .header("User-Agent", NOMINATIM_UA)
@@ -277,7 +299,34 @@ fn parse_reverse(body: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{daily_min_max, parse_forecast, parse_reverse, pct_to_u8};
+    use super::{
+        coarse, daily_min_max, forecast_url, nominatim_url, parse_forecast, parse_reverse,
+        pct_to_u8,
+    };
+
+    #[test]
+    fn coarse_rounds_to_two_decimals() {
+        assert!((coarse(52.520_008) - 52.52).abs() < 1e-9);
+        assert!((coarse(-33.868_82) - -33.87).abs() < 1e-9);
+        assert!((coarse(179.999_9) - 180.0).abs() < 1e-9);
+        assert!((coarse(-179.996) - -180.0).abs() < 1e-9);
+        assert!((coarse(89.999) - 90.0).abs() < 1e-9);
+        assert!((coarse(-90.0) - -90.0).abs() < 1e-9);
+        assert!(coarse(-0.001).is_sign_positive());
+    }
+
+    #[test]
+    fn urls_carry_only_coarse_coordinates() {
+        let u = forecast_url(-33.868_82, 151.209_3);
+        assert!(u.contains("latitude=-33.87&longitude=151.21&"), "{u}");
+        let n = nominatim_url(52.520_008, -179.996);
+        assert!(
+            n.contains("lat=52.52&lon=-180&format=jsonv2&zoom=14"),
+            "{n}"
+        );
+        let z = nominatim_url(-0.001, 0.004);
+        assert!(z.contains("lat=0&lon=0&"), "{z}");
+    }
 
     #[test]
     fn parse_forecast_ok() {

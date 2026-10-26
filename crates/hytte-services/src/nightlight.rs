@@ -444,12 +444,8 @@ pub fn set_enabled(on: bool) {
             state.set(State::settled(false));
             return;
         };
-        tracing::debug!(
-            lat = coords.lat,
-            lon = coords.lon,
-            source = coords.source,
-            "nightlight: resolved coordinates"
-        );
+        // Source only: the position itself is not worth a journal line.
+        tracing::debug!(source = coords.source, "nightlight: resolved coordinates");
         let join = tokio::task::spawn_blocking(move || {
             // Re-check on the blocking thread, not before the spawn: the later
             // the check, the narrower the window. Dropping out here also skips
@@ -616,8 +612,16 @@ fn parse_coord(raw: &str, limit: f64) -> Option<f64> {
 /// by the unit's `ExecStart` — the `swaybg.args` shape. Rust's `f64` `Display`
 /// is locale-independent and round-trips, so no trailing-zero padding reaches
 /// `wlsunset`.
+///
+/// Coordinates are rounded to two decimals (about 1 km) first: the file sits
+/// in `~/.config`, and sunrise/sunset times do not change within that radius.
+/// `wlsunset` reads `-l`/`-L` with `strtod`, so any decimal is accepted.
 fn args_file_body(coords: Coords) -> String {
-    format!("-l\n{}\n-L\n{}\n", coords.lat, coords.lon)
+    format!(
+        "-l\n{}\n-L\n{}\n",
+        crate::weather::coarse(coords.lat),
+        crate::weather::coarse(coords.lon)
+    )
 }
 
 // ── Unit control ─────────────────────────────────────────────────────────────
@@ -983,10 +987,24 @@ mod tests {
     #[test]
     fn args_file_is_one_argument_per_line() {
         let body = args_file_body(Coords::live(52.52, 13.405));
-        assert_eq!(body, "-l\n52.52\n-L\n13.405\n");
+        assert_eq!(body, "-l\n52.52\n-L\n13.41\n");
         assert_eq!(
             body.lines().collect::<Vec<_>>(),
-            ["-l", "52.52", "-L", "13.405"]
+            ["-l", "52.52", "-L", "13.41"]
+        );
+    }
+
+    #[test]
+    fn args_file_rounds_full_precision_fixes_to_two_decimals() {
+        let body = args_file_body(Coords::live(-33.868_820_1, 179.999_9));
+        assert_eq!(
+            body.lines().collect::<Vec<_>>(),
+            ["-l", "-33.87", "-L", "180"]
+        );
+        let body = args_file_body(Coords::live(-89.996, -179.996));
+        assert_eq!(
+            body.lines().collect::<Vec<_>>(),
+            ["-l", "-90", "-L", "-180"]
         );
     }
 

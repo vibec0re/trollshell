@@ -7066,6 +7066,39 @@ mod gtk_tests {
         dismiss(&window);
     }
 
+    /// #1564: the host-connection row's subtitle carries the mount a plugin's
+    /// `plugins.json` declared, which is nobody's validated text. `&` and `<`
+    /// in it must display literally rather than blank the row.
+    ///
+    /// Falsified by dropping `plain_text` from `conn_row` in `build_detail`.
+    #[gtk::test]
+    fn the_host_connection_row_shows_a_hostile_declared_mount_literally() {
+        adw::init().expect("libadwaita init");
+        let (bin, state) = build_tab();
+        let hostile = "Tom & <b>Jerry</b>";
+        let units = vec![("clock".to_owned(), "active".to_owned(), true)];
+        let mut rt = HashMap::new();
+        rt.insert(
+            "clock".to_owned(),
+            PluginRuntime {
+                rendering: true,
+                mount: hostile.to_owned(),
+                declared_mount: None,
+                last_seen_secs: 1,
+                violations: 0,
+                version: None,
+            },
+        );
+        apply_plugins(&state, &units, &rt);
+        pump();
+        click(&state, "clock");
+        let window = present(&bin, 640);
+        let shown = state.detail.conn_row.subtitle().expect("a subtitle");
+        assert!(shown.contains(hostile), "{shown:?}");
+        crate::markup::test_support::assert_shows(&state.detail.conn_row, shown.as_str());
+        dismiss(&window);
+    }
+
     /// The status column reaches the row, and says what the plugin is doing
     /// rather than repeating what the unit is doing.
     #[gtk::test]

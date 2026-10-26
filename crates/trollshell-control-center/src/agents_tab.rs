@@ -85,11 +85,11 @@
 //! `AdwNavigationPage:title` needs neither: it renders through `AdwWindowTitle`,
 //! whose labels declare no `use-markup` and so are plain text.
 //!
-//! `adw::Toast:title` is the odd one out in this census, not because it needs
-//! a third mechanism but because it needs **none**: Adw-1.gir documents that
-//! toast titles use Pango markup by default, but the one caller
-//! ([`toast`]) never puts wire text there — its argument is a GIO error's own
-//! message, not a string the hive or an agent wrote (#1147 review, NIT N4).
+//! `adw::Toast:title` uses Pango markup by default and has no way to turn it off
+//! before the text is set, so the one caller ([`toast`]) escapes through
+//! `crate::markup::toast` (#1564). Its argument is **not** only a GIO message:
+//! `launch_detached` returns `systemd-run`'s stderr when the helper starts but
+//! the unit fails, and #1147 review NIT N4 wrongly called that safe.
 //!
 //! # Why the poll is a `glib` timer and not a task
 //!
@@ -4084,6 +4084,40 @@ mod gtk_tests {
             state.probe.borrow_mut().available(),
             agent_window::on_path(),
             "the pinned probe survived a launch that proved it wrong"
+        );
+        dismiss(&window);
+    }
+
+    /// #1564: the launch-failure toast carries the launcher's own error text
+    /// (possibly `systemd-run`'s stderr), and toast titles are Pango markup,
+    /// so an `&` or `<` in it must display literally rather than blank it.
+    ///
+    /// Falsified by making `toast` build `adw::Toast::new(text)` unescaped.
+    #[gtk::test]
+    fn a_failed_launch_toast_shows_the_error_literally() {
+        let (bin, state) = build_tab(cfg());
+        let window = present(&bin, 900);
+        let hostile = "Tom & <b>Jerry</b>";
+        let _seen = record(&state, Err(hostile.to_owned()));
+        *state.probe.borrow_mut() = agent_window::Probe::fixed(true);
+        on_status(
+            &state,
+            &Ok(Response {
+                version: HOST_SOCK_VERSION,
+                ok: true,
+                agent_statuses: Some(vec![AgentStatusRow {
+                    url: Some("https://hive.example/a/argus".to_owned()),
+                    ..row("argus")
+                }]),
+                ..Response::default()
+            }),
+        );
+        pump();
+        adw::prelude::ActionRowExt::activate(&state.detail.agent_page);
+        pump();
+        crate::markup::test_support::assert_shows(
+            &state.toasts,
+            &format!("Could not open the agent window: {hostile}"),
         );
         dismiss(&window);
     }

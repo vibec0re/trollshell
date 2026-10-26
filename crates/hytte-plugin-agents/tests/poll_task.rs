@@ -390,6 +390,86 @@ async fn a_reload_with_a_bad_display_value_keeps_the_files_socket() {
     task.abort();
 }
 
+/// Drive ticks until a `Msg::Config` shows up, or `None` if none does in `secs`.
+async fn next_config(rx: &mut mpsc::UnboundedReceiver<Msg>, secs: u64) -> Option<AgentsConfig> {
+    tokio::time::timeout(Duration::from_secs(secs), async {
+        loop {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            settle().await;
+            while let Ok(msg) = rx.try_recv() {
+                if let Msg::Config(cfg) = msg {
+                    return *cfg;
+                }
+            }
+        }
+    })
+    .await
+    .ok()
+}
+
+/// **A live reload of a corrupt `agents.toml` keeps the config in use**
+/// (review of `main`, LOW) — a whole-file failure (not TOML) still reaches
+/// `ConfigSource::read`'s `Err`, and used to publish the built-in default:
+/// default socket, default cadence, `[display]` wiped, rows "no socket" until
+/// the file was fixed. Now the running config stays, and fixing the file applies.
+///
+/// Falsification: make `ConfigSource::read` return `Some(AgentsConfig::default())`
+/// on `Err` and the corrupt-step assertion reds.
+#[tokio::test(start_paused = true)]
+async fn a_corrupt_reload_keeps_the_running_config_until_the_file_is_fixed() {
+    let hive = FakeHive::serve(replies(&[(
+        "agent_status",
+        &fixture("agent_status_grouped.json"),
+    )]));
+    let socket = hive.path().display().to_string();
+    let good = |label: &str, secs: u64| {
+        format!(
+            "socket = {}\npoll_seconds = {secs}\n[display.argus]\nlabel = \"{label}\"\n",
+            toml::Value::from(socket.as_str())
+        )
+    };
+    let layer_dir = tempfile::tempdir().expect("a tempdir");
+    let layer: PathBuf = layer_dir.path().join("agents.toml");
+
+    let (tx, rx) = cmd_channel();
+    let (msg_tx, mut msg_rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(poll_task_with(
+        rx,
+        msg_tx,
+        cfg_for(&hive),
+        ConfigSource::over(vec![layer.clone()]),
+    ));
+    assert!(matches!(
+        recv_soon(&mut msg_rx, "the seed config").await,
+        Msg::Config(_)
+    ));
+    tx.send(Cmd::SetVisible(true)).expect("the lane is open");
+
+    // A good file is picked up.
+    write_at(&layer, &good("Argus", 3), 1_000);
+    let running = next_config(&mut msg_rx, 30)
+        .await
+        .expect("the file applies");
+    assert_eq!(running.socket, socket);
+    assert_eq!(running.poll_seconds, 3);
+    assert_eq!(running.label_for("argus"), "Argus");
+
+    // Corrupt it: nothing is published (least of all the default).
+    write_at(&layer, "socket = [unterminated\n", 2_000);
+    assert!(
+        next_config(&mut msg_rx, 30).await.is_none(),
+        "a corrupt file must not publish a config"
+    );
+
+    // Fix it: the new values apply.
+    write_at(&layer, &good("Argus II", 5), 3_000);
+    let fixed = next_config(&mut msg_rx, 30).await.expect("the fix applies");
+    assert_eq!(fixed.socket, socket);
+    assert_eq!(fixed.poll_seconds, 5);
+    assert_eq!(fixed.label_for("argus"), "Argus II");
+    task.abort();
+}
+
 /// How many times the journal named `trollshell-choom`'s bad `label`.
 fn label_lines(log: &Captured) -> usize {
     log.warnings()

@@ -619,10 +619,12 @@ pub fn save_stack_to(
 /// doc says *"Phase 4's edit form is where an existing stack is changed"*. This
 /// is that form's writer, so it replaces by design.
 ///
-/// `previous` is the name the form opened on: `None` for an ephemeral card
-/// (§3.7, where Save is what creates the entry) and `Some(old)` for a saved one.
-/// When `old` differs from `name` this is a **rename** — see `rename_within`
-/// for what moves.
+/// `previous` is the name the form opened on: `Some(old)` for a saved card, and
+/// `None` for a creation. When `old` differs from `name` this is a **rename** —
+/// see `rename_within` for what moves. An ephemeral card's Save (§3.7) is a
+/// creation that never reaches this writer: it also has to name its niri
+/// workspace, so the form routes it through `workspace_stacks::save`, which
+/// writes with [`save_stack`] (and [`save_stack_in`]'s taken-name check).
 ///
 /// Writing the whole `[workspace.<name>]` table is right here, and is exactly
 /// what made it wrong for [`set_stack_monitor`]: a drag says nothing about a
@@ -758,13 +760,16 @@ pub fn save_edit_to(
 
     // A Save under a name that is already somebody else's would silently eat
     // that stack — `Table::insert` replaces. That is a rename onto a taken
-    // name, and equally an ephemeral card's Save (`previous: None`, a
-    // creation) under one: the form's own `plan_save` refuses both, and so
-    // does this, because two Saves in flight can each pass the form's check
-    // against a view that predates the other (#1559). `taken` is the
-    // **merged** view, handed in by the caller (see `save_edit_in`), because a
-    // base-pinned name is taken too and this function must not go looking for
-    // one.
+    // name, and equally a creation (`previous: None`) under one. The form's
+    // own `plan_save` refuses both, and so does this, because two Saves in
+    // flight can each pass the form's check against a view that predates the
+    // other (#1559). No production Save creates through here today: an
+    // ephemeral card's goes through `workspace_stacks::save` → `save_stack`,
+    // whose `save_stack_in` makes the same check under the same lock. This
+    // writer refuses a taken creation anyway, so it can never replace a stack
+    // whatever calls it. `taken` is the **merged** view, handed in by the
+    // caller (see `save_edit_in`), because a base-pinned name is taken too and
+    // this function must not go looking for one.
     if previous.as_deref() != Some(name.as_str()) && context.taken.contains(&name) {
         return Err(ConfigError::Invalid(format!(
             "a workspace called {name:?} already exists"

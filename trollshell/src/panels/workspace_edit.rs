@@ -902,6 +902,12 @@ fn build_form(seed: &Draft, seams: &RowSeams) -> gtk::Widget {
 
 /// Close the form when its own Save succeeds; show why when it does not.
 ///
+/// Closing goes back through [`crate::modal::leave_workspace_edit`], which
+/// opens nothing: the outcome arrives after an asynchronous write, and a user
+/// may have dismissed the drawer while it was in flight. `switch_active`'s
+/// #799 fallback, which this called before, then opened the Workspaces page
+/// on the focused output — re-opening the drawer they had just closed.
+///
 /// Split out so the `bind` call site can be driven with a synthetic signal in a
 /// `#[gtk::test]` — the same seam `build_slot` and `panels::workspaces`'
 /// `bind_columns` carve, and for the same reason. The apply closure takes its
@@ -931,7 +937,7 @@ fn bind_save_outcome<S>(
         match outcome.error {
             None => {
                 close();
-                crate::modal::switch_active(crate::modal::Page::Workspaces);
+                crate::modal::leave_workspace_edit();
             }
             Some(error) => {
                 if let Some(refusal) = refusal_weak.upgrade() {
@@ -941,6 +947,21 @@ fn bind_save_outcome<S>(
             }
         }
     });
+}
+
+/// [`bind_save_outcome`] for `modal`'s drawer harness: the Save route's "opens
+/// no drawer" contract needs a mounted drawer, and only `modal::gtk_tests` can
+/// mount one.
+#[cfg(all(test, feature = "system-tests"))]
+pub(crate) fn bind_save_outcome_for_test<S>(
+    save: &gtk::Button,
+    outcomes: S,
+    pending: &Rc<std::cell::Cell<Option<u64>>>,
+    refusal_label: &gtk::Label,
+) where
+    S: Signal<Item = Option<workspace_stacks::SaveOutcome>> + 'static,
+{
+    bind_save_outcome(save, outcomes, pending, refusal_label);
 }
 
 /// The Save/Cancel row, and the label a refused Save writes under it.
@@ -1147,9 +1168,14 @@ fn fire(redraw: &Redraw) {
 /// Everything the form changed lives in its own `Draft`, which is dropped with
 /// the page — there is no write to undo, which is what makes "Cancel reverts"
 /// true by construction rather than by remembering to roll something back.
+///
+/// Back to the Workspaces page through the same non-opening route Save takes
+/// ([`crate::modal::leave_workspace_edit`]). Cancel is a click on the open
+/// form, so `switch_active`'s fallback could never fire from here; the two
+/// exits share one route so they cannot differ.
 fn cancel() {
     close();
-    crate::modal::switch_active(crate::modal::Page::Workspaces);
+    crate::modal::leave_workspace_edit();
 }
 
 /// The message a refused Save puts on the name field.

@@ -99,35 +99,123 @@ pub(crate) fn action_indicator(class: &str, on_click: impl Fn() + 'static) -> gt
 /// Attach a vertical-scroll controller to `widget` that accumulates
 /// smooth-scroll deltas into whole "notches" before firing `on_step`.
 ///
-/// Trackpads and high-resolution mice report `scroll` events as fractional
-/// pixel deltas (libinput smooth scrolling) rather than a wheel's integral
-/// clicks, so a naive `dy.round()` per event either fires on every
-/// sub-pixel tick or misses slow scrolls entirely. Accumulating the raw
-/// deltas in a `Cell<f64>` and only firing once the running total crosses a
-/// whole unit reproduces the one-notch-per-click feel of a physical wheel
-/// for both input types, and lets a fast flick fire `on_step` more than
-/// once per event.
+/// A wheel reports `±1.0` per detent (a high-resolution one, fractions of
+/// it), but a touchpad reports raw surface **pixels**
+/// ([`gtk::gdk::ScrollUnit::Surface`]), which this controller passes through
+/// unscaled because it does not set `DISCRETE`. So each delta is first put in
+/// notches ([`in_notches`]), then summed, and `on_step` fires only once the
+/// running total crosses a whole notch. A naive `dy.round()` per event would
+/// either fire on every sub-notch tick or miss slow scrolls entirely; summing
+/// gives both input types the one-notch-per-click feel of a physical wheel,
+/// and lets a fast flick fire `on_step` more than once per event. Without the
+/// unit scaling, a touchpad fired one step per pixel.
 ///
 /// `on_step` is called with `1.0` for a scroll down and `-1.0` for a scroll
 /// up (matching raw GDK `dy` sign — down is positive); callers map that to
 /// "increase"/"decrease" as appropriate for the chip.
+///
+/// The unspent fraction is **dropped** when the direction flips and after
+/// [`SCROLL_IDLE_RESET`] of quiet ([`Notches`]), so it only ever carries
+/// within one gesture.
 pub(crate) fn wire_scroll<W: IsA<gtk::Widget>>(widget: &W, on_step: impl Fn(f64) + 'static) {
     let controller = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
-    let accumulated = std::cell::Cell::new(0.0_f64);
-    controller.connect_scroll(move |_, _dx, dy| {
-        let mut total = accumulated.get() + dy;
-        while total >= 1.0 {
-            on_step(1.0);
-            total -= 1.0;
+    let notches = std::cell::Cell::new(Notches::default());
+    controller.connect_scroll(move |controller, _dx, dy| {
+        let mut acc = notches.get();
+        let steps = acc.feed(in_notches(dy, controller.unit()), std::time::Instant::now());
+        notches.set(acc);
+        // Fire after the state is stored, so an `on_step` that re-enters this
+        // handler (a synchronous emission) reads the settled remainder.
+        for _ in 0..steps.unsigned_abs() {
+            on_step(if steps > 0 { 1.0 } else { -1.0 });
         }
-        while total <= -1.0 {
-            on_step(-1.0);
-            total += 1.0;
-        }
-        accumulated.set(total);
         gtk::glib::Propagation::Stop
     });
     widget.add_controller(controller);
+}
+
+/// Surface pixels per notch for a [`gtk::gdk::ScrollUnit::Surface`] delta —
+/// a touchpad's two-finger scroll, which GDK reports in raw surface pixels
+/// and `EventControllerScroll` passes through unscaled unless `DISCRETE` is
+/// set. GTK's own `SURFACE_UNIT_DISCRETE_MAPPING`, the divisor its
+/// `DISCRETE` mode applies to the same deltas.
+const SURFACE_PX_PER_NOTCH: f64 = 10.0;
+
+/// `dy` in notches, whatever unit GDK delivered it in.
+fn in_notches(dy: f64, unit: gtk::gdk::ScrollUnit) -> f64 {
+    if unit == gtk::gdk::ScrollUnit::Surface {
+        dy / SURFACE_PX_PER_NOTCH
+    } else {
+        dy
+    }
+}
+
+/// How long a scroll may pause before its unspent fraction of a notch is
+/// dropped.
+///
+/// Within one gesture the events come close together — a wheel spun by hand
+/// reports its detents tens of milliseconds apart, a touchpad a frame every
+/// ~10 ms — so half a second of nothing is the gesture over. Without the
+/// reset, a sub-notch remainder survived indefinitely, and the first tiny
+/// nudge of the next scroll, minutes later, completed a notch nobody asked
+/// for.
+const SCROLL_IDLE_RESET: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// [`wire_scroll`]'s accumulator: smooth-scroll deltas summed into whole
+/// notches, the remainder carried only within one gesture.
+///
+/// Pure, so the arithmetic is tested without a scroll controller. Two resets
+/// on top of the plain sum it replaces:
+///
+/// - **Direction flip.** A remainder left by scrolling one way is not credit
+///   toward the other: `+0.9` then a full `-1.0` notch used to net `-0.1` and
+///   fire nothing, so the first notch back was lost.
+/// - **Idle** ([`SCROLL_IDLE_RESET`]).
+///
+/// An integral wheel (`dy = ±1.0` per detent) leaves no remainder, so neither
+/// reset changes anything there — the brightness and volume chips' per-notch
+/// behaviour (#1495) is untouched; both only ever see the `±1.0` steps this
+/// emits.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Notches {
+    /// The fraction of a notch carried so far, in `(-1.0, 1.0)`.
+    remainder: f64,
+    /// When the last delta arrived; `None` before the first.
+    last: Option<std::time::Instant>,
+}
+
+impl Notches {
+    /// Feed one event's `dy` at `now`; the signed number of whole notches it
+    /// completes (positive = down).
+    ///
+    /// A non-finite `dy` is ignored rather than summed: one `NaN` would
+    /// otherwise poison the remainder, and every comparison against it is
+    /// false, so the chip would stop scrolling for good.
+    fn feed(&mut self, dy: f64, now: std::time::Instant) -> i32 {
+        if !dy.is_finite() {
+            return 0;
+        }
+        let idle = self
+            .last
+            .is_some_and(|last| now.saturating_duration_since(last) >= SCROLL_IDLE_RESET);
+        let flipped = self.remainder * dy < 0.0;
+        if idle || flipped {
+            self.remainder = 0.0;
+        }
+        self.last = Some(now);
+        let mut total = self.remainder + dy;
+        let mut steps = 0_i32;
+        while total >= 1.0 {
+            steps = steps.saturating_add(1);
+            total -= 1.0;
+        }
+        while total <= -1.0 {
+            steps = steps.saturating_sub(1);
+            total += 1.0;
+        }
+        self.remainder = total;
+        steps
+    }
 }
 
 /// Build the standard vertical fill bar used in the cpu / memory / gpu / disk
@@ -148,4 +236,92 @@ pub(crate) fn vertical_bar() -> gtk::ProgressBar {
     bar.set_inverted(true);
     bar.set_valign(gtk::Align::Center);
     bar
+}
+
+#[cfg(test)]
+mod notch_tests {
+    use super::{Notches, SCROLL_IDLE_RESET};
+    use std::time::{Duration, Instant};
+
+    /// The plain sum still works: fractions within one gesture add up, the
+    /// remainder carries into the next event, and a big delta fires more than
+    /// once.
+    #[test]
+    fn fractions_add_up_within_a_gesture() {
+        let t = Instant::now();
+        let mut n = Notches::default();
+        assert_eq!(n.feed(0.4, t), 0);
+        assert_eq!(n.feed(0.4, t + Duration::from_millis(10)), 0);
+        assert_eq!(n.feed(0.4, t + Duration::from_millis(20)), 1);
+        // 0.2 carried + 2.8 = three whole notches.
+        assert_eq!(n.feed(2.8, t + Duration::from_millis(30)), 3);
+        // Fresh, so no remainder (and no flip reset) is involved.
+        assert_eq!(Notches::default().feed(-3.0, t), -3);
+    }
+
+    /// An integral wheel never carries anything, so the resets cannot change
+    /// it: one detent, one step, whatever the gap.
+    #[test]
+    fn an_integral_wheel_is_unchanged() {
+        let t = Instant::now();
+        let mut n = Notches::default();
+        assert_eq!(n.feed(1.0, t), 1);
+        assert_eq!(n.feed(-1.0, t + Duration::from_millis(5)), -1);
+        assert_eq!(n.feed(1.0, t + Duration::from_mins(1)), 1);
+    }
+
+    /// `+0.9` then a full notch the other way fires that notch. It used to net
+    /// `-0.1` and fire nothing.
+    ///
+    /// **Falsification:** drop the `flipped` reset → this reds.
+    #[test]
+    fn a_direction_flip_drops_the_remainder() {
+        let t = Instant::now();
+        let mut n = Notches::default();
+        assert_eq!(n.feed(0.9, t), 0);
+        assert_eq!(n.feed(-1.0, t + Duration::from_millis(10)), -1);
+    }
+
+    /// A remainder left from an earlier gesture is gone after the idle reset:
+    /// a small nudge later completes no notch.
+    ///
+    /// **Falsification:** drop the `idle` reset → this reds.
+    #[test]
+    fn an_idle_pause_drops_the_remainder() {
+        let t = Instant::now();
+        let mut n = Notches::default();
+        assert_eq!(n.feed(0.9, t), 0);
+        assert_eq!(n.feed(0.2, t + SCROLL_IDLE_RESET), 0);
+        // …but inside the window it still carries.
+        let mut m = Notches::default();
+        assert_eq!(m.feed(0.9, t), 0);
+        assert_eq!(
+            m.feed(
+                0.2,
+                t + SCROLL_IDLE_RESET.saturating_sub(Duration::from_millis(1))
+            ),
+            1
+        );
+    }
+
+    /// A touchpad's surface-pixel delta is scaled to notches; a wheel's is not.
+    ///
+    /// **Falsification:** drop the `Surface` arm → 25 px reads as 25 notches.
+    #[test]
+    fn a_touchpad_delta_is_scaled_to_notches() {
+        use hytte::gtk::gdk::ScrollUnit;
+        assert!((super::in_notches(25.0, ScrollUnit::Surface) - 2.5).abs() < f64::EPSILON);
+        assert!((super::in_notches(1.0, ScrollUnit::Wheel) - 1.0).abs() < f64::EPSILON);
+    }
+
+    /// A non-finite delta is ignored, and does not poison what follows.
+    #[test]
+    fn a_non_finite_delta_is_ignored() {
+        let t = Instant::now();
+        let mut n = Notches::default();
+        assert_eq!(n.feed(0.6, t), 0);
+        assert_eq!(n.feed(f64::NAN, t), 0);
+        assert_eq!(n.feed(f64::INFINITY, t), 0);
+        assert_eq!(n.feed(0.6, t + Duration::from_millis(10)), 1);
+    }
 }

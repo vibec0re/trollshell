@@ -436,6 +436,8 @@ fn react(state: &Mutex<ReactorState>, devices: &[Device], sinks: &[Sink], enable
 mod tests {
     use super::*;
     use hytte_config::test_support::scratch_home;
+    use hytte_reactive::test_lock::TEST_LOCK;
+    use std::sync::PoisonError;
 
     fn dev(addr: &str, icon: &str, connected: bool) -> Device {
         Device {
@@ -584,8 +586,14 @@ mod tests {
         assert!(!is_bluez_sink_name(""));
     }
 
+    /// Takes `TEST_LOCK`: the second `react` restores `alsa_output.builtin`,
+    /// and `pipewire::set_default_sink` publishes to `audio_native`'s
+    /// process-global `COMMAND_TX`. Without the lock that `SetDefaultSink`
+    /// lands in whatever channel an `audio_native` loop test has published,
+    /// and the command that test counts as delivered is no longer its own.
     #[test]
     fn react_handles_bt_disconnect_race_without_pollution() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         // Reproduces the C1/C2 race: BlueZ reports the device as no longer
         // connected, but pipewire still has the bluez_output sink as
         // is_default=true. The bookkeeping must NOT misclassify that sink as
@@ -646,8 +654,12 @@ mod tests {
         );
     }
 
+    /// `TEST_LOCK` for the reason
+    /// `react_handles_bt_disconnect_race_without_pollution` takes it: the
+    /// restore this exercises calls `set_default_sink`.
     #[test]
     fn react_disappear_arm_with_no_current_default() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         // BT-disappear edge with no current default sink at all: the
         // top-of-react bookkeeping leaves `last_non_bt_default` intact, so
         // the disappear arm sees a real restore-needed scenario (this is

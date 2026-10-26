@@ -5891,6 +5891,46 @@ trollshell`. Expect the cards to come back Active and **no notification at
       subscriber; this bullet is the on-machine confirmation the #1035 PR
       body flagged as not yet run.
 
+### A write that did not land says so (#1519)
+
+Four places in the app lost an edit, or claimed one, with nothing on screen
+saying so. The decisions are pinned hermetically and the widget halves in
+`system-tests`; what no test can reach is each one's **wiring** — the close
+handler in `build_window`, and three handlers that make a real `Control`
+call, which a test run inside a live session would make against the
+operator's own shell and keyring.
+
+- [ ] **(#1519)** **AI Keys, shell down.** `systemctl --user stop trollshell`,
+      open the control-center → **AI Keys**, paste a key into **OpenRouter**
+      and press apply. The key **stays in the field**, the entry turns red,
+      and a line under the rows reads _The OpenRouter key was not stored:
+      trollshell is not running. It is still in the field — press apply to
+      try again._ Start the shell, press apply again: the field empties, the
+      red and the line go, and the status flips to **Key stored**.
+- [ ] **(#1519)** **A config edit made just before closing the window.** In
+      **Plugins** → the pinned **Shell** entry → **Core LEDs**, nudge a spin
+      row (or flip a switch) and close the window **immediately** — under
+      300 ms, so a keyboard close (`Super+Q`/your niri close bind) right after
+      the click. `~/.config/trollshell/core-leds.toml` holds the new value.
+      Repeat on a plugin's form (`stats`): change a switch and click another
+      plugin in the sidebar at once — the edit is in `stats.toml` too.
+- [ ] **(#1519)** **Delete survives a reorder under its dialog.** With two or
+      more places, open the **second** place's page and press the trash
+      button, but leave the confirmation dialog up. In `$EDITOR`, swap the
+      first two `[[place]]` blocks in `~/.config/trollshell/places.toml` and
+      save; wait ~2 s for the poll (the page behind the dialog pops back to
+      the list). Now press **Delete**: the place the dialog **named** is the
+      one removed, not the one that moved into its slot. Repeat, but delete
+      that place in `$EDITOR` instead of moving it: **Delete** removes
+      nothing.
+- [ ] **(#1519)** **The weather override, shell down.** Stop the shell, open
+      **Places**: the status line reads _trollshell isn't running — place and
+      departures edits apply the next time it starts; the weather override
+      below needs it running_. Flip **Automatic location**: it snaps back,
+      and a toast says it was not changed and that nothing was saved for when
+      the shell starts. Type a city into **Set city manually** and apply: the
+      same toast, for the city, and the text stays in the entry.
+
 ### The config form's collections (#888 P2, #1373)
 
 The generic form's `Map` and `List` rows became editable with P2: a

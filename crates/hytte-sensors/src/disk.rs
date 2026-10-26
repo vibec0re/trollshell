@@ -707,4 +707,38 @@ not a real line at all
             "the in-flight flag survived a panic"
         );
     }
+
+    /// A mount whose call is stuck keeps its slot (in flight, so the prune
+    /// spares it), and only the serve-time staleness check retires its last
+    /// row. This is the dead-NAS path: its numbers must vanish once they are
+    /// older than the bound, and stay while they are not.
+    ///
+    /// `a_row_that_stops_refreshing_goes_stale` no longer reaches that check:
+    /// since the prune honours the injected bound, it drops that test's
+    /// (idle) slot first. Seeded directly, so no sleep and no side thread.
+    #[test]
+    fn a_stuck_call_stops_serving_its_row_past_the_bound() {
+        static S: SlotMap = Mutex::new(BTreeMap::new());
+        let old = Instant::now()
+            .checked_sub(Duration::from_secs(5))
+            .expect("monotonic clock older than 5 s");
+        lock(&S).insert(
+            "/test-dead-mount".into(),
+            MountSlot {
+                in_flight: true,
+                last: Some((fake_stat("/test-dead-mount").unwrap(), old)),
+            },
+        );
+        let specs = [spec("/test-dead-mount", "nfs4")];
+        let tick = |stale| read_disk_with(&S, &specs, Duration::from_millis(1), stale, fake_stat);
+        assert!(
+            tick(Duration::from_secs(1)).mounts.is_empty(),
+            "served a stuck mount's row past the bound"
+        );
+        assert_eq!(
+            tick(STALE).mounts.len(),
+            1,
+            "dropped a fresh-enough row while its call is still running"
+        );
+    }
 }

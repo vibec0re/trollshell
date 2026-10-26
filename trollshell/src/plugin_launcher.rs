@@ -41,6 +41,7 @@
 //! | declared | live unit                    | action    |
 //! |----------|------------------------------|-----------|
 //! | enabled  | not running                  | launch    |
+//! | enabled  | still stopping (`deactivating`) | wait, then launch |
 //! | enabled  | running, fingerprint matches  | leave     |
 //! | enabled  | running, fingerprint differs  | restart   |
 //! | enabled  | running, no fingerprint      | restart   |
@@ -214,6 +215,23 @@
 //! the deadline gets [`restart`]'s own rules ([`relaunch_after_wait`]), and
 //! one unit's answer never changes another's. A Save restarts one plugin and
 //! still goes through [`restart`].
+//!
+//! **A launch waits out a unit that is still stopping** (#1417 follow-up).
+//! The restart paths wait for their own stop, but two paths launch without
+//! stopping anything: the Plugins tab's [`start`], and a reconcile's launch
+//! of a plugin that is switched on but not running. `deactivating` is not
+//! running ([`is_running`]), and `StopUnit` returns once its job is queued,
+//! so both reached a unit still on its way down: a switch flipped off and
+//! straight back on, or a `plugins.json` that enables a plugin a moment
+//! after something stopped it. systemd refuses `systemd-run` under that
+//! name until the unit is gone (#1417's measurement, every time), and
+//! nothing retried, so the plugin stayed down with "on" persisted until the
+//! next rebuild, `ReloadPlugins` or shell start. Both now wait for the unit
+//! first, by the restart's own wait and under the same lock: [`start`]
+//! through [`wait_until_stopped`], and the reconcile by putting the launch
+//! in its [`restart_all`] batch ([`Action::WaitThenLaunch`]) without a stop
+//! of its own. A unit still stopping when [`STOP_WAIT`] runs out is not
+//! launched, and the answer is [`StillStopping`] ([`launch_after_wait`]).
 //!
 //! ## The session target (#707)
 //!
@@ -1682,7 +1700,16 @@ enum Action {
     /// `package`/`exec` or `secrets` changed — or the unit predates the
     /// fingerprint) → stop, wait for it to go down, relaunch from the new spec.
     Restart,
-    /// Declared enabled and not running → launch it now.
+    /// Declared enabled, not running, and its unit still stopping
+    /// (`deactivating`): something stopped it a moment ago, a switch flipped
+    /// off and straight back on, or the `plugins.json` that switched it off
+    /// before this one switched it on again. A launch now would be refused
+    /// while the unit holds its name ([`blocks_relaunch`]), so → wait for it
+    /// to go down, then launch (#1417 follow-up). [`reconcile`] waits for
+    /// these in the same batch as its restarts ([`restart_all`]), sending
+    /// them no stop of their own.
+    WaitThenLaunch,
+    /// Declared enabled, not running and not stopping → launch it now.
     Launch,
 }
 
@@ -1691,7 +1718,14 @@ enum Action {
 ///
 /// `declared` is the freshly read state file; `units` is
 /// [`systemd::list_plugin_units`]'s answer. Output is sorted (stops before
-/// restarts before launches, then by id) so execution order is deterministic.
+/// restarts before waits before launches, then by id) so execution order is
+/// deterministic.
+///
+/// An enabled plugin whose unit is `deactivating` is not running, but its
+/// unit still holds the name, so it is [`Action::WaitThenLaunch`] rather than
+/// a bare [`Action::Launch`], stamped or not (#1417 follow-up). A
+/// `deactivating` unit of a plugin that is off, or no longer declared, is
+/// already going where the reconcile wants it, and is left alone.
 ///
 /// Two deliberate asymmetries:
 /// - A **running unit with no fingerprint** whose id is declared **enabled**
@@ -1715,6 +1749,9 @@ fn plan(declared: &Declared, units: &[systemd::PluginUnit]) -> Vec<(String, Acti
     let mut out: Vec<(String, Action)> = Vec::new();
     for (id, spec) in &declared.plugins {
         match (spec.enabled, running.get(id.as_str())) {
+            (true, None) if stopping_unit(units, id).is_some() => {
+                out.push((id.clone(), Action::WaitThenLaunch));
+            }
             (true, None) => out.push((id.clone(), Action::Launch)),
             (true, Some(live)) => {
                 if *live != Some(spec_fingerprint(spec, &declared.target).as_str()) {
@@ -1943,14 +1980,25 @@ where
         }
         // Every restart in one batch (#1444): all the stops, one wait, then
         // each unit's own relaunch. Each carries the stamp of the unit it was
-        // planned from.
+        // planned from. A launch onto a unit still stopping joins the same
+        // wait (#1417 follow-up), sent no stop of its own, so the pass costs
+        // its slowest stop whichever kind that is.
         let restarts: Vec<Restarting<'_>> = planned(Action::Restart)
             .filter_map(|id| {
                 let spec = declared.plugins.get(id)?;
                 tracing::info!(plugin = %id, exec = %spec.exec, "declared spec changed; restarting");
                 let stamped = running_unit(&units, id).is_some_and(is_stamped);
-                Some(Restarting { id, spec, stamped })
+                Some(Restarting { id, spec, stamped, stopping: false })
             })
+            .chain(planned(Action::WaitThenLaunch).filter_map(|id| {
+                let spec = declared.plugins.get(id)?;
+                tracing::info!(
+                    plugin = %id,
+                    "declared enabled, but its unit is still stopping; launching it once it is down",
+                );
+                let stamped = stopping_unit(&units, id).is_some_and(is_stamped);
+                Some(Restarting { id, spec, stamped, stopping: true })
+            }))
             .collect();
         for (id, restarted) in restart_all(&restarts, &declared.target).await {
             if let Err(err) = restarted {
@@ -2191,18 +2239,105 @@ fn merge_declared(
 /// already exists" (#866's F6). It calls neither `reconcile` nor `restart`, so
 /// there is no reentrancy.
 ///
+/// **A unit still stopping is waited for first** (#1417 follow-up), the way
+/// [`restart`] waits for its own stop: [`wait_until_stopped`], under the same
+/// lock and the same [`STOP_WAIT`] bound. That is the Plugins tab's switch
+/// flipped off and straight back on. Its `StopPlugin` answers once `StopUnit`
+/// is queued, so this `StartPlugin` used to reach a unit still
+/// `deactivating`, which systemd refuses a `systemd-run` under its name for;
+/// the switch then fell back to off with "on" persisted, and nothing
+/// retried. A unit that is running is not waited for: the launch answers
+/// "already loaded" at once, as before. See [`start_via`] for what a wait
+/// that runs out answers.
+///
 /// # Errors
-/// Unknown/invalid id, a still-running unit, or an unreachable user manager.
+/// Unknown/invalid id, a still-running unit, a unit still stopping when
+/// [`STOP_WAIT`] ran out ([`StillStopping`]), or an unreachable user manager.
 pub async fn start(id: &str) -> anyhow::Result<()> {
-    converge_locked(async {
-        let declared = load_declared().await.unwrap_or_default();
-        match declared.plugins.get(id) {
-            Some(spec) => {
-                let extra_env = resolve_secret_env(id, spec).await;
-                launch(id, spec, &extra_env, &declared.target).await
+    start_via(
+        id,
+        load_declared,
+        systemd::list_plugin_units,
+        || wait_until_stopped(id),
+        |spec: PluginSpec, target: String| async move {
+            let extra_env = resolve_secret_env(id, &spec).await;
+            launch(id, &spec, &extra_env, &target).await
+        },
+        || systemd::start_plugin(id),
+    )
+    .await
+}
+
+/// [`start`] with its five effects passed in, in the [`restart_via`] seam's
+/// shape: the declaration, the unit listing, the wait for a unit still
+/// stopping, the launch (the keyring read, then `systemd-run`, handed the
+/// spec and the target) and the legacy `StartUnit`. A test can then drive
+/// what a unit still stopping leads to without a user manager.
+///
+/// Under [`CONVERGE_LOCK`], in this order:
+/// 1. An **undeclared** id gets `StartUnit`, for a legacy static unit, and
+///    nothing is listed: systemd itself starts a static unit again while it
+///    is stopping.
+/// 2. A declared plugin's units are **listed**. Unless its unit is still
+///    stopping ([`stopping_unit`]) it is launched at once, as before; a
+///    listing that fails launches at once too, and the launch finds out for
+///    itself, as a failed listing in the wait does.
+/// 3. A unit still stopping is **waited for** (`wait_down`), and then
+///    decided by [`launch_after_wait`]: launched once it is down, and not
+///    launched if it was still stopping when [`STOP_WAIT`] ran out.
+///
+/// What a wait that runs out answers is [`restart`]'s rule for a unit it
+/// started (#1417 item 1), and for the same reason: a launch now would be
+/// refused at once, so the answer is [`StillStopping`], naming the
+/// `SubState`, and nothing is launched. Unlike a restart, a start has no
+/// unit-file fallback to make of the refusal, stamped unit or not (it never
+/// had one for a declared plugin: the module doc's "Legacy static units"),
+/// so the stamp does not enter into it. The plugin is down, its switch's
+/// "on" persisted; it comes up at its next start, the switch flipped again
+/// once the unit is gone, or a reconcile ([`plan`] launches an enabled
+/// plugin that is not running), as after a restart's `still-stopping`.
+///
+/// The parameters are named so none shares a name with a function in this
+/// module, for [`restart_via`]'s reason.
+async fn start_via<D, DF, L, LF, W, WF, R, RF, U, UF>(
+    id: &str,
+    load: D,
+    list_units: L,
+    wait_down: W,
+    launch_now: R,
+    unit_file_start: U,
+) -> anyhow::Result<()>
+where
+    D: FnOnce() -> DF,
+    DF: Future<Output = Option<Declared>>,
+    L: FnOnce() -> LF,
+    LF: Future<Output = anyhow::Result<Vec<systemd::PluginUnit>>>,
+    W: FnOnce() -> WF,
+    WF: Future<Output = StopWait>,
+    R: FnOnce(PluginSpec, String) -> RF,
+    RF: Future<Output = anyhow::Result<()>>,
+    U: FnOnce() -> UF,
+    UF: Future<Output = anyhow::Result<()>>,
+{
+    converge_locked(async move {
+        let declared = load().await.unwrap_or_default();
+        let Some(spec) = declared.plugins.get(id).cloned() else {
+            return unit_file_start().await;
+        };
+        let target = declared.target;
+        let stopping = match list_units().await {
+            Ok(units) => stopping_unit(&units, id).is_some(),
+            Err(err) => {
+                tracing::debug!(plugin = %id, %err, "listing plugin units before a start failed; launching");
+                false
             }
-            None => systemd::start_plugin(id).await,
+        };
+        if !stopping {
+            return launch_now(spec, target).await;
         }
+        tracing::info!(plugin = %id, "its unit is still stopping; starting it once it is down");
+        let waited = wait_down().await;
+        launch_after_wait(id, waited, move || launch_now(spec, target)).await
     })
     .await
 }
@@ -2221,7 +2356,10 @@ pub async fn start(id: &str) -> anyhow::Result<()> {
 /// restart in progress:
 /// - a reconcile's or a key change's restarts, up to [`STOP_WAIT`] for the
 ///   slowest stop among them (they wait together since #1444,
-///   [`restart_all`]);
+///   [`restart_all`]), a reconcile's launches onto a unit still stopping
+///   among them;
+/// - a [`start`] onto a unit still stopping, up to [`STOP_WAIT`] (#1417
+///   follow-up);
 /// - the keyring reads of every launch and relaunch, each of which can sit
 ///   out an unlock prompt;
 /// - `systemd-run` itself;
@@ -2397,6 +2535,7 @@ async fn relaunch_for_secret_inner(slot: &str) -> Vec<(String, String)> {
                     id,
                     spec,
                     stamped: *stamped,
+                    stopping: false,
                 })
                 .collect();
             restart_all(&restarts, &target)
@@ -2573,6 +2712,20 @@ fn running_unit<'a>(units: &'a [systemd::PluginUnit], id: &str) -> Option<&'a sy
         .find(|u| u.id == id && is_running(&u.active_state))
 }
 
+/// Plugin `id`'s unit in `units` if it is still stopping: not running
+/// ([`running_unit`] skips it), but still holding its name
+/// ([`blocks_relaunch`]), which is `deactivating`. A launch under the name
+/// would be refused until it is gone, so [`start`] and [`plan`] wait for it
+/// first (#1417 follow-up). Pure.
+fn stopping_unit<'a>(
+    units: &'a [systemd::PluginUnit],
+    id: &str,
+) -> Option<&'a systemd::PluginUnit> {
+    units
+        .iter()
+        .find(|u| u.id == id && blocks_relaunch(&u.active_state) && !is_running(&u.active_state))
+}
+
 /// Stop a declared plugin's unit, wait for it to actually go down (so its
 /// `--collect` unit name frees up), then relaunch it with freshly resolved
 /// secret env. `systemd-run` refuses to replace a live unit, hence the
@@ -2668,10 +2821,12 @@ where
 /// soon as that plugin's wait has ended, so each unit is decided on its own
 /// wait and nothing else.
 ///
-/// - `waited` ran out on a `stamped` unit: [`StillStopping`], and neither
-///   `relaunch` nor `unit_file_start` runs.
-/// - Otherwise `relaunch` runs. If it fails, `unit_file_start` runs only for
-///   a unit that is not `stamped`, and the answer is the relaunch's error.
+/// - A `stamped` unit has no fallback, and is decided by
+///   [`launch_after_wait`]: `waited` ran out → [`StillStopping`], and neither
+///   `relaunch` nor `unit_file_start` runs; otherwise `relaunch` runs, and
+///   its answer is the answer.
+/// - Otherwise `relaunch` runs whatever `waited` says. If it fails,
+///   `unit_file_start` runs, and the answer is the relaunch's error.
 async fn relaunch_after_wait<R, RF, U, UF>(
     id: &str,
     stamped: bool,
@@ -2685,21 +2840,12 @@ where
     U: FnOnce() -> UF,
     UF: Future<Output = anyhow::Result<()>>,
 {
-    if let StopWait::RanOut { sub_state } = waited
-        && stamped
-    {
-        return Err(StillStopping {
-            id: id.to_owned(),
-            sub_state,
-        }
-        .into());
+    if stamped {
+        return launch_after_wait(id, waited, relaunch).await;
     }
     let Err(err) = relaunch().await else {
         return Ok(());
     };
-    if stamped {
-        return Err(err);
-    }
     if unit_file_start().await.is_ok() {
         tracing::warn!(
             plugin = %id,
@@ -2712,23 +2858,62 @@ where
     Err(err)
 }
 
+/// What a launch with **no unit-file fallback** does once the wait for its
+/// unit has ended: `waited` ran out → [`StillStopping`], and `launch_now`
+/// does not run; otherwise `launch_now` runs, and its answer is the answer.
+///
+/// The one place a run-out is turned into "not launched" (#1417 item 1). It
+/// is [`relaunch_after_wait`]'s rule for a stamped unit, and since the #1417
+/// follow-up also the rule for the two launches that never had a fallback
+/// whatever the stamp: [`start`] ([`start_via`]) and a reconcile's
+/// [`Action::WaitThenLaunch`] ([`restart_all_via`]). A launch while the unit
+/// is still stopping is refused at once, every time (#1417's measurement),
+/// so trying it would only turn the run-out into systemd's "already loaded",
+/// which says less.
+async fn launch_after_wait<R, RF>(id: &str, waited: StopWait, launch_now: R) -> anyhow::Result<()>
+where
+    R: FnOnce() -> RF,
+    RF: Future<Output = anyhow::Result<()>>,
+{
+    if let StopWait::RanOut { sub_state } = waited {
+        return Err(StillStopping {
+            id: id.to_owned(),
+            sub_state,
+        }
+        .into());
+    }
+    launch_now().await
+}
+
 /// One plugin in [`restart_all`]'s batch (#1444): one of a reconcile's
-/// restarts, or one running reader of a changed key.
+/// restarts, one running reader of a changed key, or a reconcile's launch
+/// onto a unit still stopping ([`Action::WaitThenLaunch`], #1417 follow-up).
 #[derive(Clone, Copy, Debug)]
 struct Restarting<'a> {
     /// The plugin id.
     id: &'a str,
     /// Its declared spec, the one the relaunch launches.
     spec: &'a PluginSpec,
-    /// Whether its running unit is one this launcher started
-    /// ([`is_stamped`]), read from the listing the restart was planned from.
+    /// Whether its unit is one this launcher started ([`is_stamped`]), read
+    /// from the listing the restart was planned from. It decides the
+    /// fallback, which a unit already `stopping` never gets, so for one of
+    /// those it is not consulted.
     stamped: bool,
+    /// Whether its unit was already stopping (`deactivating`) when the pass
+    /// was planned: an [`Action::WaitThenLaunch`]. The batch then sends it no
+    /// `StopUnit` (its stop was sent before this pass, and a second one
+    /// fails once the unit is gone, which would end a launch that would have
+    /// gone through), waits for it with the rest, and launches it by
+    /// [`launch_after_wait`], without [`restart`]'s fallback.
+    stopping: bool,
 }
 
 /// Restart every plugin in `restarts` together (#1444): a reconcile's
 /// Restart set, which a rebuild fills with every plugin whose exec path
 /// changed, or every running reader of a changed key
-/// ([`relaunch_for_secret`]).
+/// ([`relaunch_for_secret`]). A reconcile's launches onto a unit still
+/// stopping ride the same batch (#1417 follow-up, [`Restarting::stopping`]),
+/// so their wait and the restarts' are one.
 ///
 /// [`restart`], one plugin after another, paid each stop's wait in turn
 /// under [`CONVERGE_LOCK`]: two plugins that ignore SIGTERM cost about 20.1 s
@@ -2767,7 +2952,9 @@ async fn restart_all<'a>(
 ///    old unit.
 /// 2. **Every stop is sent.** A stop that fails ends that plugin's restart
 ///    with the stop's error, as in [`restart_via`]. That plugin is not
-///    waited for or relaunched.
+///    waited for or relaunched. A unit already
+///    [`stopping`](Restarting::stopping) is sent none, and goes straight to
+///    the wait (#1417 follow-up).
 /// 3. **One wait, for all the stopped units together**
 ///    ([`wait_then_settle`]). It makes one listing per poll, and it has one
 ///    [`STOP_WAIT`] deadline, which starts once the last stop has been sent,
@@ -2778,7 +2965,10 @@ async fn restart_all<'a>(
 ///
 /// Each unit is decided on its own wait ([`relaunch_after_wait`], where
 /// [`restart`]'s rules live), with its own keys. One unit's answer, a
-/// [`StillStopping`] included, never keeps another from being decided.
+/// [`StillStopping`] included, never keeps another from being decided. A
+/// unit already stopping is a launch, not a restart: it is decided by
+/// [`launch_after_wait`], so it never gets the unit-file fallback, which a
+/// reconcile's launch has never had.
 ///
 /// The parameters are named so none shares a name with a function in this
 /// module, for [`restart_via`]'s reason.
@@ -2809,6 +2999,10 @@ where
     let mut answers = Vec::with_capacity(restarts.len());
     let mut stopped = Vec::with_capacity(restarts.len());
     for ((k, r), keys) in restarts.iter().enumerate().zip(keys) {
+        if r.stopping {
+            stopped.push((k, r, Some(keys)));
+            continue;
+        }
         match stop_first(r).await {
             Ok(()) => stopped.push((k, r, Some(keys))),
             Err(err) => answers.push((k, r.id, Err(err))),
@@ -2822,6 +3016,9 @@ where
         async move {
             let relaunch_with_keys =
                 move || relaunch(r, keys.expect("each unit of the batch is settled once"));
+            if r.stopping {
+                return launch_after_wait(r.id, end, relaunch_with_keys).await;
+            }
             relaunch_after_wait(r.id, r.stamped, end, relaunch_with_keys, move || {
                 unit_file_start(r)
             })
@@ -2893,7 +3090,9 @@ impl std::error::Error for StillStopping {}
 /// systemd answers `StartTransientUnit` with "was already loaded or has a
 /// fragment file". [`is_running`] deliberately counts it as *not* running
 /// (a reconcile must not skip launching a plugin that is on its way down), so
-/// the wait needs this wider predicate rather than that one.
+/// the wait needs this wider predicate rather than that one. The launch of
+/// such a plugin waits on it too, since the #1417 follow-up
+/// ([`stopping_unit`]): it used to be refused.
 fn blocks_relaunch(active_state: &str) -> bool {
     is_running(active_state) || active_state == "deactivating"
 }
@@ -5508,13 +5707,69 @@ mod tests {
         let d = declared(&[("pet", pet)]);
         // Nothing running at all (fresh session).
         assert_eq!(plan(&d, &[]), vec![("pet".to_owned(), Action::Launch)]);
-        // A unit systemd still knows but that isn't live — inactive, failed,
-        // or on its way down — is launchable (`--collect` released the name).
-        for state in ["inactive", "failed", "deactivating"] {
+        // A unit systemd still knows but that isn't live — inactive or
+        // failed — is launchable (`--collect` released the name). One still
+        // on its way down is not: it holds the name until it is gone, which
+        // is `plan_waits_for_a_unit_still_stopping_before_launching`'s.
+        for state in ["inactive", "failed"] {
             assert_eq!(
                 plan(&d, &[unit("pet", state, false)]),
                 vec![("pet".to_owned(), Action::Launch)],
                 "state {state}"
+            );
+        }
+    }
+
+    /// **An enabled plugin whose unit is still stopping waits, then launches**
+    /// (#1417 follow-up). `deactivating` is not running, so `plan` used to
+    /// answer a bare [`Action::Launch`] for it, and `systemd-run` was refused
+    /// while the unit still held its name (#1417's measurement: every time).
+    /// Nothing retried that, so a `plugins.json` that switched a plugin back
+    /// on a moment after something stopped it left it down. It is
+    /// [`Action::WaitThenLaunch`] now, stamped unit or not, since a launch
+    /// would be refused either way.
+    ///
+    /// A `deactivating` unit of a plugin that is off, or no longer declared,
+    /// is already going where the reconcile wants it, stamped or not: no
+    /// Stop, which would fail once it is gone, and nothing else.
+    ///
+    /// Falsified by the wait arm's guard dropped (every Launch waits), by it
+    /// asking [`running_unit`] or [`is_running`] (no state matches), and by a
+    /// `deactivating` unit counted as running again (a Restart, or a Stop).
+    #[test]
+    fn plan_waits_for_a_unit_still_stopping_before_launching() {
+        let pet = spec("/bin/pet", true);
+        let d = declared(&[("pet", pet.clone())]);
+        for stopping in [
+            unit("pet", "deactivating", false),
+            unit_in("pet", "deactivating", "final-sigkill"),
+            unit_for("pet", "deactivating", &pet),
+            unit_for("pet", "deactivating", &spec("/bin/pet-old", true)),
+        ] {
+            assert_eq!(
+                plan(&d, std::slice::from_ref(&stopping)),
+                vec![("pet".to_owned(), Action::WaitThenLaunch)],
+                "{stopping:?}"
+            );
+        }
+        // Another plugin's unit stopping does not hold this one up.
+        assert_eq!(
+            plan(&d, &[unit_for("caw", "deactivating", &pet)]),
+            vec![("pet".to_owned(), Action::Launch),]
+        );
+
+        let mut off = spec("/bin/off", true);
+        off.enabled = false;
+        let d = declared(&[("off", off.clone())]);
+        for stopping in [
+            unit("off", "deactivating", false),
+            unit_for("off", "deactivating", &off),
+            // An orphan, still stopping.
+            unit_for("gone", "deactivating", &spec("/bin/gone", true)),
+        ] {
+            assert!(
+                plan(&d, std::slice::from_ref(&stopping)).is_empty(),
+                "{stopping:?}"
             );
         }
     }
@@ -5667,12 +5922,15 @@ mod tests {
             ("stale", fresh),
             ("off", off.clone()),
             ("new", spec("/bin/new", true)),
+            ("again", spec("/bin/again", true)),
         ]);
         let units = vec![
             unit_for("stale", "active", &stale),
             unit_for("off", "active", &off),
             // An orphan (declared entry removed) stops too.
             unit_for("gone", "active", &spec("/bin/gone", true)),
+            // Switched on again while its unit is still stopping.
+            unit_for("again", "deactivating", &spec("/bin/again", true)),
         ];
         assert_eq!(
             plan(&d, &units),
@@ -5680,6 +5938,7 @@ mod tests {
                 ("gone".to_owned(), Action::Stop),
                 ("off".to_owned(), Action::Stop),
                 ("stale".to_owned(), Action::Restart),
+                ("again".to_owned(), Action::WaitThenLaunch),
                 ("new".to_owned(), Action::Launch),
             ]
         );
@@ -6430,9 +6689,12 @@ mod tests {
             "restart_via stops, waits, and hands the wait's answer to the decision: \
              {order:?}\n{seam}"
         );
+        // Since the #1417 follow-up a stamped unit's half of the decision is
+        // `launch_after_wait`'s, the one place a run-out becomes "not
+        // launched", which a start and a reconcile's WaitThenLaunch share.
         let decide = squash(body("async fn relaunch_after_wait<"));
         let order: Vec<Option<usize>> = [
-            "return Err(StillStopping {",
+            "if stamped { return launch_after_wait(id, waited, relaunch).await; }",
             "relaunch().await",
             "unit_file_start().await",
         ]
@@ -6441,8 +6703,22 @@ mod tests {
         .collect();
         assert!(
             !order.contains(&None) && order.is_sorted(),
-            "the decision answers a run-out first, then relaunches, and only then falls back: \
-             {order:?}\n{decide}"
+            "the decision hands a stamped unit to launch_after_wait first, then relaunches, \
+             and only then falls back: {order:?}\n{decide}"
+        );
+        let no_fallback = squash(body("async fn launch_after_wait<"));
+        let order: Vec<Option<usize>> = [
+            "if let StopWait::RanOut { sub_state } = waited {",
+            "return Err(StillStopping {",
+            "launch_now().await",
+        ]
+        .iter()
+        .map(|needle| no_fallback.find(&squash(needle)))
+        .collect();
+        assert!(
+            !order.contains(&None) && order.is_sorted(),
+            "a launch with no fallback answers a run-out before it launches: \
+             {order:?}\n{no_fallback}"
         );
         // The wrapper is the hand-over and nothing else: the decision, and
         // the SubState it names, are `wait_until_stopped_listing`'s, which
@@ -7114,6 +7390,17 @@ mod tests {
             self.note(format!("fallback {id}"));
         }
 
+        /// `id`'s unit as something outside the pass left it: stopped now,
+        /// so `deactivating` from here for its `stop_takes`, with nothing in
+        /// the log. The Plugins tab's `StopPlugin` a moment before its
+        /// `StartPlugin`, or a reconcile's Stop before the one that switches
+        /// the plugin on again (#1417 follow-up).
+        fn stopped_elsewhere(&self, id: &str) {
+            self.stopped_at
+                .borrow_mut()
+                .insert(id.to_owned(), tokio::time::Instant::now());
+        }
+
         /// When each relaunched unit was relaunched, by id.
         fn launched_at(&self) -> BTreeMap<String, Duration> {
             self.launched.borrow().iter().cloned().collect()
@@ -7184,6 +7471,7 @@ mod tests {
             id,
             spec: &on,
             stamped: true,
+            stopping: false,
         });
         let answers = manager.restart_all(&restarts).await;
         let took = manager.t0.elapsed();
@@ -7254,6 +7542,7 @@ mod tests {
             id,
             spec: &on,
             stamped,
+            stopping: false,
         });
         let mut answers = manager.restart_all(&restarts).await.into_iter();
         let took = manager.t0.elapsed();
@@ -7325,6 +7614,7 @@ mod tests {
             id,
             spec: &on,
             stamped: true,
+            stopping: false,
         });
         let mut answers = manager.restart_all(&restarts).await.into_iter();
 
@@ -7372,6 +7662,7 @@ mod tests {
             id,
             spec: &on,
             stamped: true,
+            stopping: false,
         });
         let answers = manager.restart_all(&restarts).await;
 
@@ -7407,6 +7698,7 @@ mod tests {
             id,
             spec: &on,
             stamped: true,
+            stopping: false,
         });
         let answers = manager.restart_all(&restarts).await;
         let took = manager.t0.elapsed();
@@ -7553,13 +7845,369 @@ mod tests {
         );
     }
 
+    // ── a launch onto a unit still stopping (#1417 follow-up) ──────────────
+
+    /// [`launch_after_wait`], the rule for a launch with no fallback: a wait
+    /// that ran out is [`StillStopping`], naming its `SubState`, and nothing
+    /// is launched; a wait that is over launches, and the launch's answer is
+    /// the answer, an error included, with nothing after it.
+    ///
+    /// Falsified by launching after a run-out (the refusal comes back
+    /// instead), and by a run-out answered `Ok`.
+    #[tokio::test]
+    async fn a_launch_with_no_fallback_launches_only_once_the_wait_is_over() {
+        let err = launch_after_wait("pet", ran_out("final-sigkill"), || async {
+            panic!("nothing is launched once the wait ran out")
+        })
+        .await
+        .expect_err("still stopping");
+        assert_eq!(
+            err.downcast_ref::<StillStopping>(),
+            Some(&StillStopping {
+                id: "pet".to_owned(),
+                sub_state: "final-sigkill".to_owned(),
+            }),
+            "{err:#}"
+        );
+
+        let launched = std::cell::Cell::new(0_usize);
+        launch_after_wait("pet", StopWait::Over, || {
+            launched.set(launched.get() + 1);
+            async { Ok(()) }
+        })
+        .await
+        .expect("launched");
+        let err = launch_after_wait("pet", StopWait::Over, || {
+            launched.set(launched.get() + 1);
+            async { Err(refused()) }
+        })
+        .await
+        .expect_err("the launch's own error");
+        assert!(format!("{err:#}").contains("already loaded"), "{err:#}");
+        assert_eq!(launched.get(), 2);
+    }
+
+    /// **A reconcile's launch onto a unit still stopping waits in the batch**
+    /// (#1417 follow-up). `w` was switched on again while its unit was still
+    /// stopping from before the pass (2 s left), and `a`'s spec changed (a 4
+    /// s stop). Both go through one [`restart_all_via`] wait: `w` is sent no
+    /// stop, its keys are read with `a`'s, and it is launched on the listing
+    /// that shows it gone, at 2 s, before `a` at 4 s. The pass costs the
+    /// slower of the two, not their sum. Before, `w` was launched at once and
+    /// refused, and nothing retried it.
+    ///
+    /// Falsified by sending `w` a stop (`stop w` in the log), by launching it
+    /// before its unit is gone (refused), and by waiting for it after the
+    /// restarts rather than with them (`w` at 4 s or later, and a 6 s pass).
+    #[tokio::test(start_paused = true)]
+    async fn a_launch_onto_a_unit_still_stopping_waits_in_the_batch() {
+        let secs = Duration::from_secs;
+        let manager = Manager::new(&[("a", Some(secs(4))), ("w", Some(secs(2)))]);
+        manager.stopped_elsewhere("w");
+        let on = spec("/bin/x", true);
+        let restarts = [("a", false), ("w", true)].map(|(id, stopping)| Restarting {
+            id,
+            spec: &on,
+            stamped: true,
+            stopping,
+        });
+        let answers = manager.restart_all(&restarts).await;
+        let took = manager.t0.elapsed();
+
+        for (id, answer) in &answers {
+            assert!(answer.is_ok(), "{id}: {answer:?}");
+        }
+        assert_eq!(
+            manager.launched_at(),
+            BTreeMap::from([("a".to_owned(), secs(4)), ("w".to_owned(), secs(2))]),
+            "w is launched as soon as its unit is gone"
+        );
+        assert_eq!(took, secs(4), "one wait for both");
+        assert_eq!(
+            *manager.log.borrow(),
+            [
+                "keys a", "keys w", "stop a", "list", "launch w", "list", "launch a"
+            ],
+            "w is waited for with the restart, and sent no stop"
+        );
+    }
+
+    /// **A launch onto a unit still stopping never falls back, stamped or
+    /// not** (#1417 follow-up). Both units are still stopping when the
+    /// batch's wait runs out. A reconcile's launch has never had the
+    /// unit-file fallback, so neither is launched (systemd would refuse it)
+    /// and neither is started: both answer [`StillStopping`]. A restart of
+    /// the unstamped one would have relaunched it and fallen back
+    /// (`each_restart_in_a_batch_gets_its_own_outcome`'s `c`).
+    ///
+    /// Falsified by deciding a unit already stopping by
+    /// [`relaunch_after_wait`] (`launch u`, `fallback u` in the log).
+    #[tokio::test(start_paused = true)]
+    async fn a_launch_onto_a_unit_still_stopping_never_falls_back() {
+        let manager = Manager::new(&[("s", None), ("u", None)]);
+        manager.stopped_elsewhere("s");
+        manager.stopped_elsewhere("u");
+        let on = spec("/bin/x", true);
+        let restarts = [("s", true), ("u", false)].map(|(id, stamped)| Restarting {
+            id,
+            spec: &on,
+            stamped,
+            stopping: true,
+        });
+        let answers = manager.restart_all(&restarts).await;
+
+        for (id, answer) in &answers {
+            let err = answer.as_ref().expect_err("not launched");
+            assert_eq!(
+                err.downcast_ref::<StillStopping>(),
+                Some(&StillStopping {
+                    id: (*id).to_owned(),
+                    sub_state: "stop-sigterm".to_owned(),
+                }),
+                "{id}: {err:#}"
+            );
+        }
+        assert_eq!(answers.len(), 2);
+        assert_eq!(
+            *manager.log.borrow(),
+            ["keys s", "keys u", "list"],
+            "nothing launched, nothing started"
+        );
+        assert_eq!(manager.t0.elapsed(), STOP_WAIT);
+    }
+
+    /// One [`start_via`] for a declared, switched-on `pet` against `manager`:
+    /// the real wait over the manager's listings, the keyring read and the
+    /// relaunch as the manager does them, and no `StartUnit` (a declared
+    /// plugin never gets one).
+    async fn start_against(manager: &Manager) -> anyhow::Result<()> {
+        let on = spec("/bin/pet", true);
+        start_via(
+            "pet",
+            || async { Some(declared(&[("pet", on.clone())])) },
+            || std::future::ready(Ok(manager.listing())),
+            || async {
+                wait_until_stopped_listing("pet", || std::future::ready(Ok(manager.listing())))
+                    .await
+                    .end
+            },
+            |_, _| {
+                let keys = manager.read_keys("pet");
+                std::future::ready(manager.relaunch("pet", &keys))
+            },
+            || async { panic!("a declared plugin is never started from a unit file") },
+        )
+        .await
+    }
+
+    /// **The switch flipped off and straight back on** (#1417 follow-up):
+    /// `StopPlugin` answers once `StopUnit` is queued, so `StartPlugin` finds
+    /// the unit still stopping, here for 2 more seconds. [`start`] waits for
+    /// it, by the restart's own wait, and launches it once it is gone. Before,
+    /// it launched at once, systemd refused, the switch fell back to off with
+    /// "on" persisted, and nothing retried.
+    ///
+    /// Falsified by launching without the wait (refused), and by the start
+    /// not reading the listing it decides on.
+    #[tokio::test(start_paused = true)]
+    async fn a_start_onto_a_unit_still_stopping_waits_for_it() {
+        let manager = Manager::new(&[("pet", Some(Duration::from_secs(2)))]);
+        manager.stopped_elsewhere("pet");
+        start_against(&manager)
+            .await
+            .expect("started once the unit is gone");
+        assert_eq!(
+            manager.launched_at(),
+            BTreeMap::from([("pet".to_owned(), Duration::from_secs(2))])
+        );
+        assert_eq!(*manager.log.borrow(), ["list", "keys pet", "launch pet"]);
+    }
+
+    /// A start whose unit is still stopping when [`STOP_WAIT`] runs out
+    /// launches nothing, and answers [`StillStopping`] (#1417 follow-up): a
+    /// launch then would be refused, and a start has no fallback to make of
+    /// the refusal, so the run-out is the more useful answer. That is what
+    /// the Plugins tab is told, and what the journal names.
+    ///
+    /// Falsified by launching after the run-out (the refusal comes back).
+    #[tokio::test(start_paused = true)]
+    async fn a_start_whose_unit_is_still_stopping_when_the_wait_runs_out_launches_nothing() {
+        let manager = Manager::new(&[("pet", None)]);
+        manager.stopped_elsewhere("pet");
+        let err = start_against(&manager).await.expect_err("still stopping");
+        assert_eq!(
+            err.downcast_ref::<StillStopping>(),
+            Some(&StillStopping {
+                id: "pet".to_owned(),
+                sub_state: "stop-sigterm".to_owned(),
+            }),
+            "{err:#}"
+        );
+        assert_eq!(
+            *manager.log.borrow(),
+            ["list"],
+            "no keys read, nothing launched"
+        );
+        assert!(manager.launched_at().is_empty());
+        assert_eq!(manager.t0.elapsed(), STOP_WAIT);
+    }
+
+    /// A start waits **only** for a unit still stopping (#1417 follow-up);
+    /// every other case is the start it always was, at once:
+    /// - no unit, or one inactive or failed: launched;
+    /// - a unit running: launched, which systemd refuses ("already loaded"),
+    ///   not waited for, since nothing is stopping it;
+    /// - a listing that fails: launched, and the launch finds out for
+    ///   itself, as after a failed listing in the wait;
+    /// - an undeclared id: `StartUnit` for a legacy static unit, with no
+    ///   listing at all.
+    ///
+    /// Falsified by waiting for a running unit (12 s, then a false
+    /// [`StillStopping`]), by a failed listing failing the start, and by an
+    /// undeclared id being listed or launched.
+    #[tokio::test(start_paused = true)]
+    async fn a_start_waits_only_for_a_unit_still_stopping() {
+        let on = spec("/bin/pet", true);
+        let t0 = tokio::time::Instant::now();
+        let listings: [fn() -> anyhow::Result<Vec<systemd::PluginUnit>>; 5] = [
+            || Ok(Vec::new()),
+            || Ok(vec![unit("pet", "inactive", false)]),
+            || Ok(vec![unit("pet", "failed", false)]),
+            // Another plugin's unit stopping does not hold this one up.
+            || Ok(vec![unit("caw", "deactivating", false)]),
+            || Err(anyhow::anyhow!("no user manager")),
+        ];
+        for listing in listings {
+            let launched = std::cell::Cell::new(0_usize);
+            start_via(
+                "pet",
+                || async { Some(declared(&[("pet", on.clone())])) },
+                || async move { listing() },
+                || async { panic!("nothing to wait for") },
+                |_, _| {
+                    launched.set(launched.get() + 1);
+                    async { Ok(()) }
+                },
+                || async { panic!("a declared plugin is never started from a unit file") },
+            )
+            .await
+            .expect("launched");
+            assert_eq!(launched.get(), 1, "{:?}", listing());
+        }
+
+        let err = start_via(
+            "pet",
+            || async { Some(declared(&[("pet", on.clone())])) },
+            || async { Ok(vec![unit_for("pet", "active", &on)]) },
+            || async { panic!("a running unit is not waited for") },
+            |_, _| async { Err(refused()) },
+            || async { panic!("a declared plugin is never started from a unit file") },
+        )
+        .await
+        .expect_err("systemd refuses a second unit");
+        assert!(format!("{err:#}").contains("already loaded"), "{err:#}");
+        assert_eq!(t0.elapsed(), Duration::ZERO, "nothing waited");
+
+        let started = std::cell::Cell::new(false);
+        start_via(
+            "timer",
+            || async { Some(declared(&[("pet", on.clone())])) },
+            || async { panic!("an undeclared id lists nothing") },
+            || async { panic!("an undeclared id waits for nothing") },
+            |_, _| async { panic!("an undeclared id is not launched") },
+            || {
+                started.set(true);
+                async { Ok(()) }
+            },
+        )
+        .await
+        .expect("StartUnit");
+        assert!(started.get());
+    }
+
+    /// [`start`]'s seam runs under [`CONVERGE_LOCK`], as it always has
+    /// (#866's F6): queued behind a holder, it reads nothing and launches
+    /// nothing until the lock is free. Its wait for a unit still stopping
+    /// therefore runs under the lock too, as a restart's does, and a
+    /// `StopPlugin` queued behind it lands after the launch.
+    ///
+    /// Falsified by `start_via` awaiting its body outside `converge_locked`.
+    #[tokio::test]
+    async fn a_start_waits_for_the_converge_lock() {
+        let log = std::cell::RefCell::new(Vec::<&str>::new());
+        let held = CONVERGE_LOCK.lock().await;
+        let start = start_via(
+            "pet",
+            || {
+                log.borrow_mut().push("loaded");
+                async { Some(declared(&[("pet", spec("/bin/pet", true))])) }
+            },
+            || async { Ok(Vec::new()) },
+            || async { panic!("nothing to wait for") },
+            |_, _| {
+                log.borrow_mut().push("launched");
+                async { Ok(()) }
+            },
+            || async { panic!("a declared plugin is never started from a unit file") },
+        );
+        tokio::pin!(start);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut start)
+                .await
+                .is_err(),
+            "the start must wait for whoever holds the lock"
+        );
+        assert!(log.borrow().is_empty(), "{:?}", log.borrow());
+        drop(held);
+        start.await.expect("starts once the lock is free");
+        assert_eq!(*log.borrow(), ["loaded", "launched"]);
+    }
+
+    /// The wiring the `a_start_*` tests stand in for, which a stand-in
+    /// cannot check: [`start`] hands [`start_via`] the effective
+    /// declaration, the real listing, the restart's own wait, the keyring
+    /// read plus `systemd-run`, and `StartUnit`, in that order. A source
+    /// scan, on `the_restart_waits_for_the_stop_under_the_lock`'s precedent:
+    /// the real ones need a user manager.
+    ///
+    /// Falsified by `start` handing the seam a stand-in for any of the five,
+    /// in particular a wait that does not wait.
+    #[test]
+    fn start_hands_its_seam_the_real_effects() {
+        let src = include_str!("plugin_launcher.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests").expect("tests module")];
+        let begin = prod
+            .find("pub async fn start(id: &str)")
+            .expect("start is defined");
+        let len = prod[begin..].find("\n}\n").expect("its body ends");
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let start = squash(&prod[begin..begin + len]);
+        let effects: Vec<Option<usize>> = [
+            "start_via(id, load_declared, systemd::list_plugin_units,",
+            "|| wait_until_stopped(id),",
+            "let extra_env = resolve_secret_env(id, &spec).await;",
+            "launch(id, &spec, &extra_env, &target).await",
+            "|| systemd::start_plugin(id),",
+        ]
+        .iter()
+        .map(|needle| start.find(&squash(needle)))
+        .collect();
+        assert!(
+            !effects.contains(&None) && effects.is_sorted(),
+            "start must hand start_via the real declaration, listing, wait, launch and \
+             StartUnit, in that order: {effects:?}\n{start}"
+        );
+    }
+
     /// **The reconcile restarts through one batch, with the real effects**
     /// (#1444). A source scan, on `the_restart_waits_for_the_stop_under_the_lock`'s
     /// precedent: the real stop, listing and launch need a user manager.
     ///
     /// - [`reconcile_listing`] hands **every** Restart to one
     ///   [`restart_all`] call, each with the stamp of the unit it was planned
-    ///   from, and restarts nothing on its own.
+    ///   from, and restarts nothing on its own. Its launches onto a unit
+    ///   still stopping ride the same call (#1417 follow-up), marked
+    ///   `stopping` so the batch sends them no stop; the restarts are not.
     /// - [`restart_all`] hands [`restart_all_via`] the real five effects:
     ///   the keyring read, the unlocked stop, the real listing,
     ///   `systemd-run` with the keys that read answered, and `StartUnit`.
@@ -7582,9 +8230,16 @@ mod tests {
         assert!(
             reconcile.contains(&squash(
                 "let stamped = running_unit(&units, id).is_some_and(is_stamped);
-                 Some(Restarting { id, spec, stamped })"
+                 Some(Restarting { id, spec, stamped, stopping: false })"
             )),
-            "each restart carries its planned unit's stamp:\n{reconcile}"
+            "each restart carries its planned unit's stamp, and is stopped:\n{reconcile}"
+        );
+        assert!(
+            reconcile.contains(&squash(
+                "let stamped = stopping_unit(&units, id).is_some_and(is_stamped);
+                 Some(Restarting { id, spec, stamped, stopping: true })"
+            )),
+            "each launch onto a unit still stopping is sent no stop:\n{reconcile}"
         );
         assert_eq!(
             reconcile.matches("restart_all(").count(),
@@ -7629,10 +8284,15 @@ mod tests {
     /// `restarts` statement (so nothing can narrow it) are pinned here, in
     /// the order `plan` sorts them.
     ///
+    /// Since the #1417 follow-up the batch also takes every
+    /// [`Action::WaitThenLaunch`], chained after the restarts, and the
+    /// Launch loop only what is left.
+    ///
     /// Falsified by `planned(Action::Launch)` building the batch, by the
     /// filter's `==` turned `!=`, by `.take(1)` before the batch's
-    /// `.collect()`, by the Stop loop no longer calling `stop_unit`, and by
-    /// the Launch loop skipping its ids.
+    /// `.collect()`, by the Stop loop no longer calling `stop_unit`, by the
+    /// Launch loop skipping its ids, and by the waiting ids reaching the bare
+    /// Launch loop instead of the batch.
     #[test]
     fn the_reconcile_hands_each_action_to_its_own_loop() {
         let src = include_str!("plugin_launcher.rs");
@@ -7659,8 +8319,17 @@ mod tests {
                      let spec = declared.plugins.get(id)?;
                      tracing::info!(plugin = %id, exec = %spec.exec, \"declared spec changed; restarting\");
                      let stamped = running_unit(&units, id).is_some_and(is_stamped);
-                     Some(Restarting { id, spec, stamped })
+                     Some(Restarting { id, spec, stamped, stopping: false })
                  })
+                 .chain(planned(Action::WaitThenLaunch).filter_map(|id| {
+                     let spec = declared.plugins.get(id)?;
+                     tracing::info!(
+                         plugin = %id,
+                         \"declared enabled, but its unit is still stopping; launching it once it is down\",
+                     );
+                     let stamped = stopping_unit(&units, id).is_some_and(is_stamped);
+                     Some(Restarting { id, spec, stamped, stopping: true })
+                 }))
                  .collect();
              for (id, restarted) in restart_all(&restarts, &declared.target).await {",
             "for id in planned(Action::Launch) {
@@ -7680,8 +8349,8 @@ mod tests {
         );
         assert_eq!(
             reconcile.matches("planned(Action::").count(),
-            3,
-            "one loop per Action:\n{reconcile}"
+            4,
+            "one loop per Action, the batch's two counted once each:\n{reconcile}"
         );
     }
 
@@ -7722,6 +8391,7 @@ mod tests {
                             id,
                             spec,
                             stamped: *stamped,
+                            stopping: false,
                         })
                         .collect();
                     manager
@@ -8090,7 +8760,7 @@ mod tests {
         for wiring in [
             "relaunch_for_secret_via(slot, load_declared, systemd::list_plugin_units,",
             "|batch: Vec<Relaunching>, target: String| async move {",
-            ".map(|(id, spec, stamped)| Restarting { id, spec, stamped: *stamped, })",
+            ".map(|(id, spec, stamped)| Restarting { id, spec, stamped: *stamped, stopping: false, })",
             "restart_all(&restarts, &target)",
             "stop_unit(&id)",
         ] {
@@ -8212,7 +8882,7 @@ mod tests {
     const REVIEWED_LOCK_CALLS: &[(&str, &str)] = &[
         // The lock-takers themselves, each through the one helper.
         ("reconcile_listing", "converge_locked"),
-        ("start", "converge_locked"),
+        ("start_via", "converge_locked"),
         ("stop_via", "converge_locked"),
         ("set_enabled_in", "converge_locked"),
         ("relaunch_for_secret_via", "converge_locked"),
@@ -8224,6 +8894,7 @@ mod tests {
         // `launch_at_startup` is synchronous and holds nothing; the watch it
         // hands this to runs as its own supervised task.
         ("launch_at_startup", "reconcile_then_watch"),
+        ("start", "start_via"),
         ("stop", "stop_via"),
         ("set_enabled", "set_enabled_in"),
         ("restart_for_settings", "restart_for_settings_via"),
@@ -8881,6 +9552,7 @@ mod tests {
                 id,
                 spec: &on,
                 stamped: true,
+                stopping: false,
             });
             let fallbacks = std::cell::RefCell::new(Vec::new());
             let relaunched = std::cell::RefCell::new(BTreeMap::new());
@@ -8940,6 +9612,152 @@ mod tests {
                 running(list_prefixed(&prefix).await.expect("listed")),
                 ids,
                 "each is running again, from its relaunch"
+            );
+        }
+
+        /// How long the #1417 follow-up's stand-in takes to stop.
+        const STOPPING_TAKES: Duration = Duration::from_secs(2);
+
+        /// Start `<prefix>-<id>.service` as a stand-in that takes
+        /// [`STOPPING_TAKES`] to stop, stop it with the real `StopUnit`, and
+        /// check the premise the #1417 follow-up rests on, on systemd itself:
+        /// a `systemd-run` under the name straight after is refused while the
+        /// unit is still stopping (#1417's measurement). `None` where
+        /// `systemd-run --user` cannot start a unit, i.e. the test skips.
+        async fn stopping_stand_in(prefix: &str, id: &str) -> Option<std::time::Instant> {
+            let unit = format!("{prefix}-{id}.service");
+            if let Err(err) = launch_stubborn(&unit, STOPPING_TAKES).await {
+                eprintln!("skipping: systemd-run --user could not start a unit: {err:#}");
+                return None;
+            }
+            let stopped = std::time::Instant::now();
+            systemd::stop_unit(&unit).await.expect("StopUnit queued");
+            let refused = launch_stubborn(&unit, STOPPING_TAKES)
+                .await
+                .expect_err("rail: systemd refuses a unit under a name still stopping");
+            assert!(
+                format!("{refused:#}").contains("already loaded"),
+                "{refused:#}"
+            );
+            Some(stopped)
+        }
+
+        /// **A real start waits out a unit still stopping** (#1417
+        /// follow-up), the switch flipped off and straight back on: the
+        /// stand-in is stopped, a launch straight after is refused
+        /// ([`stopping_stand_in`]), and [`start_via`], with a real listing,
+        /// the restart's own wait over it and a real `systemd-run`, launches
+        /// it once the unit is gone: no sooner than its stop takes, within
+        /// [`SLACK`] of it, and running afterwards.
+        ///
+        /// The unit is `ts1417-start-<pid>-pet.service`, never named like a
+        /// plugin's. A guard SIGKILLs, stops and resets it however the test
+        /// ends.
+        #[tokio::test]
+        async fn a_real_start_waits_out_a_unit_still_stopping() {
+            let prefix = format!("ts1417-start-{}", std::process::id());
+            let unit = format!("{prefix}-pet.service");
+            let _cleanup = Cleanup(vec![unit.clone()]);
+            let Some(stopped) = stopping_stand_in(&prefix, "pet").await else {
+                return;
+            };
+            let on = spec("/bin/x", true);
+            let launched_at = std::cell::Cell::new(None);
+            start_via(
+                "pet",
+                || async { Some(declared(&[("pet", on.clone())])) },
+                || list_prefixed(&prefix),
+                || async {
+                    wait_until_stopped_listing("pet", || list_prefixed(&prefix))
+                        .await
+                        .end
+                },
+                |_, _| {
+                    let (unit, launched_at) = (&unit, &launched_at);
+                    async move {
+                        launched_at.set(Some(stopped.elapsed()));
+                        launch_stubborn(unit, STOPPING_TAKES).await
+                    }
+                },
+                || async { panic!("a declared plugin is never started from a unit file") },
+            )
+            .await
+            .expect("started once the unit was gone");
+            let at = launched_at.get().expect("launched");
+            eprintln!("a stop of {STOPPING_TAKES:?}, then a start: launched at {at:?}");
+            assert!(
+                at >= STOPPING_TAKES,
+                "launched at {at:?}, before its {STOPPING_TAKES:?} stop was over"
+            );
+            assert!(
+                at < STOPPING_TAKES + SLACK,
+                "launched at {at:?}: it must come as soon as the unit is gone"
+            );
+            let units = list_prefixed(&prefix).await.expect("listed");
+            assert!(
+                units
+                    .iter()
+                    .any(|u| u.id == "pet" && u.active_state == "active"),
+                "running again, from the start: {units:?}"
+            );
+        }
+
+        /// **A reconcile's launch onto a real unit still stopping waits in
+        /// the batch** (#1417 follow-up): the stand-in is stopped, a launch
+        /// straight after is refused ([`stopping_stand_in`]), and
+        /// [`restart_all_via`] with a `stopping` entry for it, a real listing
+        /// and a real `systemd-run`, sends it no stop and launches it once
+        /// the unit is gone, within [`SLACK`] of its stop, without the
+        /// fallback.
+        ///
+        /// The unit is `ts1417-batch-<pid>-w.service`, and the same guard
+        /// cleans it up.
+        #[tokio::test]
+        async fn a_real_launch_onto_a_unit_still_stopping_waits_in_the_batch() {
+            let prefix = format!("ts1417-batch-{}", std::process::id());
+            let unit_of = |id: &str| format!("{prefix}-{id}.service");
+            let _cleanup = Cleanup(vec![unit_of("w")]);
+            let Some(stopped) = stopping_stand_in(&prefix, "w").await else {
+                return;
+            };
+            let on = spec("/bin/x", true);
+            let restarts = [Restarting {
+                id: "w",
+                spec: &on,
+                stamped: true,
+                stopping: true,
+            }];
+            let launched_at = std::cell::Cell::new(None);
+            let answers = restart_all_via(
+                &restarts,
+                |r| std::future::ready(unit_of(r.id)),
+                |_| async { panic!("a unit already stopping is sent no stop") },
+                || list_prefixed(&prefix),
+                |_, unit| {
+                    let launched_at = &launched_at;
+                    async move {
+                        launched_at.set(Some(stopped.elapsed()));
+                        launch_stubborn(&unit, STOPPING_TAKES).await
+                    }
+                },
+                |_| async { panic!("a launch onto a unit still stopping never falls back") },
+            )
+            .await;
+            for (id, answer) in &answers {
+                assert!(answer.is_ok(), "{id}: {answer:?}");
+            }
+            let at = launched_at.get().expect("launched");
+            eprintln!("a stop of {STOPPING_TAKES:?}, then a reconcile's launch: at {at:?}");
+            assert!(
+                (STOPPING_TAKES..STOPPING_TAKES + SLACK).contains(&at),
+                "launched at {at:?}: once the unit was gone, and as soon as it was"
+            );
+            let units = list_prefixed(&prefix).await.expect("listed");
+            assert!(
+                units
+                    .iter()
+                    .any(|u| u.id == "w" && u.active_state == "active"),
+                "running again, from the launch: {units:?}"
             );
         }
     }

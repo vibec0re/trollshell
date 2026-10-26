@@ -41,6 +41,9 @@
 //! wedged UI never leaves a card on screen; whether that teardown *sends* a
 //! decision is the table above. Every prompt resolves **exactly once** — the
 //! first of a button click, `Esc`, or the timeout wins and cancels the rest.
+//! A card taken off the screen unresolved — superseded by a newer request,
+//! closed by a hot-plug — sends **nothing**: its requester falls back to its
+//! own deadline, and no decision is made for a card nobody can see.
 //!
 //! **Focused output.** [`install`] registers each monitor by connector;
 //! [`request`] picks the monitor for niri's focused output via the shared
@@ -77,6 +80,20 @@ use tokio::sync::mpsc;
 /// What the teardown *sends* is [`ConsentChoices::unanswered`]'s call, not this
 /// constant's: `Deny` for a grant, nothing at all for an approval.
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(CONSENT_PROMPT_TIMEOUT_SECS);
+
+/// The timeout [`request`] arms: [`PROMPT_TIMEOUT`], except under `gtk_tests`,
+/// which shortens it so the real timer path — the one a superseded card's late
+/// resolution runs — is driven rather than stood in for. Compiled out of every
+/// shipped build.
+fn prompt_timeout() -> Duration {
+    #[cfg(all(test, feature = "system-tests"))]
+    {
+        if let Some(timeout) = gtk_tests::TIMEOUT.get() {
+            return timeout;
+        }
+    }
+    PROMPT_TIMEOUT
+}
 
 /// One button on a consent card: the label the human reads, the decision a
 /// click sends, and the style class that colours it.
@@ -233,6 +250,10 @@ pub(crate) fn ask_line(agent: &str, datasource: &str, scope: &str) -> String {
 thread_local! {
     /// The single live consent window, if any. A fresh [`request`] replaces it
     /// (the superseded one's requester falls back to the broker's own timeout).
+    /// Emptied by whichever takes the card down: [`close_all`], the supersede
+    /// step in [`request`], the card's own resolution (a click, `Esc`, the
+    /// timeout), or its window leaving the screen any other way — so [`is_up`]
+    /// answers for what is on screen.
     static CONSENT_WINDOW: RefCell<Option<gtk::Window>> = const { RefCell::new(None) };
 
     /// Mounted monitors keyed by `Monitor.connector()`, so [`request`] can build
@@ -449,6 +470,16 @@ pub fn request(
                     "consent prompt dismissed unanswered; the requester keeps the request"
                 );
             }
+            // Give up the slot, or `is_up` goes on answering `true` for a card
+            // nobody can see — and `overlays::dialog::may_raise` refuses every
+            // sidebar plugin's page for the rest of the session, until the next
+            // consent request or a hot-plug happens to take it. Only if the
+            // slot still holds *this* card: a superseding `request` has already
+            // taken this window out and put its own in, and releasing that one
+            // would let a dialog cover a live card (#1361 review, HIGH-1).
+            // Bind-then-act (#631): the borrow ends before `close` runs.
+            let released = CONSENT_WINDOW.with(|w| w.borrow_mut().take_if(|live| *live == window));
+            drop(released);
             window.close();
         }
     };
@@ -494,10 +525,38 @@ pub fn request(
     // ── Bounded: 60 s of silence tears the card down ──────────────────────────
     {
         let resolve = resolve.clone();
-        let id = glib::timeout_add_local_once(PROMPT_TIMEOUT, move || {
+        let id = glib::timeout_add_local_once(prompt_timeout(), move || {
             resolve(plan.on_silence);
         });
         timeout.set(Some(id));
+    }
+
+    // ── Leaving the screen unresolved ends the card too ───────────────────────
+    //
+    // A superseding `request` and `close_all` close this window without
+    // resolving it. The timer used to stay armed through both and resolve the
+    // card 60 s after it went up: for a grant that sent `Deny` — which the
+    // infobroker *persists* — for a card nobody could still see, ahead of the
+    // broker's own park timeout, whose transient deny is what
+    // `CONSENT_WINDOW`'s doc promises a superseded requester. Now a card is
+    // over the moment it leaves the screen, by whatever route: `done` latches
+    // so nothing more is sent, the timer is disarmed, and the slot is released
+    // if it is still this card's (the compositor closing the surface on its
+    // own would otherwise strand it). `resolve`'s own `close` lands here after
+    // it has done all three — a no-op. The `prompt` overlay's teardown idiom.
+    {
+        let done = done.clone();
+        let timeout = timeout.clone();
+        window.connect_unmap(move |window| {
+            done.set(true);
+            if let Some(id) = timeout.take() {
+                id.remove();
+            }
+            // Every `close` that unmaps this window releases its own borrow of
+            // the slot first (#631), so this one cannot collide with it.
+            let released = CONSENT_WINDOW.with(|w| w.borrow_mut().take_if(|live| live == window));
+            drop(released);
+        });
     }
 
     window.set_visible(true);
@@ -538,9 +597,9 @@ fn focused_monitor() -> Option<Monitor> {
 /// A rendering of the *table* rather than of the widgets: [`request`] builds
 /// the buttons by a straight `map` over [`card`] with no per-variant branch
 /// left in it, so the table is the whole of what "which card" means. (The
-/// widget half wants a display server, a layer-shell compositor and a mounted
-/// `Monitor` to exist at all, which is exactly the wall
-/// `tests/overlay_reentrancy.rs` documents.)
+/// widget half wants a display server and a mounted `Monitor` to exist at all,
+/// so only `gtk_tests`, under `xvfb-run`, raises it — for the slot, not the
+/// card's contents.)
 #[cfg(test)]
 fn render_card(choices: ConsentChoices) -> String {
     use std::fmt::Write as _;
@@ -769,6 +828,314 @@ unanswered=None
         assert_eq!(
             ask_line("trollshell-choom", "", "merge a reviewed config PR"),
             "trollshell-choom wants: merge a reviewed config PR"
+        );
+    }
+}
+
+/// The real [`request`], end to end, under a display server: a card resolved
+/// by a click, `Esc` or its timer must give up [`CONSENT_WINDOW`], or [`is_up`]
+/// answers `true` for the rest of the session and `overlays::dialog::may_raise`
+/// refuses every sidebar plugin's page.
+///
+/// `layer_window` builds under `xvfb-run` (X11 has no layer shell, so the
+/// surface is an ordinary toplevel; `overlays::notifications`' tests rely on the
+/// same), and the `Monitor` comes from a one-shot `App::run`, as there. The
+/// timer is the real one, shortened through [`TIMEOUT`]: a superseded card's
+/// late resolution can only be reached through it, because closing a window
+/// disposes its buttons and controllers along with their handlers.
+#[cfg(all(test, feature = "system-tests"))]
+pub(crate) mod gtk_tests {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    use super::{CONSENT_WINDOW, MONITORS, close_all, is_up, request};
+    use crate::overlays::{dialog, prompt};
+    use hytte::gtk::glib::translate::IntoGlib;
+    use hytte::gtk::{self, gdk, glib, prelude::*};
+    use hytte::prelude::*;
+    use hytte_plugin_proto::{ConsentChoices, ConsentDecision, HostMsg};
+    use tokio::sync::mpsc;
+
+    thread_local! {
+        static TEST_MONITOR: RefCell<Option<Monitor>> = const { RefCell::new(None) };
+
+        /// When `Some`, the timeout the next [`request`] arms instead of the
+        /// 60 s one (`super::prompt_timeout`). Reset by [`Mounted`]'s drop.
+        pub(super) static TIMEOUT: Cell<Option<Duration>> = const { Cell::new(None) };
+    }
+
+    /// A card timeout short enough to wait out in a test.
+    const SHORT: Duration = Duration::from_millis(20);
+
+    /// Run the main loop for `span` — long enough for every [`SHORT`] timer
+    /// armed before the call to have fired, since glib dispatches expired
+    /// timers in deadline order.
+    fn run_for(span: Duration) {
+        let elapsed = Rc::new(Cell::new(false));
+        let flag = elapsed.clone();
+        glib::timeout_add_local_once(span, move || flag.set(true));
+        let ctx = glib::MainContext::default();
+        while !elapsed.get() {
+            ctx.iteration(true);
+        }
+    }
+
+    /// A real `Monitor`, captured once from a one-shot `App::run` and cached —
+    /// `overlays::notifications`' `test_monitor`, for the same reasons (every
+    /// `#[gtk::test]` in a binary shares one thread, and `App::run` has
+    /// process-global side effects worth paying once). `pub(crate)` so
+    /// `overlays::prompt`'s tests take the same one rather than a sixth copy.
+    pub(crate) fn test_monitor() -> Monitor {
+        if let Some(monitor) = TEST_MONITOR.with(|cell| cell.borrow().clone()) {
+            return monitor;
+        }
+        App::new("mov.vibec0re.trollshell.test.shell-prompt-slots")
+            .run(|app| {
+                let first = app.monitors().first().cloned();
+                TEST_MONITOR.with(|cell| *cell.borrow_mut() = first);
+                app.quit();
+            })
+            .expect("App::run");
+        TEST_MONITOR
+            .with(|cell| cell.borrow().clone())
+            .expect("the display server must report at least one output; `xvfb-run` provides one")
+    }
+
+    /// Mounts the test monitor for [`request`] and tears every card and the
+    /// map down on drop — failing assertion included, so no other
+    /// `#[gtk::test]` on this shared thread inherits a mounted output (the
+    /// no-monitor test in `tests` relies on an empty map, though on its own
+    /// thread).
+    ///
+    /// Seeds `MONITORS` directly rather than through `install`, which skips a
+    /// monitor with no connector name — what an X11 output may well report.
+    struct Mounted;
+
+    impl Mounted {
+        fn new() -> Self {
+            let monitor = test_monitor();
+            MONITORS.with(|m| m.borrow_mut().insert("TEST-1".to_owned(), monitor));
+            Self
+        }
+    }
+
+    impl Drop for Mounted {
+        fn drop(&mut self) {
+            close_all();
+            TIMEOUT.set(None);
+        }
+    }
+
+    fn raise(
+        request_id: u64,
+        choices: ConsentChoices,
+        outbound: &mpsc::Sender<HostMsg>,
+    ) -> gtk::Window {
+        request(
+            request_id,
+            "claude",
+            "departures",
+            "next",
+            "",
+            choices,
+            outbound.clone(),
+        );
+        CONSENT_WINDOW
+            .with(|w| w.borrow().clone())
+            .expect("request must have put its card in the slot")
+    }
+
+    /// The card's button labelled `label`.
+    fn button(window: &gtk::Window, label: &str) -> gtk::Button {
+        let mut stack: Vec<gtk::Widget> = vec![window.clone().upcast()];
+        while let Some(w) = stack.pop() {
+            if let Some(btn) = w.downcast_ref::<gtk::Button>()
+                && btn.label().as_deref() == Some(label)
+            {
+                return btn.clone();
+            }
+            let mut child = w.first_child();
+            while let Some(c) = child {
+                child = c.next_sibling();
+                stack.push(c);
+            }
+        }
+        panic!("no {label:?} button on the card");
+    }
+
+    /// Press `Esc` on the card, through its own key controller.
+    fn escape(window: &gtk::Window) {
+        let controller = window
+            .observe_controllers()
+            .into_iter()
+            .filter_map(Result::ok)
+            .find_map(|c| c.downcast::<gtk::EventControllerKey>().ok())
+            .expect("the card has a key controller");
+        controller.emit_by_name::<bool>(
+            "key-pressed",
+            &[
+                &gdk::Key::Escape.into_glib(),
+                &0u32,
+                &gdk::ModifierType::empty(),
+            ],
+        );
+    }
+
+    fn a_dialog_may_raise() -> bool {
+        dialog::may_raise(is_up(), prompt::is_up())
+    }
+
+    /// **The reported bug.** Falsified by deleting `resolve`'s slot release:
+    /// `is_up()` stays `true` after the click and every assertion after the
+    /// first reds.
+    #[gtk::test]
+    fn a_clicked_card_releases_its_slot() {
+        let _mounted = Mounted::new();
+        let (tx, mut rx) = mpsc::channel(4);
+        let window = raise(1, ConsentChoices::Grant, &tx);
+        assert!(is_up());
+        assert!(
+            !a_dialog_may_raise(),
+            "sanity: a live card refuses a dialog"
+        );
+
+        button(&window, "Allow once").emit_clicked();
+
+        assert!(!is_up(), "an answered card must give up the slot");
+        assert!(
+            a_dialog_may_raise(),
+            "a plugin dialog must be raisable once the card is answered"
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(HostMsg::ConsentDecision {
+                request_id: 1,
+                decision: ConsentDecision::AllowOnce,
+            })
+        ));
+    }
+
+    /// The timer's resolution releases the slot too — the commonest way a
+    /// card ends, since an unanswered approval is the expected case.
+    #[gtk::test]
+    fn a_timed_out_card_releases_its_slot() {
+        let _mounted = Mounted::new();
+        let (tx, mut rx) = mpsc::channel(4);
+        TIMEOUT.set(Some(SHORT));
+        let _card = raise(1, ConsentChoices::Grant, &tx);
+        assert!(is_up());
+
+        run_for(SHORT * 10);
+
+        assert!(!is_up(), "a timed-out card must give up the slot");
+        assert!(a_dialog_may_raise());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(HostMsg::ConsentDecision {
+                request_id: 1,
+                decision: ConsentDecision::Deny,
+            })
+        ));
+    }
+
+    /// `Esc` — the same `resolve(plan.on_silence)` call the timer makes —
+    /// releases the slot on both cards, whatever it sends.
+    #[gtk::test]
+    fn an_unanswered_card_releases_its_slot() {
+        let _mounted = Mounted::new();
+        let (tx, mut rx) = mpsc::channel(4);
+
+        let grant = raise(1, ConsentChoices::Grant, &tx);
+        escape(&grant);
+        assert!(!is_up());
+        assert!(a_dialog_may_raise());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(HostMsg::ConsentDecision {
+                request_id: 1,
+                decision: ConsentDecision::Deny,
+            })
+        ));
+
+        let approval = raise(2, ConsentChoices::Approval, &tx);
+        escape(&approval);
+        assert!(!is_up());
+        assert!(a_dialog_may_raise());
+        assert!(
+            rx.try_recv().is_err(),
+            "an unanswered approval sends nothing"
+        );
+    }
+
+    /// A superseded card is over when the newer one replaces it: its timer
+    /// must neither send a late decision for the old request — a grant's
+    /// `Deny`, which the infobroker persists, for a card nobody could still
+    /// see — nor release the slot the replacement now holds, or a dialog could
+    /// be raised over a live card (#1361 review, HIGH-1).
+    ///
+    /// Falsified by deleting the `connect_unmap` teardown (the late `Deny`
+    /// arrives).
+    #[gtk::test]
+    fn a_superseded_card_sends_nothing_and_keeps_the_live_cards_slot() {
+        let _mounted = Mounted::new();
+        let (tx, mut rx) = mpsc::channel(4);
+        TIMEOUT.set(Some(SHORT));
+        let first = raise(1, ConsentChoices::Grant, &tx);
+        TIMEOUT.set(None); // the replacement keeps the real 60 s
+        let second = raise(2, ConsentChoices::Grant, &tx);
+        assert_ne!(first, second);
+
+        run_for(SHORT * 10);
+
+        assert!(
+            rx.try_recv().is_err(),
+            "a superseded card's timer must not send a late decision"
+        );
+        assert!(is_up(), "the live card's slot must survive the old one");
+        assert_eq!(CONSENT_WINDOW.with(|w| w.borrow().clone()), Some(second));
+        assert!(!a_dialog_may_raise());
+    }
+
+    /// A hot-plug's `close_all` ends the card the same way: nothing sent
+    /// later, nothing left in the slot.
+    #[gtk::test]
+    fn a_hot_plug_ends_the_card_without_a_decision() {
+        let _mounted = Mounted::new();
+        let (tx, mut rx) = mpsc::channel(4);
+        TIMEOUT.set(Some(SHORT));
+        let _card = raise(1, ConsentChoices::Grant, &tx);
+
+        close_all();
+        run_for(SHORT * 10);
+
+        assert!(!is_up());
+        assert!(
+            rx.try_recv().is_err(),
+            "the hot-plug must not send a late Deny"
+        );
+    }
+
+    /// A card whose window is closed out from under it — by the compositor, or
+    /// anything but this module — releases the slot then and there, rather
+    /// than 60 s later or never.
+    ///
+    /// Falsified by deleting the `take_if` in the `connect_unmap` teardown.
+    #[gtk::test]
+    fn a_card_closed_out_from_under_it_releases_its_slot() {
+        let _mounted = Mounted::new();
+        let (tx, mut rx) = mpsc::channel(4);
+        TIMEOUT.set(Some(SHORT));
+        let card = raise(1, ConsentChoices::Grant, &tx);
+
+        card.close();
+
+        assert!(!is_up(), "the slot must not outlive the window");
+        assert!(a_dialog_may_raise());
+        run_for(SHORT * 10);
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing is decided for a card nobody saw out"
         );
     }
 }

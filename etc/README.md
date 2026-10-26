@@ -55,8 +55,38 @@ inhibitors (a held `idle` inhibitor — e.g. the Power drawer's "Keep awake"
 toggle — skips dim/lock). This replaced swayidle (#204).
 
 trollshell does **not** ship a lock screen — locking is delegated to an
-established, security-audited tool. This config uses `swaylock`; the native lock
-timer, the trollshell bar's Power → Lock button, and any `loginctl lock-session`
-all trigger it via logind's `Lock` signal. Wire swaylock's own PAM stack
-(`/etc/pam.d/swaylock`; NixOS: `security.pam.services.swaylock = {};`) — without
-it swaylock can never verify a password.
+established, security-audited tool. This config uses `swaylock`. Wire swaylock's
+own PAM stack (`/etc/pam.d/swaylock`; NixOS: `security.pam.services.swaylock =
+{};`) — without it swaylock can never verify a password.
+
+**trollshell emits logind's `Lock` signal; it does not draw or spawn a locker.**
+The native idle timer (300 s), the bar's Power → Lock button, the D-Bus `Lock()`
+method and the relock before suspend all end in `loginctl lock-session`, which
+only makes logind emit `Lock` on the session. `swaylock` does not subscribe to
+logind, so **something in the session must translate `Lock` into the locker** —
+without that bridge the idle timer "fires" and nothing appears on screen. Use
+either:
+
+- `swayidle` with **only** the `lock` and `before-sleep` handlers — no
+  timeouts. The idle timeouts are native now; giving swayidle any would
+  double-fire them. `before-sleep` is worth having for a second reason: it also
+  takes a logind `sleep` _delay_ inhibitor, which is what makes suspend wait for
+  the locker to be up. (trollshell's own `PrepareForSleep` relock takes none.)
+- an equivalent bridge such as `systemd-lock-handler`.
+
+home-manager, for example:
+
+```nix
+services.swayidle = {
+  enable = true;
+  events = [
+    { event = "lock"; command = "${pkgs.swaylock}/bin/swaylock -f"; }
+    { event = "before-sleep"; command = "${pkgs.swaylock}/bin/swaylock -f"; }
+  ];
+  timeouts = [ ]; # idle → dim → lock → suspend is trollshell's, not swayidle's
+};
+```
+
+Nothing here sets logind's `LockedHint` either: swaylock never talks to logind
+and swayidle only ever calls `SetIdleHint` (and only with an `idlehint` event),
+so `LockedHint` stays `false` unless your locker or bridge sets it.

@@ -750,7 +750,9 @@ in
 
       # Idle pipeline: native since #204 Phase 4 — trollshell owns dim → lock →
       # suspend + before-sleep relock in-process (an ext-idle-notify-v1 client
-      # gated on logind inhibitors), so there is no swayidle unit to wire here.
+      # gated on logind inhibitors), so there is no idle swayidle unit to wire here.
+      # It only emits logind `Lock`; a Lock -> locker bridge is still the session's
+      # job (see etc/README.md, "Idle & screen locking").
       # brightnessctl (for the dim step) is on PATH via the session; add it to
       # home.packages if your login shell doesn't already provide it.
 

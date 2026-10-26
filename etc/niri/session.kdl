@@ -15,7 +15,7 @@
 //      a launcher fail to connect to the Wayland display.
 //
 //   2. `systemctl --user start niri-session.target` brings up the umbrella
-//      target, which in turn pulls in trollshell.service, swayidle.service,
+//      target, which in turn pulls in trollshell.service,
 //      swaybg.service, and any other unit installed with
 //      `WantedBy=niri-session.target`.
 //

@@ -1098,8 +1098,8 @@ mod tests {
         );
     }
 
-    fn reading(id: u32, linear: f64) -> Option<(u32, Volume)> {
-        Some((id, vol(linear, false)))
+    fn reading(id: u32, linear: f64) -> (u32, Volume) {
+        (id, vol(linear, false))
     }
 
     /// The gate's answers for a run of emissions, in order.
@@ -1115,15 +1115,15 @@ mod tests {
     fn a_default_sink_switch_seeds_silently_and_a_change_after_it_shows() {
         assert_eq!(
             gated(&[
-                None,            // placeholder
-                reading(1, 0.3), // first real reading seeds
-                reading(1, 0.4), // same sink, new value: shows
-                reading(2, 0.8), // switch to sink 2: silent
-                reading(2, 0.8), // repeat: nothing
-                reading(2, 0.9), // change on the new sink: shows
-                None,            // device gone: nothing
-                reading(2, 0.9), // back, same value: nothing
-                reading(1, 0.4), // switch back: silent
+                None,                  // placeholder
+                Some(reading(1, 0.3)), // first real reading seeds
+                Some(reading(1, 0.4)), // same sink, new value: shows
+                Some(reading(2, 0.8)), // switch to sink 2: silent
+                Some(reading(2, 0.8)), // repeat: nothing
+                Some(reading(2, 0.9)), // change on the new sink: shows
+                None,                  // device gone: nothing
+                Some(reading(2, 0.9)), // back, same value: nothing
+                Some(reading(1, 0.4)), // switch back: silent
             ]),
             vec![
                 None,
@@ -1143,7 +1143,7 @@ mod tests {
     #[test]
     fn a_mute_toggle_on_the_same_sink_shows() {
         let mut gate = VolumeGate::default();
-        assert_eq!(gate.admit(reading(1, 0.5)), None);
+        assert_eq!(gate.admit(Some(reading(1, 0.5))), None);
         assert_eq!(gate.admit(Some((1, vol(0.5, true)))), Some(vol(0.5, true)));
     }
 

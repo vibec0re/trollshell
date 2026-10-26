@@ -62,6 +62,24 @@ use crate::wire::{
 /// Cap on the in-memory audit ring shown in the panel. Oldest entries fall off.
 const AUDIT_CAP: usize = 30;
 
+/// How long one (agent, datasource) pair's refusal stays quiet after it raised
+/// a toast (#1556): a same-uid process re-asking in a loop under a standing
+/// deny is audited every time but toasts once per window. The audit ring has no
+/// per-pair window to share (it is only [`AUDIT_CAP`]-bounded), so this is its
+/// own number: long enough that a tight loop is one toast, short enough that a
+/// pair the human is still ignoring resurfaces within the minute.
+const DENY_TOAST_WINDOW_SECS: i64 = 60;
+
+/// How many (agent, datasource) pairs [`DenyToastLimiter`] tracks; past it the
+/// pair whose toast is oldest is forgotten, so a process inventing fresh agent
+/// names cannot grow the table.
+const DENY_TOAST_KEYS_CAP: usize = 256;
+
+/// Toasts of any pair allowed per [`DENY_TOAST_WINDOW_SECS`]. A per-pair limit
+/// alone is defeated by inventing a fresh agent name per request; this is the
+/// backstop. Refusals past it are still audited and visible in the panel.
+const DENY_TOAST_GLOBAL_BURST: u32 = 5;
+
 /// How long a connected client has to send its one request line before the
 /// broker gives up on it. Bounds one reader task (`read_request`) — which
 /// is all a silent client can hold up, since the read runs off the session
@@ -567,6 +585,57 @@ struct BrokerState {
     /// Set when this session has no socket of its own (#995): every snapshot
     /// carries the explanation up to the panel, for the session's whole life.
     notice: Option<String>,
+    /// Which refusals may raise a toast (#1556).
+    deny_toasts: DenyToastLimiter,
+}
+
+/// Rate limiter for the "denied" toast (#1556), keyed by (agent, datasource).
+/// Time is injected (`now`, unix seconds, like the rest of the state) so the
+/// tests need no sleeps.
+#[derive(Default)]
+struct DenyToastLimiter {
+    /// Pair -> when it last toasted. Bounded by [`DENY_TOAST_KEYS_CAP`].
+    last: HashMap<(String, String), i64>,
+    /// Start of the current global window and the toasts raised in it.
+    window_start: i64,
+    window_count: u32,
+}
+
+impl DenyToastLimiter {
+    /// Whether a refusal of `agent` on `datasource` at `now` may raise a toast;
+    /// records it when it may. The first refusal of a pair always may (unless
+    /// the global burst is spent), and the next one after the window.
+    fn admit(&mut self, agent: &str, datasource: &str, now: i64) -> bool {
+        let key = (agent.to_owned(), datasource.to_owned());
+        if let Some(&at) = self.last.get(&key)
+            && now.saturating_sub(at) < DENY_TOAST_WINDOW_SECS
+            && now >= at
+        {
+            return false;
+        }
+        if now.saturating_sub(self.window_start) >= DENY_TOAST_WINDOW_SECS
+            || now < self.window_start
+        {
+            self.window_start = now;
+            self.window_count = 0;
+        }
+        if self.window_count >= DENY_TOAST_GLOBAL_BURST {
+            return false;
+        }
+        self.window_count += 1;
+        if !self.last.contains_key(&key)
+            && self.last.len() >= DENY_TOAST_KEYS_CAP
+            && let Some(oldest) = self
+                .last
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(k, _)| k.clone())
+        {
+            self.last.remove(&oldest);
+        }
+        self.last.insert(key, now);
+        true
+    }
 }
 
 /// The current wall clock in unix seconds.
@@ -582,7 +651,17 @@ impl BrokerState {
             audit: VecDeque::with_capacity(AUDIT_CAP),
             calendar: Vec::new(),
             notice: None,
+            deny_toasts: DenyToastLimiter::default(),
         }
+    }
+
+    /// The refusal toast for `agent` on `datasource`, or `None` when this pair
+    /// toasted within [`DENY_TOAST_WINDOW_SECS`] (or the global burst is spent).
+    /// Only the toast is limited; callers audit every refusal before asking.
+    fn deny_toast(&mut self, agent: &str, datasource: &str, now: i64) -> Option<Toast> {
+        self.deny_toasts
+            .admit(agent, datasource, now)
+            .then(|| denied_toast(agent, datasource))
     }
 
     /// Record one request in the capped audit ring (oldest falls off).
@@ -814,7 +893,7 @@ impl BrokerState {
                         format!("no grant for agent '{agent}' on '{datasource}'"),
                         hint,
                     ),
-                    Some(denied_toast(agent, datasource)),
+                    self.deny_toast(agent, datasource, now),
                 )
             }
             AuthOutcome::NeedsConsent => Dispatch::Consent {
@@ -889,7 +968,7 @@ impl BrokerState {
                 format!("consent request for agent '{agent}' on '{datasource}' timed out"),
                 grant_hint(agent, datasource),
             ),
-            Some(denied_toast(agent, datasource)),
+            self.deny_toast(agent, datasource, now),
         )
     }
 
@@ -3278,6 +3357,101 @@ mod tests {
                 agent: "claude".to_owned(),
                 datasource: "calendar".to_owned(),
             }],
+        );
+    }
+
+    /// #1556: a loop re-asking under a standing deny toasts once, but every
+    /// refusal is still audited.
+    #[test]
+    fn a_standing_deny_toasts_once_and_audits_every_refusal() {
+        let mut state = BrokerState::new(store(vec![Grant {
+            agent: "scratch".to_owned(),
+            datasource: "departures".to_owned(),
+            scope: "*".to_owned(),
+            decision: Decision::Deny,
+        }]));
+        let mut toasts = 0;
+        for _ in 0..40 {
+            let (resp, toast) = answer(state.handle_auth("scratch", Some("departures")));
+            assert!(!resp.ok);
+            toasts += usize::from(toast.is_some());
+        }
+        assert_eq!(toasts, 1, "the flood raises one toast, not one per refusal");
+        // The ring is AUDIT_CAP-bounded, so a full ring of Denied is the proof
+        // every refusal reached `record` (40 > AUDIT_CAP).
+        assert_eq!(state.audit.len(), AUDIT_CAP);
+        assert!(state.audit.iter().all(|e| e.outcome == Outcome::Denied));
+    }
+
+    #[test]
+    fn deny_toast_limiter_first_per_key_then_window_then_again() {
+        let mut l = DenyToastLimiter::default();
+        let t0 = 1_000_000;
+        assert!(l.admit("a", "departures", t0), "first refusal toasts");
+        assert!(!l.admit("a", "departures", t0 + 1));
+        assert!(!l.admit("a", "departures", t0 + DENY_TOAST_WINDOW_SECS - 1));
+        assert!(
+            l.admit("a", "departures", t0 + DENY_TOAST_WINDOW_SECS),
+            "toasts again once the window has passed"
+        );
+        assert!(!l.admit("a", "departures", t0 + DENY_TOAST_WINDOW_SECS + 1));
+    }
+
+    #[test]
+    fn deny_toast_limiter_keys_are_independent() {
+        let mut l = DenyToastLimiter::default();
+        let t0 = 1_000_000;
+        assert!(l.admit("a", "departures", t0));
+        assert!(l.admit("b", "departures", t0), "another agent toasts");
+        assert!(l.admit("a", "weather", t0), "another datasource toasts");
+        assert!(!l.admit("b", "departures", t0 + 1));
+    }
+
+    /// Fresh agent names are the starvation route: the table stays bounded, and
+    /// the global burst keeps the toasts themselves bounded too.
+    #[test]
+    fn deny_toast_limiter_stays_bounded_under_10k_distinct_keys() {
+        let mut l = DenyToastLimiter::default();
+        let t0 = 1_000_000;
+        let mut toasts = 0;
+        for i in 0..10_000 {
+            // Spread over many windows so the burst refills and the key cap,
+            // not the burst, is what is exercised.
+            let now = t0 + i64::from(i) * DENY_TOAST_WINDOW_SECS;
+            toasts += usize::from(l.admit(&format!("agent{i}"), "departures", now));
+            assert!(l.last.len() <= DENY_TOAST_KEYS_CAP);
+        }
+        assert_eq!(toasts, 10_000);
+        assert_eq!(l.last.len(), DENY_TOAST_KEYS_CAP);
+
+        // Inside one window, 10k fresh names raise at most the burst.
+        let mut l = DenyToastLimiter::default();
+        let toasts = (0..10_000)
+            .filter(|i| l.admit(&format!("agent{i}"), "departures", t0))
+            .count();
+        assert_eq!(toasts, DENY_TOAST_GLOBAL_BURST as usize);
+        assert!(l.last.len() <= DENY_TOAST_KEYS_CAP);
+    }
+
+    #[test]
+    fn deny_toast_limiter_evicts_the_oldest_key() {
+        let mut l = DenyToastLimiter::default();
+        let t0 = 1_000_000;
+        // Oldest first, one window apart so the burst never gates.
+        for i in 0..DENY_TOAST_KEYS_CAP {
+            let now = t0 + i64::try_from(i).unwrap() * DENY_TOAST_WINDOW_SECS;
+            assert!(l.admit(&format!("a{i}"), "departures", now));
+        }
+        let now = t0 + i64::try_from(DENY_TOAST_KEYS_CAP).unwrap() * DENY_TOAST_WINDOW_SECS;
+        assert!(l.admit("fresh", "departures", now));
+        assert_eq!(l.last.len(), DENY_TOAST_KEYS_CAP);
+        assert!(
+            !l.last
+                .contains_key(&("a0".to_owned(), "departures".to_owned()))
+        );
+        assert!(
+            l.last
+                .contains_key(&("fresh".to_owned(), "departures".to_owned()))
         );
     }
 

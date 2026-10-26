@@ -1505,7 +1505,10 @@ mod tests {
             ),
         ] {
             assert!(
-                matches!(zone.from_local_datetime(&at), MappedLocalTime::Ambiguous(..)),
+                matches!(
+                    zone.from_local_datetime(&at),
+                    MappedLocalTime::Ambiguous(..)
+                ),
                 "fixture: {tzid} {at} happens twice"
             );
             for viewer in [New_York, Berlin, Kolkata, chrono_tz::UTC] {
@@ -1586,18 +1589,53 @@ mod tests {
         }
     }
 
+    /// What a `TZID=<tzid>` due at `at` must resolve to, worked out without
+    /// `wall_clock_to_unix`, and which case that is: icalendar's own answer
+    /// where it has one; else the earlier instant in a fold; else `at` read
+    /// with the offset three hours before it, in a gap (no zone swept here
+    /// changes twice within three hours).
+    fn expected_due<Tz: TimeZone>(
+        tzid: &str,
+        zone: &Tz,
+        at: NaiveDateTime,
+    ) -> (DateTime<chrono::Utc>, &'static str) {
+        use chrono::{MappedLocalTime, Offset as _};
+
+        let icalendar = CalendarDateTime::WithTimezone {
+            date_time: at,
+            tzid: tzid.to_string(),
+        }
+        .try_into_utc();
+        match (icalendar, zone.from_local_datetime(&at)) {
+            (Some(resolved), _) => (resolved, "ordinary"),
+            (None, MappedLocalTime::Ambiguous(a, b)) => {
+                (a.min(b).with_timezone(&chrono::Utc), "fold")
+            }
+            (None, MappedLocalTime::None) => {
+                let before = zone
+                    .offset_from_local_datetime(&(at - Duration::hours(3)))
+                    .single()
+                    .expect("no transition three hours before a gap")
+                    .fix();
+                let read = at.checked_sub_offset(before).expect("in range");
+                (read.and_utc(), "gap")
+            }
+            (None, MappedLocalTime::Single(_)) => {
+                panic!("{tzid} {at}: icalendar gave up on a time that happens once")
+            }
+        }
+    }
+
     /// Off a transition, a resolved `TZID` due is exactly what icalendar's
-    /// `try_into_utc` resolves, as before #1588. Every 30 minutes of 2026 in
-    /// six zones, half-hour DST and southern-hemisphere DST among them; the
-    /// sweep also counts the folds and gaps it crossed, and checks each of
-    /// those against the zone's own clock.
+    /// `try_into_utc` resolves, as before #1588; on one, it is the zone's own
+    /// answer. Every 30 minutes of 2026 in six zones, with half-hour and
+    /// southern-hemisphere DST among them, from two viewers.
     #[test]
     fn a_resolved_tzid_due_off_a_transition_is_what_icalendar_resolves() {
-        use chrono::{MappedLocalTime, Offset as _};
+        use chrono_tz::America::New_York;
         use chrono_tz::Asia::Kolkata;
         use chrono_tz::Tz;
 
-        let viewers = [chrono_tz::America::New_York, Kolkata];
         let (mut ordinary, mut folds, mut gaps) = (0_u32, 0_u32, 0_u32);
         for tzid in [
             "America/Chicago",
@@ -1610,61 +1648,27 @@ mod tests {
             let zone: Tz = tzid.parse().expect("an IANA zone");
             let mut at = naive(2026, 1, 1, 0, 0);
             while at < naive(2027, 1, 1, 0, 0) {
-                let icalendar = CalendarDateTime::WithTimezone {
-                    date_time: at,
-                    tzid: tzid.to_string(),
+                let (want, kind) = expected_due(tzid, &zone, at);
+                for viewer in [New_York, Kolkata] {
+                    assert_eq!(
+                        due_in(with_tzid(tzid, at), &viewer),
+                        Some((want, false)),
+                        "{kind}: {tzid} {at} viewed from {viewer}"
+                    );
                 }
-                .try_into_utc();
-                for viewer in viewers {
-                    let got = due_in(with_tzid(tzid, at), &viewer).map(|(t, _)| t);
-                    match icalendar {
-                        Some(resolved) => {
-                            assert_eq!(got, Some(resolved), "{tzid} {at} viewed from {viewer}");
-                        }
-                        None => {
-                            let got = got.expect("a due in a fold or gap is kept");
-                            match zone.from_local_datetime(&at) {
-                                MappedLocalTime::Ambiguous(a, b) => {
-                                    let first = a.min(b).with_timezone(&chrono::Utc);
-                                    assert_eq!(got, first, "{tzid} {at} viewed from {viewer}");
-                                }
-                                MappedLocalTime::None => {
-                                    // An oracle apart from `wall_clock_to_unix`:
-                                    // the offset three hours earlier, since no
-                                    // zone here changes twice within that.
-                                    let before = zone
-                                        .offset_from_local_datetime(&(at - Duration::hours(3)))
-                                        .single()
-                                        .expect("no transition three hours before a gap")
-                                        .fix();
-                                    let want = at
-                                        .checked_sub_offset(before)
-                                        .expect("in range")
-                                        .and_utc();
-                                    assert_eq!(got, want, "{tzid} {at} viewed from {viewer}");
-                                }
-                                MappedLocalTime::Single(_) => {
-                                    panic!("{tzid} {at}: icalendar gave up on a single time");
-                                }
-                            }
-                        }
-                    }
-                }
-                match icalendar {
-                    Some(_) => ordinary += 1,
-                    None if matches!(zone.from_local_datetime(&at), MappedLocalTime::None) => {
-                        gaps += 1;
-                    }
-                    None => folds += 1,
+                match kind {
+                    "fold" => folds += 1,
+                    "gap" => gaps += 1,
+                    _ => ordinary += 1,
                 }
                 at += Duration::minutes(30);
             }
         }
-        // Chicago, New York and Berlin: 2 folds and 2 gaps a year at
-        // 30-minute steps; Lord Howe and Santiago differ. Pin only that the
-        // sweep crossed both kinds.
-        assert!(folds > 0 && gaps > 0, "folds {folds}, gaps {gaps}");
-        assert!(ordinary > 100_000, "ordinary {ordinary}");
+        // Two 30-minute slots in each one-hour fold and gap of Chicago, New
+        // York, Berlin and Santiago, one in each of Lord Howe's half-hour
+        // ones, none in Kolkata (tzdb 2025b, chrono-tz 0.10.4).
+        assert_eq!((folds, gaps), (9, 9), "the sweep's folds and gaps");
+        assert_eq!(ordinary, 6 * 365 * 48 - 18, "the sweep's ordinary slots");
     }
 
     const TZID_CHILD: &str = "HYTTE_1588_TZID_DUE_LOCAL_CHILD";

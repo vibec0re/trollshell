@@ -347,22 +347,23 @@ fn install_subscriptions() {
     // default sink known yet" into `Volume::default()`, a real-looking 0 %,
     // so the startup guard could not tell its placeholder from a reading.
     // The value is the one the backend publishes there — the default sink's
-    // averaged volume and its mute — and `dedupe` keeps another sink's
-    // change from re-firing it.
+    // averaged volume and its mute — and `VolumeGate` keeps another sink's
+    // change from re-firing it. The default sink's *id* rides along with the
+    // value: switching the default between two present sinks changes the
+    // value without the user touching a volume key, so [`VolumeGate`] seeds
+    // silently on an id change and only shows a change on the same sink.
     {
-        let mut guard = StartupGuard::default();
-        let volume = pipewire::sinks()
-            .map(|sinks| default_volume(&sinks))
-            .dedupe();
+        let mut gate = VolumeGate::default();
+        let volume = pipewire::sinks().map(|sinks| default_volume(&sinks));
 
-        glib::MainContext::default().spawn_local(volume.for_each(move |volume: Option<Volume>| {
-            if guard.admits(volume.is_some())
-                && let Some(v) = volume
-            {
-                route_show(&render_volume(v));
-            }
-            std::future::ready(())
-        }));
+        glib::MainContext::default().spawn_local(volume.for_each(
+            move |reading: Option<(u32, Volume)>| {
+                if let Some(v) = gate.admit(reading) {
+                    route_show(&render_volume(v));
+                }
+                std::future::ready(())
+            },
+        ));
     }
 
     // ── Microphone (default source) ───────────────────────────────────
@@ -515,6 +516,35 @@ impl StartupGuard {
     }
 }
 
+/// Decides which default-sink readings the volume OSD shows.
+///
+/// A reading is the default sink's id plus its volume and mute. The gate
+/// keeps the last reading it saw and admits a new one only when it is on the
+/// **same sink** and the value differs: the first reading seeds (the startup
+/// rule [`StartupGuard` documents]), and a reading on a *different* sink
+/// seeds too, because a switch between two present sinks changes the value
+/// with no volume key involved. A volume change on the new sink right after
+/// the switch compares against the seeded value, so it still shows. A
+/// placeholder (`None`, no default sink) shows nothing and leaves the
+/// baseline alone.
+///
+/// [`StartupGuard` documents]: StartupGuard
+#[derive(Debug, Default)]
+struct VolumeGate {
+    last: Option<(u32, Volume)>,
+}
+
+impl VolumeGate {
+    /// Feed one emission; the volume to show, if any.
+    fn admit(&mut self, reading: Option<(u32, Volume)>) -> Option<Volume> {
+        let (id, volume) = reading?;
+        match self.last.replace((id, volume)) {
+            Some((last_id, last_volume)) if last_id == id && last_volume != volume => Some(volume),
+            _ => None,
+        }
+    }
+}
+
 /// Raise a transient "leave-by" nudge — the public entry point behind the
 /// plugin→shell `Effect::RaiseOsd` (#236). Generic and reusable: the caller
 /// (any plugin, via the host effect broker) computes the display strings and
@@ -632,14 +662,20 @@ fn detect_battery_event(prev: Option<&Battery>, curr: &Battery) -> Option<Batter
     None
 }
 
-/// The default sink's volume and mute out of the sink list — the value the
-/// backend publishes as `pipewire::default_sink()` — or `None` while no sink
-/// is the default, which `default_sink()` instead reports as a real-looking
-/// `Volume::default()`.
-fn default_volume(sinks: &[Sink]) -> Option<Volume> {
-    sinks.iter().find(|s| s.is_default).map(|s| Volume {
-        linear: s.volume,
-        muted: s.muted,
+/// The default sink's id, volume and mute out of the sink list — the value
+/// the backend publishes as `pipewire::default_sink()` — or `None` while no
+/// sink is the default, which `default_sink()` instead reports as a
+/// real-looking `Volume::default()`. The id is what [`VolumeGate`] uses to tell
+/// a volume change from a switch of default sink.
+fn default_volume(sinks: &[Sink]) -> Option<(u32, Volume)> {
+    sinks.iter().find(|s| s.is_default).map(|s| {
+        (
+            s.id,
+            Volume {
+                linear: s.volume,
+                muted: s.muted,
+            },
+        )
     })
 }
 
@@ -1053,13 +1089,62 @@ mod tests {
                 sink("hdmi", 0.4, false, false),
                 sink("speakers", 0.7, true, true),
             ]),
-            Some(vol(0.7, true)),
+            Some((0, vol(0.7, true))),
         );
         assert_eq!(
             default_volume(&[sink("silent", 0.0, false, true)]),
-            Some(vol(0.0, false)),
+            Some((0, vol(0.0, false))),
             "a real 0 % default sink is a reading",
         );
+    }
+
+    fn reading(id: u32, linear: f64) -> Option<(u32, Volume)> {
+        Some((id, vol(linear, false)))
+    }
+
+    /// The gate's answers for a run of emissions, in order.
+    fn gated(readings: &[Option<(u32, Volume)>]) -> Vec<Option<Volume>> {
+        let mut gate = VolumeGate::default();
+        readings.iter().map(|&r| gate.admit(r)).collect()
+    }
+
+    /// Switching the default between two present sinks at different volumes
+    /// is not a volume change: it seeds silently. A change on the new sink
+    /// right after still shows, and the same sink's change shows as before.
+    #[test]
+    fn a_default_sink_switch_seeds_silently_and_a_change_after_it_shows() {
+        assert_eq!(
+            gated(&[
+                None,            // placeholder
+                reading(1, 0.3), // first real reading seeds
+                reading(1, 0.4), // same sink, new value: shows
+                reading(2, 0.8), // switch to sink 2: silent
+                reading(2, 0.8), // repeat: nothing
+                reading(2, 0.9), // change on the new sink: shows
+                None,            // device gone: nothing
+                reading(2, 0.9), // back, same value: nothing
+                reading(1, 0.4), // switch back: silent
+            ]),
+            vec![
+                None,
+                None,
+                Some(vol(0.4, false)),
+                None,
+                None,
+                Some(vol(0.9, false)),
+                None,
+                None,
+                None,
+            ],
+        );
+    }
+
+    /// Mute is part of the value: a mute toggle on the same sink shows.
+    #[test]
+    fn a_mute_toggle_on_the_same_sink_shows() {
+        let mut gate = VolumeGate::default();
+        assert_eq!(gate.admit(reading(1, 0.5)), None);
+        assert_eq!(gate.admit(Some((1, vol(0.5, true)))), Some(vol(0.5, true)));
     }
 
     /// What `guard` answers for each emission in `real`, in order.

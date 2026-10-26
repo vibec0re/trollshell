@@ -215,6 +215,10 @@ pub struct Gate<C, V> {
 impl<C, V: Fn(&C) -> Option<bool>> Gate<C, V> {
     /// A gate over `cmds`, refreshing every `period` while open.
     ///
+    /// A `period` shorter than [`MIN_PERIOD`] (1 ms) — `Duration::ZERO`
+    /// included — is raised to it rather than panicking, so a config-derived
+    /// value cannot abort the plugin.
+    ///
     /// `visibility` classifies each command: `Some(want)` is a visibility
     /// change the gate absorbs (answering an open edge with
     /// [`Wake::Refresh`]), `None` is anything else, handed back as
@@ -310,6 +314,9 @@ impl<C, V: Fn(&C) -> Option<bool>> Gate<C, V> {
     /// as after [`reset`](Gate::reset). A caller that wants a refresh right
     /// now does it itself — which is what re-arming from inside a refresh
     /// already amounts to.
+    ///
+    /// As in [`new`](Gate::new), a `period` shorter than [`MIN_PERIOD`] (1 ms),
+    /// zero included, is raised to it instead of panicking.
     pub fn set_period(&mut self, period: Duration) {
         self.interval = fresh(period, false);
     }
@@ -321,10 +328,22 @@ impl<C, V: Fn(&C) -> Option<bool>> Gate<C, V> {
     }
 }
 
+/// The shortest cadence a [`Gate`] will run at: 1 ms.
+///
+/// [`tokio::time::interval`] panics on a zero period, and a gate's period is
+/// routinely config-derived, so a plugin author's `0` would abort the plugin's
+/// own process. A shorter period is raised to this instead. 1 ms is tokio's
+/// timer resolution, so no real cadence is lost by it: nothing can tick faster
+/// anyway, and with `MissedTickBehavior::Delay` a zero period degrades to
+/// "refresh as soon as the previous one returns", never a burst.
+pub const MIN_PERIOD: Duration = Duration::from_millis(1);
+
 /// An interval with the gate's missed-tick policy. `leading` picks whether the
 /// first tick is due immediately (construction, where the gate is closed
-/// anyway so nothing can consume it) or one period out (a re-arm).
+/// anyway so nothing can consume it) or one period out (a re-arm). A `period`
+/// below [`MIN_PERIOD`] is raised to it.
 fn fresh(period: Duration, leading: bool) -> tokio::time::Interval {
+    let period = period.max(MIN_PERIOD);
     let mut interval = if leading {
         tokio::time::interval(period)
     } else {
@@ -412,10 +431,11 @@ mod tests {
     //! | a closed lane ends the loop | [`a_closed_lane_ends_the_loop`] |
     //! | `Wake::Cmd` passthrough | [`an_unclassified_command_is_handed_back`] |
     //! | `set_period` | [`set_period_re_arms_from_now`] |
+    //! | the 1 ms floor | [`a_zero_period_ticks_at_the_floor`] |
 
     use std::time::Duration;
 
-    use super::{Gate, Wake};
+    use super::{Gate, MIN_PERIOD, Wake};
     use crate::cmd_channel;
 
     const P: Duration = Duration::from_secs(10);
@@ -670,5 +690,35 @@ mod tests {
             Some(Wake::Refresh),
             "the re-armed cadence"
         );
+    }
+
+    /// **The floor.** A zero period, from `new` or `set_period`, must not
+    /// panic (`tokio::time::interval` does) and ticks at `MIN_PERIOD`.
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_period_ticks_at_the_floor() {
+        let (tx, rx) = cmd_channel();
+        let mut g: Gate<Cmd, fn(&Cmd) -> Option<bool>> =
+            Gate::new(rx, Duration::ZERO, |c| match c {
+                Cmd::SetVisible(v) => Some(*v),
+                Cmd::Other(_) => None,
+            });
+
+        tx.send(Cmd::SetVisible(true)).expect("open lane");
+        assert_eq!(wake_soon(&mut g).await, Some(Wake::Refresh), "the edge");
+
+        // Measured, not probed with a sub-millisecond window: tokio's timer
+        // wheel rounds a deadline up to whole milliseconds.
+        for rearm in [false, true] {
+            if rearm {
+                g.set_period(Duration::ZERO);
+            }
+            let from = tokio::time::Instant::now();
+            assert_eq!(wake_soon(&mut g).await, Some(Wake::Refresh), "a floor tick");
+            let waited = from.elapsed();
+            assert!(
+                waited >= MIN_PERIOD && waited <= MIN_PERIOD * 3,
+                "ticked after {waited:?}, expected about {MIN_PERIOD:?} (rearm: {rearm})"
+            );
+        }
     }
 }

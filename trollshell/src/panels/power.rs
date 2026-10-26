@@ -325,7 +325,7 @@ mod markup_tests {
 /// `bind_two_way_drag_safe`, whose grab tracker is a capture-phase controller
 /// fed by the pointer. Its input type is private to `hytte-reactive`, so a test
 /// in this crate cannot hand it a press the way `hytte-reactive`'s own display
-/// tests do. These send one instead: XTest input into the `xvfb-run` display
+/// tests do. These send one instead: `XTest` input into the `xvfb-run` display
 /// through `xdotool`, the route `plugins::region`'s press-tracker tests take
 /// (#1413), so the press, the drag and the release go down GTK's own dispatch
 /// to the controller the binding installed, as a user's would.
@@ -465,11 +465,11 @@ mod slider_tests {
             let releases = Rc::new(Cell::new(0_u32));
             let counter = gtk::EventControllerLegacy::new();
             counter.set_propagation_phase(gtk::PropagationPhase::Capture);
-            let (pressed, released) = (Rc::clone(&presses), Rc::clone(&releases));
+            let counts = (Rc::clone(&presses), Rc::clone(&releases));
             counter.connect_event(move |_, event| {
                 match event.event_type() {
-                    gtk::gdk::EventType::ButtonPress => pressed.set(pressed.get() + 1),
-                    gtk::gdk::EventType::ButtonRelease => released.set(released.get() + 1),
+                    gtk::gdk::EventType::ButtonPress => counts.0.set(counts.0.get() + 1),
+                    gtk::gdk::EventType::ButtonRelease => counts.1.set(counts.1.get() + 1),
                     _ => {}
                 }
                 glib::Propagation::Proceed

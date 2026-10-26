@@ -33,12 +33,28 @@
 //!
 //! # The clock lives in the plugin — the host stays stateless
 //!
-//! State lives here (#195): the running countdown is `remaining` seconds,
-//! decremented by the plugin's own 1 Hz [`sources`](Plugin::sources) tick — so a
-//! running timer keeps counting whether or not its chip is on screen, and a host
-//! restart simply re-seeds a fresh idle timer (nothing to persist). The reducer
-//! is pure and panic-free, which is what makes it the plugin's whole correctness
-//! signal (see the `tests` module) since the live host isn't reachable here.
+//! State lives here (#195). A running countdown holds a **wall-clock deadline**
+//! ([`SystemTime`]) and every tick derives `remaining` from `deadline - now`,
+//! saturating at zero. The 1 Hz [`sources`](Plugin::sources) interval is only a
+//! repaint cadence: it runs on `CLOCK_MONOTONIC`, which does not advance across
+//! suspend, so counting its ticks made a 25-minute timer with 20 minutes of
+//! suspend in the middle fire 20 minutes late. A paused timer stores
+//! `remaining`, not a deadline, and resume sets a fresh deadline. If the wall
+//! clock steps backwards (NTP) the deadline is rebased onto the new clock, so
+//! the readout never grows. Time is injected (`*_at(now)` methods), which is
+//! what lets the tests simulate suspend and clock steps without sleeping.
+//!
+//! The SDK builds the model fresh on every session and `systemctl --user
+//! restart trollshell` reconnects the *same* plugin process, so `init` would
+//! otherwise turn a running pomodoro into an idle 25:00. The model is therefore
+//! mirrored into a process-level holder (`HELD`) after every update and
+//! re-read by `init`. The SDK has no state seam and no other plugin carries
+//! state across sessions; a process-level holder is enough because the process
+//! outlives the host connection, and it is simpler than persisting to
+//! `$XDG_STATE_HOME` (a plugin restart loses it, which is acceptable). A
+//! deadline that passed during the gap fires its notification on the first
+//! tick after reconnect. The reducer is pure and panic-free, which is what
+//! makes it the plugin's whole correctness signal (see the `tests` module).
 //!
 //! # Input — `Node::Entry` + `Submitted` (#357)
 //!
@@ -53,7 +69,8 @@
 //! notification daemon — the payoff of the additive effect this crate ships
 //! alongside.
 
-use std::time::Duration;
+use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, SystemTime};
 
 use hytte_plugin::display::{SevenSeg, StyleName};
 use hytte_plugin::proto::{Capability, Dir, Effect, EventKind, Manifest, Mount, Node, Page};
@@ -103,24 +120,61 @@ enum TimerMsg {
     Tick,
 }
 
-/// The timer's whole state — rebuilt on every (re)connect (the host stores
-/// nothing). `remaining` is the live countdown; `total` is the last-set duration
-/// so **Reset** can restore it.
+/// The timer's whole state — rebuilt on every (re)connect from `HELD`. While
+/// running, `deadline` is the truth and `remaining` its per-tick projection;
+/// while paused or idle, `remaining` is the truth. `total` is the last-set
+/// duration so **Reset** can restore it.
 #[derive(Debug, PartialEq, Eq)]
 struct Timer {
-    /// Seconds left on the countdown (the "deadline", relative — decremented by
-    /// the 1 Hz tick so the reducer stays pure).
+    /// Seconds left on the countdown, as last derived from `deadline`.
     remaining: u32,
     /// The duration last set (entry or preset), restored by [`Timer::reset`].
     total: u32,
     /// Whether the countdown is advancing.
     running: bool,
+    /// Wall-clock instant the countdown reaches zero; `Some` only while
+    /// `running`.
+    deadline: Option<SystemTime>,
+    /// The `now` of the last tick/start/resume, to notice a backwards clock
+    /// step. `Some` only while `running`.
+    last_seen: Option<SystemTime>,
     /// The `MM:SS` readout the chip and the panel both draw (#884). Config
     /// only — a seven-segment strip is pure, so this carries no animation state
     /// and needs no `advance`; the reading is handed to `node` at render time.
     /// One instance for both call sites: the two nodes differ in nothing but
     /// their id, which is what keys each to its own renderer host-side.
     seg: SevenSeg,
+}
+
+/// The persistent part of a [`Timer`] — what survives a reconnect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Saved {
+    /// See [`Timer::remaining`].
+    remaining: u32,
+    /// See [`Timer::total`].
+    total: u32,
+    /// See [`Timer::running`].
+    running: bool,
+    /// See [`Timer::deadline`].
+    deadline: Option<SystemTime>,
+    /// See [`Timer::last_seen`].
+    last_seen: Option<SystemTime>,
+}
+
+/// A process-level slot holding the timer across sessions.
+type Holder = Mutex<Option<Saved>>;
+
+/// The production holder: the plugin process outlives each host connection.
+static HELD: Holder = Mutex::new(None);
+
+/// Whole seconds from `now` until `deadline`, rounded up (so the readout shows
+/// `00:01` until the deadline actually passes), saturating at zero.
+fn secs_until(deadline: SystemTime, now: SystemTime) -> u32 {
+    let Ok(left) = deadline.duration_since(now) else {
+        return 0;
+    };
+    let secs = left.as_secs() + u64::from(left.subsec_nanos() > 0);
+    u32::try_from(secs).unwrap_or(u32::MAX)
 }
 
 /// Format a whole-second count as a `MM:SS` (or wider) readout for the 7seg.
@@ -197,39 +251,117 @@ impl Timer {
         fmt_mmss(self.remaining)
     }
 
-    /// Load and start a duration (clamped): what a preset click or a parsed
-    /// entry does. A zero duration loads but doesn't run.
-    fn start(&mut self, secs: u32) {
+    /// A fresh idle pomodoro (25:00, not running).
+    fn fresh() -> Self {
+        Self {
+            remaining: POMODORO_SECS,
+            total: POMODORO_SECS,
+            running: false,
+            deadline: None,
+            last_seen: None,
+            seg: SevenSeg::new(STYLE),
+        }
+    }
+
+    /// The model as `init` builds it: whatever `holder` kept from the previous
+    /// session, else a fresh idle pomodoro.
+    fn restore(holder: &Holder) -> Self {
+        let saved = *holder.lock().unwrap_or_else(PoisonError::into_inner);
+        match saved {
+            Some(s) => Self {
+                remaining: s.remaining,
+                total: s.total,
+                running: s.running,
+                deadline: s.deadline,
+                last_seen: s.last_seen,
+                seg: SevenSeg::new(STYLE),
+            },
+            None => Self::fresh(),
+        }
+    }
+
+    /// Mirror the persistent state into `holder`.
+    fn remember(&self, holder: &Holder) {
+        *holder.lock().unwrap_or_else(PoisonError::into_inner) = Some(Saved {
+            remaining: self.remaining,
+            total: self.total,
+            running: self.running,
+            deadline: self.deadline,
+            last_seen: self.last_seen,
+        });
+    }
+
+    /// Load and start a duration (clamped) at `now`: what a preset click or a
+    /// parsed entry does. A zero duration loads but doesn't run.
+    fn start_at(&mut self, secs: u32, now: SystemTime) {
         let secs = secs.min(MAX_SECS);
         self.total = secs;
         self.remaining = secs;
-        self.running = secs > 0;
+        self.run_from(now);
     }
 
-    /// Pause a running countdown, or resume a paused one — a no-op once it has
-    /// hit zero (nothing left to run).
-    fn toggle_pause(&mut self) {
+    /// Arm the deadline `remaining` seconds after `now` if there is anything
+    /// left to run, else stop.
+    fn run_from(&mut self, now: SystemTime) {
         if self.remaining > 0 {
-            self.running = !self.running;
+            self.running = true;
+            self.deadline = Some(now + Duration::from_secs(u64::from(self.remaining)));
+            self.last_seen = Some(now);
+        } else {
+            self.stop();
+        }
+    }
+
+    /// Drop the running state (deadline and clock bookkeeping with it).
+    fn stop(&mut self) {
+        self.running = false;
+        self.deadline = None;
+        self.last_seen = None;
+    }
+
+    /// Pause a running countdown (freezing `remaining` as of `now`), or resume
+    /// a paused one with a fresh deadline — a no-op once it has hit zero.
+    fn toggle_pause_at(&mut self, now: SystemTime) {
+        if self.running {
+            self.sync(now);
+            self.stop();
+        } else if self.remaining > 0 {
+            self.run_from(now);
         }
     }
 
     /// Stop and restore the last-set duration.
     fn reset(&mut self) {
         self.remaining = self.total;
-        self.running = false;
+        self.stop();
     }
 
-    /// The 1 Hz heartbeat: advance a running countdown by one second and, on the
-    /// tick that reaches zero, stop and emit exactly one [`Effect::Notify`]. An
-    /// idle (or already-finished) timer ticks to nothing.
-    fn tick(&mut self) -> Vec<Effect> {
-        if !self.running || self.remaining == 0 {
+    /// Re-derive `remaining` from the deadline at `now`. A wall clock that
+    /// stepped backwards since the last look rebases the deadline onto the new
+    /// clock instead (losing at most one tick), so `remaining` never grows.
+    fn sync(&mut self, now: SystemTime) {
+        let (Some(deadline), Some(last)) = (self.deadline, self.last_seen) else {
+            return;
+        };
+        if now < last {
+            self.deadline = Some(now + Duration::from_secs(u64::from(self.remaining)));
+        } else {
+            self.remaining = secs_until(deadline, now).min(self.remaining);
+        }
+        self.last_seen = Some(now);
+    }
+
+    /// The heartbeat: re-derive a running countdown from the wall clock and, on
+    /// the tick that finds the deadline reached, stop and emit exactly one
+    /// [`Effect::Notify`]. An idle (or already-finished) timer ticks to
+    /// nothing.
+    fn tick_at(&mut self, now: SystemTime) -> Vec<Effect> {
+        if !self.running {
             return Vec::new();
         }
-        self.remaining -= 1;
+        self.sync(now);
         if self.remaining == 0 {
-            self.running = false;
+            self.stop();
             return vec![Effect::Notify {
                 summary: "Timer done".to_owned(),
                 body: format!("{} timer finished", fmt_mmss(self.total)),
@@ -240,17 +372,17 @@ impl Timer {
 
     /// Fold one user interaction. The chip click asks the host to open this
     /// plugin's panel; the panel controls mutate the model.
-    fn on_event(&mut self, node: &str, kind: &EventKind) -> Vec<Effect> {
+    fn on_event(&mut self, node: &str, kind: &EventKind, now: SystemTime) -> Vec<Effect> {
         match (kind, node) {
             (EventKind::Click, CHIP_BTN) => return vec![Effect::OpenPage(Page::PluginSelf)],
-            (EventKind::Click, PRESET_25) => self.start(POMODORO_SECS),
-            (EventKind::Click, PRESET_5) => self.start(SHORT_BREAK_SECS),
-            (EventKind::Click, PRESET_15) => self.start(LONG_BREAK_SECS),
-            (EventKind::Click, PAUSE_ID) => self.toggle_pause(),
+            (EventKind::Click, PRESET_25) => self.start_at(POMODORO_SECS, now),
+            (EventKind::Click, PRESET_5) => self.start_at(SHORT_BREAK_SECS, now),
+            (EventKind::Click, PRESET_15) => self.start_at(LONG_BREAK_SECS, now),
+            (EventKind::Click, PAUSE_ID) => self.toggle_pause_at(now),
             (EventKind::Click, RESET_ID) => self.reset(),
             (EventKind::Submitted { text }, ENTRY_ID) => {
                 if let Some(secs) = parse_duration(text) {
-                    self.start(secs);
+                    self.start_at(secs, now);
                 }
             }
             _ => {}
@@ -290,20 +422,19 @@ impl Plugin for Timer {
         m
     }
 
-    /// A fresh idle pomodoro (25:00, not running) — the seed render mounts the
-    /// chip immediately. The command sender goes unused (`Cmd = Infallible`).
+    /// The model the previous session left in `HELD` (so a shell restart
+    /// keeps a running countdown), else a fresh idle pomodoro (25:00, not
+    /// running) — the seed render mounts the chip immediately. The command
+    /// sender goes unused (`Cmd = Infallible`).
     fn init(_cmds: CmdSender<Self::Cmd>) -> Self {
-        Self {
-            remaining: POMODORO_SECS,
-            total: POMODORO_SECS,
-            running: false,
-            seg: SevenSeg::new(STYLE),
-        }
+        Self::restore(&HELD)
     }
 
-    /// A 1 Hz tick, created per session and dropped on disconnect. The command
-    /// receiver goes unused. [`tick_stream`] fires immediately then every
-    /// second — the leading tick is a harmless no-op on an idle timer.
+    /// A 1 Hz repaint cadence, created per session and dropped on disconnect;
+    /// the countdown itself comes from the wall clock, not from counting these.
+    /// The command receiver goes unused. [`tick_stream`] fires immediately then
+    /// every second — the leading tick is a no-op on an idle timer and, after a
+    /// reconnect, fires a deadline that passed meanwhile.
     fn sources(_cmds: CmdReceiver<Self::Cmd>) -> Option<MsgStream<Self::Msg>> {
         Some(Box::pin(tick_stream(TICK, TimerMsg::Tick)))
     }
@@ -312,9 +443,10 @@ impl Plugin for Timer {
     /// is the runtime's problem (identical trees are deduped, effects force a
     /// send).
     fn update(&mut self, input: Input<Self::Msg>) -> Vec<Effect> {
-        match input {
-            Input::App(TimerMsg::Tick) => self.tick(),
-            Input::Event { node, kind, .. } => self.on_event(&node, &kind),
+        let now = SystemTime::now();
+        let effects = match input {
+            Input::App(TimerMsg::Tick) => self.tick_at(now),
+            Input::Event { node, kind, .. } => self.on_event(&node, &kind, now),
             // No host state is subscribed and no command is issued, so the
             // snapshot / effect-result / visibility pushes are all no-ops. The
             // countdown keeps ticking whether or not the chip is on screen.
@@ -328,7 +460,9 @@ impl Plugin for Timer {
             | Input::NowPlaying(_)
             | Input::DatasourceQuery { .. }
             | Input::DatasourceResult { .. } => Vec::new(),
-        }
+        };
+        self.remember(&HELD);
+        effects
     }
 
     /// The rendered [`View`] (#349). The bar **chip**: a clickable button
@@ -405,8 +539,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        CHIP_BTN, ENTRY_ID, LONG_BREAK_SECS, PANEL_SEG_ID, PLUGIN_ID, POMODORO_SECS, PRESET_5,
-        PRESET_25, SEG_ID, SHORT_BREAK_SECS, Timer, parse_duration,
+        CHIP_BTN, ENTRY_ID, Holder, LONG_BREAK_SECS, PANEL_SEG_ID, PLUGIN_ID, POMODORO_SECS,
+        PRESET_5, PRESET_25, SEG_ID, SHORT_BREAK_SECS, Timer, parse_duration,
     };
     use hytte_plugin::display::{RenderMode, StyleName, testing::with_render_mode};
     use hytte_plugin::preem::{DisplayStyle, seven_seg};
@@ -415,11 +549,28 @@ mod tests {
         Capability, Effect, EventKind, Manifest, Node, Page, PluginMsg, decode, encode,
     };
     use hytte_plugin::{Input, Plugin};
+    use std::sync::Mutex;
+    use std::time::{Duration, SystemTime};
 
-    /// A fresh model with a throwaway command sender — the timer issues no
-    /// commands, so the lane goes unused.
+    /// A fresh idle model, built without the process-level holder so parallel
+    /// tests never see each other's state.
     fn fresh() -> Timer {
-        Timer::init(hytte_plugin::cmd_channel().0)
+        Timer::fresh()
+    }
+
+    /// A fixed wall-clock origin, `s` seconds after which the tests read "now".
+    fn at(s: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 + s)
+    }
+
+    /// Start `secs` at the test origin.
+    fn start(m: &mut Timer, secs: u32) {
+        m.start_at(secs, at(0));
+    }
+
+    /// An isolated holder, standing in for `HELD`.
+    fn holder() -> Holder {
+        Mutex::new(None)
     }
 
     fn click(node: &str) -> Input<super::TimerMsg> {
@@ -435,8 +586,9 @@ mod tests {
         )
     }
 
-    fn tick(model: &mut Timer) -> Vec<Effect> {
-        model.update(Input::App(super::TimerMsg::Tick))
+    /// A tick as the wall clock reads `s` seconds after the origin.
+    fn tick(model: &mut Timer, s: u64) -> Vec<Effect> {
+        model.tick_at(at(s))
     }
 
     /// The parse table — the reducer's testable heart (#357). `25m`→1500,
@@ -474,16 +626,16 @@ mod tests {
     #[test]
     fn a_tick_decrements_and_zero_notifies() {
         let mut m = fresh();
-        m.start(3);
+        start(&mut m, 3);
         assert_eq!((m.remaining, m.running), (3, true));
 
-        assert!(tick(&mut m).is_empty());
+        assert!(tick(&mut m, 1).is_empty());
         assert_eq!(m.remaining, 2);
-        assert!(tick(&mut m).is_empty());
+        assert!(tick(&mut m, 2).is_empty());
         assert_eq!(m.remaining, 1);
 
         // The tick that reaches zero stops the timer and emits exactly one Notify.
-        let fx = tick(&mut m);
+        let fx = tick(&mut m, 3);
         assert_eq!(m.remaining, 0);
         assert!(!m.running, "a finished timer stops");
         assert_eq!(
@@ -495,7 +647,7 @@ mod tests {
         );
 
         // Ticking a finished timer does nothing more (no repeat Notify).
-        assert!(tick(&mut m).is_empty());
+        assert!(tick(&mut m, 4).is_empty());
         assert_eq!(m.remaining, 0);
     }
 
@@ -505,7 +657,7 @@ mod tests {
         let mut m = fresh();
         assert!(!m.running);
         let before = m.remaining;
-        assert!(tick(&mut m).is_empty());
+        assert!(tick(&mut m, 5).is_empty());
         assert_eq!(m.remaining, before, "an idle timer holds its readout");
     }
 
@@ -559,15 +711,15 @@ mod tests {
     #[test]
     fn pause_toggles_and_reset_restores() {
         let mut m = fresh();
-        m.start(600);
-        let _ = m.update(click(super::PAUSE_ID));
+        start(&mut m, 600);
+        m.toggle_pause_at(at(0));
         assert!(!m.running, "pause halts");
-        let _ = tick(&mut m);
+        let _ = tick(&mut m, 30);
         assert_eq!(m.remaining, 600, "paused timers don't advance");
-        let _ = m.update(click(super::PAUSE_ID));
+        m.toggle_pause_at(at(30));
         assert!(m.running, "a second toggle resumes");
 
-        let _ = tick(&mut m);
+        let _ = tick(&mut m, 31);
         assert_eq!(m.remaining, 599);
         let _ = m.update(click(super::RESET_ID));
         assert_eq!(
@@ -575,6 +727,109 @@ mod tests {
             (600, false),
             "reset restores total"
         );
+    }
+
+    /// A deadline crossed while the process was suspended (the monotonic tick
+    /// clock stood still) fires on the very next tick, not 20 minutes later.
+    #[test]
+    fn a_deadline_crossed_in_suspend_fires_on_the_next_tick() {
+        let mut m = fresh();
+        start(&mut m, 25 * 60);
+        assert!(tick(&mut m, 5 * 60).is_empty());
+        assert_eq!(m.remaining, 20 * 60);
+
+        // Suspended for 25 minutes: the next tick sees the wall clock far past
+        // the deadline.
+        let fx = tick(&mut m, 30 * 60);
+        assert_eq!(m.remaining, 0);
+        assert!(!m.running);
+        assert!(matches!(fx.as_slice(), [Effect::Notify { .. }]));
+        assert!(tick(&mut m, 31 * 60).is_empty(), "exactly one Notify");
+
+        // A suspend that ends before the deadline just shows the lost time.
+        let mut m = fresh();
+        start(&mut m, 25 * 60);
+        assert!(tick(&mut m, 20 * 60).is_empty());
+        assert_eq!(m.remaining, 5 * 60);
+    }
+
+    /// Time that passes while paused is not counted, and resume re-arms the
+    /// deadline from the resume instant.
+    #[test]
+    fn pause_and_resume_across_a_gap() {
+        let mut m = fresh();
+        start(&mut m, 600);
+        assert!(tick(&mut m, 100).is_empty());
+        m.toggle_pause_at(at(100));
+        assert_eq!((m.remaining, m.running, m.deadline), (500, false, None));
+
+        // An hour passes (suspend included) while paused.
+        let _ = tick(&mut m, 3700);
+        assert_eq!(m.remaining, 500);
+        m.toggle_pause_at(at(3700));
+        assert_eq!((m.remaining, m.running), (500, true));
+        assert!(tick(&mut m, 3700 + 499).is_empty());
+        assert_eq!(m.remaining, 1);
+        let fx = tick(&mut m, 3700 + 500);
+        assert!(matches!(fx.as_slice(), [Effect::Notify { .. }]));
+    }
+
+    /// A wall clock stepped backwards never makes the readout grow past what it
+    /// showed (or past the original duration); the countdown carries on from
+    /// the new clock.
+    #[test]
+    fn a_backwards_clock_jump_never_grows_the_readout() {
+        let mut m = fresh();
+        start(&mut m, 600);
+        assert!(tick(&mut m, 100).is_empty());
+        assert_eq!(m.remaining, 500);
+
+        // NTP steps the clock back an hour.
+        let back = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 - 3600);
+        assert!(m.tick_at(back).is_empty());
+        assert_eq!(m.remaining, 500, "no growth");
+        assert!(m.remaining <= m.total);
+
+        // And it keeps counting down on the new clock.
+        assert!(m.tick_at(back + Duration::from_secs(10)).is_empty());
+        assert_eq!(m.remaining, 490);
+        let fx = m.tick_at(back + Duration::from_secs(500));
+        assert!(matches!(fx.as_slice(), [Effect::Notify { .. }]));
+    }
+
+    /// A reconnect re-runs `init`: a running timer must survive it, and a
+    /// deadline that passed in the gap fires on the first tick after.
+    #[test]
+    fn reinit_keeps_a_running_timer() {
+        let held = holder();
+        assert_eq!(Timer::restore(&held), Timer::fresh(), "empty holder: idle");
+
+        let mut m = Timer::restore(&held);
+        start(&mut m, 600);
+        assert!(tick(&mut m, 60).is_empty());
+        m.remember(&held);
+
+        let mut again = Timer::restore(&held);
+        assert_eq!(
+            (again.remaining, again.total, again.running),
+            (540, 600, true)
+        );
+        assert!(tick(&mut again, 120).is_empty());
+        assert_eq!(again.remaining, 480);
+
+        // The shell was down past the deadline.
+        again.remember(&held);
+        let mut late = Timer::restore(&held);
+        let fx = tick(&mut late, 10_000);
+        assert!(matches!(fx.as_slice(), [Effect::Notify { .. }]));
+
+        // A paused timer survives too, without a deadline.
+        let mut p = fresh();
+        start(&mut p, 600);
+        p.toggle_pause_at(at(10));
+        p.remember(&held);
+        let p = Timer::restore(&held);
+        assert_eq!((p.remaining, p.running, p.deadline), (590, false, None));
     }
 
     /// Clicking the chip asks the host to open this plugin's own panel.
@@ -634,7 +889,7 @@ mod tests {
     fn against_an_old_shell_both_readouts_are_rasterised_seven_segs() {
         let mut m = fresh();
         // A face with a digit in every position, so a wrong glyph can't hide.
-        m.start(23 * 60 + 45);
+        start(&mut m, 23 * 60 + 45);
         let view = with_render_mode(RenderMode::Raster, || m.view());
 
         let Node::Box { children, .. } = &view.tree else {
@@ -705,7 +960,7 @@ mod tests {
     #[test]
     fn against_a_preem_shell_both_readouts_are_state_nodes() {
         let mut m = fresh();
-        m.start(23 * 60 + 45);
+        start(&mut m, 23 * 60 + 45);
         let view = with_render_mode(RenderMode::State, || m.view());
 
         let Node::Box { children, .. } = &view.tree else {
@@ -744,8 +999,8 @@ mod tests {
         assert_eq!(reg, back);
 
         let mut m = fresh();
-        m.start(1);
-        let effects = tick(&mut m);
+        start(&mut m, 1);
+        let effects = tick(&mut m, 1);
         assert!(matches!(effects.as_slice(), [Effect::Notify { .. }]));
         let view = m.view();
         let render = PluginMsg::Render {

@@ -314,8 +314,8 @@ pub struct Window {
     retry: RefCell<Option<Queued>>,
     /// How many attempts in a row got no answer — what
     /// [`Window::next_retry_delay`] doubles on. Back to zero the moment one
-    /// settles: a probe's verdict, or (#1557 item 2) the mounted page's
-    /// load committing after a reload.
+    /// settles: a probe's verdict, or (#1557 item 2) the mounted page
+    /// reporting [`webview::Gateway::Answered`] after a reload.
     unanswered: std::cell::Cell<u32>,
     /// Whether the compositor is presenting this window — the poll's own
     /// signal ([`watch_presentation`]), followed here for the retry
@@ -1051,10 +1051,12 @@ impl Window {
     /// `WebKit`'s error page stayed up and nothing ever reloaded it — the
     /// gateway coming back changed nothing until the window was closed.
     ///
-    /// [`webview::Gateway::Answered`] is a load committing while that card
-    /// was up: the hive is back, so the backoff starts over and anything
-    /// still waiting is dropped — a reload queued behind a page that already
-    /// came back would throw away whatever the operator has typed into it.
+    /// [`webview::Gateway::Answered`] is something answering while that card
+    /// was up — a load committing, or (#1578 review, LOW 2) one failing in a
+    /// way asking again cannot mend: the gateway is back, so the backoff
+    /// starts over and anything still waiting is dropped — a reload queued
+    /// behind a page that already came back would throw away whatever the
+    /// operator has typed into it.
     fn on_gateway(&self, event: webview::Gateway) {
         match event {
             webview::Gateway::Unanswered { uri, why } => {

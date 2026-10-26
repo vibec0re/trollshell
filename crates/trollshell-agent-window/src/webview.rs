@@ -56,8 +56,10 @@ pub enum Gateway {
         /// The `GError`'s message, for the card and the journal.
         why: String,
     },
-    /// A main-frame load committed while that card was up: something
-    /// answered. The card is already down when this is sent.
+    /// Something answered while that card was up: a main-frame load
+    /// committed, or one failed in a way asking again cannot mend (a
+    /// redirect off the hive the policy refused, say). The card is already
+    /// down when this is sent.
     Answered,
 }
 
@@ -228,13 +230,28 @@ pub fn page(url: &str, trust: &Resolved, gateway: impl Fn(Gateway) + 'static) ->
 /// card's own state that is checked, not the URI: whichever load got through,
 /// the page is back.
 ///
-/// That includes the error page `WebKit` draws for a failure asking again
-/// cannot mend — a reload that is refused for a reason other than silence:
-/// `load_alternate_html` commits like any load. The card then comes down onto
-/// `WebKit`'s own explanation of that failure, which is the right thing to
-/// show for it, and nothing is left queued, since that failure queued
-/// nothing. A certificate failure is the exception, and stays one: its card
-/// is up by then, so this check never sees the unanswered card at all.
+/// # A failure asking again cannot mend, while the card is up
+///
+/// A reload can also be refused for a reason other than silence. That is not
+/// left to `load-changed`, because `WebKit` does not always draw anything for
+/// it: its default `load-failed` handler (`webkitWebViewLoadFail`,
+/// `WebKitWebView.cpp:594-609` in the webkitgtk 2.52.6 the flake links)
+/// returns early, with no error page and so no commit, for a cancellation
+/// (`WebKitNetworkError` 302) and a policy interruption (`WebKitPolicyError`
+/// 102). Those are exactly what the one-origin rule produces when a gateway
+/// that has come back answers the reload with a redirect off the hive. Left
+/// to the commit, the card stayed up promising a retry nobody had queued,
+/// and "Try again now" found nothing to run (#1578 review, LOW 2).
+///
+/// So the `load-failed` handler itself takes the card down when it declines a
+/// failure while the unanswered card is showing, and tells the window
+/// [`Gateway::Answered`]: something did answer, the backoff starts over and
+/// nothing stays queued. The view then shows whatever `WebKit` makes of that
+/// failure: its error page where it draws one, which commits onto a page the
+/// card no longer covers and so is not reported twice, or the document
+/// underneath where it draws none. A certificate failure is still the
+/// exception: its card is up before `load-failed` runs, so the unanswered
+/// card is not the one showing and nothing here touches either.
 fn watch_loads(
     view: &webkit::WebView,
     stack: &gtk::Stack,
@@ -261,6 +278,13 @@ fn watch_loads(
                 error = %error,
                 "the page's load failed; not one that asking again can mend"
             );
+            // Something answered, just not with the page: the card cannot
+            // wait for a commit `WebKit` may never make (see this function's
+            // docs, and the #1578 review's LOW 2).
+            if stack.visible_child_name().as_deref() == Some(UNANSWERED) {
+                stack.set_visible_child_name(PAGE);
+                report(Gateway::Answered);
+            }
             return false;
         }
         report(Gateway::Unanswered {
@@ -1284,6 +1308,66 @@ mod gtk_tests {
         let before = view.uri();
         super::reload(&w, "https://hive.local/agent/stray/turn/3");
         assert_eq!(view.uri(), before, "and nothing reloads behind it");
+    }
+
+    /// **A reload the policy refuses takes the card down** — #1578 review,
+    /// LOW 2.
+    ///
+    /// The gateway is down at open, so the card is up and a reload is
+    /// queued; then it comes back and answers the reload with a redirect off
+    /// the hive. `decide-policy` refuses that, and `WebKit` reports a policy
+    /// interruption (102) or a cancellation (302) — the two failures its
+    /// default handler draws **no** page for, so nothing commits and the
+    /// `load-changed` flip never runs. Each row starts from the card and
+    /// checks that the failure itself takes it down and tells the window,
+    /// and that the commit of whatever `WebKit` loads next is not reported a
+    /// second time.
+    ///
+    /// Mutation (run this round, red): drop the card-lifting branch from the
+    /// `load-failed` handler — the card left up, the review's finding — and
+    /// the first row's `shows_unanswered` assertion reds.
+    #[gtk::test]
+    fn a_reload_the_policy_refuses_takes_the_card_down() {
+        let url = "https://hive.local/agent/stray/?hide=header";
+        let (w, view, heard, declined) = listening_page(url);
+        let refused = gtk::glib::Error::new(gtk::gio::IOErrorEnum::ConnectionRefused, "refused");
+        for answer in [
+            gtk::glib::Error::new(
+                webkit::PolicyError::FrameLoadInterruptedByPolicyChange,
+                "Frame load was interrupted",
+            ),
+            gtk::glib::Error::new(webkit::NetworkError::Cancelled, "Load request cancelled"),
+        ] {
+            assert!(fail(&view, &declined, url, &refused));
+            super::show_unanswered(&w, &gtk::Label::new(Some("card")).upcast());
+            let before = heard.borrow().len();
+
+            assert!(
+                !fail(&view, &declined, url, &answer),
+                "{answer:?} still goes WebKit's own way"
+            );
+            assert!(
+                !super::shows_unanswered(&w),
+                "{answer:?}: something answered, so the card comes down"
+            );
+            let stack = w.downcast_ref::<gtk::Stack>().expect("a stack");
+            assert_eq!(stack.visible_child_name().as_deref(), Some(PAGE));
+            assert_eq!(
+                heard.borrow()[before..],
+                [super::Gateway::Answered],
+                "{answer:?}: the window is told once, so nothing stays queued"
+            );
+
+            {
+                use gtk::glib::object::ObjectExt as _;
+                view.emit_by_name::<()>("load-changed", &[&webkit::LoadEvent::Committed]);
+            }
+            assert_eq!(
+                heard.borrow().len(),
+                before + 1,
+                "{answer:?}: a later commit is not reported a second time"
+            );
+        }
     }
 
     /// The session is **ephemeral**: no cookies, cache or `IndexedDB` left under

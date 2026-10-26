@@ -790,11 +790,18 @@ fn mutate(edit: impl FnOnce(&mut WallpaperState)) {
     }
 }
 
-/// Non-empty trim of a user-supplied path, or `None` (with a warning) if blank.
+/// Non-empty trim of a user-supplied path, or `None` (with a warning) if blank
+/// or if it contains a newline or NUL. `swaybg.args` is newline-delimited
+/// ([`args_file_body`]), so an embedded `\n` would split one path into extra
+/// `swaybg` arguments; NUL cannot be part of a path at all. The warning names
+/// the problem, never the raw path.
 fn clean(path: &str) -> Option<String> {
     let trimmed = path.trim();
     if trimmed.is_empty() {
         tracing::warn!("wallpaper: refusing empty path");
+        None
+    } else if trimmed.contains(['\n', '\r', '\0']) {
+        tracing::warn!("wallpaper: refusing path containing a newline or NUL");
         None
     } else {
         Some(trimmed.to_string())
@@ -866,6 +873,16 @@ mod tests {
         WallpaperState, args_file_body, load_state, primary_image, shell_single_quote, state,
         state_from_disk, swaybg_args,
     };
+
+    #[test]
+    fn clean_rejects_paths_that_would_split_the_args_file() {
+        assert_eq!(super::clean("  /a/b.png \n"), Some("/a/b.png".to_string()));
+        assert_eq!(super::clean("/a b/c.png"), Some("/a b/c.png".to_string()));
+        assert_eq!(super::clean("/a.png\n-o\n*\n-i\n/etc/x"), None);
+        assert_eq!(super::clean("/a\r/b.png"), None);
+        assert_eq!(super::clean("/a\0b.png"), None);
+        assert_eq!(super::clean("   "), None);
+    }
     use hytte_config::test_support::{capture, scratch_home};
     use std::collections::BTreeMap;
 

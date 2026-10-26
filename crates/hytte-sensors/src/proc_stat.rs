@@ -60,7 +60,18 @@ pub fn compute_cpu_load(prev: &[(u64, u64)], now: &[(u64, u64)]) -> CpuLoad {
 
     let overall = load_for(0);
     let core_count = now.len().saturating_sub(1);
-    let per_core = (0..core_count).map(|i| load_for(i + 1)).collect();
+    // `/proc/stat` omits offline CPUs, so when one went offline or came back
+    // between the two samples the entries no longer line up by position:
+    // core `i` of `prev` is a different CPU than core `i` of `now`, and every
+    // core after the hotplugged one would be computed against its neighbour.
+    // The entries carry no `cpuN` label to re-pair them by, so a changed core
+    // count publishes a zero frame for that one tick; the next tick pairs
+    // like with like again. (The aggregate line stays valid either way.)
+    let per_core = if prev.len() == now.len() {
+        (0..core_count).map(|i| load_for(i + 1)).collect()
+    } else {
+        vec![0.0; core_count]
+    };
 
     CpuLoad { overall, per_core }
 }
@@ -107,5 +118,26 @@ mod tests {
             load.overall, 0.0,
             "zero d_total must yield 0.0, not NaN/panic"
         );
+    }
+
+    /// A core going offline shifts every later entry down one slot; pairing by
+    /// position would report core 2's old numbers against core 3's new ones.
+    #[test]
+    fn hotplug_does_not_misalign_cores() {
+        // aggregate + cpu0..cpu2 (cpu1 busy), then cpu1 goes offline.
+        let prev = vec![(0, 0), (0, 0), (100, 100), (0, 0)];
+        let now = vec![(10, 100), (0, 100), (0, 100)];
+        let load = compute_cpu_load(&prev, &now);
+        assert_eq!(load.per_core.len(), 2);
+        assert!(
+            load.per_core.iter().all(|l| l.abs() < 1e-12),
+            "a zero frame, not shifted: {:?}",
+            load.per_core
+        );
+        assert!((load.overall - 0.1).abs() < 1e-9, "aggregate still valid");
+        // The next tick pairs like with like again.
+        let later = vec![(20, 200), (50, 200), (0, 200)];
+        let load = compute_cpu_load(&now, &later);
+        assert!((load.per_core[0] - 0.5).abs() < 1e-9);
     }
 }

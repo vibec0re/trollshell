@@ -1512,3 +1512,72 @@ fn wrap(
     toolbar.set_content(Some(page));
     adw::NavigationPage::new(&toolbar, title)
 }
+
+#[cfg(all(test, feature = "system-tests"))]
+mod gtk_tests {
+    use std::rc::Rc;
+
+    use adw::prelude::*;
+    use hytte_config::schema::{Field, Kind};
+    use hytte_config::xdg;
+
+    use super::{list_page, map_page, records_page};
+
+    /// #1564: the three sub-page group titles are `humanise(leaf_of(key))`,
+    /// and `AdwPreferencesGroup`'s title label is hardcoded markup. A key a
+    /// schema could only spell in a fixture still has to show literally.
+    ///
+    /// Falsified by passing `title` unescaped at any one of `map_page`,
+    /// `list_page` or `records_page`'s group builder.
+    #[gtk::test]
+    fn every_sub_page_group_title_shows_its_key_literally() {
+        adw::init().expect("libadwaita init");
+        let dir = tempfile::tempdir().expect("a scratch config tree");
+        let env = Rc::new(xdg::Env {
+            home: None,
+            config_home: Some(dir.path().join("home").to_string_lossy().into_owned()),
+            config_dirs: Some(dir.path().join("etc").to_string_lossy().into_owned()),
+            state_home: None,
+        });
+        let ops = super::super::tests::fixture_ops();
+        let form = super::super::build(ops, &env);
+        let field = |path: &str| -> &'static Field {
+            ops.family
+                .schema
+                .fields
+                .iter()
+                .find(|field| field.path == path)
+                .expect("a fixture field")
+        };
+        // `humanise` splits on `_`: this is `Tom & <b>jerry</b>` on screen.
+        let key = "tom_&_<b>jerry</b>";
+        let shown = "Tom & <b>jerry</b>";
+
+        let (entry, order, items) = (field("entry"), field("order"), field("items"));
+        let (Kind::Map(entry_fields), Kind::List(element), Kind::List(Kind::Map(item_fields))) =
+            (entry.kind, order.kind, items.kind)
+        else {
+            panic!("the fixture's three collections changed shape");
+        };
+        for (name, sub) in [
+            (
+                "map_page",
+                map_page(&form.inner, entry, key.to_owned(), entry_fields),
+            ),
+            (
+                "list_page",
+                list_page(&form.inner, order, key.to_owned(), element),
+            ),
+            (
+                "records_page",
+                records_page(&form.inner, items, key.to_owned(), item_fields),
+            ),
+        ] {
+            let texts = crate::markup::test_support::label_texts(sub.page.upcast_ref());
+            assert!(
+                texts.iter().any(|text| text == shown),
+                "{name}: no label displays {shown:?}; labels show {texts:?}"
+            );
+        }
+    }
+}

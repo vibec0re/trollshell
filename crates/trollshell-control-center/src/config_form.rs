@@ -3748,6 +3748,51 @@ mod gtk_tests {
         crate::markup::test_support::assert_shows(row, &shown);
     }
 
+    /// #1564 end to end: a map key and a record's name come from the config
+    /// file, travel through the drill-down (`collection.rs`'s map/records
+    /// rows, then `entry_page`/`record_page`'s `single_group`) and land in a
+    /// group title, which is hardcoded markup. Both hops must show them
+    /// literally.
+    ///
+    /// Falsified by passing `title` unescaped at `build_form`'s single-group
+    /// builder.
+    #[gtk::test]
+    fn a_hostile_map_key_and_record_name_show_literally_through_the_drill_down() {
+        let hostile = "Tom & <b>Jerry</b>";
+        let escaped = crate::markup::escape(hostile);
+
+        let scratch = Scratch::new();
+        let page = mounted(
+            &scratch,
+            Some(
+                "items = [{ id = \"Tom & <b>Jerry</b>\", exec = \"a && b\" }]\n\n\
+                 [entry.\"Tom & <b>Jerry</b>\"]\nname = \"x\"\n",
+            ),
+        );
+
+        page.open("entry");
+        let row: adw::ActionRow = page.find(&escaped).expect("the entry is listed");
+        crate::markup::test_support::assert_shows(&row, hostile);
+        page.activate_row(&escaped);
+        assert_eq!(
+            page.title(),
+            hostile,
+            "the entry page is titled for the entry"
+        );
+        let group = page.widgets::<adw::PreferencesGroup>().remove(0);
+        crate::markup::test_support::assert_shows(&group, hostile);
+        page.back();
+        page.back();
+
+        page.open("items");
+        let row: adw::ActionRow = page.find(&escaped).expect("the record is listed");
+        crate::markup::test_support::assert_shows(&row, hostile);
+        crate::markup::test_support::assert_shows(&row, "id = Tom & <b>Jerry</b>, exec = a && b");
+        page.activate_row(&escaped);
+        let group = page.widgets::<adw::PreferencesGroup>().remove(0);
+        crate::markup::test_support::assert_shows(&group, hostile);
+    }
+
     // ── The real families, as the tab mounts them ───────────────────────────
 
     /// `stats.toml` is `[sidebar]` and `[bar]`, so its form is two groups of

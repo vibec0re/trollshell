@@ -885,12 +885,15 @@ fn dpt_to_local(dpt: DatePerhapsTime) -> Option<(DateTime<Local>, bool)> {
 /// - A `TZID` `DUE` is read by that same rule **in its own zone** (#1588),
 ///   resolved with chrono-tz the way icalendar's `try_into_utc` resolves it.
 ///   That call took `.single()` in the task's zone, so a wall clock in that
-///   zone's fold or gap fell through to the viewer's zone: a `TZID=
-///   America/Chicago` 01:30 on 2026-11-01, viewed from New York, read 05:30Z
+///   zone's fold or gap fell through to the viewer's zone: a
+///   `TZID=America/Chicago` 01:30 on 2026-11-01, viewed from New York, read 05:30Z
 ///   instead of 06:30Z (01:30 CDT). Off a transition, the rule's answer is
 ///   `.single()`'s, so nothing else moves. A `TZID` chrono-tz does not know (a
 ///   Windows zone name, say) is read in the viewer's zone, like a floating
-///   time.
+///   time. libical's own spelling of a builtin zone,
+///   `/freeassociation.sourceforge.net/America/Chicago` (what Evolution
+///   writes), is first reduced to the bare IANA name by [`bare_tzid`], so it
+///   resolves like the plain one (#1590).
 ///
 /// `None` only when the instant is outside chrono's range.
 fn dpt_to_zone<Tz: TimeZone>(dpt: DatePerhapsTime, tz: &Tz) -> Option<(DateTime<Tz>, bool)> {
@@ -903,7 +906,7 @@ fn dpt_to_zone<Tz: TimeZone>(dpt: DatePerhapsTime, tz: &Tz) -> Option<(DateTime<
             // answers `None`: that `None` means either "unknown zone" or "a
             // fold or gap in a known one", so telling them apart would parse
             // the `TZID` a second time, and leave two rules for one zone.
-            CalendarDateTime::WithTimezone { date_time, tzid } => tzid
+            CalendarDateTime::WithTimezone { date_time, tzid } => bare_tzid(&tzid)
                 .parse::<chrono_tz::Tz>()
                 .ok()
                 .and_then(|own| wall_clock_in(&own, date_time))
@@ -912,6 +915,24 @@ fn dpt_to_zone<Tz: TimeZone>(dpt: DatePerhapsTime, tz: &Tz) -> Option<(DateTime<
                 .map(|at| (at, false)),
         },
     }
+}
+
+/// `tzid` without libical's builtin-zone prefix (#1590).
+///
+/// libical 3.0.x names every builtin zone
+/// `/freeassociation.sourceforge.net/<IANA name>` (`BUILTIN_TZID_PREFIX` in its
+/// `icaltimezone.c`; the shipped `libical.so` also carries the
+/// `/freeassociation.sourceforge.net/Tzfile/` form its
+/// `icaltimezone_get_builtin_timezone_from_tzid` accepts), and Evolution takes
+/// its zones from that table, so its `TZID`s carry the prefix. chrono-tz parses
+/// only the bare name, here and in icalendar's own `try_into_utc`, so without
+/// this such a due fell back to the viewer's zone on every day, not just at a
+/// transition. The other `/…/` strings in that binary (`/citadel.org/`) belong
+/// to other generators, not libical's builtin table. Any other `TZID` is
+/// returned unchanged.
+fn bare_tzid(tzid: &str) -> &str {
+    tzid.strip_prefix("/freeassociation.sourceforge.net/")
+        .map_or(tzid, |rest| rest.strip_prefix("Tzfile/").unwrap_or(rest))
 }
 
 /// The instant the wall clock `naive` names in `tz`, by
@@ -1291,6 +1312,54 @@ mod tests {
             ),
             Some((utc(2026, 7, 22, 13, 0), false))
         );
+    }
+
+    /// libical's `/freeassociation.sourceforge.net/<IANA>` `TZID` (what Evolution
+    /// writes) is read in its IANA zone, on an ordinary day and in a fold, and
+    /// an unknown zone behind the prefix still falls back to the viewer (#1590).
+    #[test]
+    fn a_libical_prefixed_tzid_resolves_like_its_plain_iana_name() {
+        use chrono_tz::Europe::Berlin;
+
+        for prefix in [
+            "/freeassociation.sourceforge.net/",
+            "/freeassociation.sourceforge.net/Tzfile/",
+        ] {
+            let tzid = format!("{prefix}America/Chicago");
+            assert_eq!(
+                CalendarDateTime::WithTimezone {
+                    date_time: naive(2026, 7, 22, 9, 0),
+                    tzid: tzid.clone(),
+                }
+                .try_into_utc(),
+                None,
+                "fixture: icalendar must not resolve {tzid}"
+            );
+            // An ordinary day: 09:00 CDT, the same as the plain name.
+            let ordinary = due_in(with_tzid(&tzid, naive(2026, 7, 22, 9, 0)), &Berlin);
+            assert_eq!(
+                ordinary,
+                due_in(
+                    with_tzid("America/Chicago", naive(2026, 7, 22, 9, 0)),
+                    &Berlin
+                ),
+                "{tzid}, ordinary"
+            );
+            assert_eq!(ordinary, Some((utc(2026, 7, 22, 14, 0), false)));
+            // Chicago's fold, 01:30 CDT, its first occurrence: 06:30Z.
+            assert_eq!(
+                due_in(with_tzid(&tzid, naive(2026, 11, 1, 1, 30)), &Berlin),
+                Some((utc(2026, 11, 1, 6, 30), false)),
+                "{tzid}, fold"
+            );
+            // An unknown zone behind the prefix is read in the viewer's zone.
+            let unknown = format!("{prefix}Nowhere/Atlantis");
+            assert_eq!(
+                due_in(with_tzid(&unknown, naive(2026, 7, 22, 9, 0)), &Berlin),
+                Some((utc(2026, 7, 22, 7, 0), false)),
+                "{unknown}"
+            );
+        }
     }
 
     const LOCAL_CHILD: &str = "HYTTE_1579_TASK_DUE_LOCAL_CHILD";
@@ -1740,6 +1809,19 @@ mod tests {
             (
                 BERLIN,
                 "America/Chicago",
+                "2026-07-22T09:00:00",
+                "2026-07-22T14:00:00+00:00",
+            ),
+            // The `TZID` Evolution writes for the same zone (#1590).
+            (
+                BERLIN,
+                "/freeassociation.sourceforge.net/America/Chicago",
+                "2026-11-01T01:30:00",
+                "2026-11-01T06:30:00+00:00",
+            ),
+            (
+                BERLIN,
+                "/freeassociation.sourceforge.net/America/Chicago",
                 "2026-07-22T09:00:00",
                 "2026-07-22T14:00:00+00:00",
             ),

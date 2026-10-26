@@ -2195,8 +2195,9 @@ const GAP_SEARCH_STEPS: i64 = 48 * 60 / GAP_SEARCH_STEP_MINUTES;
 /// instant put a floating 03:00 an hour early (#1579). If neither candidate
 /// reads back, the time is treated as a gap.
 ///
-/// Public so `hytte-services`' task list reads a floating `DUE` by the same
-/// rule the calendar reads a floating `DTSTART` by (#1554), not a copy of it.
+/// Public so `hytte-services`' task list reads a floating `DUE`, and a
+/// `TZID` one in its own zone (#1588), by the same rule the calendar reads a
+/// floating `DTSTART` by (#1554), not a copy of it.
 ///
 /// `None` only when no offset before a gap can be found within 48 hours, or
 /// the result does not fit chrono's range.

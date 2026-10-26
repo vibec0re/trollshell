@@ -23,7 +23,7 @@ use std::io::ErrorKind;
 use std::path::Path;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::UnixStream;
 
 use super::wire::{Request, Response, VersionMismatch, check_version};
@@ -36,6 +36,17 @@ use super::wire::{Request, Response, VersionMismatch, check_version};
 /// against the 2 s default cadence, because the failure it guards is a hang,
 /// not slowness.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The longest answer line this client reads, terminating newline included:
+/// 1 MiB.
+///
+/// [`REQUEST_TIMEOUT`] bounds how *long* a round trip may take, not how much
+/// it may deliver, and a unix socket moves gigabytes in five seconds — so a
+/// daemon that never sends its newline (wedged, or simply wrong) would have
+/// this plugin buffer all of it. Real answers are a few KiB: a roster row is a
+/// few hundred bytes, an approval about as much. Past the cap the answer is
+/// refused as a [`HiveError::Protocol`] rather than parsed from a prefix.
+pub const MAX_ANSWER_BYTES: usize = 1 << 20;
 
 /// Why a round trip did not produce a usable answer.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -96,8 +107,9 @@ pub fn connect_reason(kind: ErrorKind) -> String {
 /// # Errors
 /// [`HiveError::Unreachable`] when the socket cannot be dialed or the round
 /// trip exceeds [`REQUEST_TIMEOUT`]; [`HiveError::Protocol`] for a truncated
-/// or unparseable answer; [`HiveError::Version`] when the daemon is newer than
-/// this build; [`HiveError::Refused`] when the daemon answers `ok: false`.
+/// or unparseable answer, or one longer than [`MAX_ANSWER_BYTES`];
+/// [`HiveError::Version`] when the daemon is newer than this build;
+/// [`HiveError::Refused`] when the daemon answers `ok: false`.
 pub async fn request(socket: &Path, req: &Request) -> Result<Response, HiveError> {
     match tokio::time::timeout(REQUEST_TIMEOUT, round_trip(socket, req)).await {
         Ok(result) => result,
@@ -129,20 +141,31 @@ async fn round_trip(socket: &Path, req: &Request) -> Result<Response, HiveError>
         reason: format!("flush failed: {e}"),
     })?;
 
-    let mut reader = BufReader::new(read);
-    let mut line = String::new();
+    // Bytes, not `read_line`: the cap has to bite before a missing newline
+    // turns into an unbounded buffer, and `serde_json` checks the UTF-8 itself.
+    let mut reader = BufReader::new(read).take(MAX_ANSWER_BYTES as u64);
+    let mut line = Vec::new();
     reader
-        .read_line(&mut line)
+        .read_until(b'\n', &mut line)
         .await
         .map_err(|e| HiveError::Unreachable {
             reason: format!("read failed: {e}"),
         })?;
-    if line.trim().is_empty() {
+    if line.len() >= MAX_ANSWER_BYTES && line.last() != Some(&b'\n') {
+        return Err(HiveError::Protocol {
+            reason: format!(
+                "hive's answer is over {} MiB; not read",
+                MAX_ANSWER_BYTES >> 20
+            ),
+        });
+    }
+    let line = line.trim_ascii();
+    if line.is_empty() {
         return Err(HiveError::Protocol {
             reason: "hive closed the connection without answering".to_owned(),
         });
     }
-    let resp: Response = serde_json::from_str(line.trim()).map_err(|e| HiveError::Protocol {
+    let resp: Response = serde_json::from_slice(line).map_err(|e| HiveError::Protocol {
         reason: format!("unparseable answer: {e}"),
     })?;
 

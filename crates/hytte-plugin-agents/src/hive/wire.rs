@@ -58,6 +58,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::model::{AgentName, clamp, single_line};
+
 /// The wire-schema version this build speaks, mirroring hyperhive's
 /// `HOST_SOCK_VERSION` (`hive-host-sock/src/lib.rs:543`, currently `1`).
 ///
@@ -227,7 +229,9 @@ pub enum Request {
 ///   struct (`hive-host-sock/src/lib.rs:485-500`), so they arrive as `false`.
 /// - There is **no `Default` impl** and no all-false constructor.
 ///   [`Scope::agent`] is the only way to build one and it always fills
-///   `agent_names` with exactly one non-empty name.
+///   `agent_names` with exactly one name — an [`AgentName`], so a name that
+///   passed hyperhive's own `Ident` rule, and never `""`. The type says so
+///   rather than a convention among its callers.
 ///
 /// Should the hive ever drop those `#[serde(default)]`s, this frame is
 /// *rejected* rather than silently widened — a loud failure, which is the
@@ -241,10 +245,14 @@ pub struct Scope {
 
 impl Scope {
     /// The only constructor: scope a lifecycle verb to one named agent.
+    ///
+    /// Takes an [`AgentName`] rather than a `&str` so the one name cannot be
+    /// empty or outside the hive's `Ident` charset — every caller already
+    /// holds one, re-parsed off the wire.
     #[must_use]
-    pub fn agent(name: &str) -> Self {
+    pub fn agent(name: &AgentName) -> Self {
         Self {
-            agent_names: vec![name.to_owned()],
+            agent_names: vec![name.as_str().to_owned()],
         }
     }
 
@@ -310,6 +318,11 @@ pub struct Response {
 pub struct Approval {
     /// The queue id — what [`Request::Approve`] / [`Request::Deny`] name, and
     /// the plugin's dedup key.
+    ///
+    /// `#[serde(default)]` like every field here, so a row that omits it
+    /// decodes rather than failing the queue — as `0`, which no hive row has.
+    /// [`crate::model::PendingApprovals::new`] drops every row with an id that
+    /// is not positive, so a defaulted one never reaches a card or a frame.
     #[serde(default)]
     pub id: i64,
     /// The agent that asked. An `Ident` hive-side, a plain string on the wire
@@ -375,6 +388,13 @@ impl ApprovalKind {
     /// vocabulary becomes English. An [`Unknown`](ApprovalKind::Unknown) reads
     /// as the hive's own token rather than as "unknown": the operator can act
     /// on `spawn_replica`, and cannot act on a shrug.
+    ///
+    /// That token is a raw wire string, and this sentence is the consent card's
+    /// *"wants:"* clause — a wrapping label, like the detail line — so it is
+    /// flattened to one line and bounded ([`KIND_CHARS`]) exactly the way the
+    /// detail line's free text is. Here rather than at the card, so the
+    /// companion window and the control-center, which render the same
+    /// wording, are bounded too.
     #[must_use]
     pub fn human(&self) -> String {
         match self {
@@ -383,10 +403,17 @@ impl ApprovalKind {
             Self::UpdateMetaInputs => "update the hive's flake inputs".to_owned(),
             Self::SchedulePrompt => "schedule a prompt".to_owned(),
             Self::MergeConfigPr => "merge a reviewed config PR".to_owned(),
-            Self::Unknown(raw) => format!("perform `{raw}`"),
+            Self::Unknown(raw) => format!("perform `{}`", clamp(&single_line(raw), KIND_CHARS)),
         }
     }
 }
+
+/// How much of an [`ApprovalKind::Unknown`] token reaches its wording.
+///
+/// Hyperhive's kinds are `snake_case` enum tokens, the longest known one
+/// (`update_meta_inputs`) 18 characters, so a real new kind is never shortened
+/// and only a value that could not have been one is.
+pub const KIND_CHARS: usize = 40;
 
 /// Where an approval is in its lifecycle.
 ///
@@ -536,6 +563,11 @@ mod tests {
         AgentStatusRow, Approval, ApprovalKind, ApprovalStatus, HOST_SOCK_VERSION, Request,
         Response, Scope, VersionMismatch, check_version,
     };
+    use crate::model::AgentName;
+
+    fn scope_of(name: &str) -> Scope {
+        Scope::agent(&AgentName::parse(name).expect("a legal test name"))
+    }
 
     fn line(req: &Request) -> String {
         serde_json::to_string(req).expect("a Request always serializes")
@@ -569,13 +601,13 @@ mod tests {
         );
         assert_eq!(
             line(&Request::Start {
-                scope: Scope::agent("trollshell-choom"),
+                scope: scope_of("trollshell-choom"),
             }),
             r#"{"cmd":"start","scope":{"agent_names":["trollshell-choom"]}}"#
         );
         assert_eq!(
             line(&Request::Stop {
-                scope: Scope::agent("trollshell-choom"),
+                scope: scope_of("trollshell-choom"),
                 graceful: true,
             }),
             r#"{"cmd":"stop","scope":{"agent_names":["trollshell-choom"]},"graceful":true}"#
@@ -589,10 +621,11 @@ mod tests {
         assert_eq!(line(&Request::Deny { id: 42 }), r#"{"cmd":"deny","id":42}"#);
     }
 
-    /// The id is `i64` on both sides, so a queue that has run past `u32` — or a
-    /// hive that ever hands back a negative sentinel — still addresses the row
-    /// it means. Pinned because a `u32` here would compile, pass every
-    /// small-number test, and silently refuse the 4-billionth approval.
+    /// The id is `i64` on both sides, so a queue that has run past `u32` still
+    /// addresses the row it means, and the frame carries any `i64` faithfully
+    /// (which rows the *plugin* will address is `PendingApprovals::new`'s call:
+    /// positive ids only). Pinned because a `u32` here would compile, pass
+    /// every small-number test, and silently refuse the 4-billionth approval.
     #[test]
     fn an_approval_id_is_a_full_width_signed_integer_on_the_wire() {
         assert_eq!(
@@ -614,14 +647,14 @@ mod tests {
     fn every_lifecycle_frame_names_exactly_one_agent() {
         let frames = [
             Request::Start {
-                scope: Scope::agent("alpha"),
+                scope: scope_of("alpha"),
             },
             Request::Stop {
-                scope: Scope::agent("alpha"),
+                scope: scope_of("alpha"),
                 graceful: false,
             },
             Request::Stop {
-                scope: Scope::agent("alpha"),
+                scope: scope_of("alpha"),
                 graceful: true,
             },
         ];
@@ -644,7 +677,7 @@ mod tests {
     #[test]
     fn the_scope_frame_carries_no_class_flags() {
         let value: serde_json::Value = serde_json::from_str(&line(&Request::Start {
-            scope: Scope::agent("alpha"),
+            scope: scope_of("alpha"),
         }))
         .expect("our own frame parses");
         let scope = value
@@ -661,7 +694,7 @@ mod tests {
 
     #[test]
     fn scope_agent_names_is_never_empty() {
-        assert_eq!(Scope::agent("alpha").agent_names(), ["alpha".to_owned()]);
+        assert_eq!(scope_of("alpha").agent_names(), ["alpha".to_owned()]);
     }
 
     /// A response carrying keys this build has never heard of still decodes —

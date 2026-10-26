@@ -21,11 +21,11 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use hytte_plugin_agents::hive::client::{HiveError, REQUEST_TIMEOUT, request};
+use hytte_plugin_agents::hive::client::{HiveError, MAX_ANSWER_BYTES, REQUEST_TIMEOUT, request};
 use hytte_plugin_agents::hive::wire::{
     ApprovalKind, ApprovalStatus, HOST_SOCK_VERSION, Request, Scope, VersionMismatch,
 };
-use hytte_plugin_agents::model::PendingApprovals;
+use hytte_plugin_agents::model::{AgentName, PendingApprovals};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::UnixListener;
 
@@ -217,10 +217,10 @@ async fn the_control_verbs_put_their_pinned_bytes_on_the_socket() {
             paused: false,
         },
         Request::Start {
-            scope: Scope::agent("trollshell-choom"),
+            scope: Scope::agent(&AgentName::parse("trollshell-choom").expect("a legal test name")),
         },
         Request::Stop {
-            scope: Scope::agent("trollshell-choom"),
+            scope: Scope::agent(&AgentName::parse("trollshell-choom").expect("a legal test name")),
             graceful: true,
         },
     ] {
@@ -497,6 +497,48 @@ async fn a_reset_connection_parks_too() {
         "a hung-up socket must park, got {err:?}"
     );
     task.abort();
+}
+
+/// An answer line longer than [`MAX_ANSWER_BYTES`] is refused as a protocol
+/// error, not buffered whole and parsed. The timeout bounds how long a round
+/// trip takes, not how much it delivers, and a unix socket moves gigabytes in
+/// that time.
+///
+/// The line here is otherwise a perfectly good answer, which is the point: an
+/// uncapped reader parses it and says `Ok`.
+///
+/// Falsification: put `read_line` into an unbounded `String` back and this
+/// returns `Ok`.
+#[tokio::test]
+async fn an_over_long_answer_line_is_refused_not_buffered() {
+    let long = format!(
+        r#"{{"version":1,"ok":true,"error":"{}"}}"#,
+        "x".repeat(MAX_ANSWER_BYTES)
+    );
+    let hive = FakeHive::serve(replies(&[("agent_status", &long)]));
+
+    match request(hive.path(), &Request::AgentStatus).await {
+        Err(HiveError::Protocol { reason }) => {
+            assert!(reason.contains("over 1 MiB"), "{reason}");
+        }
+        other => panic!("expected a Protocol error for an over-long line, got {other:?}"),
+    }
+}
+
+/// …and the cap is exactly the documented one: a line of `MAX_ANSWER_BYTES`
+/// bytes, newline included, is still read. Pinned so the cap cannot shrink to
+/// something a real roster could hit without this going red.
+#[tokio::test]
+async fn an_answer_line_of_exactly_the_cap_is_still_read() {
+    let body = r#"{"version":1,"ok":true,"agents":["a"]}"#;
+    // `serve_one` appends the newline, so the line is `MAX_ANSWER_BYTES` long.
+    let padded = format!("{}{body}", " ".repeat(MAX_ANSWER_BYTES - 1 - body.len()));
+    let hive = FakeHive::serve(replies(&[("list", &padded)]));
+
+    let resp = request(hive.path(), &Request::List)
+        .await
+        .expect("a line at the cap is an answer");
+    assert_eq!(resp.agents, Some(vec!["a".to_owned()]));
 }
 
 // ── #947 P3: the approval queue, end to end ──────────────────────────────────

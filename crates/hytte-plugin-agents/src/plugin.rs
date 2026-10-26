@@ -15,12 +15,19 @@ use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View};
 use tokio::sync::mpsc;
 
 use crate::config::AgentsConfig;
-use crate::hive::wire::{Approval, HiveUrls, Request, Scope};
+use crate::hive::wire::{Approval, ApprovalKind, HiveUrls, Request, Scope};
 use crate::hive::{AgentStatusRow, HiveError};
-use crate::model::{Agent, AgentName, ExpandedGroups, Hive, PendingApprovals, Status, agent_url};
+use crate::model::{
+    Agent, AgentName, ExpandedGroups, Hive, PendingApprovals, Status, agent_url, single_line,
+};
 use crate::poll::{Cmd, Msg, poll_task};
 use crate::view::{self, PanelContext, ids};
 use crate::window;
+
+/// Re-exported at the path it was `pub` at since #1141's review (M4), with
+/// [`detail_line`]; it lives in [`crate::model`] now, beside
+/// [`single_line`], so `wire.rs` can bound an unknown approval kind with it.
+pub use crate::model::clamp;
 
 /// Stable plugin id — the host's mount-slot ownership key, the audit-log
 /// subject, and the `programs.trollshell.plugins.<id>` config key.
@@ -74,13 +81,17 @@ pub const REQUESTED_AT_CHARS: usize = 40;
 /// raised, so a burst of five approvals is answered one at a time instead of
 /// five cards superseding each other inside one 60 s window. It opens again
 /// when a decision arrives, when the approval leaves the queue (answered on the
-/// dashboard), or when a badge click deliberately re-raises.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// dashboard), when its id comes to name a different request ([`Shown`]), or
+/// when a badge click deliberately re-raises.
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct RaisedPrompt {
     /// The correlation token, from [`Agents::take_effect_id`].
     request_id: u64,
-    /// The approval it is asking about.
+    /// The approval it is asking about — the id `Approve`/`Deny` will name.
     approval: i64,
+    /// What the card showed about it. A decision is only sent while the row
+    /// queued under [`RaisedPrompt::approval`] still matches this.
+    shown: Shown,
     /// The host clock's unix seconds when it was raised, or `0` before the
     /// first [`Input::Snapshot`] carries a clock.
     ///
@@ -92,6 +103,84 @@ struct RaisedPrompt {
     /// shuts for the rest of the session on the most ordinary user action
     /// there is: ignoring one card (#1140's review, MEDIUM-1).
     raised_unix: i64,
+}
+
+impl RaisedPrompt {
+    /// Where this prompt's approval stands in `pending`.
+    fn standing(&self, pending: &PendingApprovals) -> Standing {
+        match pending.get(self.approval) {
+            None => Standing::Gone,
+            Some(row) if self.shown.is(row) => Standing::Queued,
+            Some(_) => Standing::Replaced,
+        }
+    }
+
+    /// Whether this prompt has outlived the host's prompt bound at `now_unix`
+    /// — see [`Agents::raise_next`].
+    fn is_abandoned(&self, now_unix: i64) -> bool {
+        let bound = i64::try_from(CONSENT_PROMPT_TIMEOUT_SECS + CONSENT_PROMPT_GRACE_SECS)
+            .unwrap_or(i64::MAX);
+        self.raised_unix > 0 && now_unix.saturating_sub(self.raised_unix) >= bound
+    }
+}
+
+/// Where a raised prompt's approval stands in the queue as last read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Standing {
+    /// The row under its id is still the request the card showed.
+    Queued,
+    /// Nothing is queued under its id any more — answered on the dashboard, by
+    /// `hivectl`, or withdrawn.
+    Gone,
+    /// Something **else** is queued under its id: the hive's store was reset
+    /// or restored, and the id was handed to a different request.
+    Replaced,
+}
+
+/// What one consent card **showed** about the approval it asks about — the
+/// identity a decision is bound to.
+///
+/// The hive's queue id alone is not that identity. It is what `Approve` and
+/// `Deny` name, but a hive whose store was reset or restored can hand the same
+/// id to a different request, and an answer bound to the bare id would then
+/// spend the operator's authority on an approval the card never showed. So a
+/// prompt remembers the wire values the card was rendered from, and a decision
+/// is sent only while the row queued under that id still carries all of them.
+///
+/// These are the **wire** values, not the rendered strings: the headline's
+/// label comes from `agents.toml` and the text is bounded before it is drawn,
+/// and neither is a property of the request. `commit_ref` and `fetched_sha`
+/// would pin it tighter still, but the mirror does not carry them (`wire.rs`'s
+/// rule 2), and the card does not show them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Shown {
+    /// [`Approval::agent`] — the headline.
+    agent: String,
+    /// [`Approval::kind`] — the "wants:" clause.
+    kind: ApprovalKind,
+    /// [`Approval::requested_at`] — the detail line's stamp.
+    requested_at: String,
+    /// [`Approval::description`] — the detail line's sentence.
+    description: Option<String>,
+}
+
+impl Shown {
+    fn of(approval: &Approval) -> Self {
+        Self {
+            agent: approval.agent.clone(),
+            kind: approval.kind.clone(),
+            requested_at: approval.requested_at.clone(),
+            description: approval.description.clone(),
+        }
+    }
+
+    /// Whether `row` is still the request this card showed.
+    fn is(&self, row: &Approval) -> bool {
+        self.agent == row.agent
+            && self.kind == row.kind
+            && self.requested_at == row.requested_at
+            && self.description == row.description
+    }
 }
 
 /// The two edge-triggered flags §8's `Effect::Notify` watches.
@@ -129,20 +218,33 @@ pub struct Agents {
     /// Absent means the default (open unless the group is all-stopped).
     pub expanded: ExpandedGroups,
     /// The hive's approval queue as of the last `Pending` answer (#947 P3) —
-    /// what the badges count and what a decision is validated against.
+    /// what the badges count and what a decision is validated against. Empty
+    /// while that queue cannot be read (a `Pending` refusal, or no hive) — the
+    /// private `queue_known` flag says which.
     pub pending: PendingApprovals,
-    /// Approval ids a prompt has already been raised for.
+    /// The approvals a prompt has already been raised for, by id, each with
+    /// what its card showed.
     ///
     /// The dedup set spec §6.5 needs: an approval prompts **once**, and only
     /// leaving the queue lets it prompt again (it is pruned to the live queue
     /// on every fold). Without it a hive with one unanswered approval would
     /// raise a modal on every poll — every two seconds, by default.
     ///
+    /// Keyed on the id but **bound to the request** ([`Shown`]): an entry is
+    /// pruned the moment its id names a different request, so a hive that
+    /// re-numbered its queue (a store reset or restore) gets the new request
+    /// prompted rather than silently treated as already asked about. That is
+    /// what lets this survive a `Pending` refusal or an unreachable hive
+    /// untouched — the same request coming back stays quiet (#1140's LOW-3),
+    /// and a different one under a re-used id does not — whether or not the
+    /// plugin ever saw the hive go away, which a restart faster than one poll
+    /// would never show it.
+    ///
     /// Deliberately **not** persisted anywhere: it is per-session state, so a
     /// plugin restart re-raises what is still waiting, which is the right side
     /// to err on for a queue whose whole point is that a human has not answered
     /// it yet.
-    prompted: BTreeSet<i64>,
+    prompted: BTreeMap<i64, Shown>,
     /// The one consent prompt in flight — see [`RaisedPrompt`].
     prompt: Option<RaisedPrompt>,
     /// Agents named by an approval that the roster does not list, already
@@ -184,6 +286,16 @@ pub struct Agents {
     /// that costs nothing on screen: the only node it gates also needs a
     /// running agent, which needs a poll to have happened at all.
     window_available: bool,
+    /// Whether [`Agents::pending`] is the hive's latest answer, rather than
+    /// the empty stand-in for a queue this build cannot see right now (a
+    /// `Pending` refusal, or no hive at all).
+    ///
+    /// The difference is invisible on the card — no badges either way — and
+    /// matters only to [`Agents::decide`]: an approval missing from an answered
+    /// queue was resolved elsewhere and is dropped quietly (§6.5), while one
+    /// missing from a queue nobody could read was not sent, and the operator
+    /// who clicked is told so.
+    queue_known: bool,
 }
 
 impl Agents {
@@ -198,7 +310,7 @@ impl Agents {
             selected: None,
             expanded: ExpandedGroups::new(),
             pending: PendingApprovals::default(),
-            prompted: BTreeSet::new(),
+            prompted: BTreeMap::new(),
             prompt: None,
             warned_unknown: BTreeSet::new(),
             now_unix: 0,
@@ -208,7 +320,18 @@ impl Agents {
             cmd_tx,
             window: window::Probe::path(),
             window_available: false,
+            queue_known: false,
         }
+    }
+
+    /// Drop the approval queue this build can no longer vouch for — see
+    /// [`Agents::queue_known`]. `prompted` and the in-flight prompt are left
+    /// alone: both are bound to the request they asked about ([`Shown`]), so
+    /// the same request coming back stays quiet and a different one under a
+    /// re-used id does not.
+    fn forget_queue(&mut self) {
+        self.pending = PendingApprovals::default();
+        self.queue_known = false;
     }
 
     /// Pin whether the companion window is installed, instead of resolving it
@@ -288,6 +411,13 @@ impl Agents {
         // first call (the probe caches), and this is the `&mut self` path that
         // always precedes a card with a roster on it.
         self.window_available = self.window.available();
+        if result.is_err() {
+            // No roster, so no queue either — the same call `on_roster` makes
+            // for a queue that arrives while the hive is down. Keeping the last
+            // good one would let a click on an open card send a bare id to a
+            // hive that may come back holding something else under it.
+            self.forget_queue();
+        }
         match result {
             Err(HiveError::Version(mismatch)) => {
                 self.hive = Hive::Incompatible(mismatch);
@@ -381,28 +511,45 @@ impl Agents {
     ///
     /// 1. **Prune the dedup set to the live queue.** An approval that left
     ///    `Pending` — answered here, on the dashboard, or by `hivectl` — stops
-    ///    being remembered as prompted, so its id is free again. (Hive ids are
-    ///    not reused, so this is hygiene rather than correctness; the
-    ///    correctness it buys is that the set cannot grow without bound over a
-    ///    long session.)
-    /// 2. **Drop an in-flight prompt whose approval is gone.** §6.5: "an
-    ///    approval that disappears from `Pending` between the prompt and the
-    ///    answer … is dropped with a debug line, not an error". Dropping it
-    ///    also reopens the gate.
+    ///    being remembered as prompted, so its id is free again; so does one
+    ///    whose id now names a **different** request ([`Shown`]), which is what
+    ///    gets a re-numbered queue's new request prompted at all. It also keeps
+    ///    the set from growing without bound over a long session.
+    /// 2. **Drop an in-flight prompt whose approval is gone — or replaced.**
+    ///    §6.5: "an approval that disappears from `Pending` between the prompt
+    ///    and the answer … is dropped with a debug line, not an error". A
+    ///    re-used id is the same case seen from the other side: the request the
+    ///    card shows has left the queue, and something else holds its id.
+    ///    Dropping it also reopens the gate.
     /// 3. **Raise the next one**, if nothing is in flight.
     fn fold_pending(&mut self, queue: Vec<Approval>) -> Vec<Effect> {
         let pending = PendingApprovals::new(self.on_roster(queue));
-        self.prompted.retain(|id| pending.contains(*id));
-        if let Some(raised) = self.prompt
-            && !pending.contains(raised.approval)
-        {
-            tracing::debug!(
-                approval = raised.approval,
-                "the approval left the queue before its prompt was answered; dropping the prompt"
-            );
-            self.prompt = None;
+        self.prompted
+            .retain(|id, shown| pending.get(*id).is_some_and(|row| shown.is(row)));
+        let standing = self
+            .prompt
+            .as_ref()
+            .map(|raised| (raised.approval, raised.standing(&pending)));
+        match standing {
+            None | Some((_, Standing::Queued)) => {}
+            Some((approval, Standing::Gone)) => {
+                tracing::debug!(
+                    approval,
+                    "the approval left the queue before its prompt was answered; dropping the prompt"
+                );
+                self.prompt = None;
+            }
+            Some((approval, Standing::Replaced)) => {
+                tracing::debug!(
+                    approval,
+                    "the queue now holds a different request under this id than the open card \
+                     shows; dropping the prompt"
+                );
+                self.prompt = None;
+            }
         }
         self.pending = pending;
+        self.queue_known = true;
         self.raise_next()
     }
 
@@ -479,30 +626,24 @@ impl Agents {
     /// A zero `raised_unix` (no clock yet) never ages: guessing at elapsed time
     /// without a clock would abandon a card that is still on screen.
     fn raise_next(&mut self) -> Vec<Effect> {
-        if let Some(raised) = self.prompt
-            && self.prompt_is_abandoned(raised)
-        {
+        let now = self.now_unix;
+        if let Some(raised) = self.prompt.take_if(|p| p.is_abandoned(now)) {
             tracing::debug!(
                 approval = raised.approval,
                 "the consent card went unanswered past its bound; reopening the gate"
             );
-            self.prompt = None;
         }
         if self.prompt.is_some() {
             return Vec::new();
         }
-        let Some(next) = self.pending.oldest_unprompted(&self.prompted).cloned() else {
+        let Some(next) = self
+            .pending
+            .oldest_unprompted(|a| self.prompted.get(&a.id).is_some_and(|shown| shown.is(a)))
+            .cloned()
+        else {
             return Vec::new();
         };
         self.raise(&next)
-    }
-
-    /// Whether `raised` has outlived the host's prompt bound — see
-    /// [`Agents::raise_next`].
-    fn prompt_is_abandoned(&self, raised: RaisedPrompt) -> bool {
-        let bound = i64::try_from(CONSENT_PROMPT_TIMEOUT_SECS + CONSENT_PROMPT_GRACE_SECS)
-            .unwrap_or(i64::MAX);
-        raised.raised_unix > 0 && self.now_unix.saturating_sub(raised.raised_unix) >= bound
     }
 
     /// Raise the consent prompt for one approval.
@@ -525,12 +666,18 @@ impl Agents {
     /// values this mirror deliberately keeps unparsed, and both are
     /// interpolated into a 480 px wrapping label. A 5 000-char agent name
     /// pushes the buttons off the only surface that can answer the approval.
+    ///
+    /// What the card shows is recorded with it ([`Shown`]), in the dedup set
+    /// and in the prompt, so the answer can later be checked against the row
+    /// it was actually about.
     fn raise(&mut self, approval: &Approval) -> Vec<Effect> {
         let request_id = self.take_effect_id();
-        self.prompted.insert(approval.id);
+        let shown = Shown::of(approval);
+        self.prompted.insert(approval.id, shown.clone());
         self.prompt = Some(RaisedPrompt {
             request_id,
             approval: approval.id,
+            shown,
             raised_unix: self.now_unix,
         });
         vec![Effect::RequestConsent {
@@ -571,7 +718,7 @@ impl Agents {
 
     /// Route the human's answer to one approval prompt (#947 P3, spec §6.5).
     ///
-    /// Three guards, each one a way this could go wrong:
+    /// Four guards, each one a way this could go wrong:
     ///
     /// - **The token must be the live one.** A decision for a `request_id` this
     ///   model is not waiting on is a superseded card's late answer; it is
@@ -582,6 +729,22 @@ impl Agents {
     ///   the way `SetPaused` is.
     /// - **The approval must still be queued.** One that was answered elsewhere
     ///   in the meantime is dropped with a debug line (§6.5), not re-decided.
+    /// - **It must still be the request the card showed** ([`Shown`]). The
+    ///   frame names a bare id, and a hive that re-numbered its queue can have
+    ///   a different request under it; that answer is dropped unsent with a
+    ///   debug line, because the operator never saw what it would decide.
+    ///   [`Agents::fold_pending`] already drops such a prompt on the fold that
+    ///   first sees the new row, so this is the last line rather than the only
+    ///   one — it is what holds if a decision and a queue ever meet in the
+    ///   other order.
+    ///
+    /// The third guard has two ways to fail, and they are **not** the same
+    /// outcome. An approval missing from a queue the hive *answered* was
+    /// resolved elsewhere, which is legitimately silent. One missing because
+    /// the queue *could not be read* — a `Pending` refusal, or no hive at all
+    /// ([`Agents::queue_known`]) — was simply not sent: the operator clicked a
+    /// button and nothing happened, so that one gets a toast saying so, and
+    /// saying the request is still waiting for them.
     ///
     /// The mapping is §6.5's, and it is deliberately lossy: **every** `Allow*`
     /// becomes one `Approve { id }` for that one id, and no standing grant is
@@ -590,22 +753,39 @@ impl Agents {
     /// #947 draws four buttons for the same effect, so the other two arms are
     /// the reason that host degrades to "approved once" rather than to nothing.
     fn decide(&mut self, request_id: u64, decision: ConsentDecision) -> Vec<Effect> {
-        let Some(raised) = self.prompt.filter(|p| p.request_id == request_id) else {
+        let Some(raised) = self.prompt.take_if(|p| p.request_id == request_id) else {
             tracing::debug!(
                 request_id,
                 "a consent decision for a prompt this session is not waiting on; ignored"
             );
             return Vec::new();
         };
-        self.prompt = None;
 
         let id = raised.approval;
-        if !self.pending.contains(id) {
-            tracing::debug!(
+        if !self.queue_known {
+            tracing::info!(
                 approval = id,
-                "the approval was resolved elsewhere before the answer arrived; dropping it"
+                "a consent decision arrived while the approval queue is unreadable; not sent"
             );
-            return Vec::new();
+            return vec![self.unsent(&raised, decision)];
+        }
+        match raised.standing(&self.pending) {
+            Standing::Queued => {}
+            Standing::Gone => {
+                tracing::debug!(
+                    approval = id,
+                    "the approval was resolved elsewhere before the answer arrived; dropping it"
+                );
+                return Vec::new();
+            }
+            Standing::Replaced => {
+                tracing::debug!(
+                    approval = id,
+                    "the queue holds a different request under this id than the card showed; \
+                     dropping the answer unsent"
+                );
+                return Vec::new();
+            }
         }
         let request = match decision {
             ConsentDecision::Deny => Request::Deny { id },
@@ -615,6 +795,34 @@ impl Agents {
         };
         let _ = self.cmd_tx.send(Cmd::Send(request));
         Vec::new()
+    }
+
+    /// The toast for a decision [`Agents::decide`] could not send because the
+    /// queue was unreadable when it arrived.
+    ///
+    /// Named from what the card **showed** rather than from the queue, which
+    /// is exactly what is missing at this moment ([`Agents::approval_label`]
+    /// would fall back to the bare id). The badge is gone while the queue is
+    /// unreadable and comes back with it, which is where the request is
+    /// answered from next — a badge click re-raises it, and no other prompt
+    /// will (it keeps its `prompted` entry).
+    fn unsent(&self, raised: &RaisedPrompt, decision: ConsentDecision) -> Effect {
+        let what = match decision {
+            ConsentDecision::Deny => "denial",
+            ConsentDecision::AllowOnce
+            | ConsentDecision::AllowSession
+            | ConsentDecision::AllowAlways => "approval",
+        };
+        Effect::Notify {
+            summary: format!("{what} not sent — hive unavailable"),
+            body: format!(
+                "\"{}\" for {} (#{}) is still waiting on you; answer it from its badge once \
+                 the hive is back",
+                raised.shown.kind.human(),
+                self.cfg.label_for(&raised.shown.agent),
+                raised.approval
+            ),
+        }
     }
 
     /// The pause toggle: flip optimistically, then ask the hive.
@@ -674,7 +882,7 @@ impl Agents {
     /// and a poll can land in either order, and "request #7" is still something
     /// the operator can look up on the dashboard.
     fn approval_label(&self, id: i64) -> String {
-        self.pending.all().iter().find(|a| a.id == id).map_or_else(
+        self.pending.get(id).map_or_else(
             || format!("request #{id}"),
             |a| {
                 format!(
@@ -900,7 +1108,7 @@ impl Agents {
         if let Some(rest) = node.strip_prefix(ids::START) {
             if let Some(name) = AgentName::parse(rest) {
                 let _ = self.cmd_tx.send(Cmd::Send(Request::Start {
-                    scope: Scope::agent(name.as_str()),
+                    scope: Scope::agent(&name),
                 }));
             }
             return Vec::new();
@@ -908,7 +1116,7 @@ impl Agents {
         if let Some(rest) = node.strip_prefix(ids::STOP) {
             if let Some(name) = AgentName::parse(rest) {
                 let _ = self.cmd_tx.send(Cmd::Send(Request::Stop {
-                    scope: Scope::agent(name.as_str()),
+                    scope: Scope::agent(&name),
                     graceful: true,
                 }));
             }
@@ -1040,9 +1248,11 @@ impl Plugin for Agents {
             // …and a queue the hive refused (#1140's review, LOW-3). The badges
             // go, because they are claims about a queue this build can no
             // longer see; `prompted` and the in-flight prompt stay, so a
-            // one-tick blip cannot re-raise a card the operator already has.
+            // one-tick blip cannot re-raise a card the operator already has —
+            // and a click on that card meanwhile is told it was not sent
+            // (`decide`), rather than dropped as if resolved elsewhere.
             Input::App(Msg::Pending(Err(_))) => {
-                self.pending = PendingApprovals::default();
+                self.forget_queue();
                 Vec::new()
             }
             // #947 P3: the human answered (or the two-button card would have
@@ -1120,10 +1330,12 @@ pub fn card_of(model: &Agents) -> Node {
 ///
 /// The description is what the person who queued the approval wrote about it,
 /// so it is the sentence worth showing — but it is free text from another
-/// process, so it is bounded ([`DETAIL_CHARS`]) before it reaches a 480 px
-/// card. An approval with none still gets a line, because "when was this asked"
-/// is the next thing an operator wants and a blank detail would hide the
-/// overlay's whole second row.
+/// process, so it is flattened to one line ([`single_line`]) and then bounded
+/// ([`DETAIL_CHARS`]) before it reaches a 480 px card. Both halves matter: the
+/// cap counts characters, and a description of a few hundred `\n`s is short by
+/// that count and still hundreds of lines tall. An approval with none still
+/// gets a line, because "when was this asked" is the next thing an operator
+/// wants and a blank detail would hide the overlay's whole second row.
 ///
 /// `pub` since #1141's review (M4). `trollshell-agent-window` renders the same
 /// approval on its Settings page and had a byte-for-byte copy of this body;
@@ -1132,40 +1344,26 @@ pub fn card_of(model: &Agents) -> Node {
 /// that a compile-time fact rather than a reviewer's eyeball.
 #[must_use]
 pub fn detail_line(approval: &Approval) -> String {
-    let stamp = if approval.requested_at.is_empty() {
+    // Flattened and bounded like the description: the mirror keeps
+    // `requested_at` an unparsed wire string on purpose, so nothing else caps
+    // it — in length or in height.
+    let requested_at = single_line(&approval.requested_at);
+    let stamp = if requested_at.is_empty() {
         format!("request #{}", approval.id)
     } else {
-        // Bounded like the description: the mirror keeps `requested_at` an
-        // unparsed wire string on purpose, so nothing else caps it.
         format!(
             "request #{}, asked {}",
             approval.id,
-            clamp(&approval.requested_at, REQUESTED_AT_CHARS)
+            clamp(&requested_at, REQUESTED_AT_CHARS)
         )
     };
     match approval
         .description
         .as_deref()
-        .map(str::trim)
+        .map(single_line)
         .filter(|d| !d.is_empty())
     {
-        Some(description) => format!("{} — {stamp}", clamp(description, DETAIL_CHARS)),
+        Some(description) => format!("{} — {stamp}", clamp(&description, DETAIL_CHARS)),
         None => stamp,
     }
-}
-
-/// Truncate on a **char** boundary, appending an ellipsis when it bit.
-///
-/// `&s[..n]` would panic mid-codepoint, and a description is arbitrary UTF-8
-/// somebody else wrote — a plugin that panicked on an emoji in a PR title would
-/// take its whole session down.
-///
-/// `pub` since #1141's review (M4), with [`detail_line`].
-#[must_use]
-pub fn clamp(s: &str, chars: usize) -> String {
-    if s.chars().count() <= chars {
-        return s.to_owned();
-    }
-    let head: String = s.chars().take(chars).collect();
-    format!("{head}…")
 }

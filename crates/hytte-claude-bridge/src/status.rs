@@ -105,12 +105,18 @@ pub fn publish(startup: Startup) {
     let _ = STARTUP.set(startup);
 }
 
-/// Record one answered request by its HTTP status. 2xx is healthy, everything
-/// else is not — including the 404/405/400 a stray probe earns, because the chip
-/// is showing "is this thing answering the way its clients expect", and a client
-/// that gets a 400 is a client that fell back.
-pub fn record(http_status: u16) {
-    if (200..300).contains(&http_status) {
+/// Record one answered request by its HTTP status and whether the response
+/// reached the client. A **delivered** 2xx is healthy, everything else is not —
+/// including the 404/405/400 a stray request earns, because the chip is showing
+/// "is this thing answering the way its clients expect", and a client that gets
+/// a 400 is a client that fell back. So is one that never got its 200 (a client
+/// that stopped reading, or gave up first), which is why `delivered` is asked
+/// for at all: the tally is taken after the write, not before it.
+///
+/// A connection that sent no bytes at all is not a request and is never
+/// recorded — see `bridge::serve_connection`.
+pub fn record(http_status: u16, delivered: bool) {
+    if delivered && (200..300).contains(&http_status) {
         OK.fetch_add(1, Ordering::Relaxed);
         LAST.store(LAST_OK, Ordering::Relaxed);
     } else {
@@ -143,12 +149,12 @@ mod tests {
     #[test]
     fn record_classifies_by_status_class() {
         let before = snapshot();
-        record(200);
+        record(200, true);
         let after_ok = snapshot();
         assert!(after_ok.ok > before.ok, "a 2xx counts as healthy");
         assert_eq!(after_ok.last, Last::Ok);
 
-        record(504);
+        record(504, true);
         let after_err = snapshot();
         assert!(
             after_err.errors > after_ok.errors,
@@ -156,12 +162,29 @@ mod tests {
         );
         assert_eq!(after_err.last, Last::Error);
 
-        record(404);
+        record(404, true);
         assert_eq!(
             snapshot().last,
             Last::Error,
             "a stray probe's 404 is not health"
         );
+
+        // A 200 the client never received is not a served answer: the client
+        // fell back exactly as it would have on a 5xx. Here rather than in a
+        // test of its own because the board is process-global, and a second
+        // recording test running in parallel could flip `last` under the
+        // `Last::Ok` assertion above.
+        record(200, true);
+        let before_undelivered = snapshot();
+        assert_eq!(before_undelivered.last, Last::Ok);
+        record(200, false);
+        let after_undelivered = snapshot();
+        assert!(
+            after_undelivered.errors > before_undelivered.errors,
+            "an undelivered 2xx is an error"
+        );
+        assert_eq!(after_undelivered.ok, before_undelivered.ok);
+        assert_eq!(after_undelivered.last, Last::Error);
     }
 
     /// An unknown discriminant in the `last` byte degrades to "nothing served

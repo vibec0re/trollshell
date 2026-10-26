@@ -149,7 +149,17 @@ pub fn parse_head(buf: &[u8]) -> Result<Option<Head>, Failure> {
 }
 
 /// Read one complete request off `stream`, bounded by [`READ_TIMEOUT`].
-pub async fn read_request(stream: &mut impl Stream) -> Result<(Head, Vec<u8>), Failure> {
+///
+/// `Ok(None)` is a peer that closed **before sending a single byte** — not a
+/// malformed request but no request at all, and the caller answers it with
+/// nothing. That is exactly what a second bridge's startup probe
+/// ([`crate::socket::socket_in_use`]) does to the incumbent: connect, learn the
+/// socket is live, hang up. Reading it as a 400 used to count every such probe
+/// against the chip's health (its `ERRORS` and its last-request warning) for a
+/// request nobody sent. A peer that sends *some* bytes and then closes is still
+/// the 400 it always was, and so is one that connects and then sits silent
+/// until [`READ_TIMEOUT`] (a 408).
+pub async fn read_request(stream: &mut impl Stream) -> Result<Option<(Head, Vec<u8>)>, Failure> {
     let read = async {
         let mut buf = Vec::with_capacity(4096);
         let mut chunk = [0u8; 4096];
@@ -162,6 +172,9 @@ pub async fn read_request(stream: &mut impl Stream) -> Result<(Head, Vec<u8>), F
                 .await
                 .map_err(|e| Failure::new(400, format!("read failed: {e}")))?;
             if n == 0 {
+                if buf.is_empty() {
+                    return Ok(None);
+                }
                 return Err(Failure::new(400, "connection closed mid-head"));
             }
             buf.extend_from_slice(&chunk[..n]);
@@ -178,7 +191,7 @@ pub async fn read_request(stream: &mut impl Stream) -> Result<(Head, Vec<u8>), F
             buf.extend_from_slice(&chunk[..n]);
         }
         let body = buf[head.body_offset..want].to_vec();
-        Ok((head, body))
+        Ok(Some((head, body)))
     };
     match tokio::time::timeout(READ_TIMEOUT, read).await {
         Ok(result) => result,
@@ -205,27 +218,38 @@ pub fn response_bytes(status: u16, body: &[u8]) -> Vec<u8> {
 }
 
 /// Write a response and close the write half, bounded by [`WRITE_TIMEOUT`].
+/// Returns whether the client was handed the whole response.
 ///
 /// Every outcome is the end of the connection — the client gets the reply or
 /// it does not, and there is nobody left to report a failure to — so each is
-/// one debug line, never an error.
-pub async fn write_response(stream: &mut impl Stream, status: u16, body: &[u8]) {
+/// one debug line, never an error. The `bool` is for the one reader that does
+/// care: the status chip, which should not count an answer as served when the
+/// client never got it (see `bridge::serve_connection`).
+///
+/// "Handed" means `write_all` finished: on a Unix stream socket the bytes are
+/// then in the peer's receive buffer, `Content-Length` already tells it where
+/// they end, and a failed `shutdown` after that costs the client nothing.
+pub async fn write_response(stream: &mut impl Stream, status: u16, body: &[u8]) -> bool {
     let bytes = response_bytes(status, body);
     let write = async {
         if let Err(e) = stream.write_all(&bytes).await {
             tracing::debug!(error = %e, "response write failed");
-            return;
+            return false;
         }
         if let Err(e) = stream.shutdown().await {
             tracing::debug!(error = %e, "response shutdown failed");
         }
+        true
     };
-    if tokio::time::timeout(WRITE_TIMEOUT, write).await.is_err() {
-        tracing::debug!(
-            timeout_s = WRITE_TIMEOUT.as_secs(),
-            "timed out writing the response; dropping the connection",
-        );
-    }
+    tokio::time::timeout(WRITE_TIMEOUT, write)
+        .await
+        .unwrap_or_else(|_elapsed| {
+            tracing::debug!(
+                timeout_s = WRITE_TIMEOUT.as_secs(),
+                "timed out writing the response; dropping the connection",
+            );
+            false
+        })
 }
 
 /// Reason phrase for the statuses this bridge emits.
@@ -248,7 +272,7 @@ fn reason(status: u16) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{ROUTE, WRITE_TIMEOUT, parse_head, response_bytes, write_response};
+    use super::{ROUTE, WRITE_TIMEOUT, parse_head, read_request, response_bytes, write_response};
 
     /// A client that never reads cannot hold its connection task forever: a
     /// reply bigger than the pipe's buffer gives up after [`WRITE_TIMEOUT`]
@@ -261,12 +285,13 @@ mod tests {
         // 4 KiB reply can only ever block.
         let (_client, mut server) = tokio::io::duplex(64);
         let started = tokio::time::Instant::now();
-        tokio::time::timeout(
+        let delivered = tokio::time::timeout(
             WRITE_TIMEOUT * 2,
             write_response(&mut server, 200, &[b'x'; 4096]),
         )
         .await
         .expect("the write gave up on its own");
+        assert!(!delivered, "a reply the client never took is not delivered");
         let elapsed = started.elapsed();
         assert!(
             (WRITE_TIMEOUT..WRITE_TIMEOUT * 2).contains(&elapsed),
@@ -283,16 +308,50 @@ mod tests {
         let body = [b'x'; 4096];
         let started = tokio::time::Instant::now();
         let mut got = Vec::new();
-        let ((), read) = tokio::join!(
+        let (delivered, read) = tokio::join!(
             write_response(&mut server, 200, &body),
             client.read_to_end(&mut got),
         );
         read.expect("read to EOF");
+        assert!(delivered);
         assert_eq!(got, response_bytes(200, &body));
         assert!(
             started.elapsed() < WRITE_TIMEOUT,
             "no timeout on the happy path"
         );
+    }
+
+    /// A peer that hangs up before sending anything made no request: `None`,
+    /// which the caller answers with nothing and does not count. This is the
+    /// shape of a second bridge's startup probe (`socket::socket_in_use`),
+    /// which used to land on the incumbent's chip as a 400.
+    #[tokio::test]
+    async fn a_peer_that_closes_before_any_byte_made_no_request() {
+        let (client, mut server) = tokio::io::duplex(64);
+        drop(client);
+        assert!(
+            read_request(&mut server)
+                .await
+                .expect("not a failure")
+                .is_none()
+        );
+    }
+
+    /// …but one byte is a request, and a request cut short is still the 400 it
+    /// always was — the exemption is for *no* bytes, not for a short read.
+    #[tokio::test]
+    async fn a_peer_that_closes_mid_head_is_still_a_bad_request() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (mut client, mut server) = tokio::io::duplex(64);
+        client
+            .write_all(b"POST /v1/chat")
+            .await
+            .expect("write a partial head");
+        drop(client);
+        let failure = read_request(&mut server).await.expect_err("a short read");
+        assert_eq!(failure.status, 400);
+        assert!(failure.message.contains("mid-head"), "{}", failure.message);
     }
 
     /// The exact head `ureq` 3 sends for `chat()` — since #993 over a Unix

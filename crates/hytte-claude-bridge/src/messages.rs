@@ -170,8 +170,9 @@ impl Client {
     ///
     /// `budget` is the whole round trip (connect + send + read) and must stay
     /// **under** the bridge's own per-request budget: `spawn_blocking` is not
-    /// cancellable, so the outer `tokio::time::timeout` firing first would
-    /// leave this request running with nobody left to read it.
+    /// cancellable, so the request's deadline (`backend::Turn::deadline`)
+    /// firing first would leave this request running with nobody left to read
+    /// it.
     #[must_use]
     pub fn new(key: String, model: String, thinking: Thinking, budget: Duration) -> Self {
         Self {

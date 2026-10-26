@@ -150,7 +150,7 @@
 //! | `XDG_RUNTIME_DIR` | set by logind | where the socket lives; unset ⇒ the daemon refuses to serve. The path *within* it is not configurable (#993), and `CLAUDE_BRIDGE_PORT` is gone with the port it named |
 //! | `CLAUDE_BRIDGE_MODEL` | unset | the model; empty leaves claude's own default, or [`messages::DEFAULT_MODEL`] in `api` mode |
 //! | `CLAUDE_BRIDGE_MODE` | `subscription` | `subscription` (persisted session), `reprompt`, or `api` (#730) |
-//! | `CLAUDE_BRIDGE_TIMEOUT_SECS` | `8` | per-request budget; must stay under the client's 10s |
+//! | `CLAUDE_BRIDGE_TIMEOUT_SECS` | `8` | per-request budget; a `claude` child still running at it is killed and reaped before the 504. Must stay under the client's 10s |
 //! | `CLAUDE_BRIDGE_STATE_DIR` | `$XDG_STATE_HOME/hytte-claude-bridge` | the child's cwd, which is what scopes claude's on-disk sessions (`claude` modes only), and where the retired-session map is kept (#855) |
 //! | `CLAUDE_BRIDGE_THINKING` | `disabled` | `api` mode only: `disabled`, `adaptive`, or `auto` — see [`messages::Thinking`] |
 //! | `ANTHROPIC_API_KEY` | unset | `api` mode only: it outranks `~/.config/trollshell/anthropic.key`. In the `claude` modes it is a **startup refusal** (see [`envguard`]) |
@@ -297,13 +297,19 @@ impl Settings {
         }
     }
 
-    /// The budget the *inner* client gets: one second under the request budget.
+    /// The budget the `api` mode's HTTP client gets: one second under the
+    /// request budget.
     ///
-    /// Both backends need the same ordering for the same reason — whatever is
-    /// doing the work must give up before the outer `tokio::time::timeout`
-    /// does, or the outer one fires and the work carries on with nobody left to
-    /// read it (a `claude` child with no `kill_on_drop`; a `spawn_blocking`
-    /// HTTP request that cannot be cancelled).
+    /// That request runs under `spawn_blocking`, which cannot be cancelled, so
+    /// it has to give up on its own before the bridge's deadline does — or the
+    /// deadline fires and the request carries on with nobody left to read it.
+    ///
+    /// The `claude` modes do **not** use this any more. They used to, as the
+    /// driver's idle-watchdog window, on the same "give up first" reasoning —
+    /// but that watchdog could not give up first (see
+    /// [`Settings::claude_config`]), and a child process, unlike a blocking
+    /// thread, *can* be stopped from outside: the bridge kills and reaps it at
+    /// the deadline itself (`backend::run_until`).
     fn inner_budget(&self) -> Duration {
         self.budget
             .saturating_sub(Duration::from_secs(1))
@@ -313,11 +319,21 @@ impl Settings {
     /// The `hive-claude` invocation config — the one place both `claude` modes
     /// get theirs from.
     ///
-    /// `idle_timeout` is [`Settings::inner_budget`], so a stalled turn is
-    /// killed and reaped by the driver — yielding a typed `Error::IdleTimeout`
-    /// — *before* the outer budget fires. The outer timeout remains as a
-    /// backstop for a turn that is streaming but too slow; that path can leave
-    /// the child running, which is logged rather than papered over.
+    /// # No idle watchdog
+    ///
+    /// `idle_timeout` is `None`: the bridge's own deadline kills and reaps the
+    /// child (`backend::run_until`), for a silent stall and a slow stream
+    /// alike. This used to be [`Settings::inner_budget`], on the theory that
+    /// the driver would kill a stalled turn a second before the outer budget
+    /// fired. It could not: `hive-claude` 0.1.1 re-checks silence only every
+    /// 5 s (`IDLE_PROBE`), so at the default 8 s budget the 7 s window was
+    /// checked at t=5 — too soon — and next at t=10, two seconds after the
+    /// outer timeout had dropped the turn, watchdog and all. The driver sets no
+    /// `kill_on_drop`, so a stalled child simply outlived its request, along
+    /// with its permit and title lock. Kept, the watchdog would beat the
+    /// deadline only at budgets of 6, 11, 16 … seconds, and only for a child
+    /// silent from the start — a second, misleading account of who stops the
+    /// child rather than a second line of defence.
     ///
     /// # No tools, no MCP servers, no slash commands
     ///
@@ -363,7 +379,7 @@ impl Settings {
         hive_claude::Config {
             model: self.model_arg(),
             cwd: Some(self.state_dir.clone()),
-            idle_timeout: Some(self.inner_budget()),
+            idle_timeout: None,
             tools: Some(NO_TOOLS.to_owned()),
             strict_mcp_config: true,
             mcp_config: None,
@@ -696,9 +712,14 @@ mod tests {
     /// The request budget must stay under `hytte-ai-providers`' 10s global
     /// timeout, or the client sees a torn connection instead of a clean error
     /// it can fall back from.
+    ///
+    /// Since the bridge kills and reaps its own `claude` child at the deadline,
+    /// a 504 can land up to [`REAP_GRACE`](crate::backend::REAP_GRACE) after
+    /// the budget, and the last-resort backstop in `bridge.rs` sits a second
+    /// grace past that — so it is that whole sum which has to fit.
     #[test]
     fn the_default_budget_is_under_the_clients_global_timeout() {
-        assert!(DEFAULT_BUDGET < Duration::from_secs(10));
+        assert!(DEFAULT_BUDGET + crate::backend::REAP_GRACE * 2 < Duration::from_secs(10));
     }
 
     /// **The usage-poll gate.** The poll's only consumer is the chip the SDK
@@ -818,20 +839,17 @@ mod tests {
     /// tools back.
     ///
     /// A shell-script stand-in for `claude` records its argv one `<arg>` per
-    /// line (so the empty `--tools` value is visible) and exits cleanly.
+    /// line (so the empty `--tools` value is visible) and exits cleanly. It is
+    /// installed through `backend::stand_in::install`, not written in-process,
+    /// so a sibling test's fork cannot make it "Text file busy".
     #[tokio::test]
     async fn the_restrictions_reach_the_child_argv() {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let dir = tempfile::tempdir().expect("tempdir");
         let program = dir.path().join("fake-claude");
-        std::fs::write(
+        crate::backend::stand_in::install(
             &program,
             "#!/bin/sh\ncat > /dev/null\nfor arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done > \"$0.argv\"\n",
-        )
-        .expect("write the stand-in");
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod +x");
+        );
 
         let mut config = Settings {
             state_dir: dir.path().to_path_buf(),

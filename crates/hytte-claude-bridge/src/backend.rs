@@ -24,9 +24,11 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use hive_claude::{Attach, Claude, Config, Error as ClaudeError, Sink};
 use serde_json::Value;
+use tokio::time::Instant;
 
 use crate::http::Failure;
 use crate::messages::Client as MessagesClient;
@@ -49,6 +51,23 @@ const MAX_RECORD_MESSAGES: usize = 64;
 /// How many conversations [`Reprompt`] keeps records for.
 const MAX_RECORDS: usize = 64;
 
+/// How long a `claude` child killed with `SIGKILL` at the request deadline gets
+/// to be **reaped** before [`run_until`] stops waiting for it.
+///
+/// The kill itself cannot be ignored and lands at once; what this bounds is the
+/// driver noticing. `hive-claude`'s `RunningClaude::wait` returns only once the
+/// child has been `wait()`ed **and** both of its output pipes have hit EOF, so a
+/// grandchild that inherited stdout/stderr (a hook the owner's settings run,
+/// say) could hold the turn open after the child itself is dead. Without one
+/// the reap is a few milliseconds — 2.4 ms past the deadline when
+/// `a_silently_hung_child_is_killed_and_reaped_at_the_deadline` was first run —
+/// so half a second is generous, and still leaves the 504 well inside the
+/// client's 10s timeout at the default 8s budget: `main`'s
+/// `the_default_budget_is_under_the_clients_global_timeout` pins that sum.
+///
+/// `pub(crate)` because `bridge.rs` sizes its last-resort backstop from it.
+pub(crate) const REAP_GRACE: Duration = Duration::from_millis(500);
+
 /// One turn to answer.
 #[derive(Debug, Clone, Copy)]
 pub struct Turn<'a> {
@@ -67,6 +86,17 @@ pub struct Turn<'a> {
     /// Messages API **requires** it, so [`crate::messages`] is the one arm that
     /// can honour it, and does.
     pub max_tokens: Option<u32>,
+    /// When the bridge's per-request budget runs out — **one** deadline for the
+    /// whole request, a session rotation's retry included.
+    ///
+    /// Carried down rather than enforced by a timeout wrapped around the
+    /// backend, because that wrapper is exactly what used to orphan `claude`:
+    /// dropping the future drops the `hive-claude` turn with no `kill_on_drop`
+    /// on its child, and with it the title lock and the request permit that
+    /// were meant to bound live children. Every wait in a backend is bounded by
+    /// this instead, and the one that owns a child ([`run_until`]) kills and
+    /// reaps it before giving the deadline back as a 504.
+    pub deadline: Instant,
 }
 
 /// The abstraction both backends implement.
@@ -109,9 +139,16 @@ impl Subscription {
 
 impl Conversation for Subscription {
     async fn respond(&self, turn: Turn<'_>) -> Result<String, Failure> {
+        // The child runs inside `resume_then_create`'s title lock, and
+        // `run_until` returns only once a deadline-killed child is reaped — so
+        // the next turn on this title cannot `--resume` the session while this
+        // one's child still has it open (#693's fork, by the back door).
         resume_then_create(turn, &self.turns, |attach, prompt| async move {
             let sink = TextSink::default();
-            match Claude::run(&self.config, &attach, &prompt, &sink).await {
+            let ended = run_until(&self.config, &attach, &prompt, &sink, turn.deadline)
+                .await
+                .map_err(RunError::Failed)?;
+            match ended {
                 Ok(()) => sink.into_text().map_err(RunError::Failed),
                 Err(ClaudeError::SessionNotFound) => Err(RunError::NoSession),
                 Err(e) => Err(RunError::Failed(map_error(&e))),
@@ -157,7 +194,13 @@ where
     F: Fn(Attach, String) -> Fut,
     Fut: Future<Output = Result<String, RunError>>,
 {
-    let _serialised = locks.acquire(turn.title).await;
+    // Bounded by the request's deadline, not merely by the holder: a turn that
+    // spent its whole budget queued behind another one on this title answers
+    // its 504 on time rather than once the holder lets go.
+    let Ok(_serialised) = tokio::time::timeout_at(turn.deadline, locks.acquire(turn.title)).await
+    else {
+        return Err(expired());
+    };
 
     // Resume first — always. The session may exist from an earlier turn, an
     // earlier bridge process, or an identical earlier request; in every one
@@ -181,6 +224,97 @@ where
             RunError::NoSession => map_error(&ClaudeError::SessionNotFound),
             RunError::Failed(failure) => failure,
         })
+}
+
+/// Run one `claude` turn to completion — or, if `deadline` passes first, kill
+/// the child and **reap it before returning**.
+///
+/// `Ok` is whatever the driver reported for a turn that ended on its own; `Err`
+/// is the deadline, already the 504 the client should see.
+///
+/// # Why the bridge kills its own child
+///
+/// Before this, the only thing between a stalled `claude` and the outer
+/// `tokio::time::timeout` was `hive-claude`'s idle watchdog, set a second under
+/// the budget — and that watchdog could never fire in time. It re-checks
+/// silence on a fixed 5 s probe (`IDLE_PROBE`, `driver.rs`), so at the default
+/// 8 s budget its 7 s window was checked at t=5 (not yet idle long enough) and
+/// next at t=10, two seconds after the outer timeout had dropped the whole
+/// turn — the watchdog included, since it lives in the same `tokio::join!` as
+/// the stream pumps. The driver sets no `kill_on_drop`, so the child simply
+/// kept running, unreaped; the request released its permit (so `bridge.rs`'s
+/// `PERMITS` stopped bounding live children) and its title lock (so the next
+/// tick `--resume`d the session the orphan still had open). A child that was
+/// still *streaming* was never covered by the watchdog at all.
+///
+/// So the deadline is enforced here, around the one future that owns the child,
+/// using the seam `hive-claude` provides for exactly this: [`Claude::spawn`]
+/// plus [`RunningClaude::cancel_handle`](hive_claude::RunningClaude::cancel_handle).
+/// When the deadline wins, the child gets `SIGKILL` (what the driver's own
+/// watchdog sends, via `Child::kill`) and the **same** `wait` future is then
+/// driven on — not dropped — because it is what calls `waitpid` and drains the
+/// pipes. Only once it returns does this function, and with it the title lock
+/// and the request permit above it, let go.
+///
+/// # The edges, stated plainly
+///
+/// - **A pipe-holding grandchild.** `wait` also needs both output pipes at EOF,
+///   which a grandchild that inherited them can withhold after the child is
+///   dead. That wait is bounded by [`REAP_GRACE`] and then abandoned with a
+///   warning: the child itself is already dead, and dropping the driver's
+///   `Child` hands its zombie to tokio's orphan reaper. The grandchild is not
+///   reachable from here — the driver builds its `Command` privately, so there
+///   is no process group to signal.
+/// - **A stall while writing the prompt.** If the child never reads stdin and
+///   the prompt overflows the pipe buffer, the kill surfaces as an `EPIPE` from
+///   the driver's stdin write, which returns *before* it reaps; the child is
+///   dead either way and tokio's orphan reaper collects it.
+/// - **The raw pid.** `Cancel` signals a pid with no generation check
+///   (hive-claude#15). It is only ever sent while `wait` is still pending, so
+///   the child is unreaped and its pid cannot have been recycled — except in
+///   the grandchild case above, where it can only have been recycled if the
+///   pid space wrapped within the turn.
+///
+/// A deadline that has already passed spawns nothing: a turn that spent its
+/// budget queued behind another one must not start a child just to kill it.
+async fn run_until(
+    config: &Config,
+    attach: &Attach,
+    prompt: &str,
+    sink: &impl Sink,
+    deadline: Instant,
+) -> Result<hive_claude::Result<()>, Failure> {
+    if Instant::now() >= deadline {
+        return Err(expired());
+    }
+    let running = match Claude::spawn(config, attach) {
+        Ok(running) => running,
+        Err(e) => return Ok(Err(e)),
+    };
+    let cancel = running.cancel_handle();
+    let mut turn = std::pin::pin!(running.wait(prompt, sink));
+    // `timeout_at` polls the turn before it checks the clock, so a turn that
+    // finished on the same tick the deadline fell is still taken as an answer.
+    if let Ok(ended) = tokio::time::timeout_at(deadline, &mut turn).await {
+        return Ok(ended);
+    }
+    cancel.cancel(true);
+    if tokio::time::timeout(REAP_GRACE, &mut turn).await.is_ok() {
+        tracing::warn!("claude did not finish within the request budget; killed and reaped it");
+    } else {
+        tracing::warn!(
+            grace_ms = REAP_GRACE.as_millis(),
+            "claude did not finish within the request budget and was killed, but its output \
+             pipes are still open (a grandchild holding them?); leaving the reap to tokio",
+        );
+    }
+    Err(expired())
+}
+
+/// The status a request gets when its budget ran out while it was still
+/// waiting or working — one wording wherever along the turn that happened.
+pub(crate) fn expired() -> Failure {
+    Failure::new(504, "no answer within the bridge's budget")
 }
 
 /// One async mutex per conversation title, minted on demand and retired when
@@ -326,17 +460,25 @@ impl Conversation for Reprompt {
         let reply = match &self.engine {
             Engine::Cli(config) => {
                 let sink = TextSink::default();
-                Claude::run(
+                run_until(
                     config,
                     &Attach::OneOff,
                     &render_transcript(&messages),
                     &sink,
+                    turn.deadline,
                 )
-                .await
+                .await?
                 .map_err(|e| map_error(&e))?;
                 sink.into_text()?
             }
-            Engine::Api(client) => client.respond(&messages, turn.max_tokens).await?,
+            // No child to reap here: `spawn_blocking` cannot be cancelled, so
+            // the client carries its own budget, under this deadline (see
+            // `messages::Client::new`), and this only stops *waiting* for it.
+            Engine::Api(client) => {
+                tokio::time::timeout_at(turn.deadline, client.respond(&messages, turn.max_tokens))
+                    .await
+                    .map_err(|_elapsed| expired())??
+            }
         };
         {
             let mut records = self.records.lock().unwrap_or_else(PoisonError::into_inner);
@@ -556,6 +698,129 @@ pub fn truncate(text: &str, max: usize) -> String {
     format!("{clamped}…")
 }
 
+/// A stand-in `claude` that **hangs silently**, for the tests that pin
+/// [`run_until`]'s kill-and-reap — here and in `bridge.rs`, which drives it
+/// through a whole request.
+///
+/// It is the stall the bug needed: it reads its prompt to EOF (as `claude`
+/// does before it calls out), then `exec`s a `sleep` that never writes a byte —
+/// `exec`, so the pid the bridge signals *is* the sleeping process rather than
+/// a shell whose `sleep` child would survive the kill holding the pipes open
+/// (the trap `hive-claude`'s own `sleepy_program` test documents).
+///
+/// Each run leaves two traces in its directory, both keyed by its pid: a
+/// `<pid>.pid` marker once it is up, and a `<pid>.saw` listing every *earlier*
+/// stand-in still in `/proc` at the moment it started. `/proc/<pid>` outlives
+/// the process until it is **reaped** — a zombie still has one — so "absent from
+/// `/proc`" is the reap, not merely the kill, and `.saw` is how a test asks
+/// whether a child started while another was still unreaped.
+#[cfg(test)]
+pub(crate) mod stand_in {
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    /// Parameter expansion rather than `dirname`/`basename`, so the script
+    /// needs nothing but `cat` and `sleep` beside the shell. The pid lives in
+    /// the marker's *name*, so creating it is the whole write, and it is
+    /// created last: once a test sees `<pid>.pid`, that run's `.saw` is final.
+    const SCRIPT: &str = r#"#!/bin/sh
+dir="${0%/*}"
+cat > /dev/null
+for f in "$dir"/*.pid; do
+  [ -e "$f" ] || continue
+  pid="${f##*/}"
+  pid="${pid%.pid}"
+  [ -d "/proc/$pid" ] && echo "$pid" >> "$dir/$$.saw"
+done
+: > "$dir/$$.pid"
+exec sleep 30
+"#;
+
+    /// Write the stand-in into `dir` and return its path.
+    pub(crate) fn hung_claude(dir: &Path) -> PathBuf {
+        let program = dir.join("hung-claude");
+        install(&program, SCRIPT);
+        program
+    }
+
+    /// Install `script` at `path` as an executable — written by a `sh` child,
+    /// **never by this process**.
+    ///
+    /// Not `std::fs::write` plus a chmod, because of `ETXTBSY`. Every test
+    /// thread in this binary that forks (each stand-in spawn, `plugin.rs`'s
+    /// re-exec of the test binary) hands its child a copy of *every* fd this
+    /// process has open at that instant — `O_CLOEXEC` closes them only at the
+    /// child's `exec` — and `execve` refuses a file that anyone holds open for
+    /// writing. A script written in-process can therefore fail to start with
+    /// "Text file busy" if a sibling test forked during the write; measured
+    /// here, once in eight runs of this suite as soon as three tests spawned
+    /// stand-ins. With the write in a child process, this process never holds
+    /// a writable fd on the script for anyone to inherit, and once that child
+    /// is reaped nobody does.
+    pub(crate) fn install(path: &Path, script: &str) {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let mut writer = Command::new("/bin/sh")
+            .args(["-c", r#"cat > "$1" && chmod 755 "$1""#, "sh"])
+            .arg(path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn the script writer");
+        writer
+            .stdin
+            .take()
+            .expect("piped")
+            .write_all(script.as_bytes())
+            .expect("hand the script over");
+        assert!(
+            writer.wait().expect("reap the script writer").success(),
+            "could not install {}",
+            path.display(),
+        );
+    }
+
+    /// The pids of every stand-in that has started in `dir`, ascending.
+    pub(crate) fn started(dir: &Path) -> Vec<u32> {
+        let mut pids: Vec<u32> = std::fs::read_dir(dir)
+            .expect("read the stand-in dir")
+            .filter_map(|entry| {
+                let name = entry.ok()?.file_name();
+                name.to_str()?.strip_suffix(".pid")?.parse().ok()
+            })
+            .collect();
+        pids.sort_unstable();
+        pids
+    }
+
+    /// Wait (bounded) until `n` stand-ins have started in `dir`, and return
+    /// their pids.
+    pub(crate) async fn wait_for(dir: &Path, n: usize) -> Vec<u32> {
+        for _ in 0..1000 {
+            let pids = started(dir);
+            if pids.len() >= n {
+                return pids;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("{n} stand-in(s) never started in {}", dir.display());
+    }
+
+    /// The earlier stand-ins `pid` found still in `/proc` when it started.
+    pub(crate) fn saw(dir: &Path, pid: u32) -> Vec<u32> {
+        std::fs::read_to_string(dir.join(format!("{pid}.saw")))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| line.parse().expect("one pid per line"))
+            .collect()
+    }
+
+    /// Whether `pid` is still in `/proc` — running, **or dead but unreaped**.
+    pub(crate) fn present(pid: u32) -> bool {
+        Path::new("/proc").join(pid.to_string()).exists()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Records, RunError, TextSink, TitleLocks, Turn, map_error, truncate};
@@ -587,6 +852,9 @@ mod tests {
             transcript,
             delta: transcript.last().expect("non-empty"),
             max_tokens: None,
+            // Far enough out that no test below that is not *about* the
+            // deadline can reach it.
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_hours(1),
         }
     }
 
@@ -979,6 +1247,155 @@ mod tests {
             drop(guard);
         }
         assert_eq!(locks.len(), 0);
+    }
+
+    // ---- the request deadline kills and reaps the child --------------------
+
+    /// **The orphan, closed.** A `claude` that stalls without a byte of output
+    /// is killed with `SIGKILL` at the deadline and reaped before `run_until`
+    /// hands the 504 back — so before the title lock and the request permit
+    /// above it can be released.
+    ///
+    /// Before the fix this was `hive-claude`'s idle watchdog's job, and at the
+    /// default budget it could not do it (5 s probes against a 7 s window, an 8
+    /// s outer timeout): the turn was dropped and the stand-in here would have
+    /// slept on, unreaped, for its full 30 s.
+    ///
+    /// The claim is the `/proc` assertion: the child is gone — reaped, not
+    /// merely killed — when `run_until` returns. The wall clock is checked only
+    /// coarsely, and on purpose. Its lower bound is exact (tokio timers never
+    /// fire early, so the turn really was held to its deadline), but its upper
+    /// bound is a generous `STALL_SLACK` rather than [`super::REAP_GRACE`]:
+    /// on a loaded CI runner, scheduler lateness lands in that number too, and
+    /// a bound tight enough to tell a reap from a grace expiry would fail on a
+    /// slow machine rather than on a regression. What it still catches is the
+    /// deadline not being enforced at all — the stand-in sleeps for 30 s.
+    #[tokio::test]
+    async fn a_silently_hung_child_is_killed_and_reaped_at_the_deadline() {
+        use super::{run_until, stand_in};
+        use hive_claude::Config;
+        use std::time::Duration;
+        use tokio::time::Instant;
+
+        /// How late past the deadline the answer may land before this test
+        /// calls it a hang — scheduler lateness on a loaded runner included.
+        const STALL_SLACK: Duration = Duration::from_secs(5);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = Config {
+            program: Some(stand_in::hung_claude(dir.path())),
+            ..Config::default()
+        };
+        // Long enough that a loaded machine still gets the stand-in to its
+        // marker before the kill; the claim is about what happens after it.
+        let budget = Duration::from_secs(2);
+        let started = Instant::now();
+        let outcome = run_until(
+            &config,
+            &Attach::OneOff,
+            "hi",
+            &TextSink::default(),
+            started + budget,
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            outcome.expect_err("the deadline, not an answer").status,
+            504
+        );
+        assert!(
+            (budget..budget + STALL_SLACK).contains(&elapsed),
+            "answered after {elapsed:?}: not at the {budget:?} deadline",
+        );
+        let [pid] = stand_in::started(dir.path())[..] else {
+            panic!("expected exactly one stand-in run");
+        };
+        assert!(
+            !stand_in::present(pid),
+            "the child ({pid}) is still in /proc after its 504 — running, or dead but unreaped",
+        );
+    }
+
+    /// A turn whose deadline has already passed — it spent the budget queued
+    /// behind another turn on its title — must not start a child just to kill
+    /// it. Proved with a program that does not exist: had a spawn been
+    /// attempted, the outcome would be the driver's `Error::Spawn`, not the 504.
+    #[tokio::test]
+    async fn a_spent_deadline_spawns_nothing() {
+        use super::run_until;
+        use hive_claude::Config;
+
+        let config = Config {
+            program: Some("/nonexistent/hytte-bridge-test/claude".into()),
+            ..Config::default()
+        };
+        let outcome = run_until(
+            &config,
+            &Attach::OneOff,
+            "hi",
+            &TextSink::default(),
+            tokio::time::Instant::now(),
+        )
+        .await;
+        assert_eq!(outcome.expect_err("refused before spawning").status, 504);
+    }
+
+    /// Queuing for the title lock is bounded by the deadline too: a turn that
+    /// spent its whole budget behind another one on its title answers its 504
+    /// at the deadline and never runs, rather than whenever the holder lets
+    /// go. On a paused clock, so the second it waits costs no real time.
+    #[tokio::test(start_paused = true)]
+    async fn a_turn_queued_on_its_title_past_the_deadline_never_runs() {
+        let locks = TitleLocks::default();
+        let held = locks.acquire("t").await;
+        let transcript = vec![msg("user", "hi")];
+        let queued = Turn {
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+            ..turn("t", &transcript)
+        };
+        let attempts = AtomicUsize::new(0);
+
+        let out = super::resume_then_create(queued, &locks, |_attach, _prompt| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Ok(String::new()))
+        })
+        .await;
+
+        assert_eq!(out.expect_err("the deadline").status, 504);
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            0,
+            "it ran past its deadline"
+        );
+        drop(held);
+        assert_eq!(locks.len(), 0, "the abandoned wait left its title's entry");
+    }
+
+    /// A turn that ends on its own is the driver's answer, untouched by the
+    /// deadline machinery — here the spawn failure itself, which must still
+    /// reach `map_error` as the typed `Error::Spawn` it is.
+    #[tokio::test]
+    async fn a_turn_that_ends_before_the_deadline_is_the_drivers_own_outcome() {
+        use super::run_until;
+        use hive_claude::Config;
+
+        let config = Config {
+            program: Some("/nonexistent/hytte-bridge-test/claude".into()),
+            ..Config::default()
+        };
+        let outcome = run_until(
+            &config,
+            &Attach::OneOff,
+            "hi",
+            &TextSink::default(),
+            tokio::time::Instant::now() + std::time::Duration::from_mins(1),
+        )
+        .await;
+        assert!(
+            matches!(outcome, Ok(Err(ClaudeError::Spawn { .. }))),
+            "{outcome:?}"
+        );
     }
 
     /// A resume that lands never creates — the delta rule depends on it.

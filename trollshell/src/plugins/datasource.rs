@@ -203,19 +203,19 @@ impl DatasourceRouter {
         };
         match outcome {
             Registered::Standby { holder } => tracing::warn!(
-                datasource = %id,
-                holder = %holder,
-                standby = %plugin_id,
+                datasource = %log_field(id),
+                holder = %log_field(&holder),
+                standby = %log_field(plugin_id),
                 "datasource id is already served by another live plugin; the holder keeps \
                  serving, and this one stands by to take over when it leaves",
             ),
             Registered::Replaced => tracing::info!(
-                datasource = %id,
-                plugin = %plugin_id,
+                datasource = %log_field(id),
+                plugin = %log_field(plugin_id),
                 "datasource provider re-registered by the same plugin; replacing its earlier entry",
             ),
             Registered::Serving => {
-                tracing::info!(datasource = %id, plugin = %plugin_id, "datasource provider registered");
+                tracing::info!(datasource = %log_field(id), plugin = %log_field(plugin_id), "datasource provider registered");
             }
         }
     }
@@ -265,15 +265,15 @@ impl DatasourceRouter {
         match outcome {
             Unregistered::Nothing => {}
             Unregistered::Standby => {
-                tracing::debug!(datasource = %id, "datasource standby left before it served");
+                tracing::debug!(datasource = %log_field(id), "datasource standby left before it served");
             }
             Unregistered::Free => {
-                tracing::info!(datasource = %id, "datasource provider unregistered");
+                tracing::info!(datasource = %log_field(id), "datasource provider unregistered");
             }
             Unregistered::Promoted { left, holder } => tracing::info!(
-                datasource = %id,
-                left = %left,
-                holder = %holder,
+                datasource = %log_field(id),
+                left = %log_field(&left),
+                holder = %log_field(&holder),
                 "datasource provider left; its oldest standby serves now",
             ),
         }
@@ -309,10 +309,7 @@ impl DatasourceRouter {
                 })
             };
             let Some((provider_id, provider_out, scopes)) = found else {
-                tracing::info!(
-                    requester = %requester_id, %provider, %scope,
-                    "datasource query for an unprovided datasource; NotFound",
-                );
+                log_not_found(&requester_id, &provider, &scope);
                 fail(
                     &requester,
                     request_id,
@@ -323,10 +320,7 @@ impl DatasourceRouter {
                 return;
             };
             if !scopes.iter().any(|s| s == &scope) {
-                tracing::info!(
-                    requester = %requester_id, %provider, %scope,
-                    "datasource query for a scope the provider does not serve; ScopeDenied",
-                );
+                log_scope_denied(&requester_id, &provider, &scope);
                 fail(
                     &requester,
                     request_id,
@@ -353,7 +347,11 @@ impl DatasourceRouter {
                 },
             );
             tracing::info!(
-                requester = %requester_id, %provider, %scope, corr, request_id,
+                requester = %log_field(&requester_id),
+                provider = %log_field(&provider),
+                scope = %log_field(&scope),
+                corr,
+                request_id,
                 "datasource query routed to provider",
             );
             // Forward to the provider under the opaque host correlation. A closed
@@ -447,8 +445,8 @@ impl DatasourceRouter {
                     Some(routed_to) => {
                         tracing::warn!(
                             corr,
-                            responder = %responder_id,
-                            routed_to = %routed_to,
+                            responder = %log_field(&responder_id),
+                            routed_to = %log_field(&routed_to),
                             "datasource result from a plugin that is not the routed-to provider; dropped",
                         );
                         None
@@ -456,7 +454,7 @@ impl DatasourceRouter {
                     None => {
                         tracing::debug!(
                             corr,
-                            responder = %responder_id,
+                            responder = %log_field(&responder_id),
                             "datasource result for an unknown/expired query; dropped",
                         );
                         None
@@ -529,9 +527,115 @@ async fn fail(
         .await;
 }
 
+/// Longest name, in characters, a log field carries before the visible `…`.
+const LOG_FIELD_CHARS: usize = 64;
+
+/// A plugin-supplied name, made safe to put in a journal field (#1555).
+///
+/// A requester names the `provider` and `scope` it queries, and a provider
+/// declares its own ids and scopes; the wire caps them at 4 KiB but allows any
+/// character. Logged raw, a newline forges a journal record and an `ESC`
+/// sequence reaches whoever reads it on a terminal, the same class #1529 closed
+/// for plugin ids and `Log` text. So every such field goes through
+/// `version::single_line` (line breaks become a space, every other invisible
+/// or control character is removed: one definition of "invisible" for the whole
+/// host) and is then cut to [`LOG_FIELD_CHARS`] characters with a visible `…`.
+fn log_field(raw: &str) -> String {
+    let mut line = super::version::single_line(raw);
+    if let Some((cut, _)) = line.char_indices().nth(LOG_FIELD_CHARS) {
+        line.truncate(cut);
+        line.push('…');
+    }
+    line
+}
+
+/// The journal line for a query naming a datasource nobody provides.
+fn log_not_found(requester: &str, provider: &str, scope: &str) {
+    tracing::info!(
+        requester = %log_field(requester),
+        provider = %log_field(provider),
+        scope = %log_field(scope),
+        "datasource query for an unprovided datasource; NotFound",
+    );
+}
+
+/// The journal line for a query naming a scope the provider does not serve.
+fn log_scope_denied(requester: &str, provider: &str, scope: &str) {
+    tracing::info!(
+        requester = %log_field(requester),
+        provider = %log_field(provider),
+        scope = %log_field(scope),
+        "datasource query for a scope the provider does not serve; ScopeDenied",
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The log-field helper (#1555): no line break, escape or control
+    /// character survives, and the length is bounded however long the name.
+    ///
+    /// **Falsified** by returning `raw` unchanged: every assertion goes red.
+    #[test]
+    fn log_field_is_one_safe_bounded_line() {
+        assert_eq!(log_field("weather"), "weather");
+        assert_eq!(
+            log_field("a\nb"),
+            "a b",
+            "a newline is a space, not a record break"
+        );
+        assert_eq!(log_field("a\r\nb"), "a  b");
+        assert_eq!(
+            log_field("a\x1b[31mred\x1b[0m"),
+            "a[31mred[0m",
+            "ESC is removed"
+        );
+        assert_eq!(log_field("a\0b"), "ab", "NUL is removed");
+        let long = log_field(&"x".repeat(4096));
+        assert_eq!(long.chars().count(), LOG_FIELD_CHARS + 1);
+        assert!(long.ends_with('…'));
+        let exact = "y".repeat(LOG_FIELD_CHARS);
+        assert_eq!(log_field(&exact), exact, "a name at the cap is not marked");
+        // Multi-byte characters are cut on a boundary, not mid-sequence.
+        assert_eq!(
+            log_field(&"é".repeat(200)).chars().count(),
+            LOG_FIELD_CHARS + 1
+        );
+    }
+
+    /// A requester's `provider` and `scope` reach the journal only in their
+    /// safe form, on both routing-failure lines: the line the requester forged
+    /// stays one record, and a 4 KiB name does not become a 4 KiB line.
+    ///
+    /// **Falsified** by logging `%provider` raw in `log_not_found` (the
+    /// newline and the 4 KiB run reach the captured field).
+    #[test]
+    fn routing_failures_log_the_sanitised_names() {
+        let provider = format!("fake\nINFO forged record\x1b[2J{}", "p".repeat(4096));
+        let scope = "s\ncope\x1b]0;x\x07";
+        let (captured, guard) = hytte_config::test_support::capture();
+        log_not_found("req\nuester", &provider, scope);
+        log_scope_denied("req\nuester", &provider, scope);
+        drop(guard);
+        let events = captured.events();
+        assert_eq!(events.len(), 2, "{events:?}");
+        for e in &events {
+            for key in ["requester", "provider", "scope"] {
+                let v = &e.fields[key];
+                assert!(
+                    !v.chars().any(char::is_control),
+                    "{key} carries a control character: {v:?}"
+                );
+                assert!(v.chars().count() <= LOG_FIELD_CHARS + 1, "{key}: {v:?}");
+            }
+            assert_eq!(e.fields["requester"], "req uester");
+            assert!(e.fields["provider"].starts_with("fake INFO forged record"));
+            assert_eq!(e.fields["scope"], "s cope]0;x");
+        }
+        assert!(events[0].message.contains("NotFound"), "{events:?}");
+        assert!(events[1].message.contains("ScopeDenied"), "{events:?}");
+    }
 
     /// A channel whose receiver is already gone: what a provider's outbound
     /// looks like once its writer has stopped.

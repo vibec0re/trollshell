@@ -936,6 +936,39 @@ nothing in that file signs the chain it presented (UNKNOWN_CA)`. That
       window, let it miss twice, start nginx and press **Try again now**: the
       spinner must appear at once (not at the end of the step) and the page
       must load.
+- [ ] **(#1578)** **A gateway that was down at open is reloaded on a pinned
+      route.** Checks of #1578's behaviour (the `load-failed` handler); it may
+      not have merged yet.
+  1. Set `TROLLSHELL_AGENT_WINDOW_CERT` to the gateway's leaf (or rely on
+     `gateway.pem`). Stop nginx on the hive, but keep `host.sock` up.
+  2. Open the agent window. Expected: the _"The hive's gateway did not answer"_
+     card, naming the URI and WebKit's reason (for example "Connection
+     refused"), not WebKit's bare error page.
+  3. Start nginx. Expected: the page loads by itself within the current
+     backoff step (2 s, then 4, 8 … up to 60 s), with no click.
+  4. The same with no hive TLS material, with the hive behind a CA the system
+     trusts. Without one, this ends on the TLS card, which is correct.
+- [ ] **(#1578)** **"Try again now" on a reload.** With the gateway down and
+      the card up, start nginx and press **Try again now** at once. Expected:
+      the page loads at once, not at the end of the backoff step.
+- [ ] **(#1578)** **A certificate failure keeps the TLS card and never
+      reloads.** With a pin that does not match the gateway's leaf, the TLS
+      card shows, nothing reloads, and the journal shows no reload lines.
+- [ ] **(#1578)** **A retry due while the window is hidden parks.**
+  1. With the gateway down and the card up, move the window to another
+     workspace for more than a minute. With
+     `RUST_LOG=trollshell_agent_window=debug`, the journal shows "a retry came
+     due while the compositor is not presenting this window; parked".
+  2. The gateway log shows no connections while the window is hidden.
+  3. Switch back. Expected: one attempt at once.
+- [ ] **(#1578)** **Flapping costs at most one attempt per interval.** Flick
+      across the window's workspace several times within two seconds, with the
+      card up. Expected: at most one attempt per poll interval in the gateway
+      log.
+- [ ] **(#1578)** **A reload on a different port is not retried.** Click a link
+      in the agent's output to another port of the hive's host (for example
+      `https://<hive-host>:8444/`) while nothing answers there. Expected: it
+      is not reloaded on the backoff for as long as the window stays open.
 - [ ] **(#1246)** **A slow or dead hive does not freeze the window — it opens
       instantly, on the verifying state.** This is the one to do on glass,
       because it is the half CI cannot reach: stop nginx on the hive and put a
@@ -4586,6 +4619,16 @@ control-center's Plugins tab).
      reopens.
   4. A normal open, close and swap between two pages with the drawer fully
      open are unchanged.
+- [ ] **(#1565)** **A keybind sidebar toggle during a drawer's retract does not
+      slide the card sideways.** Niri session, a sidebar bound to a key.
+  1. Open a drawer from a chip. Press `Esc`, and within its roughly 180 ms
+     retract press the sidebar toggle keybind. Expected: the drawer card
+     closes in place and does not jump sideways while it closes.
+     `wire_recenter_on_bar_geometry` reads `is_open`, which is false
+     mid-retract, so a bar geometry change then must not recentre the card.
+     Repeat a few times, since the window is short.
+  2. With the drawer fully open, toggle the sidebar by keybind. The card
+     recentres as before (#1547).
 
 ## Stats drawer
 

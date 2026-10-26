@@ -20,7 +20,9 @@
 use crate::layout::{self, Layout};
 use crate::plugin::PLUGIN_ID;
 use niri_ipc::socket::Socket;
-use niri_ipc::{Action, Output, Reply, Request, Response, SizeChange, Window, Workspace};
+use niri_ipc::{
+    Action, Output, Reply, Request, Response, SizeChange, Window, Workspace, WorkspaceReferenceArg,
+};
 use std::collections::HashMap;
 
 /// One niri request, one niri reply.
@@ -99,9 +101,11 @@ fn ask(transport: &mut impl Transport, request: Request) -> Result<Response, Str
 /// held no tiled columns, which is a no-op and not an error (and, since
 /// #1129, sends no reflow nudge either — there is no column to nudge). `Err`
 /// carries niri's own text for the first request that failed, resize or
-/// reflow; nothing is retried and no widths are rolled back, because a
-/// partially applied layout — even one whose reflow nudge itself failed
-/// partway — is still a coherent one and the next click fixes it.
+/// reflow. No widths are rolled back, because a partially applied layout is
+/// still a coherent one and the next click fixes it. A reflow nudge that fails
+/// partway is different: it would leave the leftmost column at the far end
+/// and focus where the nudge put it. So [`reflow`] puts both back,
+/// best-effort, before the error is returned.
 ///
 /// Always fetches `Outputs` (#1052), even for `equal`/`split`, which never
 /// look at it: `apply` doesn't special-case the layout when asking niri, only
@@ -152,26 +156,123 @@ pub(crate) fn apply(
     // window (`layout::plan`'s `BTreeMap` is keyed by column index), so no
     // second windows-in-column-order pass is needed. No columns → no nudge:
     // there is nothing to reflow, and no `FocusWindow` to steal focus for no
-    // reason. `windows` was fetched once, at the top of `apply`, before
-    // anything above changed niri's state — so "whatever had focus" here
-    // really does mean "before this apply ran".
+    // reason. `windows` and `workspaces` were fetched once, at the top of
+    // `apply`, before anything above changed niri's state — so "whatever had
+    // focus" in `reflow` really does mean "before this apply ran".
     if let Some(&(first_id, _)) = plan.first() {
-        ask(
-            transport,
-            Request::Action(Action::FocusWindow { id: first_id }),
-        )?;
-        ask(transport, Request::Action(Action::MoveColumnToFirst {}))?;
-        ask(transport, Request::Action(Action::MoveColumnToLast {}))?;
-        ask(transport, Request::Action(Action::MoveColumnToFirst {}))?;
-        if let Some(focused) = windows.iter().find(|w| w.is_focused) {
-            ask(
-                transport,
-                Request::Action(Action::FocusWindow { id: focused.id }),
-            )?;
-        }
+        reflow(transport, first_id, &windows, &workspaces)?;
     }
 
     Ok(plan.len())
+}
+
+/// [`apply`]'s #1129 reflow nudge, plus the two things it has to put back
+/// however it ends: the leftmost column's place, and focus.
+///
+/// The chain is `FocusWindow` (the leftmost column) → `MoveColumnToFirst` →
+/// `MoveColumnToLast` → `MoveColumnToFirst`. It is not atomic: niri can refuse
+/// any step, or the socket can go away between two of them. Once the
+/// `FocusWindow` has landed, a failure has always left something out of place:
+///
+/// * focus is on the leftmost column, not wherever the user had it;
+/// * a failure after `MoveColumnToLast` landed leaves the leftmost column as
+///   the **rightmost** one.
+///
+/// So once the chain has started, the put-back steps run however it ended. One
+/// more `MoveColumnToFirst` follows a failed move (a no-op unless the column
+/// was left at the end, since it is the leftmost column), and then
+/// [`restore_focus`]. Each is best-effort. The **first** error is returned, and
+/// a later one is logged rather than dropped.
+///
+/// A refused `FocusWindow` sends nothing further. Nothing has moved yet, focus
+/// included, so there is nothing to put back, and a focus "restore" sent then
+/// would act on a workspace that never lost focus (see [`restore_focus`] for why
+/// that is not harmless).
+fn reflow(
+    transport: &mut impl Transport,
+    first_id: u64,
+    windows: &[Window],
+    workspaces: &[Workspace],
+) -> Result<(), String> {
+    ask(
+        transport,
+        Request::Action(Action::FocusWindow { id: first_id }),
+    )?;
+    // The workspace the nudge just focused, for `restore_focus`'s one guard.
+    let nudged = windows
+        .iter()
+        .find(|w| w.id == first_id)
+        .and_then(|w| w.workspace_id);
+
+    let moved = [
+        Action::MoveColumnToFirst {},
+        Action::MoveColumnToLast {},
+        Action::MoveColumnToFirst {},
+    ]
+    .into_iter()
+    .try_for_each(|action| ask(transport, Request::Action(action)).map(drop));
+    if moved.is_err() {
+        // Every move acts on the focused column, and the focused column is
+        // still the leftmost one: none of the moves changes focus.
+        if let Err(e) = ask(transport, Request::Action(Action::MoveColumnToFirst {})) {
+            transport.log(&format!(
+                "[{PLUGIN_ID}] reflow: the first column was not moved back after a failed move: {e}"
+            ));
+        }
+    }
+
+    let restored = restore_focus(transport, windows, workspaces, nudged);
+    match (moved, restored) {
+        (Err(first), Err(later)) => {
+            transport.log(&format!(
+                "[{PLUGIN_ID}] reflow: focus was not restored after a failed move: {later}"
+            ));
+            Err(first)
+        }
+        (moved, restored) => moved.and(restored),
+    }
+}
+
+/// Put focus back where it was before [`apply`] ran, from the snapshots taken
+/// at its top. Three cases, in order:
+///
+/// 1. **A focused window**: focus it again, by id.
+/// 2. **No focused window, but the focused workspace has an active one**:
+///    keyboard focus was elsewhere, most likely on a layer-shell surface such
+///    as the shell's own drawer. Focusing that workspace's active window puts
+///    back the column the nudge moved off.
+/// 3. **The focused workspace is empty**: focus it by id. This is the case the
+///    restore used to skip. A click on a chip on one screen, with focus on an
+///    empty workspace on another, left focus on the clicked screen.
+///
+/// Case 3 is guarded: it never targets the workspace the nudge itself
+/// focused. A `FocusWorkspace` on the workspace that is already active on the
+/// active output is not a no-op under niri's `workspace-auto-back-and-forth`,
+/// which turns it into a switch to the *previous* workspace. That cannot happen
+/// on the path above, because an empty workspace is never the one with columns
+/// to lay out. The guard keeps it true if that ever changes.
+///
+/// With none of the three (niri reported no focused workspace at all), there
+/// is nothing to restore to and nothing is sent.
+fn restore_focus(
+    transport: &mut impl Transport,
+    windows: &[Window],
+    workspaces: &[Workspace],
+    nudged: Option<u64>,
+) -> Result<(), String> {
+    let focused_workspace = workspaces.iter().find(|w| w.is_focused);
+    let action = if let Some(window) = windows.iter().find(|w| w.is_focused) {
+        Action::FocusWindow { id: window.id }
+    } else if let Some(id) = focused_workspace.and_then(|w| w.active_window_id) {
+        Action::FocusWindow { id }
+    } else if let Some(workspace) = focused_workspace.filter(|w| Some(w.id) != nudged) {
+        Action::FocusWorkspace {
+            reference: WorkspaceReferenceArg::Id(workspace.id),
+        }
+    } else {
+        return Ok(());
+    };
+    ask(transport, Request::Action(action)).map(drop)
 }
 
 /// The line [`apply`] logs when [`Layout::Golden`] can't resolve a logical
@@ -375,6 +476,11 @@ pub(crate) mod fake {
         /// Fail the next `Action` the way niri itself would: an inner `Err`
         /// carrying niri's own text.
         pub(crate) action_error: Option<String>,
+        /// Fail the `Action` at each 0-based position (counted over every
+        /// `Action` sent, resizes included) with niri's own text. This is how a
+        /// test refuses one step of the reflow chain in the middle rather than
+        /// the first action of the apply.
+        pub(crate) failing_actions: HashMap<usize, String>,
         /// Fail every request at the transport layer (no socket at all).
         pub(crate) transport_error: Option<String>,
         pub(crate) seen: Vec<Request>,
@@ -392,6 +498,7 @@ pub(crate) mod fake {
                 focused_output: Some(output()),
                 outputs: HashMap::from([(OUTPUT.to_owned(), output())]),
                 action_error: None,
+                failing_actions: HashMap::new(),
                 transport_error: None,
                 seen: Vec::new(),
                 logs: Vec::new(),
@@ -470,10 +577,23 @@ pub(crate) mod fake {
                 Request::Workspaces => Ok(Response::Workspaces(self.workspaces.clone())),
                 Request::Outputs => Ok(Response::Outputs(self.outputs.clone())),
                 Request::FocusedOutput => Ok(Response::FocusedOutput(self.focused_output.clone())),
-                Request::Action(_) => match self.action_error.take() {
-                    Some(msg) => Err(msg),
-                    None => Ok(Response::Handled),
-                },
+                Request::Action(_) => {
+                    // This one is already in `seen`, so the count includes it.
+                    let position = self
+                        .seen
+                        .iter()
+                        .filter(|r| matches!(r, Request::Action(_)))
+                        .count()
+                        - 1;
+                    match self
+                        .action_error
+                        .take()
+                        .or_else(|| self.failing_actions.remove(&position))
+                    {
+                        Some(msg) => Err(msg),
+                        None => Ok(Response::Handled),
+                    }
+                }
                 other => Err(format!("fake got an unscripted request: {other:?}")),
             })
         }
@@ -1008,6 +1128,13 @@ mod tests {
 
     /// Mutation guard: dropping the reflow tail (or the restore step alone)
     /// must redden. `apply` must not stop at the resize half.
+    ///
+    /// It is also `restore_focus`'s back-and-forth guard. Here the focused
+    /// workspace is the one the nudge focused, and it names no active window.
+    /// So there is nothing to restore to, and a `FocusWorkspace` on it would be
+    /// a switch to the *previous* workspace under niri's
+    /// `workspace-auto-back-and-forth`. **Mutation:** drop the `!= nudged`
+    /// filter and a `FocusWorkspace` lands at the end of this chain.
     #[test]
     fn apply_reflow_chain_has_no_restore_step_when_nothing_is_focused() {
         let mut niri = Fake::two_columns(); // both windows unfocused
@@ -1028,6 +1155,153 @@ mod tests {
             ],
             "no window is focused, so the chain must end on the move back to \
              first — no trailing FocusWindow restore step"
+        );
+    }
+
+    /// Two columns with window 20 focused. The `Action` positions are 0–1 for
+    /// the resizes, then 2 `FocusWindow{10}`, 3 `MoveColumnToFirst`,
+    /// 4 `MoveColumnToLast`, 5 `MoveColumnToFirst`, then the restore.
+    fn focused_two_columns() -> Fake {
+        let mut focused = tile(20, 2);
+        focused.is_focused = true;
+        Fake::with(vec![tile(10, 1), focused])
+    }
+
+    /// The #1129 chain is not atomic, so whichever move niri refuses, the
+    /// column goes back to the front and focus goes back to window 20. The
+    /// error is still niri's own text for the refused step.
+    ///
+    /// Position 5 is the case that leaves real damage. `MoveColumnToLast`
+    /// landed, so before this the leftmost column stayed at the far end with
+    /// focus stolen onto it.
+    #[test]
+    fn a_reflow_refused_partway_still_puts_the_column_and_focus_back() {
+        for (position, step) in [
+            (3, "MoveColumnToFirst"),
+            (4, "MoveColumnToLast"),
+            (5, "MoveColumnToFirst"),
+        ] {
+            let mut niri = focused_two_columns();
+            niri.failing_actions
+                .insert(position, format!("refused {step}"));
+
+            let err = apply(&mut niri, Layout::Split, None).expect_err("niri refused a move");
+
+            assert_eq!(err, format!("refused {step}"), "position {position}");
+            let actions = all_action_wire_bytes(&niri);
+            assert_eq!(
+                actions.len(),
+                position + 1 + 2,
+                "position {position}: the chain stops at the refusal, then \
+                 exactly two put-back steps: {actions:?}"
+            );
+            assert_eq!(
+                actions[actions.len() - 2..],
+                [
+                    r#"{"Action":{"MoveColumnToFirst":{}}}"#.to_owned(),
+                    r#"{"Action":{"FocusWindow":{"id":20}}}"#.to_owned(),
+                ],
+                "position {position}: one more move to the front, then the \
+                 original focus: {actions:?}"
+            );
+        }
+    }
+
+    /// A refused `FocusWindow` on the leftmost column has moved nothing, focus
+    /// included, so nothing follows it: no move, and no focus "restore".
+    #[test]
+    fn a_refused_first_focus_sends_nothing_more() {
+        let mut niri = focused_two_columns();
+        niri.failing_actions.insert(2, "no such window".to_owned());
+
+        let err = apply(&mut niri, Layout::Split, None).expect_err("niri refused the focus");
+
+        assert_eq!(err, "no such window");
+        let actions = all_action_wire_bytes(&niri);
+        assert_eq!(
+            actions.len(),
+            3,
+            "the two resizes and the refused focus, nothing after: {actions:?}"
+        );
+    }
+
+    /// The moves landed but the restore was refused: that refusal is the
+    /// error, since it is the first one.
+    #[test]
+    fn a_refused_restore_is_the_error_when_the_moves_landed() {
+        let mut niri = focused_two_columns();
+        niri.failing_actions
+            .insert(6, "refused FocusWindow".to_owned());
+
+        let err = apply(&mut niri, Layout::Split, None).expect_err("niri refused the restore");
+
+        assert_eq!(err, "refused FocusWindow");
+    }
+
+    /// A move *and* the restore refused: the move's error is returned (it came
+    /// first), and the restore's is logged rather than dropped.
+    #[test]
+    fn the_first_reflow_error_wins_and_a_later_one_is_logged() {
+        let mut niri = focused_two_columns();
+        niri.failing_actions
+            .insert(4, "refused MoveColumnToLast".to_owned());
+        // 5 is the put-back `MoveColumnToFirst`, 6 the restore.
+        niri.failing_actions
+            .insert(6, "refused FocusWindow".to_owned());
+
+        let err = apply(&mut niri, Layout::Split, None).expect_err("niri refused twice");
+
+        assert_eq!(err, "refused MoveColumnToLast");
+        assert!(
+            niri.logs
+                .iter()
+                .any(|line| line.contains("refused FocusWindow")),
+            "the later error must reach the log: {:?}",
+            niri.logs
+        );
+    }
+
+    /// Focus on an **empty** workspace on one screen, and a click on the other
+    /// screen's chip. The nudge's `FocusWindow` moves focus to the clicked
+    /// screen. With no window to refocus, the restore used to send nothing and
+    /// focus stayed there. Now it focuses that workspace again, by id.
+    #[test]
+    fn focus_on_an_empty_workspace_elsewhere_is_restored_by_workspace_id() {
+        let mut niri = Fake::with(vec![fake::tile_on(30, 2, 1), fake::tile_on(40, 2, 2)]);
+        niri.workspaces = vec![
+            fake::workspace_on(1, fake::OUTPUT, true),
+            fake::workspace_on(2, fake::OTHER_OUTPUT, false),
+        ];
+        niri.outputs
+            .insert(fake::OTHER_OUTPUT.to_owned(), fake::other_output());
+
+        apply(&mut niri, Layout::Split, Some(fake::OTHER_OUTPUT))
+            .expect("the fake answers everything");
+
+        let actions = all_action_wire_bytes(&niri);
+        assert_eq!(
+            actions.last(),
+            Some(&r#"{"Action":{"FocusWorkspace":{"reference":{"Id":1}}}}"#.to_owned()),
+            "focus goes back to the empty workspace on DP-1: {actions:?}"
+        );
+    }
+
+    /// No window has focus, but the focused workspace names an active one. That
+    /// is keyboard focus on a layer-shell surface, the shell's drawer among
+    /// them. The nudge made the leftmost column active, so the restore makes
+    /// the workspace's own active column active again.
+    #[test]
+    fn a_workspaces_active_window_is_restored_when_no_window_has_focus() {
+        let mut niri = Fake::with(vec![tile(10, 1), tile(20, 2), tile(30, 3)]);
+        niri.workspaces[0].active_window_id = Some(30);
+
+        apply(&mut niri, Layout::Equal, None).expect("the fake answers everything");
+
+        let actions = all_action_wire_bytes(&niri);
+        assert_eq!(
+            actions.last(),
+            Some(&r#"{"Action":{"FocusWindow":{"id":30}}}"#.to_owned()),
+            "the workspace's active column, not the leftmost one: {actions:?}"
         );
     }
 

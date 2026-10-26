@@ -81,7 +81,11 @@
 //! [`refuse_build`] is the call, and both ride the per-surface
 //! `(grid, program)` latch that already bounds the compile and the journal
 //! line — **once per surface per refused build**, and again after a context
-//! recreate, which clears that latch. Pushed rather than polled, unlike the
+//! recreate, which clears that latch. **Only a compile or link refusal is
+//! pushed**: a build that fails for this surface's grid (one wider than the
+//! driver's `GL_MAX_TEXTURE_SIZE`, say) is latched and logged for that surface
+//! alone, because a host's fallback is per program and must not take every
+//! other chip of the kind down with it — see `refusal_is_the_programs`. Pushed rather than polled, unlike the
 //! `build_refused()` accessor this replaced (PR #1199 review, LOW 5): that one
 //! shipped with its host half deferred, nothing in the tree ever read it, and
 //! a question only a per-frame walk of every reconciled tree could ask is not
@@ -358,7 +362,8 @@ thread_local! {
     /// [`set_build_refusal_handler`]. Called **once per surface per refused
     /// `(grid, program)`**, unlike [`ON_CONTEXT_FAILURE`]'s once-for-the-
     /// process: a refusal is a fact about one pipeline, and a host that has
-    /// several is entitled to keep the ones that build.
+    /// several is entitled to keep the ones that build. Compile and link
+    /// refusals only — see `refusal_is_the_programs`.
     ///
     /// Boxed and taken out of the slot for the duration of a call, both for
     /// [`ON_CONTEXT_FAILURE`]'s reasons.
@@ -426,6 +431,13 @@ pub fn set_context_failure_handler(handler: impl Fn(&str) + 'static) {
 /// life of that context** — the build is latched, deliberately (#1180 item 2),
 /// so nothing retries it and nothing writes a second journal line.
 ///
+/// **Compile and link failures only.** A build refused for a reason that is
+/// the surface's rather than the program's — a grid past the driver's
+/// `GL_MAX_TEXTURE_SIZE`, a refused allocation, an incomplete framebuffer —
+/// is latched and logged for that surface and never reaches this hook, so a
+/// host's per-program fallback cannot be triggered by one plugin's oversized
+/// widget on behalf of every other plugin's.
+///
 /// # How often it fires
 ///
 /// **Once per surface per refused `(grid, program)`**, because it rides the
@@ -454,7 +466,9 @@ pub fn set_build_refusal_handler(handler: impl Fn(GlProgram, (u32, u32), &str) +
 /// log, verbatim).
 ///
 /// Called by [`GlSurface`] itself from the one place a build can be refused,
-/// behind the per-surface latch that makes it once-per-`(grid, program)`.
+/// behind the per-surface latch that makes it once-per-`(grid, program)`, and
+/// only for a compile or link failure — a refusal that is the program's on
+/// this driver rather than one surface's (see [`set_build_refusal_handler`]).
 /// Public for [`abandon_gl`]'s reason, and it is the same reason word for
 /// word: a driver that refuses one pipeline is not something a hermetic test
 /// can arrange, but "behave as if the driver had refused" is exactly one call
@@ -1016,6 +1030,12 @@ const PIPELINE_BUILD_REFUSED: &str = "a GL pipeline could not be built; the surf
 /// arbitrary code that rebuilds widgets and may write lines of its own, and a
 /// reader should find the cause above the consequence.
 ///
+/// **Only a refusal that is the program's reaches the host** — see
+/// [`refusal_is_the_programs`]. Every refusal is latched and logged here, per
+/// surface, exactly as before; the hook is the part a host turns into a
+/// process-wide fallback, so it only hears about the failures that are true
+/// of every surface on that program.
+///
 /// Returns whether the refusal was news — which is what the hermetic tests
 /// read, and the reason this is a free function rather than four lines inside
 /// `imp::GlSurface::ensure_resources`: that one needs a live `hgl::Gl` and a
@@ -1036,8 +1056,45 @@ fn report_build_refusal(
         "{}",
         PIPELINE_BUILD_REFUSED
     );
-    refuse_build(program, grid, &error.to_string());
+    if refusal_is_the_programs(error) {
+        refuse_build(program, grid, &error.to_string());
+    }
     true
+}
+
+/// Whether a refused build is a fact about the **program** on this driver —
+/// true of every surface pointed at it, so worth the host's fallback — or
+/// about **this surface's** grid or this moment's driver state.
+///
+/// Only a compile or link failure is the program's: the same GLSL fails the
+/// same way at every grid. Everything else `Resources::build` can return is
+/// not, and reporting it was a cross-plugin outage: trollshell's hook records
+/// the *program name* in a set nothing clears and puts every chip of that
+/// kind, from every plugin, on the placeholder for the session. A grid past
+/// this driver's `GL_MAX_TEXTURE_SIZE` ([`hgl::Error::TextureSize`]) is the
+/// sharp case — the wire allows strips up to 16 384 px (`hytte-plugin-proto`'s
+/// `MAX_STRIP_DIM`) and plenty of drivers cap at 8192 or below — so one
+/// plugin's over-wide dot matrix blanked every dot matrix on the bar. The
+/// rest are the same shape: an [`Extent`](hgl::Error::Extent) is this grid's,
+/// a [`Storage`](hgl::Error::Storage) refusal is this size or this moment's
+/// memory, a [`Framebuffer`](hgl::Error::Framebuffer) status is this
+/// attachment's, a [`Name`](hgl::Error::Name) is one `glGen*` that did not
+/// answer. Those stay where [`RefusedBuilds`] already keeps them: latched for
+/// this surface at this `(grid, program)`, so a different grid is asked
+/// afresh.
+///
+/// An exhaustive `match` rather than `matches!`, so a new `hgl::Error`
+/// variant is a compile error here instead of silently landing on one side.
+fn refusal_is_the_programs(error: &hgl::Error) -> bool {
+    match error {
+        hgl::Error::Compile { .. } | hgl::Error::Link { .. } => true,
+        hgl::Error::Load { .. }
+        | hgl::Error::Framebuffer { .. }
+        | hgl::Error::Extent { .. }
+        | hgl::Error::TextureSize { .. }
+        | hgl::Error::Name { .. }
+        | hgl::Error::Storage { .. } => false,
+    }
 }
 
 mod imp {
@@ -2308,6 +2365,82 @@ mod imp {
             );
         }
 
+        /// A grid this driver will not allocate is **that surface's**
+        /// refusal: latched for it, built once, and never reported to the
+        /// host's per-program hook — while the same program at a grid the
+        /// driver takes still builds, on another surface, in the same
+        /// context.
+        ///
+        /// The real input, not a stand-in: a grid wider than any
+        /// `GL_MAX_TEXTURE_SIZE` but inside `GLsizei`, which `Texture::new`
+        /// refuses as `TextureSize` from the limit alone, before anything is
+        /// allocated. Shipped, that refusal went to `refuse_build` like a
+        /// compile failure, and trollshell's handler put the whole program on
+        /// the placeholder for the session — every chip of the kind, from
+        /// every plugin, for one plugin's over-wide strip. The hermetic
+        /// `a_surfaces_own_refusal_is_latched_but_never_reaches_the_host`
+        /// pins the classification; this pins that the error a real driver
+        /// hands `ensure_resources` for this input is one it classifies as
+        /// the surface's.
+        ///
+        /// **Falsified** by reverting `report_build_refusal` to call
+        /// `refuse_build` for every error: the hook records the over-limit
+        /// grid.
+        #[gtk::test]
+        fn an_over_limit_grid_is_its_own_surfaces_refusal_not_the_programs() {
+            let Some((_window, _area, gl)) =
+                real_gl_or_skip("an_over_limit_grid_is_its_own_surfaces_refusal_not_the_programs")
+            else {
+                return;
+            };
+            let seen: Refusals = std::rc::Rc::new(RefCell::new(Vec::new()));
+            let sink = std::rc::Rc::clone(&seen);
+            super::super::set_build_refusal_handler(move |program, grid, reason| {
+                sink.borrow_mut().push((program.0, grid, reason.to_owned()));
+            });
+
+            let pipeline = GlPipeline {
+                aux: 0,
+                step: &[],
+                frame: &ONE_PASS,
+            };
+            let program = GlProgram("gl_surface_test.over_limit_grid");
+            // Past every driver's limit (GLES 3.2 guarantees 2048; desktop
+            // parts top out at 32 768), and still a positive `GLsizei`.
+            let too_wide = (1 << 30, 1);
+
+            let oversized = GlSurface::default();
+            BUILD_ATTEMPTS.set(0);
+            for frame in 0..3 {
+                assert!(
+                    !oversized.ensure_resources(&gl, &pipeline, program, too_wide, frame),
+                    "no driver allocates a {}-texel-wide texture",
+                    too_wide.0,
+                );
+            }
+            assert_eq!(BUILD_ATTEMPTS.get(), 1, "still built once, not per frame");
+            assert!(
+                oversized
+                    .refused_builds
+                    .borrow()
+                    .refused((too_wide, program)),
+                "…because it is still latched for this surface",
+            );
+            assert!(
+                seen.borrow().is_empty(),
+                "an over-limit grid is this surface's refusal and must not reach the host's \
+                 per-program fallback, got {:?}",
+                seen.borrow(),
+            );
+
+            let fitting = GlSurface::default();
+            assert!(
+                fitting.ensure_resources(&gl, &pipeline, program, (4, 4), 0),
+                "the same program at a grid the driver takes builds — the kind was never \
+                 refused",
+            );
+        }
+
         /// **PR #1199 review, MEDIUM 1.** A refusal latched under one
         /// `GdkGLContext` must not survive that context: after an unrealize /
         /// re-realize the driver is asked again, and a second refusal writes a
@@ -2893,9 +3026,9 @@ mod tests {
         GlValue, MAX_STEPS_PER_RENDER, PIPELINE_BUILD_REFUSED, PROGRAM_UNREGISTERED_REFUSED,
         REFUSED_BUILDS, RENDER_TARGET_REFUSED, RefusedBuilds, WARNED_LENGTHS, WarnLatch,
         abandon_gl, fit_rect, framebuffer_status_key, fresh_last_drawn, gl_abandoned, hgl,
-        last_drawn_after, program_key, refuse_build, refuse_data_strip, report_build_refusal,
-        resources_reusable, set_build_refusal_handler, steps_owed, warn_on_data_failure,
-        warn_on_target_failure,
+        last_drawn_after, program_key, refusal_is_the_programs, refuse_build, refuse_data_strip,
+        report_build_refusal, resources_reusable, set_build_refusal_handler, steps_owed,
+        warn_on_data_failure, warn_on_target_failure,
     };
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -3172,12 +3305,14 @@ mod tests {
         let seen = recording_handler();
         let latch = RefCell::new(RefusedBuilds::default());
         let program = GlProgram("gl_surface_test.refusal_hook");
-        // `Error::Name` rather than a `Compile`: it is the one arm of
-        // `hgl::Error` a test can build with no driver and no info log, and
-        // `Resources::build` reaches it through `VertexArray::new` (#1180
-        // item 4), so it is a refusal this call site really can see.
-        let error = hgl::Error::Name {
-            object: "vertex array",
+        // A `Compile`, built by hand: the refusal shape the hook exists for,
+        // and since `refusal_is_the_programs` the only kind (with `Link`)
+        // that reaches it. It used to be an `Error::Name` here, which a
+        // refusal for one surface's own reasons no longer reports — see
+        // `a_surfaces_own_refusal_is_latched_but_never_reaches_the_host`.
+        let error = hgl::Error::Compile {
+            stage: hgl::Stage::Fragment,
+            log: "0:3: 'frag_colour' : undeclared identifier".to_owned(),
         };
 
         assert!(
@@ -3201,7 +3336,7 @@ mod tests {
         );
         assert_eq!(seen.borrow()[0].1, (4, 4), "…at which grid");
         assert!(
-            seen.borrow()[0].2.contains("vertex array"),
+            seen.borrow()[0].2.contains("undeclared identifier"),
             "…in the driver's own words, which is the only triage there is: got {:?}",
             seen.borrow()[0].2,
         );
@@ -3211,6 +3346,88 @@ mod tests {
         assert!(report_build_refusal(&latch, ((8, 4), program), &error));
         assert_eq!(seen.borrow().len(), 2, "a new grid is a new refusal");
         assert_eq!(seen.borrow()[1].1, (8, 4));
+    }
+
+    /// A build refused for **this surface's** reasons is latched and logged
+    /// for the surface, exactly like a compile failure — and never reaches
+    /// the host's hook, which a host turns into a fallback for every chip of
+    /// the program.
+    ///
+    /// The bug this pins: `report_build_refusal` called `refuse_build` for
+    /// every error, and trollshell's handler records the program *name* in a
+    /// set nothing clears. So one plugin's dot matrix wider than this
+    /// driver's `GL_MAX_TEXTURE_SIZE` — legal on the wire up to 16 384 px,
+    /// refused by any driver capped below that — put every dot matrix from
+    /// every plugin on the placeholder for the rest of the session. The
+    /// `TextureSize` row is that input, word for word.
+    ///
+    /// Each surface-side error is asserted to be news (so it is still
+    /// latched: no per-frame rebuild, one journal line) and then *not*
+    /// reported; `Compile` and `Link` are asserted to report, so the
+    /// classification cannot pass by reporting nothing.
+    ///
+    /// **Falsified** by reverting `report_build_refusal` to call
+    /// `refuse_build` unconditionally (the first loop's hook count leaves
+    /// 0), or by moving any surface-side variant into
+    /// `refusal_is_the_programs`'s `true` arm.
+    #[test]
+    fn a_surfaces_own_refusal_is_latched_but_never_reaches_the_host() {
+        let seen = recording_handler();
+        let latch = RefCell::new(RefusedBuilds::default());
+        let program = GlProgram("gl_surface_test.surface_side_refusal");
+        let surface_side = [
+            hgl::Error::TextureSize {
+                size: (16_384, 7),
+                limit: 8192,
+            },
+            hgl::Error::Extent { size: (0, 7) },
+            hgl::Error::Storage {
+                size: (4096, 7),
+                code: 0x0505,
+            },
+            hgl::Error::Framebuffer { status: 0x8cdd },
+            hgl::Error::Name {
+                object: "vertex array",
+            },
+        ];
+        for (n, error) in surface_side.iter().enumerate() {
+            let grid = (u32::try_from(n).unwrap_or(0) + 1, 7);
+            assert!(!refusal_is_the_programs(error), "{error}");
+            assert!(
+                report_build_refusal(&latch, (grid, program), error),
+                "a surface-side refusal is still news for its own surface: {error}",
+            );
+            assert!(
+                latch.borrow().refused((grid, program)),
+                "…and still latched, so the surface does not rebuild it every frame: {error}",
+            );
+        }
+        assert!(
+            seen.borrow().is_empty(),
+            "a refusal that is one surface's must never reach the per-program host hook, got \
+             {:?}",
+            seen.borrow(),
+        );
+
+        let program_side = [
+            hgl::Error::Compile {
+                stage: hgl::Stage::Vertex,
+                log: "0:1: syntax error".to_owned(),
+            },
+            hgl::Error::Link {
+                log: "varying mismatch".to_owned(),
+            },
+        ];
+        for (n, error) in program_side.iter().enumerate() {
+            let grid = (u32::try_from(n).unwrap_or(0) + 100, 7);
+            assert!(refusal_is_the_programs(error), "{error}");
+            assert!(report_build_refusal(&latch, (grid, program), error));
+        }
+        assert_eq!(
+            seen.borrow().len(),
+            2,
+            "…while a compile or link refusal, true of every surface on the program, does",
+        );
     }
 
     /// **#1232.** The hook may re-enter this module, because a host's handler

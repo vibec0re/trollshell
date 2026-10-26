@@ -92,6 +92,9 @@ mod collection;
 /// file per step.
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
 
+/// The refusal a row shows when there is no overlay path to write to.
+const NO_OVERLAY: &str = "nowhere to write: neither $XDG_CONFIG_HOME nor $HOME is set";
+
 /// How often a mounted form re-reads its layers. The Places tab's cadence,
 /// and the Plugins tab's — the same 2 s an out-of-band `$EDITOR` save or a
 /// `nixos-rebuild` is picked up in everywhere else in this app.
@@ -321,9 +324,13 @@ pub(crate) fn shell_families() -> Vec<FamilyOps> {
 /// A mounted form: the groups to add to a page, and everything that keeps
 /// them in step with the file.
 ///
-/// Dropping it stops the poll and cancels any pending debounced save — so a
-/// caller tears a form down by dropping its handle after removing the groups
-/// from its page, and nothing is left ticking against widgets nobody shows.
+/// Dropping it stops the poll and **writes** any debounced save that has not
+/// fired yet rather than losing it — so a caller tears a form down by
+/// dropping its handle after removing the groups from its page, nothing is
+/// left ticking against widgets nobody shows, and an edit made inside the
+/// last [`SAVE_DEBOUNCE`] still reaches the file. A window that is closing
+/// calls [`Form::flush_pending_saves`] first, which is the same write with
+/// the re-read and the refusal-on-the-row a timer firing would have done.
 pub(crate) struct Form {
     inner: Rc<FormInner>,
 }
@@ -396,8 +403,19 @@ impl Drop for FormInner {
         if let Some(poll) = self.poll.take() {
             poll.remove();
         }
-        for row in &self.rows {
-            row.cancel_pending_save();
+        // An edit still inside its debounce window is **written**, not
+        // cancelled: cancelling it is how a change made just before the
+        // selection moved — or just before the window closed — used to vanish
+        // with no refusal anywhere. Only the write, though: the rows are on
+        // their way out, so there is nothing to re-read into and nobody to
+        // show a refusal to, and a drop can run from inside a parent's
+        // `popped` handler, which is no place to re-render a drill-down (see
+        // `write_on_drop`). The sub-pages' own forms flush the same way when
+        // `pop_all` below drops them.
+        for (index, row) in self.rows.iter().enumerate() {
+            if let Some(pending) = row.pending.take() {
+                self.write_on_drop(index, pending.disarm());
+            }
         }
         // A form can be unmounted while one of its collection pages is on
         // screen — `plugins_tab::unmount_config` drops the handle the moment
@@ -644,6 +662,33 @@ impl Form {
             }
         })
     }
+
+    /// Perform every debounced save that has not fired yet — this form's and
+    /// every open collection sub-page's — **now**, exactly as its timer would
+    /// have: the write, then the re-read, or the refusal on its row.
+    ///
+    /// What the window's close handler calls (through
+    /// `plugins_tab::build_page`'s third return value). A change sits for
+    /// [`SAVE_DEBOUNCE`] before it is written, and the window used to close
+    /// over it: the poll timers went, the forms were dropped with their
+    /// pending saves cancelled, and the last edit was gone with nothing on
+    /// screen or in the journal saying so.
+    pub(crate) fn flush_pending_saves(&self) {
+        self.inner.flush_pending_saves();
+    }
+
+    /// [`Self::flush_pending_saves`] as a callable that does not hold the
+    /// form — so a caller can take it out of a `RefCell` and drop the borrow
+    /// before the saves run (#643: a save re-reads and redraws, and GTK emits
+    /// synchronously into whatever handlers that wakes).
+    pub(crate) fn flusher(&self) -> impl Fn() + 'static {
+        let weak = Rc::downgrade(&self.inner);
+        move || {
+            if let Some(inner) = weak.upgrade() {
+                inner.flush_pending_saves();
+            }
+        }
+    }
 }
 
 impl FormInner {
@@ -745,31 +790,12 @@ impl FormInner {
         let Some(row) = self.rows.get(index) else {
             return;
         };
-        let Some(overlay) = self.overlay.as_ref() else {
-            row.show_error("nowhere to write: neither $XDG_CONFIG_HOME nor $HOME is set");
+        let Some(written) = self.write(row, value) else {
+            row.show_error(NO_OVERLAY);
             // #1371 L1: see the `Err` arm below — the same snap-back applies
             // to this earlier refusal.
             self.apply(&self.raw.borrow());
             return;
-        };
-        let locked = self.raw.borrow().locked.clone();
-        let written = match &self.subject {
-            Subject::Leaves { .. } => self.write_leaf(overlay, row, value, &locked),
-            Subject::Element {
-                array,
-                index,
-                key_field,
-            } => self.write_element(
-                overlay,
-                ElementAt {
-                    array,
-                    index: *index,
-                    key_field: *key_field,
-                },
-                row,
-                value,
-                &locked,
-            ),
         };
         match written {
             Ok(()) => {
@@ -797,6 +823,90 @@ impl FormInner {
                 // is what runs `Row::apply`'s own snap-back branch; `Text`
                 // and `Colour` are unaffected — they are drafts (#1338).
                 self.apply(&self.raw.borrow());
+            }
+        }
+    }
+
+    /// [`Self::save`]'s I/O half: write `row`'s value to the overlay, with
+    /// nothing re-read and nothing redrawn. `None` when there is no overlay
+    /// to write to ([`NO_OVERLAY`]).
+    fn write(&self, row: &Row, value: Option<toml_edit::Value>) -> Option<Result<(), ConfigError>> {
+        let overlay = self.overlay.as_ref()?;
+        let locked = self.raw.borrow().locked.clone();
+        Some(match &self.subject {
+            Subject::Leaves { .. } => self.write_leaf(overlay, row, value, &locked),
+            Subject::Element {
+                array,
+                index,
+                key_field,
+            } => self.write_element(
+                overlay,
+                ElementAt {
+                    array,
+                    index: *index,
+                    key_field: *key_field,
+                },
+                row,
+                value,
+                &locked,
+            ),
+        })
+    }
+
+    /// A pending save, written as the form is dropped — [`Self::write`] and
+    /// a journal line on refusal, and nothing else.
+    ///
+    /// Not [`Self::save`]: that re-reads and redraws, and a drop is the wrong
+    /// moment for either. The rows are leaving the screen, so a refusal on
+    /// one would be shown to nobody; and a sub-page's form is dropped from
+    /// inside its parent's `popped` handler, which holds the parent's
+    /// [`Self::open`] — re-rendering a drill-down from there is the #643
+    /// shape. The write alone touches only this form's own cells and the
+    /// file, and with the strong count already at zero no handler can
+    /// upgrade back into it. The parent picks the change up on its next read
+    /// (the record page's empty-record sweep re-reads first for exactly this
+    /// reason — see `collection::prune_empty_record`).
+    fn write_on_drop(&self, index: usize, value: Option<toml_edit::Value>) {
+        let Some(row) = self.rows.get(index) else {
+            return;
+        };
+        let refusal = match self.write(row, value) {
+            Some(Ok(())) => return,
+            Some(Err(err)) => err.to_string(),
+            None => NO_OVERLAY.to_owned(),
+        };
+        tracing::warn!(
+            family = self.ops.family.name,
+            key = row.key.as_str(),
+            refusal,
+            "a settings row's last edit was refused as its form closed"
+        );
+    }
+
+    /// Perform every pending debounced save now — see
+    /// [`Form::flush_pending_saves`].
+    ///
+    /// The sub-pages first, through weak handles taken while `open` is
+    /// borrowed and called after it is not: a sub-form's save re-reads, and
+    /// re-reading can pop pages, which takes the same cell (#643). Then this
+    /// form's own rows, in schema order. Each goes through [`Self::save`],
+    /// so a flushed write is indistinguishable from its timer firing — and
+    /// its timer is removed first, so it cannot also fire afterwards.
+    fn flush_pending_saves(&self) {
+        let subs: Vec<Weak<Self>> = self
+            .open
+            .borrow()
+            .iter()
+            .filter_map(collection::SubPage::form)
+            .collect();
+        for sub in subs {
+            if let Some(sub) = sub.upgrade() {
+                sub.flush_pending_saves();
+            }
+        }
+        for (index, row) in self.rows.iter().enumerate() {
+            if let Some(pending) = row.pending.take() {
+                self.save(index, pending.disarm());
             }
         }
     }
@@ -1019,13 +1129,19 @@ impl FormInner {
         let source = glib::timeout_add_local_once(SAVE_DEBOUNCE, move || {
             // Before anything else: this source has fired, so the id in the
             // cell is dead and removing it later would be the "programmer
-            // error" `SourceId::remove` documents.
-            pending.set(None);
+            // error" `SourceId::remove` documents. The value travels in the
+            // cell rather than in this closure so a flush can write it
+            // without waiting for the timer (`flush_pending_saves`); a flush
+            // removes this source before taking it, so an empty cell here is
+            // unreachable, and the early return is only what keeps it total.
+            let Some(PendingSave { value, .. }) = pending.take() else {
+                return;
+            };
             if let Some(inner) = weak.upgrade() {
                 inner.save(index, value);
             }
         });
-        row.pending.set(Some(source));
+        *row.pending.borrow_mut() = Some(PendingSave { source, value });
     }
 }
 
@@ -1078,8 +1194,9 @@ struct Row {
     /// Removes the operator's own line for this key. Absent on a read-only
     /// row, where there is nothing to remove.
     reset: Option<gtk::Button>,
-    /// A debounced save that has not fired yet.
-    pending: Rc<Cell<Option<glib::SourceId>>>,
+    /// A debounced save that has not fired yet — its timer, and what it will
+    /// write.
+    pending: Rc<RefCell<Option<PendingSave>>>,
     /// **What the file last said for this key**, which is what a re-render
     /// compares against — never the widget's own text, which is the
     /// operator's draft until they apply it (#1338).
@@ -1225,7 +1342,7 @@ impl Row {
             control,
             note,
             reset,
-            pending: Rc::new(Cell::new(None)),
+            pending: Rc::new(RefCell::new(None)),
             seen: RefCell::new(None),
             failed: Cell::new(false),
         }
@@ -1594,11 +1711,36 @@ impl Row {
         }
     }
 
-    /// Drop a debounced save that has not fired yet.
+    /// Drop a debounced save that has not fired yet — only ever because a
+    /// newer one for the same row replaces it ([`FormInner::schedule_save`]).
     fn cancel_pending_save(&self) {
-        if let Some(source) = self.pending.take() {
-            source.remove();
+        if let Some(pending) = self.pending.take() {
+            // The superseded value goes with its timer: the newer save
+            // carries the row's whole value, not a delta on this one.
+            let _superseded = pending.disarm();
         }
+    }
+}
+
+/// A debounced save that has not fired yet ([`Row::pending`]).
+///
+/// The value lives here rather than only in the timer's closure so that it
+/// can be written **without** the timer: by [`FormInner::flush_pending_saves`]
+/// when the window closes, and by `FormInner`'s `Drop` when the form is
+/// unmounted. Before that, both of those removed the source and the closure
+/// — and the operator's last edit with it — went unrun.
+struct PendingSave {
+    /// The `SAVE_DEBOUNCE` timer that writes [`Self::value`] when it fires.
+    source: glib::SourceId,
+    /// What the save writes; `None` removes the operator's line (a reset).
+    value: Option<toml_edit::Value>,
+}
+
+impl PendingSave {
+    /// Stop the timer and hand back what it would have written.
+    fn disarm(self) -> Option<toml_edit::Value> {
+        self.source.remove();
+        self.value
     }
 }
 
@@ -4585,6 +4727,106 @@ mod gtk_tests {
             Scratch::read(&overlay),
             first_file(fixture::DEFAULT_TOML, "count = 7\n"),
             "the last value, and exactly one leaf"
+        );
+    }
+
+    /// A change still inside the debounce window is written by a flush —
+    /// what the window's close handler runs — at once, and exactly once.
+    ///
+    /// Before this the close handler removed the poll timers and the window
+    /// went down with the form; the pending save sat in a timer nobody ran,
+    /// so a switch flipped in the last 300 ms before closing never reached
+    /// the file.
+    ///
+    /// **Red if `flush_pending_saves` is a no-op**: nothing is on disk when
+    /// it returns. **Red if it leaves the timer armed**: the cell still holds
+    /// a pending save, which would write a second time.
+    #[gtk::test]
+    fn a_flush_writes_a_change_still_inside_the_debounce_window() {
+        let scratch = Scratch::new();
+        let form = fixture_form(&scratch, None);
+        let overlay = scratch.overlay("form-fixture");
+        let Control::Spin { row, .. } = &row_of(&form, "count").control else {
+            panic!("an Int is a spin row");
+        };
+        row.set_value(7.0);
+        while glib::MainContext::default().iteration(false) {}
+        assert!(!overlay.exists(), "the change is still debounced");
+
+        form.flush_pending_saves();
+        assert_eq!(
+            Scratch::read(&overlay),
+            first_file(fixture::DEFAULT_TOML, "count = 7\n"),
+            "the flush wrote the pending value, and only it"
+        );
+        assert!(
+            row_of(&form, "count").pending.borrow().is_none(),
+            "the flushed save's timer is still armed"
+        );
+        assert_eq!(
+            note_of(&form, "count"),
+            "Yours",
+            "a flush re-reads exactly as its timer would have"
+        );
+
+        // …and nothing writes again once the window would have elapsed.
+        settle_nothing();
+        assert_eq!(
+            Scratch::read(&overlay),
+            first_file(fixture::DEFAULT_TOML, "count = 7\n")
+        );
+    }
+
+    /// Dropping a form **writes** its pending save rather than cancelling
+    /// it — the Plugins tab drops a plugin's form the moment the selection
+    /// moves, and a collection sub-page drops its own on Back.
+    ///
+    /// **Red with the drop cancelling** (what it did before): the overlay is
+    /// never created.
+    #[gtk::test]
+    fn dropping_a_form_writes_its_pending_save() {
+        let scratch = Scratch::new();
+        let form = fixture_form(&scratch, None);
+        let overlay = scratch.overlay("form-fixture");
+        let Control::Switch(switch) = &row_of(&form, "flag").control else {
+            panic!("a Bool is a switch row");
+        };
+        switch.set_active(!switch.is_active());
+        let line = format!("flag = {}", switch.is_active());
+        drop(form);
+        assert!(
+            wrote(&Scratch::read(&overlay), &line),
+            "the pending save went down with the form: {:?}",
+            Scratch::read(&overlay)
+        );
+        settle_nothing();
+        assert!(wrote(&Scratch::read(&overlay), &line));
+    }
+
+    /// A flush reaches an open collection sub-page's pending save, too: the
+    /// sub-page's form has a debounce of its own, and the window closing
+    /// over it is the same loss one level down.
+    ///
+    /// **Red without the sub-page walk** in `FormInner::flush_pending_saves`:
+    /// the parent has nothing pending, so nothing is written.
+    #[gtk::test]
+    fn a_flush_reaches_an_open_sub_pages_pending_save() {
+        let scratch = Scratch::new();
+        let page = mounted(
+            &scratch,
+            Some("[entry.one]\nname = \"the first\"\nicon = \"star\"\n"),
+        );
+        let overlay = scratch.overlay("form-fixture");
+        page.open("entry");
+        page.activate_row("one");
+        page.type_into("Icon", "moon");
+        assert!(!overlay.exists(), "the change is still debounced");
+
+        page.form.flush_pending_saves();
+        assert!(
+            wrote(&Scratch::read(&overlay), "icon = \"moon\""),
+            "the sub-page's pending save was not flushed: {:?}",
+            Scratch::read(&overlay)
         );
     }
 

@@ -93,7 +93,16 @@ pub(super) struct SubPage {
     on_pop: Option<Box<dyn FnOnce()>>,
     /// A sub-form's handle, when this page has one — held so its widgets and
     /// its row handlers live exactly as long as the page does.
-    _form: Option<Form>,
+    form: Option<Form>,
+}
+
+impl SubPage {
+    /// This page's own form, weakly, when it has one — what
+    /// [`FormInner::flush_pending_saves`] reaches a drill-down's pending
+    /// saves through without holding [`FormInner::open`] while they run.
+    pub(super) fn form(&self) -> Option<Weak<FormInner>> {
+        self.form.as_ref().map(|form| Rc::downgrade(&form.inner))
+    }
 }
 
 impl Drop for SubPage {
@@ -305,7 +314,7 @@ fn map_page(
         page: navigation,
         refresh,
         on_pop: None,
-        _form: None,
+        form: None,
     }
 }
 
@@ -673,7 +682,7 @@ fn entry_page(
         page: navigation,
         refresh,
         on_pop: None,
-        _form: Some(form),
+        form: Some(form),
     }
 }
 
@@ -869,7 +878,7 @@ fn list_page(
         page: navigation,
         refresh,
         on_pop: None,
-        _form: None,
+        form: None,
     }
 }
 
@@ -1125,7 +1134,7 @@ fn records_page(
         page: navigation,
         refresh,
         on_pop: None,
-        _form: None,
+        form: None,
     }
 }
 
@@ -1424,7 +1433,7 @@ fn record_page(
         page: navigation,
         refresh,
         on_pop: Some(on_pop),
-        _form: Some(form),
+        form: Some(form),
     }
 }
 
@@ -1443,6 +1452,18 @@ fn prune_empty_record(weak: &Weak<FormInner>, key: &str, index: usize) {
     let Some(inner) = weak.upgrade() else {
         return;
     };
+    // Judge the file, not the last poll's read of it. The page being swept
+    // just dropped its own form, and a form that is dropped **writes** the
+    // edit still inside its debounce window (`FormInner::write_on_drop`) —
+    // so an element this form last read as `{}` may well carry the field the
+    // operator set a moment before pressing Back. Sweeping on the cached
+    // read would remove that element, and the edit with it. A read that
+    // failed leaves the cached one in place and raises the banner, and a
+    // layer nobody can read is no reason to rewrite one, so that is a no-op.
+    inner.reload(false);
+    if inner.banner.is_visible() {
+        return;
+    }
     let empty =
         super::element_of(&inner.raw.borrow(), key, index).is_some_and(toml::Table::is_empty);
     if !empty {

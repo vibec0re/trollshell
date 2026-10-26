@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use hytte::adw;
@@ -590,7 +590,16 @@ thread_local! {
     /// `borrow_mut()` counterparties that make a held shared borrow a hazard;
     /// a `BorrowMutError` unwinding through a glib callback aborts the process.
     /// Mirrors `overlays::osd`'s `OSDS`.
-    static PANELS: RefCell<HashMap<String, Rc<ModalPanel>>> = RefCell::new(HashMap::new());
+    ///
+    /// A `BTreeMap` rather than a `HashMap`, on `overlays::dialog`'s (#1361)
+    /// and `overlays::notifications`' (#1535) precedent: [`open_on_focused`]
+    /// and [`open_plugin_on_focused`] fall back to the **first** drawer when
+    /// niri's focused output is unknown, and on two monitors hash order made
+    /// that an arbitrary screen, free to differ from one keybind to the next.
+    /// Sorted, it is the same connector every time, and the same one the
+    /// dialog and the toasts fall back to.
+    static PANELS: RefCell<BTreeMap<String, Rc<ModalPanel>>> =
+        const { RefCell::new(BTreeMap::new()) };
     /// Per-connector "which built-in page is the drawer showing" state
     /// ([`ModalPanel::shown_page`]), decoupled from `ModalPanel` lifetime so
     /// subscribers (the OSD) can wire up before `install` runs and survive bar
@@ -709,6 +718,25 @@ fn set_current(panel: &ModalPanel, active: Option<Active>) {
     let page = active.as_ref().and_then(Active::builtin);
     *panel.current.borrow_mut() = active;
     panel.shown_page.set_neq(page);
+}
+
+/// Whether `panel`'s drawer is **open**: showing something *and* revealed.
+///
+/// `current` alone is not that. `set_reveal_child(false)` starts the ~180 ms
+/// retract, and `current` is cleared only when it finishes
+/// (`wire_retract_finish`), so for the whole slide-out a closing drawer still
+/// names the page it is taking away. [`toggle_panel`] and
+/// [`reshow_plugin_if_open`] already read it this way (#1513); this is that
+/// rule as the one predicate every "is this drawer open" site uses, so a
+/// closing drawer is never swapped into (`switch_active`,
+/// `switch_to_workspace_edit`) or re-centred mid-slide
+/// (`wire_recenter_on_bar_geometry`).
+///
+/// [`recompute_gates`] deliberately keeps reading `current`: the page's
+/// pollers keep feeding it while it is still sliding out, and the gates
+/// settle when `wire_retract_finish` recomputes them.
+fn is_open(panel: &ModalPanel) -> bool {
+    panel.revealer.reveals_child() && panel.current.borrow().is_some()
 }
 
 /// Every mounted drawer, as owned handles with the [`PANELS`] borrow already
@@ -1259,8 +1287,11 @@ fn wire_retract_finish(revealer: &gtk::Revealer, key: String) {
 /// call documented to do that, and unlike `close()` it can't be vetoed by a
 /// future `close-request` handler.
 pub fn close_all() {
-    let panels: Vec<_> =
-        PANELS.with(|panels| panels.borrow_mut().drain().map(|(_, v)| v).collect());
+    let panels: Vec<_> = PANELS.with(|panels| {
+        std::mem::take(&mut *panels.borrow_mut())
+            .into_values()
+            .collect()
+    });
     for panel in panels {
         panel.window.destroy();
     }
@@ -1361,9 +1392,11 @@ fn reset_drawer_page_states() {
 /// are built once, monitor-agnostically, so an in-page deep-link callback
 /// (e.g. a Settings row → Wallpaper) doesn't have a handy `&Monitor`. This
 /// helper walks the per-monitor panel set and:
-/// - For each panel currently showing a page (`current.is_some()`), swaps
-///   the stack child to `target` (crossfade + height) without retracting.
-/// - For closed panels, does nothing — we only switch what's actually open.
+/// - For each **open** panel (`is_open`), swaps the stack child to `target`
+///   (crossfade + height) without retracting.
+/// - For closed panels, does nothing — we only switch what's actually open. A
+///   drawer mid-retract counts as closed: swapping a page into it switched the
+///   stack of a drawer that went on closing, so the deep-link was lost.
 ///
 /// If no drawer is open on *any* monitor, the deep-link falls back to
 /// **opening** `target` on niri's focused output rather than doing nothing
@@ -1378,8 +1411,9 @@ fn reset_drawer_page_states() {
 /// the choice as primary-vs-pointer-focus; the codebase settles it. GTK4 has no
 /// primary monitor to ask for — `gdk_display_get_primary_monitor` did not
 /// survive GTK3 — so "primary" would have to be *invented* here, as the first
-/// entry of `app.monitors()` or the first key of `PANELS` (i.e. `HashMap`
-/// iteration order). Both are arbitrary and neither is stable across a hot-plug.
+/// entry of `app.monitors()` or the first key of `PANELS`. Both are arbitrary
+/// (the second is only *deterministic*, sorted by connector name) and neither
+/// is stable across a hot-plug.
 /// niri, by contrast, *tells us* which output is focused, and
 /// [`crate::components::focused_output`] is already the shell's single cache of
 /// it — the same routing every other monitor-less entry point uses (`commands`'
@@ -1394,7 +1428,24 @@ fn reset_drawer_page_states() {
 /// installed) or one with no drawer mounted still opens *a* mounted drawer, so
 /// the deep-link lands somewhere instead of going quiet again. It is a genuine
 /// no-op only when no drawer is mounted anywhere — i.e. no bars exist at all.
+///
+/// A caller that is *leaving* a page inside an open drawer, rather than asking
+/// for one, wants no fallback at all: see [`leave_workspace_edit`].
 pub fn switch_active(target: Page) {
+    if switch_open_drawers(target) {
+        return;
+    }
+    // Nothing was open to jump within → open `target` instead. `open_by_key`
+    // recomputes the gates itself once the page is showing, so
+    // `switch_open_drawers`' own recompute stays exactly where it was for the
+    // common (switched) path rather than moving into a branch.
+    let focused = crate::components::focused_output::current();
+    open_on_focused(focused.as_deref(), target);
+}
+
+/// [`switch_active`] without the #799 fallback: swap every **open** drawer to
+/// `target` and recompute the gates; `true` if any drawer was switched.
+fn switch_open_drawers(target: Page) -> bool {
     // Snapshot the handles first, then act with no `PANELS` borrow live (#643):
     // `set_stack_page` and `on_page_show` are runs of GTK calls, and holding the
     // shared borrow across them means any synchronous emission that re-enters
@@ -1403,23 +1454,50 @@ pub fn switch_active(target: Page) {
     // `Rc` per open drawer is a refcount bump.
     let mut switched = false;
     for panel in live_panels() {
-        if panel.current.borrow().is_some() {
-            set_stack_page(&panel, target);
-            set_current(&panel, Some(Active::Builtin(target)));
-            on_page_show(&panel, target);
+        if is_open(&panel) {
+            show_page_in_place(&panel, target);
             switched = true;
         }
     }
     recompute_gates();
-    if switched {
-        return;
+    switched
+}
+
+/// Swap an open drawer's page to `target` in place: the stack child, the
+/// recorded page, and its on-show hook. No reveal and no re-placement — the
+/// card stays where it opened.
+fn show_page_in_place(panel: &ModalPanel, target: Page) {
+    set_stack_page(panel, target);
+    set_current(panel, Some(Active::Builtin(target)));
+    on_page_show(panel, target);
+}
+
+/// Take every open drawer that is showing the Workspaces **Edit** sub-page
+/// back to the Workspaces page — the form's Save and Cancel — and open
+/// **nothing**.
+///
+/// They used to call [`switch_active`], whose #799 fallback opens the page on
+/// the focused output when no drawer is open. That is right for a keybind and
+/// wrong here: Save awaits an asynchronous write before it closes the form, so
+/// a user who dismissed the drawer in the meantime had it slide back open on
+/// whichever screen niri focused — the drawer they had just closed. A form
+/// that is not on screen has nothing to go back from.
+///
+/// Only drawers showing the form are touched, not every open drawer:
+/// [`switch_to_workspace_edit`] puts every open drawer on the form, but one
+/// opened since on some other page is not the form's to take back. A drawer
+/// mid-retract is left to finish closing (`is_open`).
+pub fn leave_workspace_edit() {
+    // Snapshot, then act with no `PANELS` borrow live (#643); the `current`
+    // borrow ends with the `let`, before any GTK call.
+    for panel in live_panels() {
+        let editing =
+            is_open(&panel) && matches!(&*panel.current.borrow(), Some(Active::WorkspaceEdit(_)));
+        if editing {
+            show_page_in_place(&panel, Page::Workspaces);
+        }
     }
-    // Nothing was open to jump within → open `target` instead. `open_by_key`
-    // recomputes the gates itself once the page is showing, so the call above
-    // stays exactly where it was for the common (switched) path rather than
-    // moving into a branch.
-    let focused = crate::components::focused_output::current();
-    open_on_focused(focused.as_deref(), target);
+    recompute_gates();
 }
 
 /// Switch every open drawer to the Workspaces **Edit** sub-page for the card
@@ -1439,7 +1517,10 @@ pub fn switch_to_workspace_edit(key: &str) {
     // and any synchronous emission that re-enters `PANELS` would panic fatally
     // from inside a glib callback.
     for panel in live_panels() {
-        if panel.current.borrow().is_some() {
+        // Open, not merely `current` (#1513's rule, [`is_open`]): a drawer
+        // mid-retract still names its page, and a form swapped into it slid
+        // shut with the drawer.
+        if is_open(&panel) {
             let active = Active::WorkspaceEdit(key.to_owned());
             set_stack_active(&panel, &active);
             // …and the on-show side-effects, which for this `Active` is the width
@@ -1512,9 +1593,10 @@ fn open_by_key(key: &str, page: Page) {
 /// keybinds — `preferred` is niri's focused output — and a plugin's
 /// `OpenPage(<built-in>)` with no chip to hang the page under, where
 /// `preferred` is the output a sidebar card was clicked on, else the focused
-/// one (#1413). Falls back to any panel so an unknown/absent focused output
-/// still opens *a* drawer rather than silently no-op'ing. No-op only when no
-/// drawers are mounted at all.
+/// one (#1413). Falls back to the first mounted drawer by connector name (a
+/// sorted `PANELS`, so the same one every time) so an unknown/absent focused
+/// output still opens *a* drawer rather than silently no-op'ing. No-op only
+/// when no drawers are mounted at all.
 pub fn open_on_focused(preferred: Option<&str>, page: Page) {
     let key = PANELS.with(|panels| {
         let panels = panels.borrow();
@@ -1557,9 +1639,10 @@ fn open_plugin_by_key(key: &str, plugin_id: &str) {
 
 /// Command-surface analogue of [`open_on_focused`] for a plugin's own panel
 /// (#349 PR2): open `plugin_id`'s panel on the `preferred` connector if a drawer
-/// is mounted there, else on any mounted drawer. Called from the plugin effect
-/// broker when a plugin emits `Effect::OpenPage(Page::PluginSelf)`. No-op only
-/// when no drawers are mounted at all.
+/// is mounted there, else on the first mounted drawer by connector name (the
+/// same one [`open_on_focused`] picks). Called from the plugin effect broker
+/// when a plugin emits `Effect::OpenPage(Page::PluginSelf)`. No-op only when
+/// no drawers are mounted at all.
 pub fn open_plugin_on_focused(preferred: Option<&str>, plugin_id: &str) {
     let key = PANELS.with(|panels| {
         let panels = panels.borrow();
@@ -1666,9 +1749,10 @@ fn toggle_under(trigger: &gtk::Widget, active: Active) -> bool {
 pub fn reshow_plugin_if_open(plugin_id: &str) -> bool {
     let target = Active::Plugin(plugin_id.to_owned());
     // Snapshot, then act with no `PANELS` borrow live (#643).
-    let Some(panel) = live_panels().into_iter().find(|panel| {
-        panel.revealer.reveals_child() && panel.current.borrow().as_ref() == Some(&target)
-    }) else {
+    let Some(panel) = live_panels()
+        .into_iter()
+        .find(|panel| is_open(panel) && panel.current.borrow().as_ref() == Some(&target))
+    else {
         return false;
     };
     on_active_show(&panel, &target);
@@ -1760,7 +1844,7 @@ fn toggle_inner(
 /// retract was a second, no-op retract, and another chip's page was swapped
 /// into a drawer that then finished closing.
 fn toggle_panel(panel: &ModalPanel, active: Active, trigger: &gtk::Widget, retract_on_same: bool) {
-    let current = if panel.revealer.reveals_child() {
+    let current = if is_open(panel) {
         panel.current.borrow().clone()
     } else {
         None
@@ -2022,9 +2106,10 @@ fn wire_recenter_on_bar_geometry(bar_window: &gtk::Window, key: String) {
                 };
                 // Read-then-act, no `current` borrow held across the GTK below.
                 // A closed drawer needs nothing: the next open positions from
-                // scratch off the live geometry anyway.
-                let is_open = panel.current.borrow().is_some();
-                if is_open {
+                // scratch off the live geometry anyway. Nor does one
+                // **retracting** ([`is_open`]): re-placing it moved the card
+                // sideways mid-slide, and a re-open re-places it regardless.
+                if is_open(&panel) {
                     reposition_card(&panel);
                 }
             });
@@ -3339,9 +3424,11 @@ mod gtk_tests {
     /// `hscrollbar_policy: Never` without `propagate_natural_width`, so it reports
     /// its child's minimum as its natural too and nothing widens it.
     ///
-    /// Driven through `PANELS` with `current` set, because both are gates on that
-    /// function: it iterates `live_panels()` and skips any panel with no drawer
-    /// open. Measured on the pre-fix code the slot reads `-1` here.
+    /// Driven through `PANELS` with the drawer open — `current` set *and* the
+    /// revealer revealing — because those are gates on that function: it
+    /// iterates `live_panels()` and skips any panel whose drawer is not open
+    /// ([`super::is_open`]). Measured on the pre-fix code the slot reads `-1`
+    /// here.
     ///
     /// **The mutation**: deleting the `on_active_show(&panel, &active)` line from
     /// `switch_to_workspace_edit` reds this and nothing else in the binary.
@@ -3355,8 +3442,10 @@ mod gtk_tests {
             .stack
             .add_named(&slot, Some(super::WORKSPACE_EDIT_STACK_CHILD));
         // The ✎ button is *on* an open drawer, and `switch_to_workspace_edit`
-        // encodes that: a panel showing nothing is left alone.
+        // encodes that: a panel showing nothing, or one sliding shut, is left
+        // alone.
         *panel.current.borrow_mut() = Some(Active::Builtin(Page::Workspaces));
+        panel.revealer.set_reveal_child(true);
         PANELS.with(|panels| {
             panels.borrow_mut().insert(key.clone(), panel.clone());
         });
@@ -4306,5 +4395,203 @@ mod gtk_tests {
             "premise: the retract finished"
         );
         assert_eq!(panel.shown_page.get(), None, "the close");
+    }
+
+    // ── A retracting drawer is closed; leaving the Edit form opens nothing ───
+
+    /// [`builtin_drawer`] with a stand-in `Page::Workspaces` child too, so the
+    /// Workspaces page can be shown without building the real one (which wants
+    /// the niri service registered). An `adw::Clamp`, because that page's
+    /// on-show hook floors the clamp it finds there.
+    fn workspaces_drawer(key: &str) -> Rc<ModalPanel> {
+        let (panel, _chip) = builtin_drawer(&test_monitor(), key);
+        panel
+            .stack
+            .add_named(&adw::Clamp::new(), Some(Page::Workspaces.stack_name()));
+        panel
+    }
+
+    /// A deep-link fired while the only drawer **retracts** opens its page,
+    /// revealed. `switch_active` read the closing drawer as open — its
+    /// `current` still names the page until `wire_retract_finish` runs — so it
+    /// swapped the page into a drawer that went on closing, counted that as a
+    /// switch, and skipped the #799 fallback: the deep-link was lost.
+    ///
+    /// **Falsification:** put `switch_open_drawers` back on
+    /// `panel.current.borrow().is_some()` → the reveal assertion reds.
+    #[gtk::test]
+    fn a_deep_link_while_the_drawer_retracts_opens_its_page() {
+        use super::{switch_active, toggle_builtin_under};
+
+        const KEY: &str = "test-retract-deep-link";
+        if !crate::plugins::host_is_live() {
+            crate::plugins::install_test_handles();
+        }
+        let (panel, chip) = builtin_drawer(&test_monitor(), KEY);
+        panel
+            .stack
+            .add_named(&adw::Clamp::new(), Some(Page::Workspaces.stack_name()));
+        let _mounted = Mounted {
+            keys: &[KEY],
+            panels: vec![panel.clone()],
+        };
+
+        assert!(toggle_builtin_under(chip.upcast_ref(), Page::Audio));
+        assert!(toggle_builtin_under(chip.upcast_ref(), Page::Audio));
+        assert!(
+            !panel.revealer.reveals_child(),
+            "premise: the drawer is closing"
+        );
+
+        switch_active(Page::Workspaces);
+        assert!(
+            panel.revealer.reveals_child(),
+            "the deep-link opens its page instead of riding the closing drawer shut"
+        );
+        assert_eq!(
+            *panel.current.borrow(),
+            Some(Active::Builtin(Page::Workspaces))
+        );
+    }
+
+    /// The ✎ route leaves a drawer that is **retracting** alone, as it leaves a
+    /// closed one: the form is not swapped into a drawer sliding shut.
+    ///
+    /// **Falsification:** put `switch_to_workspace_edit` back on
+    /// `panel.current.borrow().is_some()` → `current` becomes the Edit
+    /// sub-page and this reds.
+    #[gtk::test]
+    fn the_edit_button_route_leaves_a_retracting_drawer_alone() {
+        const KEY: &str = "test-retract-edit";
+        if !crate::plugins::host_is_live() {
+            crate::plugins::install_test_handles();
+        }
+        let panel = workspaces_drawer(KEY);
+        let _mounted = Mounted {
+            keys: &[KEY],
+            panels: vec![panel.clone()],
+        };
+        // Mid-retract: the page is still recorded, the reveal already off.
+        *panel.current.borrow_mut() = Some(Active::Builtin(Page::Workspaces));
+        panel.revealer.set_reveal_child(false);
+
+        super::switch_to_workspace_edit("chat");
+
+        assert_eq!(
+            *panel.current.borrow(),
+            Some(Active::Builtin(Page::Workspaces)),
+            "a closing drawer must not be switched to the Edit form",
+        );
+    }
+
+    /// Leaving the Workspaces Edit form — its Save, which lands after an
+    /// asynchronous write, or its Cancel — opens no drawer. The Save path
+    /// called `switch_active`, so a user who dismissed the drawer while the
+    /// write was in flight saw its #799 fallback open it again on the focused
+    /// output.
+    ///
+    /// Three phases, each a state a Save can land in: every drawer closed,
+    /// the form's drawer still sliding shut, and the form open beside another
+    /// drawer showing some other page — which is not the form's to take back.
+    ///
+    /// **Falsification:** have `leave_workspace_edit` call
+    /// `switch_active(Page::Workspaces)` → the first phase reds (a drawer
+    /// opens); drop its `WorkspaceEdit` match → the last one does (Audio is
+    /// switched too).
+    #[gtk::test]
+    fn leaving_the_edit_form_opens_no_drawer() {
+        use super::leave_workspace_edit;
+
+        const KEYS: &[&str] = &["test-leave-edit-a", "test-leave-edit-b"];
+        if !crate::plugins::host_is_live() {
+            crate::plugins::install_test_handles();
+        }
+        let a = workspaces_drawer(KEYS[0]);
+        let b = workspaces_drawer(KEYS[1]);
+        let _mounted = Mounted {
+            keys: KEYS,
+            panels: vec![a.clone(), b.clone()],
+        };
+        let edit = Active::WorkspaceEdit("chat".to_owned());
+
+        // 1. Dismissed before the write landed: nothing is open.
+        leave_workspace_edit();
+        assert!(
+            !a.revealer.reveals_child() && !b.revealer.reveals_child(),
+            "a Save landing with every drawer closed must not open one"
+        );
+        assert_eq!(
+            (a.current.borrow().clone(), b.current.borrow().clone()),
+            (None, None)
+        );
+
+        // 2. Dismissed while the write was in flight: still retracting.
+        *a.current.borrow_mut() = Some(edit.clone());
+        leave_workspace_edit();
+        assert!(!a.revealer.reveals_child(), "…nor turn a retract around");
+        assert_eq!(*a.current.borrow(), Some(edit.clone()));
+
+        // 3. Open on the form, beside a drawer on another page.
+        a.revealer.set_reveal_child(true);
+        *b.current.borrow_mut() = Some(Active::Builtin(Page::Audio));
+        b.revealer.set_reveal_child(true);
+        leave_workspace_edit();
+        assert_eq!(
+            *a.current.borrow(),
+            Some(Active::Builtin(Page::Workspaces)),
+            "the form's drawer goes back to the Workspaces page",
+        );
+        assert!(a.revealer.reveals_child(), "…and stays open");
+        assert_eq!(
+            *b.current.borrow(),
+            Some(Active::Builtin(Page::Audio)),
+            "a drawer showing another page is left alone",
+        );
+    }
+
+    /// With niri's focused output unknown, the keybind fallback opens the
+    /// **first drawer by connector name**, the same one every time — not
+    /// whichever the hash order yields. Eight drawers inserted in reverse, so a
+    /// `HashMap` lands on the right one about one time in eight.
+    ///
+    /// **Falsification:** make `PANELS` a `HashMap` again → this reds (with
+    /// probability ~7/8 per run).
+    #[gtk::test]
+    fn the_unknown_focus_fallback_is_the_first_connector() {
+        use super::open_on_focused;
+
+        const KEYS: &[&str] = &[
+            "test-b3-0",
+            "test-b3-1",
+            "test-b3-2",
+            "test-b3-3",
+            "test-b3-4",
+            "test-b3-5",
+            "test-b3-6",
+            "test-b3-7",
+        ];
+        if !crate::plugins::host_is_live() {
+            crate::plugins::install_test_handles();
+        }
+        let panels: Vec<Rc<ModalPanel>> = KEYS
+            .iter()
+            .rev()
+            .map(|key| builtin_drawer(&test_monitor(), key).0)
+            .collect();
+        let _mounted = Mounted {
+            keys: KEYS,
+            panels: panels.clone(),
+        };
+
+        open_on_focused(None, Page::Audio);
+
+        let opened: Vec<&str> = KEYS
+            .iter()
+            .rev()
+            .zip(&panels)
+            .filter(|(_, panel)| panel.revealer.reveals_child())
+            .map(|(key, _)| *key)
+            .collect();
+        assert_eq!(opened, ["test-b3-0"]);
     }
 }

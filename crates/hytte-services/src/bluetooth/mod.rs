@@ -679,7 +679,9 @@ fn pair_outcome(reply: Result<(), hytte_bus::BusError>, paired_now: bool) -> Pai
 /// `BusError::from_zbus` carries it into `BusError::Permanent` with no D-Bus
 /// error name. `trollshell-control-center`'s `plugins_tab.rs` reads the same
 /// shape the same way. `the_deadline_is_recognised_as_hytte_bus_spells_it`
-/// reads `hytte-bus`'s own source, so a change there reddens here.
+/// reads the literal out of `call.rs`, and
+/// `hytte_bus_carries_its_deadline_to_what_is_deadline_reads` runs the real
+/// `BusError::from_zbus` over it, so a change to either reddens here.
 const HYTTE_BUS_CALL_TIMEOUT: &str = "call timeout";
 
 /// Is this the `Pair` call's own deadline running out, rather than an answer
@@ -922,8 +924,9 @@ mod tests {
 
     /// The deadline error is recognised the way `hytte-bus` spells it, read
     /// from its own source rather than from a copy: `call.rs` gives up with
-    /// `zbus::Error::Failure("call timeout")`, and `error.rs` carries a
-    /// `Failure` into a `BusError::Permanent` with no D-Bus error name.
+    /// `zbus::Error::Failure("call timeout")`. How `error.rs` carries that
+    /// `Failure` into a `BusError` is pinned by running it, in
+    /// `hytte_bus_carries_its_deadline_to_what_is_deadline_reads`.
     ///
     /// **Falsification:** change `HYTTE_BUS_CALL_TIMEOUT`, or the literal in
     /// `hytte-bus`'s `call.rs`, and the first assertion fails.
@@ -940,15 +943,6 @@ mod tests {
             )),
             "hytte-bus no longer spells its call deadline {HYTTE_BUS_CALL_TIMEOUT:?}"
         );
-        let squash = |s: &str| s.split_whitespace().collect::<String>();
-        let error_rs = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../hytte-bus/src/error.rs"
-        ));
-        assert!(
-            squash(error_rs).contains("_=>Self::Permanent{reason:err.to_string(),dbus_name:None,}"),
-            "hytte-bus no longer carries a zbus Failure as a nameless Permanent"
-        );
 
         assert!(is_deadline(&deadline_error()));
         assert!(!is_deadline(&method_error("org.bluez.Error.Failed")));
@@ -956,6 +950,22 @@ mod tests {
             reason: "disk full".to_owned(),
             dbus_name: None,
         }));
+    }
+
+    /// The deadline as `hytte-bus` actually delivers it: its own
+    /// `zbus::Error::Failure("call timeout")` run through the real
+    /// `BusError::from_zbus`, so the mapping and zbus's `Display` of a
+    /// `Failure` are both exercised (#1573 review). A source scan of
+    /// `error.rs` only proved a catch-all arm existed, and stayed green when
+    /// a dedicated `Failure` arm in front of it changed the reason.
+    ///
+    /// **Falsification:** give `BusError::from_zbus` a `Failure` arm that
+    /// rewrites the reason (e.g. `format!("bus failure: {msg}")`) and this
+    /// fails, while a device paired at the 5-minute deadline would toast.
+    #[test]
+    fn hytte_bus_carries_its_deadline_to_what_is_deadline_reads() {
+        let e = BusError::from_zbus(zbus::Error::Failure(HYTTE_BUS_CALL_TIMEOUT.into()));
+        assert!(is_deadline(&e), "{e:?}");
     }
 
     /// The trust-and-connect follow-up runs when the device is paired, not

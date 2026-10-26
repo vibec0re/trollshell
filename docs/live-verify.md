@@ -171,6 +171,23 @@ range above is a floor, not a ceiling.
       panel's Revoke/Allow buttons still live afterwards. Before the fix this
       sequence left the broker permanently socket-less with an empty panel and
       a misleading duplicate warning, recoverable only by another restart.
+- [ ] **(#1489)** A consent token reads only what its card named. With no
+      grant for the agent, `eval "$(hytte-infobroker auth --agent probe)"` →
+      the card reads _"probe wants: read access from departures"_; click
+      **This session**. Then `hytte-infobroker get departures` answers, and
+      `hytte-infobroker get calendar` / `get weather` are **refused** with a
+      `--datasource` hint (before the fix both answered). Then
+      `hytte-infobroker auth --agent probe --datasource calendar` raises a
+      second card that reads _"… from calendar"_ / _"probe wants to read your
+      upcoming calendar events"_; deny it and the panel's pending row says
+      **calendar**, not departures. Clean up the `probe` rows in the panel
+      afterwards.
+- [ ] **(#1489)** A silent client holds nothing up. Open
+      `nc -U "$XDG_RUNTIME_DIR/hytte-infobroker.sock"` and send nothing, then
+      within 5 s click a grant's **Revoke** in the infobroker panel: the row
+      goes at once (before, it waited for the silent client's 5 s timeout),
+      and `hytte-infobroker grants list` from another terminal answers
+      straight away too.
 - [ ] **(#544)** A plugin granted `Capability::RunCommand` emits
       `Effect::RunCommand` → the host spawns the argv and the plugin gets back
       an `EffectResult` with the exit status + captured stdout. A missing

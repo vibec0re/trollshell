@@ -5,26 +5,37 @@
 //! The **decision** functions ([`authorize_auth`], [`authorize_get`]) are pure
 //! and unit-tested here; [`serve`] is the thin async shell that wires sockets +
 //! the panel command lane around them. The broker owns the [`GrantStore`]
-//! (durable) and the [`TokenStore`] (ephemeral) — no shared mutex, because it
-//! processes one connection or one panel command at a time.
+//! (durable) and the [`TokenStore`] (ephemeral) — no shared mutex, because one
+//! loop owns them and handles one request or one panel command at a time.
+//! Reading a client's request line is the one per-connection step that runs
+//! **off** that loop, in a task of its own (see `run_session`), so a client
+//! that connects and sends nothing holds up nobody but itself.
 //!
 //! Consent policy (phase 1b — interactive Allow/Deny prompting, over the 1a
-//! grant/token machinery):
-//! - `auth` mints a token **silently** iff an `always` grant covers the agent.
-//! - A standing `deny` grant refuses `auth` **silently** — a settled "no" isn't
-//!   re-prompted — with an informational [`Toast`] so the knock is still visible.
+//! grant/token machinery). Every `auth` asks for **one** datasource — the one
+//! it names, or `departures` when it names none (what the prompt named before
+//! the request could) — and every decision below is about that
+//! `(agent, datasource)` pair:
+//! - `auth` mints a token **silently** iff an `always` grant covers the pair.
+//! - A standing `deny` grant for the pair refuses `auth` **silently** — a
+//!   settled "no" isn't re-prompted — with an informational [`Toast`] so the
+//!   knock is still visible.
 //! - Otherwise (no standing grant) `auth` **parks** the socket request and fires
-//!   a consent prompt at the human (`Effect::RequestConsent` via the plugin,
-//!   #487). The decision resolves the parked request per
-//!   `BrokerState::apply_consent`: `AllowAlways`/`Deny` persist to grants.toml,
-//!   `AllowSession` mints a session-scoped token, `AllowOnce` a single-fetch
-//!   token. An unanswered prompt (a pre-1b / wedged host, or a genuinely ignored
-//!   one) times out to a **transient** deny + the 1a toast — the phase-1a
-//!   fallback (`BrokerState::on_consent_timeout`).
-//! - `get <datasource>` requires a valid token whose data-access authority
-//!   ([`TokenScope`]) — durable grant, session, or a single once — covers the
-//!   datasource; a spent/uncovered token is denied *without* a toast (re-auth to
-//!   re-consent).
+//!   a consent prompt at the human naming the datasource
+//!   (`Effect::RequestConsent` via the plugin, #487). The decision resolves the
+//!   parked request per `BrokerState::apply_consent`: `AllowAlways`/`Deny`
+//!   persist to grants.toml, `AllowSession` mints a session-scoped token,
+//!   `AllowOnce` a single-fetch token — both of the latter scoped to the
+//!   datasource the prompt named, and to nothing else. An unanswered prompt (a
+//!   pre-1b / wedged host, or a genuinely ignored one) times out to a
+//!   **transient** deny + the 1a toast — the phase-1a fallback
+//!   (`BrokerState::on_consent_timeout`).
+//! - `get <datasource>` requires a valid token, and either an `always` grant
+//!   for `(agent, datasource)` or a token whose own [`TokenScope`] — a session,
+//!   or a single unspent once — names that datasource; anything else is denied
+//!   *without* a toast (re-auth naming the datasource to re-consent). So **a
+//!   token never reaches a datasource the human has not consented to for that
+//!   agent**: either in the prompt it was minted from, or as a durable grant.
 //! - An **invalid/expired token** is a transient technical failure (the agent
 //!   just re-auths), so it is denied *without* a toast — only genuine consent
 //!   knocks alert the human.
@@ -37,6 +48,7 @@ use chrono::Utc;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinSet;
 
 use crate::grants::{Decision, GrantStore};
 use crate::paths;
@@ -50,8 +62,36 @@ use crate::wire::{
 const AUDIT_CAP: usize = 30;
 
 /// How long a connected client has to send its one request line before the
-/// broker gives up on it (so a stuck client can't wedge the accept loop).
+/// broker gives up on it. Bounds one reader task (`read_request`) — which
+/// is all a silent client can hold up, since the read runs off the session
+/// loop — and so how long that client keeps one of the
+/// [`MAX_CONCURRENT_READS`] slots.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The longest request line the broker reads, newline excluded. A real request
+/// is well under a kilobyte (an op, an agent name, a token, a datasource);
+/// this exists so a client that streams bytes without a newline is refused at
+/// a fixed size instead of growing the broker's buffer for the whole of
+/// [`REQUEST_TIMEOUT`]. Overflow is answered with an error naming the limit.
+const MAX_REQUEST_LINE: usize = 64 * 1024;
+
+/// How many connections may be mid-read at once. Each one is a reader task
+/// holding a client's fd and up to [`MAX_REQUEST_LINE`] of buffer; at the cap,
+/// the session stops accepting until one finishes (new connections wait in
+/// the kernel's listen backlog), so a burst of silent clients cannot grow
+/// either without bound. A real request reads in microseconds, so 16 is far
+/// above anything the CLI produces.
+const MAX_CONCURRENT_READS: usize = 16;
+
+/// How many consent prompts may be parked at once. A resource bound, not a UX
+/// choice: the shell shows one consent card at a time (a new one supersedes
+/// the card on screen), so more than one parked knock is already a degraded
+/// state, and a stream of knocks under fresh agent names could otherwise park
+/// sockets without limit for [`CONSENT_PARK_TIMEOUT`] each. A knock past the
+/// cap is refused with a retryable error, as is a second knock for an
+/// `(agent, datasource)` pair that already has one parked (see
+/// `Session::consent_refusal`).
+const MAX_PENDING_CONSENTS: usize = 8;
 
 /// How long the broker holds a **parked** consent request before giving up and
 /// timing it out (#487 phase 1b). Deliberately a touch longer than the shell's
@@ -78,16 +118,18 @@ const SCOPE_WEATHER_CURRENT: &str = "current";
 
 // ── Pure consent decisions (unit-tested) ──────────────────────────────────────
 
-/// The outcome of an `auth` request against the grant store (#487 phase 1b).
+/// The outcome of an `auth` request for one `(agent, datasource)` pair against
+/// the grant store (#487 phase 1b).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AuthOutcome {
-    /// The agent has an `always` grant — mint a token silently.
+    /// The pair has an `always` grant — mint a token silently.
     Granted,
-    /// A standing `deny` grant covers the agent — a settled "no": refuse silently
-    /// (no re-prompt), with a how-to-grant hint.
+    /// A standing `deny` grant covers the pair — a settled "no": refuse
+    /// silently (no re-prompt), with a how-to-grant hint.
     Denied { hint: String },
     /// No standing grant either way — knock the human with an interactive consent
-    /// prompt and park the request until the decision (or the 60 s bound).
+    /// prompt naming the datasource and park the request until the decision (or
+    /// the 60 s bound).
     NeedsConsent,
 }
 
@@ -186,17 +228,64 @@ fn grant_hint(agent: &str, datasource: &str) -> String {
     )
 }
 
-/// Decide an `auth` (#487 phase 1b): a standing `always` grant mints silently; a
-/// standing `deny` grant refuses silently (no re-prompt); anything else needs an
-/// interactive consent decision. `always` wins over `deny` if both somehow exist
-/// (a live "yes" beats a stale "no").
+/// The hint for a `get` the agent's token does not reach: a fresh `auth`
+/// naming the datasource puts a prompt for exactly that datasource to the
+/// human — which is the only way a consent token for it comes to exist — or
+/// the human grants it durably.
+fn reauth_hint(agent: &str, datasource: &str) -> String {
+    format!(
+        "ask the human for it with `hytte-infobroker auth --agent {agent} --datasource \
+         {datasource}`, or {}",
+        grant_hint(agent, datasource)
+    )
+}
+
+/// The hint listing the datasources the broker serves.
+fn known_datasources_hint() -> String {
+    format!(
+        "known datasources: '{DATASOURCE_DEPARTURES}', '{DATASOURCE_WEATHER}', \
+         '{DATASOURCE_CALENDAR}'"
+    )
+}
+
+/// The consent card's detail line for `agent` asking to read `datasource` —
+/// the plain-words version of the card's "⟨agent⟩ wants: read access from
+/// ⟨datasource⟩". The departures wording is byte-for-byte what every prompt
+/// read before the request could name a datasource.
+fn consent_detail(agent: &str, datasource: &str) -> String {
+    let what = match datasource {
+        DATASOURCE_DEPARTURES => "the departures board",
+        DATASOURCE_WEATHER => "the current weather",
+        DATASOURCE_CALENDAR => "your upcoming calendar events",
+        // Unreachable from `handle_auth`, which refuses an unknown datasource
+        // before it prompts; naming it raw is the honest fallback anyway.
+        other => other,
+    };
+    format!("{agent} wants to read {what}")
+}
+
+/// Decide an `auth` for `(agent, datasource)` (#487 phase 1b): a standing
+/// `always` grant for the pair mints silently; a standing `deny` for it refuses
+/// silently (no re-prompt); anything else needs an interactive consent
+/// decision about exactly that pair. `always` wins over `deny` if both somehow
+/// exist (a live "yes" beats a stale "no").
+///
+/// Per pair rather than per agent: the prompt this falls through to names one
+/// datasource, so the silent answers on either side of it must be about that
+/// same datasource — a departures grant does not answer a calendar ask.
 #[must_use]
-pub fn authorize_auth(grants: &GrantStore, agent: &str) -> AuthOutcome {
-    if grants.has_any_always(agent) {
+pub fn authorize_auth(grants: &GrantStore, agent: &str, datasource: &str) -> AuthOutcome {
+    let decided = |decision: Decision| {
+        grants
+            .grants()
+            .iter()
+            .any(|g| g.agent == agent && g.datasource == datasource && g.decision == decision)
+    };
+    if decided(Decision::Always) {
         AuthOutcome::Granted
-    } else if grants.has_any_deny(agent) {
+    } else if decided(Decision::Deny) {
         AuthOutcome::Denied {
-            hint: grant_hint(agent, DATASOURCE_DEPARTURES),
+            hint: grant_hint(agent, datasource),
         }
     } else {
         AuthOutcome::NeedsConsent
@@ -416,6 +505,11 @@ struct AuditEntry {
     at_unix: i64,
     agent: String,
     resource: String,
+    /// The datasource the request was about: the one a `get` named, or the
+    /// one an `auth` asked for (`resource` is then `"auth"`). What a denied
+    /// entry's pending row offers to Allow, so the panel's one-click grant
+    /// names what the agent actually asked for.
+    datasource: String,
     outcome: Outcome,
 }
 
@@ -451,7 +545,17 @@ impl BrokerState {
     }
 
     /// Record one request in the capped audit ring (oldest falls off).
-    fn record(&mut self, agent: &str, resource: &str, outcome: Outcome, now: i64) {
+    /// `resource` is what the panel's activity row shows (`"auth"`, or the
+    /// datasource a `get` named); `datasource` is what the request was about —
+    /// see [`AuditEntry::datasource`].
+    fn record(
+        &mut self,
+        agent: &str,
+        resource: &str,
+        datasource: &str,
+        outcome: Outcome,
+        now: i64,
+    ) {
         if self.audit.len() == AUDIT_CAP {
             self.audit.pop_front();
         }
@@ -459,6 +563,7 @@ impl BrokerState {
             at_unix: now,
             agent: agent.to_owned(),
             resource: resource.to_owned(),
+            datasource: datasource.to_owned(),
             outcome,
         });
     }
@@ -476,20 +581,22 @@ impl BrokerState {
             })
             .collect();
 
-        // Pending = agents that were denied and still lack an `always` grant.
-        // Phase 1a has one datasource, so a denied auth (no grant at all) surfaces
-        // as a pending Allow for departures too.
+        // Pending = (agent, datasource) pairs that were denied and still lack an
+        // `always` grant — keyed by the datasource the request was about, so the
+        // row's Allow grants what the agent asked for rather than departures
+        // (all a phase-1a auth could ask for). A request for a datasource the
+        // broker does not serve has nothing to grant, so it never makes a row.
         let mut pending: Vec<PendingView> = Vec::new();
         for e in &self.audit {
-            if e.outcome != Outcome::Denied {
+            if e.outcome != Outcome::Denied || !is_known_datasource(&e.datasource) {
                 continue;
             }
-            if self.grants.decision_for(&e.agent, DATASOURCE_DEPARTURES) == Some(Decision::Always) {
+            if self.grants.decision_for(&e.agent, &e.datasource) == Some(Decision::Always) {
                 continue;
             }
             let pv = PendingView {
                 agent: e.agent.clone(),
-                datasource: DATASOURCE_DEPARTURES.to_owned(),
+                datasource: e.datasource.clone(),
             };
             if !pending.contains(&pv) {
                 pending.push(pv);
@@ -573,62 +680,11 @@ impl BrokerState {
         }
     }
 
-    /// Handle one client connection: read its request line and dispatch. Either
-    /// writes the response inline ([`ConnResult::Answered`]) or hands the stream
-    /// back to [`serve`] to **park** while a consent prompt is out
-    /// ([`ConnResult::NeedsConsent`], #487 phase 1b).
-    async fn handle_conn(&mut self, stream: UnixStream) -> ConnResult {
-        let mut reader = BufReader::new(stream);
-        let mut line = String::new();
-        let read = tokio::time::timeout(REQUEST_TIMEOUT, reader.read_line(&mut line)).await;
-        let mut stream = reader.into_inner();
-        let dispatch = match read {
-            Ok(Ok(0)) => return ConnResult::Answered { toast: None }, // client closed, no request
-            Ok(Ok(_)) => self.dispatch(line.trim()),
-            Ok(Err(e)) => Dispatch::Answer(Response::error(format!("read error: {e}")), None),
-            Err(_) => Dispatch::Answer(Response::error("timed out waiting for a request"), None),
-        };
-        match dispatch {
-            Dispatch::Answer(response, toast) => {
-                write_response(&mut stream, response).await;
-                ConnResult::Answered { toast }
-            }
-            Dispatch::Consent {
-                agent,
-                datasource,
-                scope,
-                detail,
-            } => ConnResult::NeedsConsent {
-                agent,
-                datasource,
-                scope,
-                detail,
-                stream,
-            },
-            // #509: a routed datasource query — park the client and ask the plugin
-            // to route it to the shell host; the answering `Cmd::QueryResult`
-            // resolves it.
-            Dispatch::Query {
-                datasource,
-                scope,
-                params,
-            } => ConnResult::NeedsQuery {
-                datasource,
-                scope,
-                params,
-                stream,
-            },
-        }
-    }
-
-    /// Dispatch one parsed request to its handler.
-    fn dispatch(&mut self, line: &str) -> Dispatch {
-        let req = match parse_request(line) {
-            Ok(req) => req,
-            Err(e) => return Dispatch::Answer(Response::error(e), None),
-        };
+    /// Dispatch one parsed request (read off the loop by `read_request`) to its
+    /// handler.
+    fn dispatch(&mut self, req: Request) -> Dispatch {
         match req {
-            Request::Auth { agent } => self.handle_auth(&agent),
+            Request::Auth { agent, datasource } => self.handle_auth(&agent, datasource.as_deref()),
             Request::Get {
                 token,
                 datasource,
@@ -649,32 +705,50 @@ impl BrokerState {
         }
     }
 
-    /// `auth` (#487 phase 1b): mint silently on an `always` grant; refuse
-    /// silently (+ toast) on a standing `deny`; otherwise ask for consent (the
-    /// caller parks the request).
-    fn handle_auth(&mut self, agent: &str) -> Dispatch {
+    /// `auth` for `datasource` — the one the request named, or departures when
+    /// it named none (#487 phase 1b): mint silently on an `always` grant for the
+    /// pair; refuse silently (+ toast) on a standing `deny` for it; otherwise
+    /// ask the human about exactly that pair (the caller parks the request).
+    ///
+    /// An unknown datasource is refused before any of that, without an audit
+    /// entry or a prompt: there is nothing it could be granted, and the prompt
+    /// must never show the human a datasource name the agent made up.
+    fn handle_auth(&mut self, agent: &str, datasource: Option<&str>) -> Dispatch {
         let now = now_unix();
         if agent.trim().is_empty() {
             return Dispatch::Answer(Response::error("auth: empty agent name"), None);
         }
-        match authorize_auth(&self.grants, agent) {
+        let datasource = datasource.unwrap_or(DATASOURCE_DEPARTURES);
+        if !is_known_datasource(datasource) {
+            return Dispatch::Answer(
+                Response::denied(
+                    format!("auth: unknown datasource '{datasource}'"),
+                    known_datasources_hint(),
+                ),
+                None,
+            );
+        }
+        match authorize_auth(&self.grants, agent, datasource) {
             AuthOutcome::Granted => {
                 let token = self.tokens.mint(agent, now);
-                self.record(agent, "auth", Outcome::Granted, now);
+                self.record(agent, "auth", datasource, Outcome::Granted, now);
                 Dispatch::Answer(auth_ok_response(agent, &token), None)
             }
             AuthOutcome::Denied { hint } => {
-                self.record(agent, "auth", Outcome::Denied, now);
+                self.record(agent, "auth", datasource, Outcome::Denied, now);
                 Dispatch::Answer(
-                    Response::denied(format!("no grant for agent '{agent}'"), hint),
-                    Some(denied_toast(agent, "access")),
+                    Response::denied(
+                        format!("no grant for agent '{agent}' on '{datasource}'"),
+                        hint,
+                    ),
+                    Some(denied_toast(agent, datasource)),
                 )
             }
             AuthOutcome::NeedsConsent => Dispatch::Consent {
                 agent: agent.to_owned(),
-                datasource: DATASOURCE_DEPARTURES.to_owned(),
+                datasource: datasource.to_owned(),
                 scope: "read access".to_owned(),
-                detail: format!("{agent} wants to read the {DATASOURCE_DEPARTURES} board"),
+                detail: consent_detail(agent, datasource),
             },
         }
     }
@@ -683,6 +757,11 @@ impl BrokerState {
     /// `AllowAlways`/`Deny` persist to grants.toml; `AllowSession` mints a
     /// session-scoped token; `AllowOnce` a single-fetch token. Every allow answers
     /// the parked `auth` with a fresh token; a deny persists a standing "no".
+    ///
+    /// `datasource` is the one the prompt named, and every arm is about it and
+    /// nothing wider: the two persisted decisions write that pair's row, and the
+    /// two consent tokens carry it in their [`TokenScope`], which is the only
+    /// datasource their own authority reaches.
     fn apply_consent(
         &mut self,
         agent: &str,
@@ -690,37 +769,34 @@ impl BrokerState {
         decision: ConsentDecision,
         now: i64,
     ) -> (Response, Option<Toast>) {
-        match decision {
+        let scope = match decision {
             ConsentDecision::Deny => {
                 // #1065: persists off-thread; failures self-log from inside
                 // the detached write, not here.
                 self.grants.grant_deny(agent, datasource);
-                self.record(agent, "auth", Outcome::Denied, now);
-                (
+                self.record(agent, "auth", datasource, Outcome::Denied, now);
+                return (
                     Response::denied(
-                        format!("consent denied for agent '{agent}'"),
+                        format!("consent denied for agent '{agent}' on '{datasource}'"),
                         grant_hint(agent, datasource),
                     ),
-                    Some(denied_toast(agent, "access")),
-                )
+                    Some(denied_toast(agent, datasource)),
+                );
             }
             ConsentDecision::AllowAlways => {
                 self.grants.grant_always(agent, datasource);
-                let token = self.tokens.mint_scoped(agent, now, TokenScope::Grant);
-                self.record(agent, "auth", Outcome::Granted, now);
-                (auth_ok_response(agent, &token), None)
+                TokenScope::Grant
             }
-            ConsentDecision::AllowSession => {
-                let token = self.tokens.mint_scoped(agent, now, TokenScope::Session);
-                self.record(agent, "auth", Outcome::Granted, now);
-                (auth_ok_response(agent, &token), None)
-            }
-            ConsentDecision::AllowOnce => {
-                let token = self.tokens.mint_scoped(agent, now, TokenScope::Once);
-                self.record(agent, "auth", Outcome::Granted, now);
-                (auth_ok_response(agent, &token), None)
-            }
-        }
+            ConsentDecision::AllowSession => TokenScope::Session {
+                datasource: datasource.to_owned(),
+            },
+            ConsentDecision::AllowOnce => TokenScope::Once {
+                datasource: datasource.to_owned(),
+            },
+        };
+        let token = self.tokens.mint_scoped(agent, now, scope);
+        self.record(agent, "auth", datasource, Outcome::Granted, now);
+        (auth_ok_response(agent, &token), None)
     }
 
     /// A parked consent knock that ran out its [`CONSENT_PARK_TIMEOUT`] with no
@@ -734,20 +810,23 @@ impl BrokerState {
         datasource: &str,
         now: i64,
     ) -> (Response, Option<Toast>) {
-        self.record(agent, "auth", Outcome::Denied, now);
+        self.record(agent, "auth", datasource, Outcome::Denied, now);
         (
             Response::denied(
-                format!("consent request for agent '{agent}' timed out"),
+                format!("consent request for agent '{agent}' on '{datasource}' timed out"),
                 grant_hint(agent, datasource),
             ),
-            Some(denied_toast(agent, "access")),
+            Some(denied_toast(agent, datasource)),
         )
     }
 
     /// `get <datasource>` (#487 phase 1b / #509): token → `(agent, scope)` →
-    /// data-access authority → serve. A token's [`TokenScope`] carries the consent
-    /// decision that minted it, so `get` never re-prompts — it just honors (or
-    /// spends) the authority already granted at `auth`. Once authorized, `calendar`
+    /// data-access authority → serve. Authority is the agent's `always` grant
+    /// for the datasource, or the token's own [`TokenScope`] when that names the
+    /// datasource (a `Once` is spent by the fetch it authorizes) — never a
+    /// consent token's scope stretched to a datasource its prompt did not name.
+    /// `get` never re-prompts; it honors (or spends) authority already granted.
+    /// Once authorized, `calendar`
     /// is served inline from the host-fed live copy, while `departures`/`weather` are
     /// **routed through their provider plugins** over the host's datasource query
     /// protocol ([`GetDisposition::Query`]) rather than fetched here — the #509 dedup
@@ -768,38 +847,37 @@ impl BrokerState {
         };
         let agent = auth.agent;
         if !is_known_datasource(datasource) {
-            self.record(&agent, datasource, Outcome::Denied, now);
+            self.record(&agent, datasource, datasource, Outcome::Denied, now);
             return GetDisposition::Answer(
                 Response::denied(
                     format!("unknown datasource '{datasource}'"),
-                    format!(
-                        "known datasources: '{DATASOURCE_DEPARTURES}', '{DATASOURCE_WEATHER}', '{DATASOURCE_CALENDAR}'"
-                    ),
+                    known_datasources_hint(),
                 ),
                 None,
             );
         }
-        // Data-access authority: a durable `always` grant (for a plain identity
-        // token), an open session token, or a single as-yet-unspent once token —
-        // which this get consumes.
-        let allowed = match auth.scope {
-            TokenScope::Grant => {
-                matches!(
-                    authorize_get(&self.grants, &agent, datasource),
-                    GetOutcome::Allowed
-                )
-            }
-            TokenScope::Session => true,
-            TokenScope::Once => !auth.spent && self.tokens.spend_once(token),
-        };
+        // Data-access authority: a durable `always` grant for this datasource
+        // (whatever the token's scope), or the token's own consent scope when it
+        // names this datasource — an open session, or a single as-yet-unspent
+        // once, which this get consumes. The grant is checked first so a get the
+        // grant already covers never spends a once.
+        let allowed = matches!(
+            authorize_get(&self.grants, &agent, datasource),
+            GetOutcome::Allowed
+        ) || (auth.scope.covers(datasource)
+            && match auth.scope {
+                TokenScope::Once { .. } => !auth.spent && self.tokens.spend_once(token),
+                TokenScope::Grant | TokenScope::Session { .. } => true,
+            });
         if !allowed {
-            // A spent once, or an identity token whose grant is gone: transient —
-            // re-auth to re-consent — so no toast (only genuine knocks alert).
-            self.record(&agent, datasource, Outcome::Denied, now);
+            // A spent once, a consent token for another datasource, or an
+            // identity token whose grant is gone: transient — re-auth naming the
+            // datasource to re-consent — so no toast (only genuine knocks alert).
+            self.record(&agent, datasource, datasource, Outcome::Denied, now);
             return GetDisposition::Answer(
                 Response::denied(
                     format!("agent '{agent}' has no current grant for '{datasource}'"),
-                    grant_hint(&agent, datasource),
+                    reauth_hint(&agent, datasource),
                 ),
                 None,
             );
@@ -807,7 +885,7 @@ impl BrokerState {
         // The access decision is granted; record it once here (the eventual serve
         // outcome — a live copy, or the routed query's success/failure — is separate,
         // exactly as the old inline fetch recorded granted before it could fail).
-        self.record(&agent, datasource, Outcome::Granted, now);
+        self.record(&agent, datasource, datasource, Outcome::Granted, now);
         // Calendar is a live in-memory copy (the host push feeds it), served straight.
         if datasource == DATASOURCE_CALENDAR {
             let resp = Response {
@@ -850,7 +928,8 @@ impl BrokerState {
     }
 }
 
-/// The informational toast for a denied knock.
+/// The informational toast for a denied knock on `resource` (the datasource
+/// the agent asked for).
 fn denied_toast(agent: &str, resource: &str) -> Toast {
     Toast {
         summary: format!("infobroker: {agent} denied"),
@@ -1038,29 +1117,53 @@ enum GetDisposition {
     },
 }
 
-/// The result of [`BrokerState::handle_conn`]: either the response is already
-/// written, or the request is parked awaiting a human consent decision (#487) or a
-/// routed datasource query answer (#509).
-enum ConnResult {
-    /// The response has been written; carries an optional toast to raise.
-    Answered { toast: Option<Toast> },
-    /// The request needs consent: the stream is handed back to [`serve`] to park
-    /// until the decision (or [`CONSENT_PARK_TIMEOUT`]) resolves it.
-    NeedsConsent {
-        agent: String,
-        datasource: String,
-        scope: String,
-        detail: String,
-        stream: UnixStream,
-    },
-    /// The request needs a routed datasource query (#509): the stream is parked
-    /// until the plugin relays a `Cmd::QueryResult` (or [`QUERY_PARK_TIMEOUT`]).
-    NeedsQuery {
-        datasource: String,
-        scope: String,
-        params: String,
-        stream: UnixStream,
-    },
+/// Read and parse one client's request line — the per-connection step that
+/// runs **off** the session loop, as one task in `run_session`'s reader set.
+///
+/// Before this ran on its own task the loop did it inline, between `accept()`
+/// and its next `select!`: a client that connected and sent nothing held the
+/// whole loop for [`REQUEST_TIMEOUT`], so for those five seconds no
+/// `Cmd::Decision` (a human's consent click), `Cmd::Revoke` or `QueryResult`
+/// was handled, and no other client was accepted — and a client that kept
+/// reconnecting kept it held, long enough for a consent answer to land after
+/// its park deadline and be dropped as late. Now the slow part is here, where
+/// it can only cost the client its own answer.
+///
+/// Touches no broker state, which is what lets it run off the loop: it hands
+/// a parsed [`Request`] back with the stream, and the loop — still the only
+/// owner of the grants, tokens and parked requests — dispatches it. A
+/// connection that yields no request is settled here instead: one that closes
+/// without sending anything gets nothing; a read that fails, times out,
+/// overflows [`MAX_REQUEST_LINE`] or does not parse gets its error line
+/// written back from this task, and `None` tells the loop there is nothing
+/// left to do.
+async fn read_request(stream: UnixStream) -> Option<(UnixStream, Request)> {
+    use tokio::io::AsyncReadExt as _;
+
+    // One byte past the cap, so a line of exactly `MAX_REQUEST_LINE` bytes plus
+    // its newline still reads whole, and one byte more is distinguishable from
+    // a client that sent exactly the cap and then closed.
+    let limit = u64::try_from(MAX_REQUEST_LINE + 1).unwrap_or(u64::MAX);
+    let mut reader = BufReader::new(stream).take(limit);
+    let mut line = String::new();
+    let read = tokio::time::timeout(REQUEST_TIMEOUT, reader.read_line(&mut line)).await;
+    let mut stream = reader.into_inner().into_inner();
+    let refusal = match read {
+        Ok(Ok(0)) => return None, // the client closed without a request
+        // The cap cut the line off before any newline: refuse at the cap rather
+        // than wait out the timeout for a newline that may never come.
+        Ok(Ok(_)) if line.len() > MAX_REQUEST_LINE && !line.ends_with('\n') => Response::error(
+            format!("request line longer than {MAX_REQUEST_LINE} bytes; refused"),
+        ),
+        Ok(Ok(_)) => match parse_request(line.trim()) {
+            Ok(request) => return Some((stream, request)),
+            Err(e) => Response::error(e),
+        },
+        Ok(Err(e)) => Response::error(format!("read error: {e}")),
+        Err(_) => Response::error("timed out waiting for a request"),
+    };
+    write_response(&mut stream, refusal).await;
+    None
 }
 
 /// A dispatched request's disposition, before the stream is written or parked.
@@ -1070,14 +1173,16 @@ enum ConnResult {
 enum Dispatch {
     /// A ready response (+ optional toast) to write back immediately.
     Answer(Response, Option<Toast>),
-    /// The request needs a consent decision; [`serve`] parks the connection.
+    /// The request needs a consent decision; [`run_session`] parks the
+    /// connection.
     Consent {
         agent: String,
         datasource: String,
         scope: String,
         detail: String,
     },
-    /// The request needs a routed datasource query (#509); [`serve`] parks it.
+    /// The request needs a routed datasource query (#509); [`run_session`]
+    /// parks it.
     Query {
         datasource: String,
         scope: String,
@@ -1175,8 +1280,11 @@ async fn wait_for_deadline(deadline: Option<tokio::time::Instant>) {
 ///
 /// Two jobs, and both are the fix for the same bug. [`serve`] runs once per SDK
 /// *session*, and a host restart ends session N and starts session N+1 after
-/// `BACKOFF_BASE` = 100 ms — while session N's `serve` can still be parked
-/// inside `handle_conn` for up to `REQUEST_TIMEOUT` = 5 s, listener still open.
+/// `BACKOFF_BASE` = 100 ms — while session N's `serve` can still be busy
+/// answering a client, listener still open: blocked in `write_response` for up
+/// to its `WRITE_RESPONSE_TIMEOUT` = 2 s on a client that does not read. (It
+/// used to be up to `REQUEST_TIMEOUT` = 5 s on a client that sent nothing,
+/// too, until request lines were read off the loop.)
 /// A per-session bind therefore had the new session probing its **own
 /// predecessor's** listener, concluding "another broker is live", and standing
 /// down for the rest of the process — killing the socket, the panel and the
@@ -1540,16 +1648,13 @@ pub async fn serve_with_shutdown(
 /// whose task does the `spawn_blocking` write in submission order
 /// (see [`crate::grants::GrantStore::save`]), and `write_response` offloads
 /// `encode_response` past [`LARGE_RESPONSE_ROWS`] the same way.
-// One cohesive `select!` loop (accept / command / shutdown / timeout) over the
-// parked-request state (consent + query maps); splitting its arms into helpers
-// would scatter that shared state for no readability gain — same stance as
-// the host's `handle_conn`.
-#[allow(clippy::too_many_lines)]
+///
+/// Everything after the socket is taken is [`run_session`].
 async fn serve_inner<L>(
-    mut cmds: mpsc::UnboundedReceiver<Cmd>,
+    cmds: mpsc::UnboundedReceiver<Cmd>,
     out: mpsc::UnboundedSender<BrokerMsg>,
     load_grants: L,
-    mut shutdown: Option<oneshot::Receiver<oneshot::Sender<()>>>,
+    shutdown: Option<oneshot::Receiver<oneshot::Sender<()>>>,
 ) where
     L: FnOnce() -> GrantStore + Send + 'static,
 {
@@ -1615,62 +1720,278 @@ async fn serve_inner<L>(
             ));
         }
     }
-    let listener = socket.as_ref();
+    run_session(state, socket.as_ref(), cmds, out, shutdown).await;
+}
 
-    // Seed the panel with the current grants/status before any request — and,
-    // when there is no socket, with the reason.
-    send_update(&out, state.snapshot(now_unix()), None);
+/// One session's loop-owned state: the broker state, the requests parked on
+/// it, and the lane up to the plugin. [`run_session`]'s loop owns it and
+/// nothing else touches it — the reader tasks that loop spawns each hold one
+/// client stream and no reference into this.
+struct Session {
+    state: BrokerState,
+    out: mpsc::UnboundedSender<BrokerMsg>,
+    /// Parked consent requests (#487 phase 1b), keyed by the `request_id` the
+    /// broker minted; each holds the client stream open until its decision or
+    /// deadline. At most [`MAX_PENDING_CONSENTS`] of them.
+    pending: HashMap<u64, PendingConsent>,
+    /// Parked datasource queries (#509), keyed by the same minted `request_id`
+    /// counter; each holds the client stream open until the plugin relays a
+    /// `Cmd::QueryResult` (or the query deadline elapses).
+    pending_queries: HashMap<u64, PendingQuery>,
+    next_request_id: u64,
+}
 
-    // Parked consent requests (#487 phase 1b), keyed by the request_id the broker
-    // minted; each holds the client stream open until its decision or deadline.
-    let mut pending: HashMap<u64, PendingConsent> = HashMap::new();
-    // Parked datasource queries (#509), keyed by the same minted `request_id`
-    // counter; each holds the client stream open until the plugin relays a
-    // `Cmd::QueryResult` (or the query deadline elapses).
-    let mut pending_queries: HashMap<u64, PendingQuery> = HashMap::new();
-    let mut next_request_id: u64 = 1;
+impl Session {
+    fn new(state: BrokerState, out: mpsc::UnboundedSender<BrokerMsg>) -> Self {
+        Self {
+            state,
+            out,
+            pending: HashMap::new(),
+            pending_queries: HashMap::new(),
+            next_request_id: 1,
+        }
+    }
 
-    loop {
-        // The nearest parked deadline (consent OR query) drives the timeout arm;
-        // `None` = park forever.
-        let next_deadline = pending
+    /// Push a fresh panel snapshot (+ optional toast) to the plugin.
+    fn push_update(&mut self, toast: Option<Toast>) {
+        send_update(&self.out, self.state.snapshot(now_unix()), toast);
+    }
+
+    /// The next correlation id for a parked request (consent or query).
+    fn mint_request_id(&mut self) -> u64 {
+        let id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        id
+    }
+
+    /// The nearest parked deadline (consent OR query), which drives the loop's
+    /// timeout arm; `None` = park forever.
+    fn next_deadline(&self) -> Option<tokio::time::Instant> {
+        self.pending
             .values()
             .map(|p| p.deadline)
-            .chain(pending_queries.values().map(|q| q.deadline))
-            .min();
+            .chain(self.pending_queries.values().map(|q| q.deadline))
+            .min()
+    }
+
+    /// A panel command or a host relay off the plugin lane.
+    async fn on_cmd(&mut self, cmd: Cmd) {
+        match cmd {
+            Cmd::Revoke { .. } | Cmd::Allow { .. } | Cmd::Calendar(_) => {
+                self.state.apply_cmd(cmd);
+                self.push_update(None);
+            }
+            Cmd::Decision {
+                request_id,
+                decision,
+            } => {
+                if let Some(mut p) = self.pending.remove(&request_id) {
+                    let (resp, toast) =
+                        self.state
+                            .apply_consent(&p.agent, &p.datasource, decision, now_unix());
+                    write_response(&mut p.stream, resp).await;
+                    self.push_update(toast);
+                }
+                // else: a late/unknown decision (already timed out) — ignore.
+            }
+            // #509: a routed query's answer — shape the response from the
+            // provider's payload and write it back to the parked client.
+            Cmd::QueryResult {
+                request_id,
+                outcome,
+            } => {
+                if let Some(mut q) = self.pending_queries.remove(&request_id) {
+                    let resp = query_response(&q.datasource, outcome);
+                    write_response(&mut q.stream, resp).await;
+                }
+                // else: a late/unknown result (already timed out) — ignore.
+            }
+        }
+    }
+
+    /// One parsed request, handed back by its reader task.
+    async fn on_request(&mut self, mut stream: UnixStream, request: Request) {
+        match self.state.dispatch(request) {
+            Dispatch::Answer(response, toast) => {
+                write_response(&mut stream, response).await;
+                self.push_update(toast);
+            }
+            Dispatch::Consent {
+                agent,
+                datasource,
+                scope,
+                detail,
+            } => {
+                if let Some(refusal) = self.consent_refusal(&agent, &datasource) {
+                    write_response(&mut stream, refusal).await;
+                    return;
+                }
+                let request_id = self.mint_request_id();
+                self.pending.insert(
+                    request_id,
+                    PendingConsent {
+                        agent: agent.clone(),
+                        datasource: datasource.clone(),
+                        stream,
+                        deadline: tokio::time::Instant::now() + CONSENT_PARK_TIMEOUT,
+                    },
+                );
+                // Ask the shell to prompt the human; the request stays parked
+                // until the answering `Cmd::Decision` arrives.
+                let _ = self.out.send(BrokerMsg::RequestConsent(ConsentPrompt {
+                    request_id,
+                    agent,
+                    datasource,
+                    scope,
+                    detail,
+                }));
+                self.push_update(None);
+            }
+            // #509: a routed datasource query — park the client and ask the
+            // plugin to route it to the shell host; the answering
+            // `Cmd::QueryResult` (or the deadline) resolves it.
+            Dispatch::Query {
+                datasource,
+                scope,
+                params,
+            } => {
+                let request_id = self.mint_request_id();
+                self.pending_queries.insert(
+                    request_id,
+                    PendingQuery {
+                        datasource: datasource.clone(),
+                        stream,
+                        deadline: tokio::time::Instant::now() + QUERY_PARK_TIMEOUT,
+                    },
+                );
+                let _ = self.out.send(BrokerMsg::Query(QueryRequest {
+                    request_id,
+                    provider: datasource,
+                    scope,
+                    params,
+                }));
+            }
+        }
+    }
+
+    /// Why a consent knock for `(agent, datasource)` cannot be parked right
+    /// now, as the error to answer it with — or `None` when it can.
+    ///
+    /// Two refusals, both retryable and neither audited (no human decided
+    /// anything). A second knock for a pair that already has one parked is
+    /// refused rather than prompted again: the shell's one consent card would
+    /// supersede the first prompt with an identical second one, and the first
+    /// one's own countdown would still answer later, against a decision the
+    /// human made on the second. And past [`MAX_PENDING_CONSENTS`] parked knocks
+    /// any knock is refused, which bounds the open sockets a stream of knocks
+    /// under fresh agent names can park.
+    fn consent_refusal(&self, agent: &str, datasource: &str) -> Option<Response> {
+        if self
+            .pending
+            .values()
+            .any(|p| p.agent == agent && p.datasource == datasource)
+        {
+            Some(Response::error(format!(
+                "auth: a consent prompt for agent '{agent}' on '{datasource}' is already \
+                 waiting on the human; retry once it is answered"
+            )))
+        } else if self.pending.len() >= MAX_PENDING_CONSENTS {
+            Some(Response::error(format!(
+                "auth: {MAX_PENDING_CONSENTS} consent prompts are already waiting on the \
+                 human; retry later"
+            )))
+        } else {
+            None
+        }
+    }
+
+    /// The bound elapsed on the earliest parked request(s): time them out. A
+    /// consent knock times out with a transient deny + the 1a toast (the
+    /// fallback path); a routed query with a transient error.
+    async fn on_deadline(&mut self) {
+        let now_inst = tokio::time::Instant::now();
+        let expired: Vec<u64> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| p.deadline <= now_inst)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in expired {
+            if let Some(mut p) = self.pending.remove(&id) {
+                let (resp, toast) =
+                    self.state
+                        .on_consent_timeout(&p.agent, &p.datasource, now_unix());
+                write_response(&mut p.stream, resp).await;
+                self.push_update(toast);
+            }
+        }
+        // #509: expire parked queries the plugin never answered (a wedged /
+        // pre-#509 host). A transient error — the agent may retry.
+        let expired_q: Vec<u64> = self
+            .pending_queries
+            .iter()
+            .filter(|(_, q)| q.deadline <= now_inst)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in expired_q {
+            if let Some(mut q) = self.pending_queries.remove(&id) {
+                let resp = Response::error(format!(
+                    "{}: datasource query timed out (no host response)",
+                    q.datasource
+                ));
+                write_response(&mut q.stream, resp).await;
+            }
+        }
+    }
+}
+
+/// One session, once its socket is settled: seed the panel, then loop over
+/// panel commands, the shutdown ask, parked deadlines, requests the reader
+/// tasks have read, and new connections, until the command lane closes.
+///
+/// The loop is the single owner of the [`Session`]. What it does not do is
+/// read a request line: each accepted connection gets a [`read_request`]
+/// task in `readers`, and only the parsed request comes back to the loop. So a
+/// client that connects and says nothing costs one reader slot for
+/// [`REQUEST_TIMEOUT`] and stalls nothing else — a human's consent click, a
+/// revoke or a query result is handled as soon as it arrives. At
+/// [`MAX_CONCURRENT_READS`] the accept arm pauses until a reader finishes.
+///
+/// The readers belong to the session: when the loop ends, `readers` drops
+/// and aborts any still in flight, closing those clients unanswered — the same
+/// end a parked consent or query meets, and the honest one, since a token
+/// minted by an ending session dies with it.
+///
+/// Takes the listener rather than finding it (`None` = no socket this
+/// session), so a test can drive the loop over a scratch socket without the
+/// process-wide [`SOCKET`] or `XDG_RUNTIME_DIR`.
+async fn run_session(
+    state: BrokerState,
+    listener: Option<&UnixListener>,
+    mut cmds: mpsc::UnboundedReceiver<Cmd>,
+    out: mpsc::UnboundedSender<BrokerMsg>,
+    mut shutdown: Option<oneshot::Receiver<oneshot::Sender<()>>>,
+) {
+    let mut session = Session::new(state, out);
+    // Seed the panel with the current grants/status before any request — and,
+    // when there is no socket, with the reason.
+    session.push_update(None);
+
+    let mut readers: JoinSet<Option<(UnixStream, Request)>> = JoinSet::new();
+    loop {
+        let next_deadline = session.next_deadline();
         tokio::select! {
             // Prefer draining commands (revoke / allow / a consent decision) so a
             // click — or an answer to a live prompt — lands promptly rather than
-            // behind a slow fetch.
+            // behind a slow fetch; then a due deadline; then the requests already
+            // read; and new connections last, so a burst of them can hold up
+            // none of the others.
             biased;
             cmd = cmds.recv() => {
                 let Some(cmd) = cmd else {
                     break; // lane closed → session teardown
                 };
-                match cmd {
-                    Cmd::Revoke { .. } | Cmd::Allow { .. } | Cmd::Calendar(_) => {
-                        state.apply_cmd(cmd);
-                        send_update(&out, state.snapshot(now_unix()), None);
-                    }
-                    Cmd::Decision { request_id, decision } => {
-                        if let Some(mut p) = pending.remove(&request_id) {
-                            let (resp, toast) =
-                                state.apply_consent(&p.agent, &p.datasource, decision, now_unix());
-                            write_response(&mut p.stream, resp).await;
-                            send_update(&out, state.snapshot(now_unix()), toast);
-                        }
-                        // else: a late/unknown decision (already timed out) — ignore.
-                    }
-                    // #509: a routed query's answer — shape the response from the
-                    // provider's payload and write it back to the parked client.
-                    Cmd::QueryResult { request_id, outcome } => {
-                        if let Some(mut q) = pending_queries.remove(&request_id) {
-                            let resp = query_response(&q.datasource, outcome);
-                            write_response(&mut q.stream, resp).await;
-                        }
-                        // else: a late/unknown result (already timed out) — ignore.
-                    }
-                }
+                session.on_cmd(cmd).await;
             }
             // #1079: the SDK's shutdown hook asking this session to drain the
             // grant store before the process exits — see `recv_shutdown`.
@@ -1682,84 +2003,25 @@ async fn serve_inner<L>(
             // that ordinary teardown, and it is listed first (`biased`) so it
             // wins the tie when both channels close in the same moment.
             Some(ack) = recv_shutdown(&mut shutdown) => {
-                state.grants.drain().await;
+                session.state.grants.drain().await;
                 let _ = ack.send(());
                 break;
             }
-            accepted = accept_or_park(listener) => {
+            () = wait_for_deadline(next_deadline) => session.on_deadline().await,
+            // An empty set answers `None` at once, which this pattern turns
+            // into "no branch here" for this pass rather than a busy loop.
+            Some(read) = readers.join_next() => match read {
+                Ok(Some((stream, request))) => session.on_request(stream, request).await,
+                // The reader already answered (an error), or the client left.
+                Ok(None) => {}
+                Err(e) => tracing_eprintln(&format!("request reader failed: {e}")),
+            },
+            accepted = accept_or_park(listener), if readers.len() < MAX_CONCURRENT_READS => {
                 match accepted {
-                    Ok((stream, _addr)) => match state.handle_conn(stream).await {
-                        ConnResult::Answered { toast } => {
-                            send_update(&out, state.snapshot(now_unix()), toast);
-                        }
-                        ConnResult::NeedsConsent { agent, datasource, scope, detail, stream } => {
-                            let request_id = next_request_id;
-                            next_request_id = next_request_id.wrapping_add(1);
-                            pending.insert(request_id, PendingConsent {
-                                agent: agent.clone(),
-                                datasource: datasource.clone(),
-                                stream,
-                                deadline: tokio::time::Instant::now() + CONSENT_PARK_TIMEOUT,
-                            });
-                            // Ask the shell to prompt the human; the request stays
-                            // parked until the answering `Cmd::Decision` arrives.
-                            let _ = out.send(BrokerMsg::RequestConsent(ConsentPrompt {
-                                request_id, agent, datasource, scope, detail,
-                            }));
-                            send_update(&out, state.snapshot(now_unix()), None);
-                        }
-                        // #509: a routed datasource query — park the client and ask
-                        // the plugin to route it to the shell host; the answering
-                        // `Cmd::QueryResult` (or the deadline) resolves it.
-                        ConnResult::NeedsQuery { datasource, scope, params, stream } => {
-                            let request_id = next_request_id;
-                            next_request_id = next_request_id.wrapping_add(1);
-                            pending_queries.insert(request_id, PendingQuery {
-                                datasource: datasource.clone(),
-                                stream,
-                                deadline: tokio::time::Instant::now() + QUERY_PARK_TIMEOUT,
-                            });
-                            let _ = out.send(BrokerMsg::Query(QueryRequest {
-                                request_id, provider: datasource, scope, params,
-                            }));
-                        }
-                    },
+                    Ok((stream, _addr)) => {
+                        readers.spawn(read_request(stream));
+                    }
                     Err(e) => tracing_eprintln(&format!("accept error: {e}")),
-                }
-            }
-            () = wait_for_deadline(next_deadline) => {
-                // The bound elapsed on the earliest parked request(s): time them
-                // out. A consent knock times out with a transient deny + the 1a
-                // toast (the fallback path); a routed query with a transient error.
-                let now_inst = tokio::time::Instant::now();
-                let expired: Vec<u64> = pending
-                    .iter()
-                    .filter(|(_, p)| p.deadline <= now_inst)
-                    .map(|(id, _)| *id)
-                    .collect();
-                for id in expired {
-                    if let Some(mut p) = pending.remove(&id) {
-                        let (resp, toast) =
-                            state.on_consent_timeout(&p.agent, &p.datasource, now_unix());
-                        write_response(&mut p.stream, resp).await;
-                        send_update(&out, state.snapshot(now_unix()), toast);
-                    }
-                }
-                // #509: expire parked queries the plugin never answered (a wedged /
-                // pre-#509 host). A transient error — the agent may retry.
-                let expired_q: Vec<u64> = pending_queries
-                    .iter()
-                    .filter(|(_, q)| q.deadline <= now_inst)
-                    .map(|(id, _)| *id)
-                    .collect();
-                for id in expired_q {
-                    if let Some(mut q) = pending_queries.remove(&id) {
-                        let resp = Response::error(format!(
-                            "{}: datasource query timed out (no host response)",
-                            q.datasource
-                        ));
-                        write_response(&mut q.stream, resp).await;
-                    }
                 }
             }
         }
@@ -1977,8 +2239,8 @@ mod tests {
     /// The sequence is the one a `systemctl --user restart trollshell` produces
     /// and it is not rare: the SDK ends session N, waits `BACKOFF_BASE` = 100 ms,
     /// redials and calls `sources()` → a fresh `serve` — while session N's
-    /// `serve` can still be parked in `handle_conn` for up to `REQUEST_TIMEOUT`
-    /// = 5 s with its listener open. Probing there answers "live" against **our
+    /// `serve` can still be busy answering a client (see [`SOCKET`]) with its
+    /// listener open. Probing there answers "live" against **our
     /// own listener**, and the old code took that as a duplicate: it stood down,
     /// returned before the seed `send_update`, dropped the new session's command
     /// receiver, and logged "another hytte-plugin-infobroker is running" when
@@ -2009,8 +2271,9 @@ mod tests {
         let inode = std::fs::metadata(&path).expect("socket exists").ino();
         assert!(owned.is_some(), "the process now owns the listener");
 
-        // Session 1 has ended, but its listener is still open (its `handle_conn`
-        // is parked) — so the path IS live. Session 2 starts inside that window.
+        // Session 1 has ended, but its listener is still open (it is still
+        // answering a client) — so the path IS live. Session 2 starts inside
+        // that window.
         assert!(
             socket_in_use(&path).await,
             "precondition: the predecessor's listener still answers, which is what \
@@ -2273,9 +2536,101 @@ mod tests {
     fn authorize_auth_grants_denies_or_prompts() {
         // An `always` grant → silent mint.
         let s = store(vec![Grant::always("claude", "departures")]);
-        assert_eq!(authorize_auth(&s, "claude"), AuthOutcome::Granted);
+        assert_eq!(
+            authorize_auth(&s, "claude", "departures"),
+            AuthOutcome::Granted
+        );
         // A stranger with no standing grant now needs a consent decision (#487).
-        assert_eq!(authorize_auth(&s, "stranger"), AuthOutcome::NeedsConsent);
+        assert_eq!(
+            authorize_auth(&s, "stranger", "departures"),
+            AuthOutcome::NeedsConsent
+        );
+    }
+
+    /// Auth decides per `(agent, datasource)`: the prompt it falls through to
+    /// names one datasource, so a grant for another one answers nothing. Before,
+    /// any `always` grant minted silently and any `deny` refused silently,
+    /// whatever was being asked for.
+    #[test]
+    fn authorize_auth_decides_about_the_datasource_it_was_asked_for() {
+        let s = store(vec![
+            Grant::always("claude", "departures"),
+            Grant {
+                agent: "claude".to_owned(),
+                datasource: "weather".to_owned(),
+                scope: "*".to_owned(),
+                decision: Decision::Deny,
+            },
+        ]);
+        assert_eq!(
+            authorize_auth(&s, "claude", "calendar"),
+            AuthOutcome::NeedsConsent,
+            "a departures grant does not answer a calendar ask — the human is asked"
+        );
+        assert!(
+            matches!(
+                authorize_auth(&s, "claude", "weather"),
+                AuthOutcome::Denied { .. }
+            ),
+            "a standing weather deny still refuses a weather ask silently"
+        );
+        assert_eq!(
+            authorize_auth(&s, "claude", "departures"),
+            AuthOutcome::Granted,
+            "…and the departures grant still mints silently for departures"
+        );
+    }
+
+    /// The prompt names what the agent asked for, and a request that names
+    /// nothing gets exactly the prompt it always did (departures, same detail
+    /// line) — the old-client path.
+    #[test]
+    fn the_consent_knock_names_the_requested_datasource_and_defaults_to_departures() {
+        let mut state = BrokerState::new(store(Vec::new()));
+        let Dispatch::Consent {
+            datasource, detail, ..
+        } = state.handle_auth("claude", Some("calendar"))
+        else {
+            panic!("a no-grant auth for calendar must knock");
+        };
+        assert_eq!(datasource, "calendar");
+        assert_eq!(detail, "claude wants to read your upcoming calendar events");
+
+        let Dispatch::Consent {
+            datasource, detail, ..
+        } = state.handle_auth("claude", None)
+        else {
+            panic!("a no-grant auth naming nothing must knock");
+        };
+        assert_eq!(
+            datasource, "departures",
+            "an absent datasource is departures"
+        );
+        assert_eq!(
+            detail, "claude wants to read the departures board",
+            "the pre-field prompt, byte for byte"
+        );
+    }
+
+    /// An auth naming a datasource the broker does not serve is refused
+    /// outright: no prompt (the human must never be shown a datasource name
+    /// the agent invented), no audit entry, no toast.
+    #[test]
+    fn an_auth_for_an_unknown_datasource_is_refused_without_a_prompt() {
+        let mut state = BrokerState::new(store(Vec::new()));
+        let (resp, toast) = answer(state.handle_auth("claude", Some("bank-account")));
+        assert!(!resp.ok);
+        assert!(
+            resp.error
+                .as_deref()
+                .is_some_and(|e| e.contains("unknown datasource 'bank-account'")),
+            "{resp:?}"
+        );
+        assert!(toast.is_none());
+        assert!(
+            state.audit.is_empty(),
+            "nothing was decided, so nothing is audited"
+        );
     }
 
     #[test]
@@ -2288,7 +2643,7 @@ mod tests {
             scope: "*".to_owned(),
             decision: Decision::Deny,
         }]);
-        let AuthOutcome::Denied { hint } = authorize_auth(&s, "scratch") else {
+        let AuthOutcome::Denied { hint } = authorize_auth(&s, "scratch", "departures") else {
             panic!("a standing deny refuses without prompting");
         };
         assert!(
@@ -2355,7 +2710,7 @@ mod tests {
     fn handle_auth_mints_and_audits_then_get_serves_decision() {
         let mut state = BrokerState::new(store(vec![Grant::always("claude", "departures")]));
         // Auth mints a token and records a granted audit entry.
-        let (resp, toast) = answer(state.handle_auth("claude"));
+        let (resp, toast) = answer(state.handle_auth("claude", None));
         assert!(resp.ok);
         assert!(toast.is_none(), "a silent mint raises no toast");
         let token = resp.token.expect("minted token");
@@ -2386,7 +2741,7 @@ mod tests {
         let mut state = BrokerState::new(store(Vec::new()));
         let Dispatch::Consent {
             agent, datasource, ..
-        } = state.handle_auth("stranger")
+        } = state.handle_auth("stranger", None)
         else {
             panic!("a no-grant auth must knock for consent, not deny");
         };
@@ -2400,7 +2755,7 @@ mod tests {
     #[test]
     fn empty_agent_is_rejected_without_a_toast() {
         let mut state = BrokerState::new(store(Vec::new()));
-        let (resp, toast) = answer(state.handle_auth("   "));
+        let (resp, toast) = answer(state.handle_auth("   ", None));
         assert!(!resp.ok);
         assert!(toast.is_none());
         assert!(state.audit.is_empty(), "a blank auth isn't audited");
@@ -2473,7 +2828,7 @@ mod tests {
         assert!(toast.summary.contains("scratch"));
         // …and a subsequent auth is now refused silently (no re-prompt).
         assert!(matches!(
-            authorize_auth(&state.grants, "scratch"),
+            authorize_auth(&state.grants, "scratch", "departures"),
             AuthOutcome::Denied { .. }
         ));
     }
@@ -2492,56 +2847,188 @@ mod tests {
             "an unanswered prompt persists nothing"
         );
         assert_eq!(
-            authorize_auth(&state.grants, "claude"),
+            authorize_auth(&state.grants, "claude", "departures"),
             AuthOutcome::NeedsConsent
         );
     }
 
+    /// Whether a routed `get` was let through (it became a query) — the
+    /// allowed answer for `departures`/`weather`, whose rows a provider plugin
+    /// supplies. A denial is an inline `Answer`.
+    fn routed(d: &GetDisposition) -> bool {
+        matches!(d, GetDisposition::Query { .. })
+    }
+
     #[test]
     fn get_authority_follows_the_token_scope() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("rt");
-        rt.block_on(async {
-            let mut state = BrokerState::new(store(Vec::new()));
-            // A session token authorizes a get with no durable grant. (We stop at
-            // the authorization decision — the live fetch needs the network — by
-            // asserting a Session token resolves as allowed via the scope, which
-            // the handler consults before fetching.)
-            let session = state
-                .tokens
-                .mint_scoped("claude", now_unix(), TokenScope::Session);
-            let auth = state
-                .tokens
-                .resolve(&session.value, now_unix())
-                .expect("resolves");
-            assert_eq!(auth.scope, TokenScope::Session);
+        let mut state = BrokerState::new(store(Vec::new()));
+        // A session token authorizes its datasource with no durable grant (the
+        // routed query is the "allowed" answer; the fetch itself is a provider's).
+        let session = state.tokens.mint_scoped(
+            "claude",
+            now_unix(),
+            TokenScope::Session {
+                datasource: "departures".to_owned(),
+            },
+        );
+        assert!(routed(&state.handle_get(
+            &session.value,
+            "departures",
+            None
+        )));
+        assert!(
+            routed(&state.handle_get(&session.value, "departures", None)),
+            "a session token is not spent by a fetch"
+        );
 
-            // A once token authorizes exactly one fetch: the first spend succeeds,
-            // the second is denied (spent).
-            let once = state
-                .tokens
-                .mint_scoped("claude", now_unix(), TokenScope::Once);
-            assert!(state.tokens.spend_once(&once.value), "first fetch allowed");
-            assert!(
-                !state.tokens.spend_once(&once.value),
-                "the once authority is spent after one fetch"
-            );
+        // A once token authorizes exactly one fetch of its datasource.
+        let once = state.tokens.mint_scoped(
+            "claude",
+            now_unix(),
+            TokenScope::Once {
+                datasource: "departures".to_owned(),
+            },
+        );
+        assert!(
+            routed(&state.handle_get(&once.value, "departures", None)),
+            "first fetch allowed"
+        );
+        let (resp, toast) = get_answer(state.handle_get(&once.value, "departures", None));
+        assert!(!resp.ok, "the once authority is spent after one fetch");
+        assert!(toast.is_none(), "a spent once is transient, not a knock");
 
-            // A Grant-scoped token with NO durable grant is denied (no toast).
-            let identity = state.tokens.mint("stranger", now_unix()); // Grant scope
-            let (resp, toast) = get_answer(state.handle_get(&identity.value, "departures", None));
-            assert!(!resp.ok, "an identity token without a grant can't fetch");
-            assert!(toast.is_none(), "a scope miss is transient, not a knock");
-        });
+        // A Grant-scoped token with NO durable grant is denied (no toast).
+        let identity = state.tokens.mint("stranger", now_unix()); // Grant scope
+        let (resp, toast) = get_answer(state.handle_get(&identity.value, "departures", None));
+        assert!(!resp.ok, "an identity token without a grant can't fetch");
+        assert!(toast.is_none(), "a scope miss is transient, not a knock");
+    }
+
+    /// **The finding**, end to end through the broker's own handlers: the
+    /// human answers "This session" on a prompt that read "claude wants: read
+    /// access from departures", and that token then reads the calendar. Before
+    /// this, `handle_get` took `TokenScope::Session` as "every datasource" —
+    /// the prompt said departures, the authority said everything.
+    ///
+    /// Mutation: restore `TokenScope::Session => true` in `handle_get` (or make
+    /// `TokenScope::covers` answer `true`) and the calendar `get` comes back
+    /// `ok` with the rows.
+    #[test]
+    fn an_allow_session_token_for_departures_cannot_read_the_calendar() {
+        let mut state = BrokerState::new(store(Vec::new()));
+        state.apply_cmd(Cmd::Calendar(calendar_fixture()));
+        // The knock an old client gets (no datasource on the wire) names
+        // departures…
+        let Dispatch::Consent {
+            agent, datasource, ..
+        } = state.handle_auth("claude", None)
+        else {
+            panic!("a no-grant auth must knock for consent");
+        };
+        assert_eq!(datasource, "departures");
+        // …and the human answers that prompt with "This session".
+        let (resp, _) = state.apply_consent(
+            &agent,
+            &datasource,
+            ConsentDecision::AllowSession,
+            now_unix(),
+        );
+        let token = resp.token.expect("an allow mints a token");
+
+        let (resp, toast) = get_answer(state.handle_get(&token, "calendar", None));
+        assert!(
+            !resp.ok,
+            "a departures consent must not read the calendar: {resp:?}"
+        );
+        assert!(resp.calendar.is_none(), "no calendar rows leak");
+        assert!(toast.is_none(), "a scope miss is transient, not a knock");
+        assert!(
+            resp.hint
+                .as_deref()
+                .is_some_and(|h| h.contains("--datasource calendar")),
+            "the hint says how to ask for the calendar: {resp:?}"
+        );
+        assert!(
+            !routed(&state.handle_get(&token, "weather", None)),
+            "…nor route a weather query"
+        );
+        assert!(
+            routed(&state.handle_get(&token, "departures", None)),
+            "what the prompt named still reads"
+        );
+    }
+
+    /// "Allow once" is scoped the same way, and a get for another datasource
+    /// is refused **without** spending the once — so the one fetch the human
+    /// allowed is still there for what they allowed it for.
+    #[test]
+    fn an_allow_once_token_reads_only_its_own_datasource_and_only_once() {
+        let mut state = BrokerState::new(store(Vec::new()));
+        state.apply_cmd(Cmd::Calendar(calendar_fixture()));
+        let (resp, _) =
+            state.apply_consent("claude", "calendar", ConsentDecision::AllowOnce, now_unix());
+        let token = resp.token.expect("minted");
+
+        assert!(
+            !routed(&state.handle_get(&token, "departures", None)),
+            "a calendar once must not route a departures query"
+        );
+        let (resp, _) = get_answer(state.handle_get(&token, "calendar", None));
+        assert!(resp.ok, "the refused departures get did not spend the once");
+        assert_eq!(resp.calendar.expect("rows").len(), 2);
+        let (resp, _) = get_answer(state.handle_get(&token, "calendar", None));
+        assert!(!resp.ok, "…and the once is spent after its one fetch");
+    }
+
+    /// A consent token still identifies its agent, so the agent's durable
+    /// grants answer for it exactly as they do for a Grant-scoped token: the
+    /// scoping removes only what nobody consented to. And a read the grant
+    /// already covers does not spend a once on the way.
+    #[test]
+    fn a_consent_token_still_reaches_what_the_agents_durable_grants_cover() {
+        let mut state = BrokerState::new(store(vec![Grant::always("claude", "calendar")]));
+        state.apply_cmd(Cmd::Calendar(calendar_fixture()));
+        let (resp, _) = state.apply_consent(
+            "claude",
+            "departures",
+            ConsentDecision::AllowOnce,
+            now_unix(),
+        );
+        let token = resp.token.expect("minted");
+        let (resp, _) = get_answer(state.handle_get(&token, "calendar", None));
+        assert!(resp.ok, "the durable calendar grant covers it: {resp:?}");
+        assert!(
+            routed(&state.handle_get(&token, "departures", None)),
+            "the departures once is still unspent"
+        );
+    }
+
+    /// The panel's pending row offers to Allow what the agent asked for: a
+    /// denied calendar knock is a calendar row, not the departures row every
+    /// denial used to make (all a phase-1a auth could ask for). A get for a
+    /// datasource the broker does not serve makes no row — there is nothing to
+    /// grant.
+    #[test]
+    fn a_denied_knock_offers_its_own_datasource_in_the_panel() {
+        let mut state = BrokerState::new(store(Vec::new()));
+        let _ = state.apply_consent("claude", "calendar", ConsentDecision::Deny, now_unix());
+        let stranger = state.tokens.mint("stranger", now_unix());
+        let _ = state.handle_get(&stranger.value, "stocks", None);
+
+        assert_eq!(
+            state.snapshot(now_unix()).pending,
+            vec![PendingView {
+                agent: "claude".to_owned(),
+                datasource: "calendar".to_owned(),
+            }],
+        );
     }
 
     #[test]
     fn audit_ring_is_capped() {
         let mut state = BrokerState::new(store(Vec::new()));
         for _ in 0..(AUDIT_CAP + 5) {
-            state.record("claude", "auth", Outcome::Denied, now_unix());
+            state.record("claude", "auth", "departures", Outcome::Denied, now_unix());
         }
         assert_eq!(state.audit.len(), AUDIT_CAP, "the ring is bounded");
         assert_eq!(state.snapshot(now_unix()).audit.len(), AUDIT_CAP);
@@ -2573,7 +3060,10 @@ mod tests {
     #[test]
     fn get_unknown_datasource_is_denied_without_a_toast() {
         let mut state = BrokerState::new(store(vec![Grant::always("claude", "departures")]));
-        let token = answer(state.handle_auth("claude")).0.token.expect("token");
+        let token = answer(state.handle_auth("claude", None))
+            .0
+            .token
+            .expect("token");
         // `stocks` is a genuinely unknown datasource (departures/weather/calendar
         // are the known set, #509).
         let (resp, toast) = get_answer(state.handle_get(&token, "stocks", None));
@@ -2634,7 +3124,10 @@ mod tests {
         // it (the normal grant flow, datasource-scoped).
         let mut state = BrokerState::new(store(vec![Grant::always("claude", "calendar")]));
         state.apply_cmd(Cmd::Calendar(calendar_fixture()));
-        let token = answer(state.handle_auth("claude")).0.token.expect("token");
+        let token = answer(state.handle_auth("claude", Some("calendar")))
+            .0
+            .token
+            .expect("token");
         let (resp, toast) = get_answer(state.handle_get(&token, "calendar", None));
         assert!(resp.ok, "the granted agent gets the calendar copy");
         assert!(toast.is_none(), "a served datasource raises no toast");
@@ -2651,7 +3144,10 @@ mod tests {
         // A departures-only grant does NOT cover calendar (per-datasource).
         let mut state = BrokerState::new(store(vec![Grant::always("claude", "departures")]));
         state.apply_cmd(Cmd::Calendar(calendar_fixture()));
-        let token = answer(state.handle_auth("claude")).0.token.expect("token");
+        let token = answer(state.handle_auth("claude", None))
+            .0
+            .token
+            .expect("token");
         let (resp, toast) = get_answer(state.handle_get(&token, "calendar", None));
         assert!(!resp.ok, "no calendar grant → denied");
         assert!(toast.is_none(), "a scope miss is transient, not a knock");
@@ -2760,12 +3256,16 @@ mod tests {
 
     #[test]
     fn handle_get_departures_routes_a_query_under_the_grant_flow() {
-        // A session token authorizes any datasource get; departures now routes a
-        // query rather than fetching inline (#509 dedup).
+        // A departures session token authorizes a departures get; departures now
+        // routes a query rather than fetching inline (#509 dedup).
         let mut state = BrokerState::new(store(Vec::new()));
-        let token = state
-            .tokens
-            .mint_scoped("claude", now_unix(), TokenScope::Session);
+        let token = state.tokens.mint_scoped(
+            "claude",
+            now_unix(),
+            TokenScope::Session {
+                datasource: "departures".to_owned(),
+            },
+        );
         match state.handle_get(&token.value, "departures", Some(4)) {
             GetDisposition::Query {
                 datasource,
@@ -2788,7 +3288,10 @@ mod tests {
     #[test]
     fn handle_get_weather_routes_a_query_under_the_grant_flow() {
         let mut state = BrokerState::new(store(vec![Grant::always("claude", "weather")]));
-        let token = answer(state.handle_auth("claude")).0.token.expect("token");
+        let token = answer(state.handle_auth("claude", Some("weather")))
+            .0
+            .token
+            .expect("token");
         match state.handle_get(&token, "weather", None) {
             GetDisposition::Query {
                 datasource, scope, ..
@@ -2808,5 +3311,276 @@ mod tests {
         let (resp, toast) = get_answer(state.handle_get(&identity.value, "departures", None));
         assert!(!resp.ok, "no grant → denied, not routed");
         assert!(toast.is_none());
+    }
+
+    // ── The session loop, over a scratch socket ────────────────────────────────
+
+    /// How long a test below gives an answer the loop should produce at once.
+    /// Generous for a local socket round trip, and far under the
+    /// [`REQUEST_TIMEOUT`] (5 s) a stalled loop would make it wait.
+    const PROMPT: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// How long a test sleeps so the loop can accept a connection it just
+    /// made. There is no observable for "accepted"; a local accept on this
+    /// same runtime takes microseconds.
+    const ACCEPT_SETTLE: std::time::Duration = std::time::Duration::from_millis(100);
+
+    /// A listener in a scratch `0700` dir — `run_session` takes its listener
+    /// as an argument, so these tests need neither the process-wide `SOCKET`
+    /// nor `XDG_RUNTIME_DIR`. The `TempDir` must outlive the test.
+    fn scratch_listener() -> (tempfile::TempDir, std::path::PathBuf, UnixListener) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        chmod(dir.path(), 0o700).expect("chmod 0700");
+        let path = dir.path().join("hytte-infobroker.sock");
+        let listener = UnixListener::bind(&path).expect("bind the scratch socket");
+        (dir, path, listener)
+    }
+
+    /// Send one request line.
+    async fn send_line(stream: &mut UnixStream, line: &str) {
+        stream
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .expect("write the request line");
+    }
+
+    /// Read one response line (`""` on EOF).
+    async fn read_reply(stream: &mut UnixStream) -> String {
+        let mut line = String::new();
+        BufReader::new(stream)
+            .read_line(&mut line)
+            .await
+            .expect("read the response line");
+        line
+    }
+
+    /// Connect, send `line`, and return the stream for the reply.
+    async fn knock(path: &Path, line: &str) -> UnixStream {
+        let mut stream = UnixStream::connect(path).await.expect("connect");
+        send_line(&mut stream, line).await;
+        stream
+    }
+
+    /// The next consent prompt the session raises, skipping panel updates.
+    async fn next_prompt(out: &mut mpsc::UnboundedReceiver<BrokerMsg>) -> ConsentPrompt {
+        let wait = async {
+            loop {
+                match out.recv().await.expect("the session's out lane is open") {
+                    BrokerMsg::RequestConsent(prompt) => return prompt,
+                    BrokerMsg::Update { .. } | BrokerMsg::Query(_) => {}
+                }
+            }
+        };
+        tokio::time::timeout(PROMPT, wait)
+            .await
+            .expect("the session raises the consent prompt promptly")
+    }
+
+    /// Every prompt still queued on `out` (the session has had its turn).
+    fn queued_prompts(out: &mut mpsc::UnboundedReceiver<BrokerMsg>) -> Vec<ConsentPrompt> {
+        let mut prompts = Vec::new();
+        while let Ok(msg) = out.try_recv() {
+            if let BrokerMsg::RequestConsent(prompt) = msg {
+                prompts.push(prompt);
+            }
+        }
+        prompts
+    }
+
+    /// Item 2, the reviewers' scenario: a consent prompt is out, and a client
+    /// connects and sends nothing. The human's answer must still reach the
+    /// parked agent at once, and another client must still be served —
+    /// neither may wait out the silent client's [`REQUEST_TIMEOUT`].
+    ///
+    /// Before the request read moved off the loop, `handle_conn` awaited it
+    /// inside the accept arm: the loop sat in the silent client's `read_line`
+    /// for 5 s with the `Cmd::Decision` queued behind it, and a client that kept
+    /// reconnecting could hold it there past the consent park deadline.
+    ///
+    /// Mutation: `.await` `read_request(stream)` inside the accept arm (and hand
+    /// its result straight to `on_request`) instead of spawning it into
+    /// `readers` — the decision then lands only after the silent client times
+    /// out, and the `PROMPT`-bounded read of the token fails.
+    #[tokio::test]
+    async fn a_silent_client_holds_up_neither_a_consent_answer_nor_another_client() {
+        let (_dir, path, listener) = scratch_listener();
+        let (cmds_tx, cmds_rx) = mpsc::unbounded_channel();
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let session = run_session(
+            BrokerState::new(store(Vec::new())),
+            Some(&listener),
+            cmds_rx,
+            out_tx,
+            None,
+        );
+        let drive = async move {
+            // An agent knocks; the broker parks it and raises the prompt.
+            let mut asker = knock(
+                &path,
+                r#"{"op":"auth","agent":"claude","datasource":"calendar"}"#,
+            )
+            .await;
+            let prompt = next_prompt(&mut out_rx).await;
+            assert_eq!(prompt.datasource, "calendar", "the prompt names the ask");
+
+            // A client connects and says nothing; let the loop accept it.
+            let silent = UnixStream::connect(&path).await.expect("connect");
+            tokio::time::sleep(ACCEPT_SETTLE).await;
+
+            // The human answers: the token must arrive now, not in 5 s.
+            cmds_tx
+                .send(Cmd::Decision {
+                    request_id: prompt.request_id,
+                    decision: ConsentDecision::AllowSession,
+                })
+                .expect("the session is alive");
+            let reply = tokio::time::timeout(PROMPT, read_reply(&mut asker))
+                .await
+                .expect("a consent answer must not wait out a silent client's request timeout");
+            assert!(reply.contains(r#""token":"#), "{reply}");
+
+            // And a second client is served now, too.
+            let mut other = knock(&path, r#"{"op":"grants"}"#).await;
+            let reply = tokio::time::timeout(PROMPT, read_reply(&mut other))
+                .await
+                .expect("a second client must not wait out a silent one");
+            assert!(reply.contains(r#""ok":true"#), "{reply}");
+
+            drop(silent);
+            drop(cmds_tx); // ends the session
+        };
+        tokio::join!(session, drive);
+    }
+
+    /// Item 3: a client that streams bytes with no newline is refused **at
+    /// the cap**, with an error naming it — not buffered for the whole
+    /// [`REQUEST_TIMEOUT`] and then answered "timed out".
+    ///
+    /// Mutation: drop the `.take(limit)` (or the overflow arm) from
+    /// `read_request` and the reader keeps reading, so the bounded wait below
+    /// fails.
+    #[tokio::test]
+    async fn a_request_line_past_the_cap_is_refused_at_the_cap() {
+        let (server, mut client) = UnixStream::pair().expect("a connected socketpair");
+        let reader = tokio::spawn(read_request(server));
+        // One byte past the cap, no newline. Fits the socket buffer, so the
+        // write completes whether or not the reader is draining it.
+        client
+            .write_all(&vec![b'x'; MAX_REQUEST_LINE + 1])
+            .await
+            .expect("write the oversized line");
+        let read = tokio::time::timeout(PROMPT, reader)
+            .await
+            .expect("an overflowing line is refused at the cap, not at the request timeout")
+            .expect("the reader does not panic");
+        assert!(read.is_none(), "an overflowing line is not a request");
+        let reply = read_reply(&mut client).await;
+        assert!(
+            reply.contains(&format!("longer than {MAX_REQUEST_LINE} bytes")),
+            "the refusal names the cap: {reply}"
+        );
+    }
+
+    /// Item 3, the cap's other edge: a line of exactly [`MAX_REQUEST_LINE`]
+    /// bytes plus its newline is a request, read whole and parsed.
+    #[tokio::test]
+    async fn a_request_line_at_the_cap_is_read_whole() {
+        let (server, mut client) = UnixStream::pair().expect("a connected socketpair");
+        let op = r#"{"op":"grants"}"#;
+        let line = format!("{op}{}\n", " ".repeat(MAX_REQUEST_LINE - op.len()));
+        assert_eq!(line.len(), MAX_REQUEST_LINE + 1, "the cap plus the newline");
+        let reader = tokio::spawn(read_request(server));
+        client.write_all(line.as_bytes()).await.expect("write");
+        let read = tokio::time::timeout(PROMPT, reader)
+            .await
+            .expect("a line at the cap reads promptly")
+            .expect("the reader does not panic");
+        let (_stream, request) = read.expect("a line at the cap is a request");
+        assert_eq!(request, Request::Grants);
+    }
+
+    /// Item 4: a second knock for an `(agent, datasource)` pair that already
+    /// has one parked is refused at once with a retryable error, and raises no
+    /// second prompt — the shell would otherwise supersede the first card with
+    /// an identical one whose answer the first one's own timer later
+    /// contradicts. A knock for another datasource still prompts.
+    #[tokio::test]
+    async fn a_second_knock_for_a_parked_pair_is_refused_without_a_second_prompt() {
+        let (_dir, path, listener) = scratch_listener();
+        let (cmds_tx, cmds_rx) = mpsc::unbounded_channel();
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let session = run_session(
+            BrokerState::new(store(Vec::new())),
+            Some(&listener),
+            cmds_rx,
+            out_tx,
+            None,
+        );
+        let drive = async move {
+            let _first = knock(&path, r#"{"op":"auth","agent":"claude"}"#).await;
+            let first = next_prompt(&mut out_rx).await;
+
+            let mut again = knock(&path, r#"{"op":"auth","agent":"claude"}"#).await;
+            let reply = tokio::time::timeout(PROMPT, read_reply(&mut again))
+                .await
+                .expect("the duplicate is answered at once");
+            assert!(reply.contains("already waiting"), "{reply}");
+            assert!(
+                queued_prompts(&mut out_rx).is_empty(),
+                "the duplicate raised no second prompt"
+            );
+
+            let _other = knock(
+                &path,
+                r#"{"op":"auth","agent":"claude","datasource":"weather"}"#,
+            )
+            .await;
+            let other = next_prompt(&mut out_rx).await;
+            assert_eq!(other.datasource, "weather", "another pair still prompts");
+            assert_ne!(other.request_id, first.request_id);
+
+            drop(cmds_tx);
+        };
+        tokio::join!(session, drive);
+    }
+
+    /// Item 4: past [`MAX_PENDING_CONSENTS`] parked knocks, any knock — even
+    /// under a fresh agent name, which the per-pair refusal cannot catch — is
+    /// refused with a retryable error instead of parking another socket.
+    #[tokio::test]
+    async fn knocks_past_the_pending_cap_are_refused() {
+        let (_dir, path, listener) = scratch_listener();
+        let (cmds_tx, cmds_rx) = mpsc::unbounded_channel();
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let session = run_session(
+            BrokerState::new(store(Vec::new())),
+            Some(&listener),
+            cmds_rx,
+            out_tx,
+            None,
+        );
+        let drive = async move {
+            let mut parked = Vec::new();
+            for i in 0..MAX_PENDING_CONSENTS {
+                let line = format!(r#"{{"op":"auth","agent":"agent-{i}"}}"#);
+                parked.push(knock(&path, &line).await);
+                next_prompt(&mut out_rx).await;
+            }
+            let mut over = knock(&path, r#"{"op":"auth","agent":"one-too-many"}"#).await;
+            let reply = tokio::time::timeout(PROMPT, read_reply(&mut over))
+                .await
+                .expect("the knock past the cap is answered at once");
+            assert!(
+                reply.contains(&format!("{MAX_PENDING_CONSENTS} consent prompts")),
+                "{reply}"
+            );
+            assert!(
+                queued_prompts(&mut out_rx).is_empty(),
+                "no prompt past the cap"
+            );
+            drop(parked);
+            drop(cmds_tx);
+        };
+        tokio::join!(session, drive);
     }
 }

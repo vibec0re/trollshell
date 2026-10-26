@@ -28,11 +28,13 @@
 //! - **Tokens are ephemeral** ([`tokens`]): in-memory bearer "session cookies",
 //!   12 h TTL, killed by an explicit revoke or a broker/shell restart.
 //!
-//! Auth mints a token **silently** when an `always` grant covers the agent, else
-//! denies with a how-to-grant hint and an informational `Effect::Notify` toast
-//! so the human sees the knock. Interactive Allow/Deny prompting is **phase 1b**
-//! (the shell-side consent overlay, post-#419); this crate makes **zero
-//! shell-side changes**.
+//! An auth asks for one datasource (`departures` when it names none). It mints
+//! a token **silently** when an `always` grant covers that agent and
+//! datasource, is refused silently on a standing `deny` for them, and
+//! otherwise raises the shell's interactive consent prompt naming the
+//! datasource (phase 1b, `Effect::RequestConsent`). A token minted by an
+//! "Allow once" / "This session" answer reads that one datasource and nothing
+//! else beyond the agent's durable grants — see [`tokens::TokenScope`].
 //!
 //! # The datasources
 //!

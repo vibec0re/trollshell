@@ -1511,7 +1511,8 @@ apps = [
         let path = dir.path().join("workspaces.toml");
         std::fs::write(&path, "# mine\n[workspace.chat]\nlayout = \"golden\"\n").expect("writes");
 
-        save_stack_to(&serialized(), 
+        save_stack_to(
+            &serialized(),
             &path,
             "dev",
             &Stack {
@@ -1927,7 +1928,8 @@ apps = [
                 },
             ],
         };
-        save_edit_to(&serialized(), 
+        save_edit_to(
+            &serialized(),
             &path,
             Some("chat"),
             "chat",
@@ -1960,7 +1962,15 @@ apps = [
         let body = two_stacks(&path);
 
         let stack = stack_in(&path, "dev").expect("the stack is there");
-        save_edit_to(&serialized(), &path, Some("dev"), "dev", &stack, &EditContext::default()).expect("saves");
+        save_edit_to(
+            &serialized(),
+            &path,
+            Some("dev"),
+            "dev",
+            &stack,
+            &EditContext::default(),
+        )
+        .expect("saves");
 
         assert_eq!(
             std::fs::read_to_string(&path).expect("reads back"),
@@ -2001,8 +2011,15 @@ apps = [
         two_stacks(&path);
 
         let stack = stack_in(&path, "chat").expect("the stack is there");
-        save_edit_to(&serialized(), &path, Some("chat"), "talk", &stack, &EditContext::default())
-            .expect("renames");
+        save_edit_to(
+            &serialized(),
+            &path,
+            Some("chat"),
+            "talk",
+            &stack,
+            &EditContext::default(),
+        )
+        .expect("renames");
 
         let loaded =
             subsystem::load_from::<WorkspacesConfig>(std::slice::from_ref(&path)).expect("loads");
@@ -2047,7 +2064,8 @@ apps = [
             taken: ["dev".to_owned()].into_iter().collect(),
             previous_is_inherited: false,
         };
-        let err = save_edit_to(&serialized(), &path, Some("chat"), "dev", &stack, &taken).expect_err("refused");
+        let err = save_edit_to(&serialized(), &path, Some("chat"), "dev", &stack, &taken)
+            .expect_err("refused");
         assert!(matches!(err, ConfigError::Invalid(_)), "{err}");
         assert_eq!(
             std::fs::read_to_string(&path).expect("reads back"),
@@ -2057,8 +2075,15 @@ apps = [
 
         // …and with the name genuinely free it goes through, so the refusal is
         // the guard rather than the writer simply not working.
-        save_edit_to(&serialized(), &path, Some("chat"), "talk", &stack, &EditContext::default())
-            .expect("renames");
+        save_edit_to(
+            &serialized(),
+            &path,
+            Some("chat"),
+            "talk",
+            &stack,
+            &EditContext::default(),
+        )
+        .expect("renames");
         assert!(stack_in(&path, "talk").is_some());
     }
 
@@ -2102,7 +2127,8 @@ apps = [
         assert!(merged(()).stacks.contains_key("chat"), "the base pins it");
 
         let renamed = merged(()).stacks["chat"].clone();
-        save_edit_to(&serialized(), 
+        save_edit_to(
+            &serialized(),
             &overlay,
             Some("chat"),
             "talk",
@@ -2159,8 +2185,15 @@ apps = [
         two_stacks(&path);
 
         let stack = stack_in(&path, "chat").expect("the stack is there");
-        save_edit_to(&serialized(), &path, Some("chat"), "talk", &stack, &EditContext::default())
-            .expect("renames");
+        save_edit_to(
+            &serialized(),
+            &path,
+            Some("chat"),
+            "talk",
+            &stack,
+            &EditContext::default(),
+        )
+        .expect("renames");
 
         assert_eq!(
             unset_names(&path),
@@ -2185,14 +2218,30 @@ apps = [
         };
 
         let stack = stack_in(&path, "chat").expect("the stack is there");
-        save_edit_to(&serialized(), &path, Some("chat"), "talk", &stack, &inherited).expect("renames");
+        save_edit_to(
+            &serialized(),
+            &path,
+            Some("chat"),
+            "talk",
+            &stack,
+            &inherited,
+        )
+        .expect("renames");
         assert_eq!(
             unset_names(&path).as_deref(),
             Some(["chat".to_owned()].as_slice()),
             "the first rename records the removal"
         );
 
-        save_edit_to(&serialized(), &path, Some("talk"), "chat", &stack, &inherited).expect("renames back");
+        save_edit_to(
+            &serialized(),
+            &path,
+            Some("talk"),
+            "chat",
+            &stack,
+            &inherited,
+        )
+        .expect("renames back");
         let body = std::fs::read_to_string(&path).expect("reads");
         let marked = unset_names(&path).unwrap_or_default();
         assert!(
@@ -2215,7 +2264,8 @@ apps = [
         let path = dir.path().join("workspaces.toml");
         let body = two_stacks(&path);
 
-        let err = save_edit_to(&serialized(), 
+        let err = save_edit_to(
+            &serialized(),
             &path,
             Some("chat"),
             "chat--dev",
@@ -2376,9 +2426,7 @@ apps = [
     /// The index of the one Save in `results` that landed, after asserting that
     /// exactly one did and that every other was refused as a taken name.
     fn the_one_that_landed(results: &[Result<(), ConfigError>]) -> usize {
-        let landed: Vec<usize> = (0..results.len())
-            .filter(|&i| results[i].is_ok())
-            .collect();
+        let landed: Vec<usize> = (0..results.len()).filter(|&i| results[i].is_ok()).collect();
         assert_eq!(landed.len(), 1, "exactly one Save may land: {results:?}");
         for result in results {
             assert!(
@@ -2495,7 +2543,8 @@ apps = [
         let path = dir.path().join("workspaces.toml");
         std::fs::write(&path, "# mine\n[workspace.chat]\nlayout = \"golden\"\n").expect("writes");
 
-        save_edit_to(&serialized(), 
+        save_edit_to(
+            &serialized(),
             &path,
             None,
             "music",

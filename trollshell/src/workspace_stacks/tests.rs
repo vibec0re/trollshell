@@ -818,7 +818,9 @@ impl Ops for Compositor {
                 WorkspaceAction::SetName { workspace, name } => {
                     let taken = workspaces.iter().any(|w| {
                         w.id != workspace
-                            && w.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(&name))
+                            && w.name
+                                .as_deref()
+                                .is_some_and(|n| n.eq_ignore_ascii_case(&name))
                     });
                     if let Some(w) = workspaces.iter_mut().find(|w| w.id == workspace)
                         && !taken

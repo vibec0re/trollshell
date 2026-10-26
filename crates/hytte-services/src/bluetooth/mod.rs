@@ -34,7 +34,7 @@ mod types;
 pub(crate) use types::AgentReply;
 pub use types::{Adapter, Device, PairPrompt, PromptKind};
 
-use agent::{AGENT_ANCHOR_NAME, AGENT_PATH, PairAgent, run_agent};
+use agent::{AGENT_ANCHOR_NAME, AGENT_PATH, PairAgent, ReplySlot, run_agent};
 use devices::{ListenEnd, listen, wait_for_bluez};
 use futures_signals::signal::{Mutable, Signal};
 use hytte_bus::BusKind;
@@ -43,7 +43,6 @@ use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
-use tokio::sync::oneshot;
 
 use crate::retry;
 
@@ -89,7 +88,7 @@ const PAIRING_CALL_TIMEOUT: Duration = Duration::from_mins(5);
 //     pairing dialog hangs forever on a no-op.
 //   - `PairAgent` iface methods (`request_pin_code`, `request_passkey`,
 //     `request_confirmation`, `request_authorization`, `cancel`) call
-//     `lookup_alias`, `pending_response_arc` and `await_reply`, which reach
+//     `lookup_alias`, `cancel_in` and `await_reply`, which reach
 //     the prompt slot; all of them once used `registry::with`.
 //
 // The cross-thread-safe alternative is `hytte_reactive::shared` (the
@@ -100,7 +99,7 @@ pub(super) struct BluetoothShared {
     pub(super) devices: Mutable<Vec<Device>>,
     pub(super) device_actions: Mutable<HashSet<String>>,
     pub(super) pair_prompt: Mutable<Option<PairPrompt>>,
-    pub(super) pending_response: Arc<AsyncMutex<Option<oneshot::Sender<AgentReply>>>>,
+    pub(super) pending_response: Arc<ReplySlot>,
     /// Most recent connect/pair/disconnect failure (#1171), or `None` before
     /// the first one. `Mutable::set` always notifies subscribers, even on an
     /// unchanged value (see `mark_busy`'s doc below for the same invariant),
@@ -198,10 +197,12 @@ pub struct BluetoothHandles {
     /// or `None` when no prompt is pending. The UI renders a banner when
     /// `Some` and calls `respond_to_prompt(...)` on user action.
     pub(crate) pair_prompt: Mutable<Option<PairPrompt>>,
-    /// Sender half of the oneshot the agent method is awaiting. Held under
-    /// an async mutex so `respond_to_prompt` / `submit_pin` / `submit_passkey`
-    /// / `Cancel` can race-lessly take it. `None` when no prompt is in-flight.
-    pub(crate) pending_response: Arc<AsyncMutex<Option<oneshot::Sender<AgentReply>>>>,
+    /// Sender half of the oneshot the agent method is awaiting, keyed by the
+    /// [`PairPrompt::id`] of the prompt it raised. Held under an async mutex
+    /// so `respond_to_prompt` / `submit_pin` / `submit_passkey` / `Cancel`
+    /// can race-lessly take it; the three answers take it only for their own
+    /// prompt's id. `None` when no prompt is in-flight.
+    pub(crate) pending_response: Arc<ReplySlot>,
     /// Most recent connect/pair/disconnect failure, or `None` before the
     /// first one (#1171). The UI binds [`action_error`] and forwards each
     /// emission **newer than the binding itself** to a toast — see
@@ -296,10 +297,8 @@ impl Service for BluetoothService {
                         }
                         s.pending_response.clone()
                     });
-                    if let Some(pending) = pending_response
-                        && let Some(tx) = pending.lock().await.take()
-                    {
-                        let _ = tx.send(AgentReply::Reject);
+                    if let Some(pending) = pending_response {
+                        agent::cancel_in(&pending).await;
                     }
                     // Also reset the adapter path store so the next listen()
                     // call starts fresh.
@@ -432,49 +431,55 @@ fn set_action_error(action_error: &Mutable<Option<ActionError>>, message: String
     }));
 }
 
-/// Resolve the active yes/no pairing prompt. `accept = true` returns `Ok`
-/// to `BlueZ`, completing the pair; `false` returns `org.bluez.Error.Rejected`
-/// and aborts. No-op when no prompt is in flight or the prompt is a
-/// text-entry kind (use `submit_pin` / `submit_passkey` for those).
-pub fn respond_to_prompt(accept: bool) {
-    send_reply(if accept {
-        AgentReply::Confirm
-    } else {
-        AgentReply::Reject
-    });
+/// Resolve the yes/no pairing prompt `id` ([`PairPrompt::id`], the prompt
+/// the user answered). `accept = true` returns `Ok` to `BlueZ`, completing
+/// the pair; `false` returns `org.bluez.Error.Rejected` and aborts.
+///
+/// The answer reaches only the request that raised prompt `id`. If that
+/// request is no longer waiting (cancelled, timed out, or already answered),
+/// the answer is dropped and decides nothing, even if another request is
+/// waiting by then (#1551): a Confirm clicked on one device's code must never
+/// pair a different device whose code the user never saw.
+pub fn respond_to_prompt(id: u64, accept: bool) {
+    send_reply(
+        id,
+        if accept {
+            AgentReply::Confirm
+        } else {
+            AgentReply::Reject
+        },
+    );
 }
 
-/// Resolve a `RequestPinCode` prompt by submitting the user's PIN.
+/// Resolve the `RequestPinCode` prompt `id` by submitting the user's PIN.
 /// Empty string is treated as a reject so the user can dismiss the
-/// banner without triggering a malformed pair.
-pub fn submit_pin(pin: String) {
+/// banner without triggering a malformed pair. Bound to `id` the way
+/// [`respond_to_prompt`] is.
+pub fn submit_pin(id: u64, pin: String) {
     if pin.is_empty() {
-        send_reply(AgentReply::Reject);
+        send_reply(id, AgentReply::Reject);
     } else {
-        send_reply(AgentReply::Pin(pin));
+        send_reply(id, AgentReply::Pin(pin));
     }
 }
 
-/// Resolve a `RequestPasskey` prompt by submitting the user's numeric
+/// Resolve the `RequestPasskey` prompt `id` by submitting the user's numeric
 /// passkey. Out-of-range values reject so we never hand `BlueZ` something
-/// it'll trip on.
-pub fn submit_passkey(passkey: u32) {
+/// it'll trip on. Bound to `id` the way [`respond_to_prompt`] is.
+pub fn submit_passkey(id: u64, passkey: u32) {
     if passkey > 999_999 {
-        send_reply(AgentReply::Reject);
+        send_reply(id, AgentReply::Reject);
     } else {
-        send_reply(AgentReply::Passkey(passkey));
+        send_reply(id, AgentReply::Passkey(passkey));
     }
 }
 
-fn send_reply(reply: AgentReply) {
+fn send_reply(id: u64, reply: AgentReply) {
     let Some(pending) = shared_state().map(|s| s.pending_response.clone()) else {
         return;
     };
     runtime::handle().spawn(async move {
-        let mut guard = pending.lock().await;
-        if let Some(tx) = guard.take() {
-            let _ = tx.send(reply);
-        }
+        agent::answer_in(&pending, id, reply).await;
     });
 }
 
@@ -649,14 +654,50 @@ enum PairOutcome {
 ///   bluetoothd may still finish the pairing. If the device shows as paired by
 ///   the time the deadline error comes back, the follow-up runs anyway.
 ///
-/// `paired_now` reads the watcher's snapshot. It is never a reason to treat a
-/// *successful* reply as a failure.
+/// `paired_now` reads the watcher's snapshot, and it is weighed **only**
+/// against the deadline error ([`is_deadline`]), the one error that says
+/// nothing about how the pairing went. Every other error is bluetoothd's
+/// answer, and it outranks the snapshot. Until #1551 any error counted as
+/// success while the snapshot said paired. A stale `paired` (the watcher not
+/// yet caught up with an unpair, say) plus a real refusal such as
+/// `org.bluez.Error.AuthenticationRejected` then trusted and connected the
+/// device, with no toast. `paired_now` is never a reason to treat a
+/// *successful* reply as a failure either.
 fn pair_outcome(reply: Result<(), hytte_bus::BusError>, paired_now: bool) -> PairOutcome {
     match reply {
         Ok(()) => PairOutcome::Paired,
-        Err(e) if paired_now || is_already_exists(&e) => PairOutcome::PairedDespite(e),
+        Err(e) if is_already_exists(&e) || (paired_now && is_deadline(&e)) => {
+            PairOutcome::PairedDespite(e)
+        }
         Err(e) => PairOutcome::Failed(e),
     }
+}
+
+/// The reason `hytte-bus` gives when a call's own deadline runs out: `call.rs`
+/// maps the elapsed `tokio::time::timeout` to `zbus::Error::Failure("call
+/// timeout")`, zbus 5 displays a `Failure` as its bare string, and
+/// `BusError::from_zbus` carries it into `BusError::Permanent` with no D-Bus
+/// error name. `trollshell-control-center`'s `plugins_tab.rs` reads the same
+/// shape the same way. `the_deadline_is_recognised_as_hytte_bus_spells_it`
+/// reads the literal out of `call.rs`, and
+/// `hytte_bus_carries_its_deadline_to_what_is_deadline_reads` runs the real
+/// `BusError::from_zbus` over it, so a change to either reddens here.
+const HYTTE_BUS_CALL_TIMEOUT: &str = "call timeout";
+
+/// Is this the `Pair` call's own deadline running out, rather than an answer
+/// from bluetoothd? An error bluetoothd sends always carries a D-Bus error
+/// name, which is what tells the two apart.
+///
+/// The bus's `org.freedesktop.DBus.Error.NoReply` is deliberately not
+/// counted. It means bluetoothd went away with the call unanswered, so the
+/// snapshot describes a daemon that is gone, and the follow-up's own calls to
+/// `org.bluez` would D-Bus-activate a bluetoothd that was stopped on purpose.
+fn is_deadline(e: &hytte_bus::BusError) -> bool {
+    matches!(
+        e,
+        hytte_bus::BusError::Permanent { reason, dbus_name: None }
+            if reason == HYTTE_BUS_CALL_TIMEOUT
+    )
 }
 
 /// Is this bluetoothd's "already bonded" answer to `Pair`?
@@ -805,8 +846,8 @@ async fn do_remove_device(
 #[cfg(test)]
 mod tests {
     use super::{
-        ActionError, BLUEZ_AGENT_REQUEST_TIMEOUT, PairOutcome, device_call_deadline, pair_outcome,
-        set_action_error,
+        ActionError, BLUEZ_AGENT_REQUEST_TIMEOUT, HYTTE_BUS_CALL_TIMEOUT, PairOutcome,
+        device_call_deadline, is_deadline, pair_outcome, set_action_error,
     };
     use futures_signals::signal::{Mutable, Signal};
     use hytte_bus::BusError;
@@ -847,9 +888,84 @@ mod tests {
     /// What `hytte_bus::call` answers when its own deadline fires.
     fn deadline_error() -> BusError {
         BusError::Permanent {
-            reason: "call timeout".to_owned(),
+            reason: HYTTE_BUS_CALL_TIMEOUT.to_owned(),
             dbus_name: None,
         }
+    }
+
+    /// An error bluetoothd sent outranks a snapshot that shows the device as
+    /// paired: only the deadline error leaves the pairing's fate open.
+    ///
+    /// **Falsification:** let `paired_now` win over any error again (the
+    /// pre-#1551 `Err(e) if paired_now || …` guard) and every row here is
+    /// trusted and connected instead of toasted.
+    #[test]
+    fn a_refusal_outranks_a_snapshot_that_says_paired() {
+        for err in [
+            method_error("org.bluez.Error.AuthenticationRejected"),
+            method_error("org.bluez.Error.AuthenticationFailed"),
+            method_error("org.bluez.Error.AuthenticationCanceled"),
+            method_error("org.bluez.Error.ConnectionAttemptFailed"),
+            method_error("org.freedesktop.DBus.Error.NoReply"),
+            // An error from bluetoothd that happens to read like the deadline
+            // still carries its name, so it is still an answer.
+            BusError::Permanent {
+                reason: HYTTE_BUS_CALL_TIMEOUT.to_owned(),
+                dbus_name: Some("org.bluez.Error.Failed".to_owned()),
+            },
+        ] {
+            let shown = format!("{err:?}");
+            assert!(
+                matches!(pair_outcome(Err(err), true), PairOutcome::Failed(_)),
+                "{shown} must toast even when the snapshot says paired"
+            );
+        }
+    }
+
+    /// The deadline error is recognised the way `hytte-bus` spells it, read
+    /// from its own source rather than from a copy: `call.rs` gives up with
+    /// `zbus::Error::Failure("call timeout")`. How `error.rs` carries that
+    /// `Failure` into a `BusError` is pinned by running it, in
+    /// `hytte_bus_carries_its_deadline_to_what_is_deadline_reads`.
+    ///
+    /// **Falsification:** change `HYTTE_BUS_CALL_TIMEOUT`, or the literal in
+    /// `hytte-bus`'s `call.rs`, and the first assertion fails.
+    #[test]
+    fn the_deadline_is_recognised_as_hytte_bus_spells_it() {
+        let call_rs = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../hytte-bus/src/call.rs"
+        ));
+        // Not squashed: the literal's own space is part of what is pinned.
+        assert!(
+            call_rs.contains(&format!(
+                "zbus::Error::Failure({HYTTE_BUS_CALL_TIMEOUT:?}.into())"
+            )),
+            "hytte-bus no longer spells its call deadline {HYTTE_BUS_CALL_TIMEOUT:?}"
+        );
+
+        assert!(is_deadline(&deadline_error()));
+        assert!(!is_deadline(&method_error("org.bluez.Error.Failed")));
+        assert!(!is_deadline(&BusError::Permanent {
+            reason: "disk full".to_owned(),
+            dbus_name: None,
+        }));
+    }
+
+    /// The deadline as `hytte-bus` actually delivers it: its own
+    /// `zbus::Error::Failure("call timeout")` run through the real
+    /// `BusError::from_zbus`, so the mapping and zbus's `Display` of a
+    /// `Failure` are both exercised (#1573 review). A source scan of
+    /// `error.rs` only proved a catch-all arm existed, and stayed green when
+    /// a dedicated `Failure` arm in front of it changed the reason.
+    ///
+    /// **Falsification:** give `BusError::from_zbus` a `Failure` arm that
+    /// rewrites the reason (e.g. `format!("bus failure: {msg}")`) and this
+    /// fails, while a device paired at the 5-minute deadline would toast.
+    #[test]
+    fn hytte_bus_carries_its_deadline_to_what_is_deadline_reads() {
+        let e = BusError::from_zbus(zbus::Error::Failure(HYTTE_BUS_CALL_TIMEOUT.into()));
+        assert!(is_deadline(&e), "{e:?}");
     }
 
     /// The trust-and-connect follow-up runs when the device is paired, not

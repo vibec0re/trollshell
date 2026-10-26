@@ -40,7 +40,10 @@ pub struct PairPrompt {
     /// Identifies this one agent request, unique within the process. Two
     /// prompts for the same device are separate requests with separate ids,
     /// for example a retry after bluetoothd sent `Cancel`. That is how a
-    /// request takes down only its own banner and never a newer one.
+    /// request takes down only its own banner and never a newer one, and it
+    /// is what the UI hands back to `respond_to_prompt` / `submit_pin` /
+    /// `submit_passkey`, so an answer reaches only the request it was given
+    /// for (#1551).
     pub id: u64,
     pub device_path: String,
     /// Resolved alias from the `devices()` snapshot at prompt time.

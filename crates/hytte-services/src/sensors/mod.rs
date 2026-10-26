@@ -1081,7 +1081,7 @@ const WATCH_EVENTS: PollFlags = PollFlags::POLLPRI;
 /// loop already make through [`spawn_supervised_blocking`] (#654), the one
 /// idiom this tree has for a long-lived blocking body. It keeps the async
 /// task's supervision as it was: a panic restarts the body from the top
-/// (re-seed, re-open) on the shared backoff, and a return — every failure
+/// (re-open, re-seed) on the shared backoff, and a return — every failure
 /// path in [`watch_mounts`] — is the same `warn!` and kept
 /// `TaskState::Returned` health row a returning `spawn_supervised` task left.
 /// The one difference is a [`read_mountlist`] panic, which the async task
@@ -1108,18 +1108,23 @@ fn spawn_mount_watch(mount_list: Mutable<Vec<MountSpec>>) {
     });
 }
 
-/// Keep `mount_list` in sync with the mount table: seed it once, then re-read
-/// on every change `wait` reports.
+/// Keep `mount_list` in sync with the mount table: open the file to watch,
+/// seed the list, then re-read on every change `wait` reports.
 ///
-/// The seed comes before the open — the async task's order, kept as it was —
-/// so a failed open or a first `poll` that errors still leaves the list
-/// correct as of startup. (A mount made between the seed and the open is
-/// picked up only at the next change, since the file's event counter starts
-/// at the open; opening first would close that startup-only window, and is
-/// left for its own change.) Every failure — the open, a `poll(2)` error, a
-/// wake without `POLLPRI` — logs one warning and returns, and `mount_list`
-/// then holds whatever was last read: empty only if that read failed too
-/// ([`read_mountlist`] maps a failed read to an empty list).
+/// The open comes **before** the seed (#1551). The file's mount event counter
+/// starts at the open, so every change after the open wakes the first
+/// `poll`. Until #1551 the seed came first, and a mount made between the
+/// seed and the open was in neither: it showed up only at the next change,
+/// which could be never. In the new order a mount made in that gap is either
+/// in the seed already or wakes the first `poll`, and sometimes both, which
+/// costs one redundant re-read. The seed is still published when the open
+/// fails, so a host where the watch cannot start keeps a list that is correct
+/// as of startup.
+///
+/// Every failure — the open, a `poll(2)` error, a wake without `POLLPRI` —
+/// logs one warning and returns, and `mount_list` then holds whatever was
+/// last read: empty only if that read failed too ([`read_mountlist`] maps a
+/// failed read to an empty list).
 ///
 /// `open`, `wait` and `read` are seams, because the one thing a hermetic test
 /// cannot do is change the mount table under a real `poll`; production passes
@@ -1134,9 +1139,10 @@ fn watch_mounts<T, F>(
 ) where
     F: AsFd,
 {
+    let opened = open();
     mount_list.set(read());
 
-    let file = match open() {
+    let file = match opened {
         Ok(f) => f,
         Err(e) => {
             tracing::warn!(error = %e, "sensors: failed to open mountinfo for watch");
@@ -1920,7 +1926,7 @@ mod tests {
 // not link. So that half is a `docs/live-verify.md` item, and what is pinned
 // here is everything around it: the mask against the real file, the
 // no-hot-loop rule against a real fd that wakes `poll` without `POLLPRI`, and
-// the loop's seed / re-read / exit order through its seams.
+// the loop's open / seed / re-read / exit order through its seams.
 #[cfg(test)]
 mod mount_watch_tests {
     use super::{MOUNTINFO, WATCH_EVENTS, wait_for_change, watch_mounts};
@@ -2022,11 +2028,63 @@ mod mount_watch_tests {
         assert_eq!(list.get(), 3, "the list holds the last read");
     }
 
+    /// A mount made between the open and the seed is not missed (#1551).
+    ///
+    /// A model of the kernel's counter: `table` is the mount table's event
+    /// count, the file remembers the count it has caught up to, and `wait`
+    /// reports a change only when the two differ, catching the file up as it
+    /// does (`mounts_poll`). The mount lands right after whichever of the open
+    /// and the seed runs first. Opened first, the file's count predates the
+    /// mount, so the first `wait` reports it. Seeded first (the pre-#1551
+    /// order), the seed predates the mount and the open postdates it, so the
+    /// mount is in neither and `wait` never reports it.
+    ///
+    /// Falsification: read the seed before calling `open` and `list` ends
+    /// at `1`, without the mount.
+    #[test]
+    fn a_mount_made_between_the_open_and_the_seed_is_not_missed() {
+        let list = Mutable::new(0_u32);
+        let table = Cell::new(1_u32);
+        let file_seen = Cell::new(0_u32);
+        let mounted = Cell::new(false);
+        // The mount lands right after the first of the open and the seed.
+        let mount_once = || {
+            if !mounted.replace(true) {
+                table.set(table.get() + 1);
+            }
+        };
+        let (reader, _writer) = io::pipe().expect("pipe");
+
+        watch_mounts(
+            &list,
+            || {
+                file_seen.set(table.get());
+                mount_once();
+                Ok(reader)
+            },
+            |_fd| {
+                if table.get() == file_seen.get() {
+                    return Err(io::Error::other("no change since the last poll"));
+                }
+                file_seen.set(table.get());
+                Ok(())
+            },
+            || {
+                let read = table.get();
+                mount_once();
+                read
+            },
+        );
+
+        assert_eq!(list.get(), 2, "the list must include the mount");
+    }
+
     /// A failed open still publishes the seed, and never reaches `wait` —
     /// the order that keeps the list correct as of startup on a host where
     /// the watch itself cannot start.
     ///
-    /// Falsification: move the seed after the open and `list` stays `0`.
+    /// Falsification: return on the failed open before reading the seed and
+    /// `list` stays `0`.
     #[test]
     fn a_failed_open_keeps_the_seed_and_never_waits() {
         let list = Mutable::new(0_u32);
@@ -2042,7 +2100,11 @@ mod mount_watch_tests {
             || 7,
         );
 
-        assert_eq!(list.get(), 7, "the seed is published before the open");
+        assert_eq!(
+            list.get(),
+            7,
+            "the seed is published although the open failed"
+        );
         assert_eq!(waits.get(), 0, "no fd, nothing to wait on");
     }
 }

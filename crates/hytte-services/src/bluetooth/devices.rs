@@ -113,14 +113,57 @@ pub(super) async fn set_adapter_path(path: &str, store: &Arc<tokio::sync::RwLock
     *store.write().await = path.to_string();
 }
 
+/// Subscribe (`subscribe`, which takes its receiver too), then take the
+/// snapshot (`snapshot`), in that order, for [`listen`] (#1551).
+///
+/// A helper rather than two lines in `listen` so the order is pinned (#1573
+/// review): the pre-#1551 regression was the two lines swapped, which no test
+/// could see.
+async fn subscribe_then_snapshot<S, T, F>(
+    subscribe: impl FnOnce() -> S,
+    snapshot: impl FnOnce() -> F,
+) -> (S, T)
+where
+    F: std::future::Future<Output = T>,
+{
+    let subscribed = subscribe();
+    let taken = snapshot().await;
+    (subscribed, taken)
+}
+
 pub(super) async fn listen(
     adapter_mutable: &Mutable<Option<Adapter>>,
     devices_mutable: &Mutable<Vec<Device>>,
     adapter_path_store: &Arc<tokio::sync::RwLock<String>>,
 ) -> Result<ListenEnd, anyhow::Error> {
-    let managed = get_managed_objects()
-        .await
-        .map_err(|e| anyhow::anyhow!("GetManagedObjects: {e}"))?;
+    // bluetoothd itself (see `on_owner_item`), subscribed **before** the
+    // snapshot below and with its receiver taken right away, so an owner
+    // change that lands after the snapshot is queued for `event_loop` rather
+    // than emitted before anything listens (#1551). Until then the
+    // subscription was made in `event_loop`, after the snapshot and the
+    // first publish, and a bluetoothd restart in between left the old
+    // daemon's snapshot on screen until the next owner change.
+    //
+    // Replaying an owner change that predates the snapshot is harmless: a
+    // `Lost` ends this watch and the supervised loop waits for the next
+    // owner, an `Appeared` arms one extra re-sync. That is why only this
+    // subscription moves. Replaying an `InterfacesAdded` would apply an
+    // older device's properties over the snapshot's.
+    //
+    // `SignalsBuilder::start` installs its match rule from a spawned task,
+    // with nothing to wait on for it, so this orders the `AddMatch` ahead of
+    // `GetManagedObjects` in practice, not by proof. The window left is that
+    // one round trip, not the snapshot plus a publish.
+    let ((owner_sub, owner_items), managed) = subscribe_then_snapshot(
+        || {
+            let sub = name_owner_changed();
+            let items = sub.items();
+            (sub, items)
+        },
+        get_managed_objects,
+    )
+    .await;
+    let managed = managed.map_err(|e| anyhow::anyhow!("GetManagedObjects: {e}"))?;
 
     // ── Find the first adapter ────────────────────────────────────────────────
 
@@ -165,7 +208,11 @@ pub(super) async fn listen(
 
     // ── Signal subscriptions ──────────────────────────────────────────────────
 
-    event_loop(&state, &adapter_path).await
+    let end = event_loop(&state, &adapter_path, owner_items).await;
+    // The owner stream ends when its last subscription handle goes, so the
+    // handle has to outlive the loop that reads it.
+    drop(owner_sub);
+    end
 }
 
 /// What a `NameOwnerChanged` for `org.bluez` says about bluetoothd.
@@ -205,7 +252,7 @@ pub(super) enum ListenEnd {
 /// A subscription to the bus's `NameOwnerChanged`, every name. Filtered in
 /// code by [`bluez_owner_change`]. The pairing agent watches the same signal
 /// the same way (`agent::run_agent`).
-fn name_owner_changed() -> SignalSubscription {
+pub(super) fn name_owner_changed() -> SignalSubscription {
     hytte_bus::signals(BusKind::System, "org.freedesktop.DBus")
         .at_path("/org/freedesktop/DBus")
         .iface("org.freedesktop.DBus")
@@ -302,7 +349,7 @@ where
 
 /// Ask the bus whether anyone owns `org.bluez`. This is answered by the bus
 /// itself, so it activates nothing.
-async fn bluez_has_owner() -> Result<bool, hytte_bus::BusError> {
+pub(super) async fn bluez_has_owner() -> Result<bool, hytte_bus::BusError> {
     hytte_bus::call(BusKind::System, "org.freedesktop.DBus")
         .at_path("/org/freedesktop/DBus")
         .iface("org.freedesktop.DBus")
@@ -484,10 +531,20 @@ fn bluetooth_marker_or_event(
     }
 }
 
-async fn event_loop(state: &State, adapter_path: &str) -> Result<ListenEnd, anyhow::Error> {
-    // bluetoothd itself: see `on_owner_item`.
-    let owner_sub = name_owner_changed();
-
+/// Fold every signal for the adapter and its devices into `state` until the
+/// watch ends.
+///
+/// `owner_items` is the `NameOwnerChanged` stream [`listen`] subscribed to
+/// before its snapshot, so an owner change made while that snapshot was
+/// being taken is already queued here.
+async fn event_loop<S>(
+    state: &State,
+    adapter_path: &str,
+    mut owner_items: S,
+) -> Result<ListenEnd, anyhow::Error>
+where
+    S: futures_util::Stream<Item = SignalItem> + Unpin,
+{
     // Subscribe to ObjectManager signals on the root path.
     let ifaces_added_sub = hytte_bus::signals(BusKind::System, "org.bluez")
         .at_path("/")
@@ -530,7 +587,6 @@ async fn event_loop(state: &State, adapter_path: &str) -> Result<ListenEnd, anyh
     let mut ifaces_added_items = ifaces_added_sub.items();
     let mut ifaces_removed_items = ifaces_removed_sub.items();
     let mut adapter_props_items = adapter_props_sub.items();
-    let mut owner_items = owner_sub.items();
 
     loop {
         tokio::select! {
@@ -850,6 +906,27 @@ async fn handle_device_props_changed(state: &State, path: &str, body: &zbus::Mes
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `listen` subscribes to bluetoothd's owner before it takes the
+    /// snapshot (#1551), so a restart while the snapshot is taken is queued
+    /// for `event_loop` rather than missed (#1573 review).
+    ///
+    /// **Falsification:** take the snapshot first in
+    /// `subscribe_then_snapshot` (the pre-#1551 order) and the recorded order
+    /// flips.
+    #[tokio::test]
+    async fn the_owner_subscription_comes_before_the_snapshot() {
+        let log = std::cell::RefCell::new(Vec::new());
+        let ((), ()) = subscribe_then_snapshot(
+            || log.borrow_mut().push("subscribe"),
+            || {
+                log.borrow_mut().push("snapshot");
+                async {}
+            },
+        )
+        .await;
+        assert_eq!(log.into_inner(), ["subscribe", "snapshot"]);
+    }
 
     // ── #1201: bluetooth_marker_or_event routes markers to a resync ─────────
 

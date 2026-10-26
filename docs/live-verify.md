@@ -178,7 +178,8 @@ range above is a floor, not a ceiling.
       `ok: false` (no hang), with a warn in `RUST_LOG=trollshell=info`.
       `~/.local/state/trollshell/effects-audit.log` accrues one line per
       brokered effect, and one per dropped effect up to a per-plugin budget
-      (16, then one every ten seconds, each ending `suppressed=<n>`), and
+      (16, then one every ten seconds, each ending `suppressed=<n>`) and a
+      budget across all plugins (64, then one every five seconds), and
       rotates to `.log.1` past the 256 KiB cap.
 - [ ] **(#953)** The **detached** spawn mode (`Effect::RunCommand` with
       `detached: true`, i.e. `Effect::launch(...)`): click a sidebar/panel row
@@ -232,6 +233,12 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
       Meanwhile `top -H -p "$(systemctl --user show -p MainPID --value trollshell)"`
       shows no runtime worker pegged by the audit, and the shell's RSS stays
       flat. The writer is its own `effects-audit` thread now.
+  - [ ] **Cycling ids.** Same again, but the scratch plugin reconnects under
+        a new id (`x1`, `x2`, …) every few frames. Across all of them the
+        file gains about 64 drop lines, then about one every five seconds,
+        mostly `plugin=* effect=* decision=dropped suppressed=<n>`. Before
+        the global budget each new id came with a fresh 16-line burst. The
+        `allowed` line is still there afterwards.
 - [ ] **(#553)** Generic `Datasource` capability: `hytte-plugin-departures` /
       `hytte-plugin-weather` now answer `get departures` / `get weather`
       routed **through the running provider plugins** over the host protocol

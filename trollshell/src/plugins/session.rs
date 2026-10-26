@@ -1225,6 +1225,22 @@ fn register_id(manifest: &Manifest) -> Option<String> {
     Some(id.clone())
 }
 
+/// Writes a connection's closing drop-audit count
+/// ([`flush_drop_audit`](super::effects::flush_drop_audit)) when the
+/// connection goes away, however it goes.
+///
+/// A guard rather than a call in `serve_conn`'s teardown: that teardown runs
+/// only when the reader or the liveness ping returns. A panic in the reader
+/// unwinds past it, and an aborted task never reaches it. Either way the count
+/// of a flood that ended there was never written.
+struct DropAuditFlush(String);
+
+impl Drop for DropAuditFlush {
+    fn drop(&mut self) {
+        super::effects::flush_drop_audit(&self.0);
+    }
+}
+
 /// [`serve_conn`] with no unregistered-connection permit — one connection driven
 /// on its own, which is what the per-connection tests do: a socketpair, no
 /// listener, so there is no gate to hold a permit from.
@@ -1353,6 +1369,11 @@ pub(super) async fn serve_conn(
         );
         return;
     };
+    // The audit log's closing drop count for this id, written however this
+    // connection ends: the teardown below, a panic, or the task being
+    // aborted. Declared after `_id_guard`, so it runs while the id is still
+    // this connection's.
+    let _drop_audit = DropAuditFlush(plugin_id.clone());
     // #1165 item 6: **registered**, so the listener's gate permit is released
     // here rather than at teardown. What the gate bounds is *unregistered*
     // connections — a peer that dials and says nothing — and a registered
@@ -1836,10 +1857,6 @@ pub(super) async fn serve_conn(
     // inside the id's exclusive-ownership window (the `IdGuard` releases only
     // when `serve_conn` returns), so it cannot evict a fast-reconnect successor.
     super::runtime_remove(&ctx.runtime, &plugin_id);
-    // The audit log's closing count for any drop records this plugin had
-    // suppressed past its budget, so a flood that ends here is still on
-    // record at its full size (`effects::admit_drop_record`).
-    super::effects::flush_drop_audit(&plugin_id);
     if let Some(snapshot) = snapshot {
         snapshot.abort();
     }

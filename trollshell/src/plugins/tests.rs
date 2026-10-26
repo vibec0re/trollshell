@@ -3449,8 +3449,8 @@ fn a_plugin_log_line_cannot_forge_a_second_record() {
 /// other 84 are a count the teardown flushes, so a flood that ends with its
 /// connection still reaches the file at its full size.
 ///
-/// **Falsified** by deleting the `effects::flush_drop_audit` call in
-/// `serve_conn`'s teardown: the entry still owes `Some(84)`.
+/// **Falsified** by deleting the `DropAuditFlush` guard in `serve_conn`: the
+/// entry still owes `Some(84)`.
 #[tokio::test]
 async fn teardown_flushes_the_suppressed_drop_count() {
     const ID: &str = "audit-teardown-flush";
@@ -3495,6 +3495,71 @@ async fn teardown_flushes_the_suppressed_drop_count() {
         super::effects::pending_drop_audit(ID),
         Some(0),
         "teardown wrote the closing count and kept the spent budget",
+    );
+}
+
+/// The closing count is written even when the connection never reaches its
+/// teardown: here the task serving it is aborted mid-session, which skips
+/// every line after the reader's `select!`. A panic in the reader unwinds past
+/// them the same way. The `DropAuditFlush` guard runs on either.
+///
+/// **Falsified** by moving the flush back into the teardown block as a plain
+/// call: the aborted connection still owes `Some(84)`.
+#[tokio::test]
+async fn an_aborted_connection_still_flushes_the_suppressed_drop_count() {
+    const ID: &str = "audit-abort-flush";
+    let (_clock_tx, clock_rx) = watch::channel(None);
+    let (_vis_tx, vis_rx) = watch::channel(false);
+    let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+    let (host, plugin) = UnixStream::pair().expect("socketpair");
+    let conn = tokio::spawn(async move { handle_conn(host, &ctx).await });
+    let (_prd, mut pwr) = plugin.into_split();
+    write_frame(
+        &mut pwr,
+        &PluginMsg::Register {
+            manifest: Manifest::new(ID, Mount::BarCenter),
+        },
+    )
+    .await
+    .expect("Register (no caps)");
+    write_frame(
+        &mut pwr,
+        &PluginMsg::Render {
+            tree: wire::Node::Label {
+                id: None,
+                text: "hi".into(),
+                classes: vec![],
+                tooltip: None,
+            },
+            panel: None,
+            hidden_on: Vec::new(),
+            effects: vec![Effect::OpenPage(Page::PowerMenu); 100],
+        },
+    )
+    .await
+    .expect("Render with 100 ungranted effects");
+    // The socket stays open, so the connection is still live when the reader
+    // has counted the drops.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while super::effects::pending_drop_audit(ID) != Some(84) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the reader counts the 84 drops past the burst");
+    conn.abort();
+    let aborted = tokio::time::timeout(Duration::from_secs(5), conn)
+        .await
+        .expect("the aborted task finishes");
+    assert!(
+        aborted.is_err_and(|e| e.is_cancelled()),
+        "the task was aborted, not finished"
+    );
+
+    assert_eq!(
+        super::effects::pending_drop_audit(ID),
+        Some(0),
+        "the guard wrote the closing count although teardown never ran",
     );
 }
 

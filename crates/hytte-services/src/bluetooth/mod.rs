@@ -649,14 +649,48 @@ enum PairOutcome {
 ///   bluetoothd may still finish the pairing. If the device shows as paired by
 ///   the time the deadline error comes back, the follow-up runs anyway.
 ///
-/// `paired_now` reads the watcher's snapshot. It is never a reason to treat a
-/// *successful* reply as a failure.
+/// `paired_now` reads the watcher's snapshot, and it is weighed **only**
+/// against the deadline error ([`is_deadline`]), the one error that says
+/// nothing about how the pairing went. Every other error is bluetoothd's
+/// answer, and it outranks the snapshot. Until #1551 any error counted as
+/// success while the snapshot said paired. A stale `paired` (the watcher not
+/// yet caught up with an unpair, say) plus a real refusal such as
+/// `org.bluez.Error.AuthenticationRejected` then trusted and connected the
+/// device, with no toast. `paired_now` is never a reason to treat a
+/// *successful* reply as a failure either.
 fn pair_outcome(reply: Result<(), hytte_bus::BusError>, paired_now: bool) -> PairOutcome {
     match reply {
         Ok(()) => PairOutcome::Paired,
-        Err(e) if paired_now || is_already_exists(&e) => PairOutcome::PairedDespite(e),
+        Err(e) if is_already_exists(&e) || (paired_now && is_deadline(&e)) => {
+            PairOutcome::PairedDespite(e)
+        }
         Err(e) => PairOutcome::Failed(e),
     }
+}
+
+/// The reason `hytte-bus` gives when a call's own deadline runs out: `call.rs`
+/// maps the elapsed `tokio::time::timeout` to `zbus::Error::Failure("call
+/// timeout")`, zbus 5 displays a `Failure` as its bare string, and
+/// `BusError::from_zbus` carries it into `BusError::Permanent` with no D-Bus
+/// error name. `trollshell-control-center`'s `plugins_tab.rs` reads the same
+/// shape the same way. `the_deadline_is_recognised_as_hytte_bus_spells_it`
+/// reads `hytte-bus`'s own source, so a change there reddens here.
+const HYTTE_BUS_CALL_TIMEOUT: &str = "call timeout";
+
+/// Is this the `Pair` call's own deadline running out, rather than an answer
+/// from bluetoothd? An error bluetoothd sends always carries a D-Bus error
+/// name, which is what tells the two apart.
+///
+/// The bus's `org.freedesktop.DBus.Error.NoReply` is deliberately not
+/// counted. It means bluetoothd went away with the call unanswered, so the
+/// snapshot describes a daemon that is gone, and the follow-up's own calls to
+/// `org.bluez` would D-Bus-activate a bluetoothd that was stopped on purpose.
+fn is_deadline(e: &hytte_bus::BusError) -> bool {
+    matches!(
+        e,
+        hytte_bus::BusError::Permanent { reason, dbus_name: None }
+            if reason == HYTTE_BUS_CALL_TIMEOUT
+    )
 }
 
 /// Is this bluetoothd's "already bonded" answer to `Pair`?
@@ -805,8 +839,8 @@ async fn do_remove_device(
 #[cfg(test)]
 mod tests {
     use super::{
-        ActionError, BLUEZ_AGENT_REQUEST_TIMEOUT, PairOutcome, device_call_deadline, pair_outcome,
-        set_action_error,
+        ActionError, BLUEZ_AGENT_REQUEST_TIMEOUT, HYTTE_BUS_CALL_TIMEOUT, PairOutcome,
+        device_call_deadline, is_deadline, pair_outcome, set_action_error,
     };
     use futures_signals::signal::{Mutable, Signal};
     use hytte_bus::BusError;
@@ -847,9 +881,76 @@ mod tests {
     /// What `hytte_bus::call` answers when its own deadline fires.
     fn deadline_error() -> BusError {
         BusError::Permanent {
-            reason: "call timeout".to_owned(),
+            reason: HYTTE_BUS_CALL_TIMEOUT.to_owned(),
             dbus_name: None,
         }
+    }
+
+    /// An error bluetoothd sent outranks a snapshot that shows the device as
+    /// paired: only the deadline error leaves the pairing's fate open.
+    ///
+    /// **Falsification:** let `paired_now` win over any error again (the
+    /// pre-#1551 `Err(e) if paired_now || …` guard) and every row here is
+    /// trusted and connected instead of toasted.
+    #[test]
+    fn a_refusal_outranks_a_snapshot_that_says_paired() {
+        for err in [
+            method_error("org.bluez.Error.AuthenticationRejected"),
+            method_error("org.bluez.Error.AuthenticationFailed"),
+            method_error("org.bluez.Error.AuthenticationCanceled"),
+            method_error("org.bluez.Error.ConnectionAttemptFailed"),
+            method_error("org.freedesktop.DBus.Error.NoReply"),
+            // An error from bluetoothd that happens to read like the deadline
+            // still carries its name, so it is still an answer.
+            BusError::Permanent {
+                reason: HYTTE_BUS_CALL_TIMEOUT.to_owned(),
+                dbus_name: Some("org.bluez.Error.Failed".to_owned()),
+            },
+        ] {
+            let shown = format!("{err:?}");
+            assert!(
+                matches!(pair_outcome(Err(err), true), PairOutcome::Failed(_)),
+                "{shown} must toast even when the snapshot says paired"
+            );
+        }
+    }
+
+    /// The deadline error is recognised the way `hytte-bus` spells it, read
+    /// from its own source rather than from a copy: `call.rs` gives up with
+    /// `zbus::Error::Failure("call timeout")`, and `error.rs` carries a
+    /// `Failure` into a `BusError::Permanent` with no D-Bus error name.
+    ///
+    /// **Falsification:** change `HYTTE_BUS_CALL_TIMEOUT`, or the literal in
+    /// `hytte-bus`'s `call.rs`, and the first assertion fails.
+    #[test]
+    fn the_deadline_is_recognised_as_hytte_bus_spells_it() {
+        let call_rs = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../hytte-bus/src/call.rs"
+        ));
+        // Not squashed: the literal's own space is part of what is pinned.
+        assert!(
+            call_rs.contains(&format!(
+                "zbus::Error::Failure({HYTTE_BUS_CALL_TIMEOUT:?}.into())"
+            )),
+            "hytte-bus no longer spells its call deadline {HYTTE_BUS_CALL_TIMEOUT:?}"
+        );
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let error_rs = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../hytte-bus/src/error.rs"
+        ));
+        assert!(
+            squash(error_rs).contains("_=>Self::Permanent{reason:err.to_string(),dbus_name:None,}"),
+            "hytte-bus no longer carries a zbus Failure as a nameless Permanent"
+        );
+
+        assert!(is_deadline(&deadline_error()));
+        assert!(!is_deadline(&method_error("org.bluez.Error.Failed")));
+        assert!(!is_deadline(&BusError::Permanent {
+            reason: "disk full".to_owned(),
+            dbus_name: None,
+        }));
     }
 
     /// The trust-and-connect follow-up runs when the device is paired, not

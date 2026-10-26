@@ -230,7 +230,8 @@ type SlotMap = Mutex<BTreeMap<String, MountSlot>>;
 static SLOTS: SlotMap = Mutex::new(BTreeMap::new());
 
 fn lock(map: &SlotMap) -> std::sync::MutexGuard<'_, BTreeMap<String, MountSlot>> {
-    map.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    map.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Clears a mount's `in_flight` flag when dropped - including when `stat`
@@ -596,7 +597,13 @@ not a real line at all
         // While the stuck call is outstanding the mount is skipped, not
         // re-spawned onto yet another thread.
         assert!(lock(&S)["/test-hung-mount"].in_flight);
-        let again = read_disk_with(&S, &specs[1..2], Duration::from_millis(50), STALE, fake_stat);
+        let again = read_disk_with(
+            &S,
+            &specs[1..2],
+            Duration::from_millis(50),
+            STALE,
+            fake_stat,
+        );
         assert!(again.mounts.is_empty());
     }
 
@@ -637,7 +644,8 @@ not a real line at all
         // The mount dies: its last row ages past the bound and is dropped.
         let slot_age = Duration::from_millis(600);
         std::thread::sleep(slot_age);
-        let gone = read_disk_with(&S, 
+        let gone = read_disk_with(
+            &S,
             &specs,
             Duration::from_millis(1),
             Duration::from_millis(300),
@@ -664,17 +672,26 @@ not a real line at all
             let mut all = lock(&S);
             all.insert(
                 "/test-prune-mount".into(),
-                MountSlot { in_flight: false, last: Some((row.clone(), old)) },
+                MountSlot {
+                    in_flight: false,
+                    last: Some((row.clone(), old)),
+                },
             );
             all.insert(
                 "/test-prune-busy".into(),
-                MountSlot { in_flight: true, last: Some((row, old)) },
+                MountSlot {
+                    in_flight: true,
+                    last: Some((row, old)),
+                },
             );
         }
         let _ = read_disk_with(&S, &[], DL, Duration::from_secs(1), fake_stat);
         let all = lock(&S);
         assert!(!all.contains_key("/test-prune-mount"), "stale slot kept");
-        assert!(all.contains_key("/test-prune-busy"), "in-flight slot pruned");
+        assert!(
+            all.contains_key("/test-prune-busy"),
+            "in-flight slot pruned"
+        );
     }
 
     #[test]

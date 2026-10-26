@@ -3345,6 +3345,311 @@ async fn a_manifest_providing_too_many_datasources_is_rejected() {
     );
 }
 
+/// A provider manifest (it declares `Capability::DatasourceProvider`, so an
+/// accepted entry is really registered) with one `provides` entry.
+fn provider_manifest(id: &str, scopes: Vec<String>) -> Manifest {
+    let mut manifest = Manifest::new("provider", Mount::BarCenter);
+    manifest.capabilities = vec![Capability::DatasourceProvider];
+    manifest.provides = vec![ProvidedDatasource::new(id, scopes)];
+    manifest
+}
+
+/// A `provides` entry's id takes the plugin id's rule: the datasource router
+/// is keyed by it and its lines print it raw, so a newline in it forged a
+/// journal record and a 1 MiB one was a 1 MiB journal field, twice per
+/// connection. Refused at `Register`, and the refusal line names the entry by
+/// index, never by the id it refuses. Exactly 64 bytes, and every bundled id's
+/// shape, is accepted.
+///
+/// **Falsified** by deleting the per-entry `provided_datasource_refusal` check
+/// in `serve_conn`: the four bad ids are accepted.
+#[tokio::test]
+async fn a_provided_datasource_with_an_unusable_id_is_refused() {
+    let (captured, _guard) = hytte_config::test_support::capture();
+    let huge = "d".repeat(1 << 20);
+    let over = "d".repeat(hytte_plugin_proto::MAX_PLUGIN_ID_BYTES + 1);
+    let bad = [
+        ("a newline", "weather\nforged-record"),
+        ("1 MiB", huge.as_str()),
+        ("one byte over the cap", over.as_str()),
+        ("empty", ""),
+    ];
+    for (what, id) in bad {
+        assert!(
+            register_is_dropped(provider_manifest(id, vec!["current".into()])).await,
+            "a datasource id that is {what} must be refused at Register",
+        );
+    }
+    let at_cap = "d".repeat(hytte_plugin_proto::MAX_PLUGIN_ID_BYTES);
+    for good in [at_cap.as_str(), "claude-usage", "Weather_2"] {
+        assert!(
+            !register_is_dropped(provider_manifest(good, vec!["current".into()])).await,
+            "{good:?} is a valid datasource id and must be accepted",
+        );
+    }
+
+    let events = captured.events();
+    let refusals = events
+        .iter()
+        .filter(|e| e.message.contains("provides a datasource the host does not accept"))
+        .count();
+    assert_eq!(refusals, bad.len(), "one refusal line each: {events:?}");
+    for event in &events {
+        for text in event.fields.values().chain([&event.message]) {
+            assert!(
+                !text.contains("forged") && text.len() <= 1024,
+                "a refused id reached the log: {text:.200}",
+            );
+        }
+    }
+}
+
+/// A `provides` entry's scopes are bounded in count
+/// (`MAX_MANIFEST_LIST_ENTRIES`) and in length (`MAX_DATASOURCE_SCOPE_BYTES`):
+/// the router clones an entry's whole scope list for every query routed to
+/// it, so without them one entry could carry the frame's whole value budget.
+/// Exactly at both caps is accepted.
+///
+/// **Falsified** by deleting the per-entry check in `serve_conn`: the two
+/// over-cap manifests are accepted.
+#[tokio::test]
+async fn a_provided_datasource_with_too_many_or_too_long_scopes_is_refused() {
+    let count = super::session::MAX_MANIFEST_LIST_ENTRIES;
+    let bytes = super::session::MAX_DATASOURCE_SCOPE_BYTES;
+    let scopes = |n: usize| (0..n).map(|i| format!("s{i}")).collect::<Vec<_>>();
+
+    assert!(
+        register_is_dropped(provider_manifest("ds", scopes(count + 1))).await,
+        "one scope over the count cap is refused",
+    );
+    assert!(
+        register_is_dropped(provider_manifest("ds", vec!["s".repeat(bytes + 1)])).await,
+        "a scope one byte over the length cap is refused",
+    );
+    assert!(
+        !register_is_dropped(provider_manifest("ds", scopes(count))).await,
+        "exactly at the count cap is accepted",
+    );
+    assert!(
+        !register_is_dropped(provider_manifest("ds", vec!["s".repeat(bytes)])).await,
+        "exactly at the length cap is accepted",
+    );
+}
+
+/// Which rule refuses an entry, checked in order: the id, then the scope
+/// count, then each scope's length.
+#[test]
+fn provided_datasource_refusal_names_the_rule_that_refused() {
+    use super::session::{
+        MAX_DATASOURCE_SCOPE_BYTES, MAX_MANIFEST_LIST_ENTRIES, ProvidedRefusal,
+        provided_datasource_refusal,
+    };
+    let refusal = |id: &str, scopes: Vec<String>| {
+        provided_datasource_refusal(&ProvidedDatasource::new(id, scopes))
+    };
+    assert_eq!(
+        refusal("a\nb", vec!["next".into()]),
+        Some(ProvidedRefusal::Id)
+    );
+    assert_eq!(
+        refusal("ds", vec![String::new(); MAX_MANIFEST_LIST_ENTRIES + 1]),
+        Some(ProvidedRefusal::TooManyScopes),
+    );
+    assert_eq!(
+        refusal("ds", vec!["s".repeat(MAX_DATASOURCE_SCOPE_BYTES + 1)]),
+        Some(ProvidedRefusal::ScopeTooLong),
+    );
+    assert_eq!(refusal("ds", Vec::new()), None);
+    assert_eq!(refusal("departures", vec!["next".into()]), None);
+}
+
+/// Every `.rs` file under `dir`, recursively.
+fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for path in entries.flatten().map(|entry| entry.path()) {
+        if path.is_dir() {
+            rust_sources(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// The arguments of a call, from `text` starting just past its opening
+/// parenthesis: split at top-level commas (brackets nest, a string literal's
+/// contents are skipped) up to the closing parenthesis, empties dropped.
+fn call_arguments(text: &str) -> Vec<&str> {
+    let mut args = Vec::new();
+    let mut depth = 0_usize;
+    let mut start = 0;
+    let mut in_literal = false;
+    let mut escaped = false;
+    for (at, c) in text.char_indices() {
+        if in_literal {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_literal = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_literal = true,
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' if depth > 0 => depth -= 1,
+            ')' => {
+                args.push(text[start..at].trim());
+                args.retain(|arg| !arg.is_empty());
+                return args;
+            }
+            ',' if depth == 0 => {
+                args.push(text[start..at].trim());
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    panic!("unterminated call: {text:.80}");
+}
+
+/// The strings one call argument names: its string literals, and each
+/// `SCREAMING_CASE` constant it mentions, resolved to the one
+/// `const NAME: &str = "…";` its crate's `src/` declares under that name.
+fn argument_strings(arg: &str, crate_src: &str, site: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = arg;
+    while let Some(c) = rest.chars().next() {
+        if c == '"' {
+            let end = rest[1..]
+                .find('"')
+                .unwrap_or_else(|| panic!("{site}: unterminated literal in {arg}"))
+                + 1;
+            out.push(rest[1..end].to_owned());
+            rest = &rest[end + 1..];
+        } else if c.is_ascii_alphabetic() || c == '_' {
+            let len = rest
+                .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+                .unwrap_or(rest.len());
+            let ident = &rest[..len];
+            let constant = len > 1
+                && ident
+                    .chars()
+                    .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_');
+            if constant {
+                let needle = format!("const {ident}: &str = \"");
+                let values: std::collections::BTreeSet<&str> = crate_src
+                    .match_indices(&needle)
+                    .map(|(at, _)| {
+                        let value = &crate_src[at + needle.len()..];
+                        &value[..value.find('"').expect("a closed literal")]
+                    })
+                    .collect();
+                assert_eq!(
+                    values.len(),
+                    1,
+                    "{site}: `{ident}` must be exactly one `const {ident}: &str` in its crate, \
+                     found {values:?}",
+                );
+                out.extend(values.into_iter().map(str::to_owned));
+            }
+            rest = &rest[len..];
+        } else {
+            rest = &rest[c.len_utf8()..];
+        }
+    }
+    out
+}
+
+/// Every datasource a bundled plugin provides passes the host's per-entry
+/// `provides` rules (`provided_datasource_refusal`).
+///
+/// The entries are read out of the tree rather than listed here, because the
+/// providers are binaries this crate cannot link: every
+/// `ProvidedDatasource::new(…)` call under `crates/*/src` (bar
+/// `hytte-plugin-proto`, which defines the type), with its id and scope
+/// arguments resolved to the string constants they name. A new provider is
+/// checked the day it lands, and a renamed id under its new value. The three
+/// providers in the tree today (`claude-usage`, `departures`, `weather`, with
+/// the scopes `current`/`next`) must be among those found, so a scan that
+/// reads nothing cannot pass. The `.rs` sources are in crane's filtered
+/// source, so `checks.workspace-tests` reads the same files.
+///
+/// **Falsified** by setting `MAX_DATASOURCE_SCOPE_BYTES` to 4: `current` (7
+/// bytes) no longer fits, so the `weather` and `claude-usage` entries are
+/// refused.
+#[test]
+fn every_bundled_provided_datasource_passes_the_host_check() {
+    const CALL: &str = "ProvidedDatasource::new(";
+    let crates_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../crates");
+    let mut crate_dirs: Vec<_> = std::fs::read_dir(&crates_dir)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", crates_dir.display()))
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    crate_dirs.sort();
+    let mut found = std::collections::BTreeSet::new();
+    for dir in crate_dirs {
+        let krate = dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        if krate == "hytte-plugin-proto" {
+            continue;
+        }
+        let mut files = Vec::new();
+        rust_sources(&dir.join("src"), &mut files);
+        let sources: Vec<(std::path::PathBuf, String)> = files
+            .into_iter()
+            .map(|path| {
+                let text = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+                (path, text)
+            })
+            .collect();
+        let crate_src = sources
+            .iter()
+            .map(|(_, text)| text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for (path, text) in &sources {
+            for (at, _) in text.match_indices(CALL) {
+                let line = text[..at].matches('\n').count() + 1;
+                let site = format!("{}:{line}", path.display());
+                let args = call_arguments(&text[at + CALL.len()..]);
+                assert_eq!(args.len(), 2, "{site}: {args:?}");
+                let ids = argument_strings(args[0], &crate_src, &site);
+                assert_eq!(ids.len(), 1, "{site}: the id argument names {ids:?}");
+                let scopes = argument_strings(args[1], &crate_src, &site);
+                assert!(
+                    !scopes.is_empty(),
+                    "{site}: the scopes argument `{}` names nothing this scan resolves",
+                    args[1],
+                );
+                let ds = ProvidedDatasource::new(ids[0].clone(), scopes);
+                assert_eq!(
+                    super::session::provided_datasource_refusal(&ds),
+                    None,
+                    "{site}: {ds:?}",
+                );
+                found.insert(ds.id);
+            }
+        }
+    }
+    for known in ["claude-usage", "departures", "weather"] {
+        assert!(
+            found.contains(known),
+            "the {known} provider was not found under {}: {found:?}",
+            crates_dir.display(),
+        );
+    }
+}
+
 /// A frame past the host's value budget closes the connection at warn, naming
 /// the plugin and the cap, not as an ordinary info-level disconnect.
 ///

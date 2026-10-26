@@ -18,8 +18,8 @@ use hytte::services::pipewire;
 use hytte_plugin_proto::{
     AudioSpectrum, Capability, ClockState, DatasourceError, DatasourceOutcome, Effect, HostMsg,
     LogLevel, MAX_BODY_TEXT_BYTES, MAX_DISPLAY_TEXT_BYTES, MAX_FRAME_LEN, MAX_FRAME_VALUES, MAX_PLUGIN_ID_BYTES,
-    Manifest, Mount, NowPlaying, PluginMsg, ProtoError, StateKey, StateSnapshot, UpcomingEvent,
-    VOCAB, read_frame, wire, write_frame,
+    Manifest, Mount, NowPlaying, PluginMsg, ProtoError, ProvidedDatasource, StateKey,
+    StateSnapshot, UpcomingEvent, VOCAB, read_frame, wire, write_frame,
 };
 use tokio::net::UnixStream;
 use tokio::net::unix::OwnedWriteHalf;
@@ -1526,6 +1526,65 @@ pub(super) fn enforce_capabilities(
 /// number of datasource ids registered from one frame (#1555).
 pub(super) const MAX_MANIFEST_LIST_ENTRIES: usize = 64;
 
+/// The longest scope a manifest's `provides` entry may declare, in bytes.
+///
+/// A scope is a short key a requester names: the bundled providers declare
+/// `current` and `next`, 7 bytes at most. So it gets the plugin id's size,
+/// [`MAX_PLUGIN_ID_BYTES`]. With the count held to
+/// [`MAX_MANIFEST_LIST_ENTRIES`] too, one entry carries at most 4 KiB of
+/// scopes, which is what the datasource router clones for every query routed
+/// to it.
+pub(super) const MAX_DATASOURCE_SCOPE_BYTES: usize = MAX_PLUGIN_ID_BYTES;
+
+/// Why the host refuses one of a manifest's `provides` entries
+/// ([`provided_datasource_refusal`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ProvidedRefusal {
+    /// The id fails the plugin-id rule (`systemd::is_valid_plugin_id`, the one
+    /// [`register_id`] enforces): empty, over 64 bytes, or outside ASCII
+    /// letters, digits, `-` and `_`.
+    Id,
+    /// More scopes than [`MAX_MANIFEST_LIST_ENTRIES`].
+    TooManyScopes,
+    /// A scope over [`MAX_DATASOURCE_SCOPE_BYTES`].
+    ScopeTooLong,
+}
+
+impl ProvidedRefusal {
+    /// The refusal as the warn line words it.
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Id => {
+                "its id is empty, over 64 bytes, or outside ASCII letters, digits, `-` and `_`"
+            }
+            Self::TooManyScopes => "it lists more scopes than the host accepts",
+            Self::ScopeTooLong => "one of its scopes is longer than the host accepts",
+        }
+    }
+}
+
+/// Whether the host refuses one `provides` entry, and why.
+///
+/// A datasource id is a key like a plugin id: the router is keyed by it, and
+/// the datasource lines the router logs print it raw. So it takes the plugin
+/// id's own rule rather than a second one. Its scopes are bounded in count and
+/// length so an entry's size, not only the number of entries, has a bound.
+pub(super) fn provided_datasource_refusal(ds: &ProvidedDatasource) -> Option<ProvidedRefusal> {
+    if !hytte::services::systemd::is_valid_plugin_id(&ds.id) {
+        Some(ProvidedRefusal::Id)
+    } else if ds.scopes.len() > MAX_MANIFEST_LIST_ENTRIES {
+        Some(ProvidedRefusal::TooManyScopes)
+    } else if ds
+        .scopes
+        .iter()
+        .any(|scope| scope.len() > MAX_DATASOURCE_SCOPE_BYTES)
+    {
+        Some(ProvidedRefusal::ScopeTooLong)
+    } else {
+        None
+    }
+}
+
 /// The longest plugin-influenced error text the host writes into one of its
 /// own journal fields.
 const MAX_LOGGED_ERROR_BYTES: usize = 256;
@@ -1738,6 +1797,31 @@ pub(super) async fn serve_conn(
             "plugin manifest lists more subscriptions, capabilities or provided datasources \
              than the host accepts; \
              dropping the connection",
+        );
+        return;
+    }
+    // Each `provides` entry is bounded too, not only how many there are: its id
+    // is a key the datasource lines print raw, and its scopes are cloned per
+    // query. The line names the entry by index and its sizes, never by its id,
+    // since the id is what is being refused.
+    if let Some((entry, refusal)) = manifest
+        .provides
+        .iter()
+        .enumerate()
+        .find_map(|(entry, ds)| provided_datasource_refusal(ds).map(|refusal| (entry, refusal)))
+    {
+        let ds = &manifest.provides[entry];
+        tracing::warn!(
+            plugin = %plugin_id,
+            entry,
+            id_bytes = ds.id.len(),
+            scopes = ds.scopes.len(),
+            id_cap = MAX_PLUGIN_ID_BYTES,
+            scopes_cap = MAX_MANIFEST_LIST_ENTRIES,
+            scope_bytes_cap = MAX_DATASOURCE_SCOPE_BYTES,
+            "plugin manifest provides a datasource the host does not accept ({}); dropping \
+             the connection",
+            refusal.reason(),
         );
         return;
     }

@@ -47,11 +47,12 @@ thread_local! {
 /// The level one scroll notch asks for.
 ///
 /// `polled` is the service's last reading; `pending` is the last request any
-/// brightness control made ([`LAST_REQUEST`]) and when it was made. `direction` is `wire_scroll`'s `±1.0`, where
-/// GDK's `dy` is positive for scroll-down — treated as "decrease", so
-/// scroll-up raises brightness, matching the volume chip. The result is
-/// clamped by the service's own rule, so a run of notches past either end
-/// does not accumulate a base outside what was actually written.
+/// brightness control made ([`LAST_REQUEST`]) and when it was made.
+/// `direction` is `wire_scroll`'s `±1.0`, where GDK's `dy` is positive for
+/// scroll-down — treated as "decrease", so scroll-up raises brightness,
+/// matching the volume chip. The result is clamped by the service's own rule,
+/// so a run of notches past either end does not accumulate a base outside what
+/// was actually written.
 fn scroll_target(
     polled: f64,
     pending: Option<(f64, Instant)>,

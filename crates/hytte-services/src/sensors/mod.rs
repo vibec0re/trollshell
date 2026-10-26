@@ -2100,7 +2100,11 @@ mod mount_watch_tests {
             || 7,
         );
 
-        assert_eq!(list.get(), 7, "the seed is published although the open failed");
+        assert_eq!(
+            list.get(),
+            7,
+            "the seed is published although the open failed"
+        );
         assert_eq!(waits.get(), 0, "no fd, nothing to wait on");
     }
 }

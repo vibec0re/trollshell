@@ -511,10 +511,7 @@ mod tests {
         assert!(pending.lock().await.is_some(), "A's sender is in the slot");
 
         drop(a);
-        assert!(
-            pending.lock().await.is_none(),
-            "dropping A frees the slot"
-        );
+        assert!(pending.lock().await.is_none(), "dropping A frees the slot");
 
         let mut b = std::pin::pin!(await_reply_in(&pending, &banner, prompt(2)));
         assert!(
@@ -580,7 +577,10 @@ mod tests {
         assert_eq!(shown(&banner), Some(1), "A's banner stays up");
 
         answer(&pending, AgentReply::Confirm).await;
-        assert!(matches!(a.await, AgentReply::Confirm), "A is still answerable");
+        assert!(
+            matches!(a.await, AgentReply::Confirm),
+            "A is still answerable"
+        );
     }
 
     /// A request answered and then dropped before its task ran leaves the

@@ -127,7 +127,9 @@ async fn await_passphrase(
     // empty vector can only mean a malformed submit; treat it as a cancel
     // rather than handing iwd an empty passphrase it would just reject.
     match rx.await {
-        Ok(Ok(secrets)) if !secrets.is_empty() => Ok(secrets.into_iter().next().unwrap_or_default()),
+        Ok(Ok(secrets)) if !secrets.is_empty() => {
+            Ok(secrets.into_iter().next().unwrap_or_default())
+        }
         _ => Err(zbus::fdo::Error::Failed("agent cancelled".into())),
     }
 }
@@ -306,10 +308,7 @@ mod tests {
         assert!(b.as_mut().now_or_never().is_none(), "B waits on the user");
         assert_eq!(shown(&prompts), Some(2));
 
-        assert_eq!(
-            a.await.expect("request A panicked").as_deref(),
-            Ok("first")
-        );
+        assert_eq!(a.await.expect("request A panicked").as_deref(), Ok("first"));
         assert_eq!(
             shown(&prompts),
             Some(2),

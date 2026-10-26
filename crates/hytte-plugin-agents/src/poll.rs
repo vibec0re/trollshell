@@ -145,16 +145,21 @@ impl ConfigSource {
         moved
     }
 
-    /// Re-read the layers, with one journal line per rejected key, degrading
-    /// to the documented default only when a layer is unusable as a file —
-    /// the same contract [`config::load`] has, over the same reader (#1451:
-    /// a bad value costs its own key here too, not the reload).
-    fn read(&self) -> AgentsConfig {
+    /// Re-read the layers, with one journal line per rejected key (#1451: a
+    /// bad value costs its own key here too, not the reload).
+    ///
+    /// `None` when a layer is unusable as a file (not TOML, or unreadable) —
+    /// already logged. This is a *live* reload, so the caller keeps the config
+    /// it is running on rather than swapping in the built-in default: that
+    /// would point the poll at the default socket and reset `[display]` over
+    /// one typo. Only the startup read ([`config::load`]) falls back to the
+    /// default, because there is nothing better yet.
+    fn read(&self) -> Option<AgentsConfig> {
         match hytte_config::subsystem::load_layer::<AgentsFile>(&self.layers) {
-            Ok(config) => config,
+            Ok(config) => Some(config),
             Err(e) => {
-                tracing::error!(%e, "agents.toml is unusable; keeping the built-in default");
-                AgentsConfig::default()
+                tracing::error!(%e, "agents.toml is unusable; keeping the config already in use");
+                None
             }
         }
     }
@@ -260,7 +265,9 @@ fn reload(cfg: &mut AgentsConfig, watch: &mut ConfigSource, msg_tx: &UnboundedSe
     if !watch.changed() {
         return false;
     }
-    let next = watch.read();
+    let Some(next) = watch.read() else {
+        return false;
+    };
     if next == *cfg {
         // An mtime moved but nothing we read did (a comment edit, a touch).
         return false;

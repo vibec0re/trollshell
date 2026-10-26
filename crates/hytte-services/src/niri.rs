@@ -711,7 +711,7 @@ pub enum WorkspaceAction {
     ///
     /// Same no-id shape as [`Self::MoveColumnToIndex`]: a preceding
     /// [`Self::FocusWindow`] in the same batch is the target. The single
-    /// producer is `reflow_batch` (#1129) — moving a column to an end and
+    /// producer is `reflow_over` (#1129) — moving a column to an end and
     /// back is a change niri reflows the workspace for, unlike a change in
     /// the space *around* the columns (closing the sidebar, an
     /// out-of-process layout applying `SetWindowWidth`), which niri does not
@@ -951,7 +951,21 @@ fn active_workspace_id_in(connector: &str, workspaces: &[Workspace]) -> Option<u
         .map(|w| w.id)
 }
 
-/// Pure batch builder behind [`reflow_workspace`] (#1129).
+/// What [`reflow_over`] sends for one workspace: the leftmost column to nudge,
+/// and the one action that puts focus back afterwards (`None` when niri
+/// reported nothing to restore to).
+///
+/// Pure data, built by [`reflow_plan`]; the chain itself is fixed (see
+/// [`reflow_over`]).
+#[derive(Debug, PartialEq, Eq)]
+struct ReflowPlan {
+    /// The first tiled window in column order — the nudge's target.
+    first: u64,
+    /// The focus put-back, from [`restore_focus_action`].
+    restore: Option<WorkspaceAction>,
+}
+
+/// Pure planner behind [`reflow_workspace`] (#1129).
 ///
 /// **The bug:** niri lays out columns when something *about* them changes,
 /// not when the space *around* them does. Closing the sidebar commits
@@ -970,72 +984,161 @@ fn active_workspace_id_in(connector: &str, workspaces: &[Workspace]) -> Option<u
 /// (`pos_in_scrolling_layout == None`) excluded: a floating window is in no
 /// column, so there is nothing to reflow it into. The **first** tiled window
 /// in that order is the nudge's target; if `workspace` has none (empty, or
-/// floating-only), the batch is empty and [`reflow_workspace`] sends nothing.
-///
-/// The final [`WorkspaceAction::FocusWindow`] restores whatever window
-/// `windows` reports as focused (`Window::is_focused`, checked across every
-/// workspace, not just this one — the nudge's own `FocusWindow` on the first
-/// column can steal focus from a window on a workspace other than the one
-/// being reflowed) so the user doesn't land on column 1. If nothing is
-/// focused, the batch ends after the reflow with no restore step.
+/// floating-only), the plan is `None` and [`reflow_workspace`] sends nothing.
 #[must_use]
-pub(crate) fn reflow_batch(workspace: u64, windows: &[Window]) -> Vec<WorkspaceAction> {
-    let mut here: Vec<&Window> = windows
+fn reflow_plan(workspace: u64, windows: &[Window], workspaces: &[Workspace]) -> Option<ReflowPlan> {
+    let first = windows
         .iter()
-        .filter(|w| w.workspace_id == Some(workspace) && w.layout.pos_in_scrolling_layout.is_some())
-        .collect();
-    here.sort_by_key(|w| {
-        (
-            w.layout
-                .pos_in_scrolling_layout
-                .expect("filtered to Some above"),
-            w.id,
-        )
-    });
-    let Some(first) = here.first() else {
-        // No tiled column on this workspace — nothing to reflow, and no
-        // spurious FocusWindow to steal focus for no reason.
-        return Vec::new();
-    };
+        .filter(|w| w.workspace_id == Some(workspace))
+        .filter_map(|w| w.layout.pos_in_scrolling_layout.map(|pos| (pos, w.id)))
+        .min()
+        .map(|(_, id)| id)?;
+    Some(ReflowPlan {
+        first,
+        restore: restore_focus_action(windows, workspaces, workspace),
+    })
+}
 
-    let mut batch = vec![
-        WorkspaceAction::FocusWindow { window: first.id },
+/// The one action that puts focus back where it was before the nudge, from
+/// the snapshots taken before it. Three cases, in order:
+///
+/// 1. **A focused window** (checked across every workspace — the nudge's own
+///    `FocusWindow` can steal focus from another one): focus it again.
+/// 2. **No focused window, but the focused workspace has an active one**:
+///    keyboard focus was elsewhere, most likely on a layer-shell surface such
+///    as the shell's own drawer. Focusing that workspace's active window puts
+///    back the column the nudge moved off.
+/// 3. **The focused workspace is empty**: focus it by id, so a nudge on
+///    another screen does not leave focus there.
+///
+/// Case 3 never targets `nudged`, the workspace the nudge itself focuses. A
+/// `FocusWorkspace` on the workspace already active on the active output is
+/// not a no-op under niri's `workspace-auto-back-and-forth`: it switches to
+/// the *previous* workspace. (An empty workspace is never the one with columns
+/// to lay out, so this cannot happen today; the guard keeps it true.)
+///
+/// With none of the three, nothing is sent.
+///
+/// Mirrors `restore_focus` in `hytte-plugin-niri-layouts`' `niri.rs` (#1516),
+/// which cannot share this code: a plugin never links `hytte-services`. Keep
+/// the two in step.
+fn restore_focus_action(
+    windows: &[Window],
+    workspaces: &[Workspace],
+    nudged: u64,
+) -> Option<WorkspaceAction> {
+    let focused_workspace = workspaces.iter().find(|w| w.is_focused);
+    if let Some(window) = windows.iter().find(|w| w.is_focused) {
+        Some(WorkspaceAction::FocusWindow { window: window.id })
+    } else if let Some(window) = focused_workspace.and_then(|w| w.active_window_id) {
+        Some(WorkspaceAction::FocusWindow { window })
+    } else {
+        focused_workspace
+            .filter(|w| w.id != nudged)
+            .map(|w| WorkspaceAction::Focus { workspace: w.id })
+    }
+}
+
+/// Send one action on `conn`, with both reply layers checked and the same
+/// error text [`send_actions_over`] gives.
+fn send_one(conn: &mut dyn Conn, action: WorkspaceAction) -> Result<(), String> {
+    let described = format!("{action:?}");
+    match conn.send(Request::Action(lower(action)))? {
+        Ok(_) => Ok(()),
+        Err(refusal) => Err(format!("niri refused {described}: {refusal}")),
+    }
+}
+
+/// Run `plan` over **one** connection: the #1129 nudge, plus the two things it
+/// has to put back however it ends — the leftmost column's place, and focus.
+///
+/// Unlike [`send_actions_over`] this is deliberately **not** fail-fast. The
+/// chain is `FocusWindow` (the leftmost column) → `MoveColumnToFirst` →
+/// `MoveColumnToLast` → `MoveColumnToFirst`, and it is not atomic: niri can
+/// refuse any step, or the socket can go away between two of them. Once the
+/// `FocusWindow` has landed, a failure has always left something out of place:
+/// focus is on the leftmost column, and a failure after `MoveColumnToLast`
+/// landed leaves that column as the **rightmost** one.
+///
+/// So once the chain has started, the put-back steps run however it ended: one
+/// more `MoveColumnToFirst` after a failed move (a no-op unless the column was
+/// left at the end, since every move acts on the still-focused leftmost
+/// column), then the focus restore. Each is best-effort. The **first** error is
+/// returned and a later one is logged rather than dropped.
+///
+/// A refused `FocusWindow` sends nothing further: nothing has moved yet, focus
+/// included, so there is nothing to put back.
+///
+/// Mirrors `reflow` in `hytte-plugin-niri-layouts`' `niri.rs` (#1516), which
+/// cannot share this code: a plugin never links `hytte-services`. Keep the two
+/// in step.
+fn reflow_over(connector: &mut impl Connector, plan: &ReflowPlan) -> Result<(), String> {
+    let mut conn = connector.connect()?;
+    send_one(
+        &mut *conn,
+        WorkspaceAction::FocusWindow { window: plan.first },
+    )?;
+
+    let moved = [
         WorkspaceAction::MoveColumnToFirst,
         WorkspaceAction::MoveColumnToLast,
         WorkspaceAction::MoveColumnToFirst,
-    ];
-    if let Some(focused) = windows.iter().find(|w| w.is_focused) {
-        batch.push(WorkspaceAction::FocusWindow { window: focused.id });
+    ]
+    .into_iter()
+    .try_for_each(|action| send_one(&mut *conn, action));
+    if moved.is_err()
+        && let Err(e) = send_one(&mut *conn, WorkspaceAction::MoveColumnToFirst)
+    {
+        tracing::warn!(error = %e, "niri reflow: the first column was not moved back after a failed move (#1129)");
     }
-    batch
+
+    let restored = plan
+        .restore
+        .clone()
+        .map_or(Ok(()), |action| send_one(&mut *conn, action));
+    match (moved, restored) {
+        (Err(first), Err(later)) => {
+            tracing::warn!(error = %later, "niri reflow: focus was not restored after a failed move (#1129)");
+            Err(first)
+        }
+        (moved, restored) => moved.and(restored),
+    }
 }
 
 /// Nudge niri to reflow workspace `workspace`'s columns (#1129): fire and
 /// forget, mirroring [`focus_workspace`]/[`focus_window`].
 ///
-/// Reads the current window list out of the registry's cached [`windows()`]
-/// (so, like every other free-function accessor here, must run on the GTK
-/// main thread the registry lives on), builds `reflow_batch`, and — when
-/// it's non-empty — sends it over one [`send_actions`] connection on the
-/// tokio runtime. Callers (`overlays::sidebar`'s post-close settle,
-/// `hytte-plugin-niri-layouts`'s own mirrored chain over its own
-/// `Transport`) don't need to await anything back; a refused or unreachable
-/// niri just leaves the columns exactly where the triggering action left
-/// them, which is the pre-#1129 behaviour.
+/// Reads the current window and workspace lists out of the registry's cached
+/// [`windows()`]/[`workspaces()`] (so, like every other free-function accessor
+/// here, must run on the GTK main thread the registry lives on), plans with
+/// `reflow_plan`, and — when there is a column to nudge — runs `reflow_over`
+/// on the tokio runtime's blocking pool. Callers (`overlays::sidebar`'s
+/// post-close settle, `hytte-plugin-niri-layouts`'s own mirrored chain over its
+/// own `Transport`) don't need to await anything back; a refused or
+/// unreachable niri leaves the columns where the triggering action left them,
+/// which is the pre-#1129 behaviour, with the column and focus put back
+/// best-effort.
 pub fn reflow_workspace(workspace: u64) {
-    let windows = registry::with(|r| {
-        r.get::<NiriHandles>()
-            .expect("niri::service() not registered")
-            .windows
-            .get_cloned()
+    let (windows, workspaces) = registry::with(|r| {
+        let handles = r
+            .get::<NiriHandles>()
+            .expect("niri::service() not registered");
+        (
+            handles.windows.get_cloned(),
+            handles.workspaces.get_cloned(),
+        )
     });
-    let batch = reflow_batch(workspace, &windows);
-    if batch.is_empty() {
+    let Some(plan) = reflow_plan(workspace, &windows, &workspaces) else {
         return;
-    }
+    };
     runtime::handle().spawn(async move {
-        if let Err(e) = send_actions(batch).await {
-            tracing::warn!(error = %e, workspace, "niri reflow batch failed (#1129)");
+        let result = runtime::handle()
+            .spawn_blocking(move || reflow_over(&mut SocketConnector, &plan))
+            .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(error = %e, workspace, "niri reflow batch failed (#1129)"),
+            Err(e) => tracing::warn!(error = %e, workspace, "niri reflow task failed (#1129)"),
         }
     });
 }
@@ -2040,135 +2143,234 @@ mod tests {
         w
     }
 
+    const FOCUS_10: &str = r#"{"FocusWindow":{"id":10}}"#;
+    const FOCUS_20: &str = r#"{"FocusWindow":{"id":20}}"#;
+    const TO_FIRST: &str = r#"{"MoveColumnToFirst":{}}"#;
+    const TO_LAST: &str = r#"{"MoveColumnToLast":{}}"#;
+
+    /// Plan workspace 1 and run it against `fake`, returning niri's verdict and
+    /// the actions it saw as wire JSON.
+    fn run_reflow(
+        fake: &mut Fake,
+        windows: &[Window],
+        workspaces: &[Workspace],
+    ) -> (Result<(), String>, Vec<String>) {
+        let plan = reflow_plan(1, windows, workspaces).expect("workspace 1 has a tiled window");
+        let result = reflow_over(fake, &plan);
+        let seen = fake.seen().into_iter().map(|(_, a)| a).collect();
+        (result, seen)
+    }
+
+    /// Two columns on workspace 1 with window 20 focused.
+    fn focused_two_columns() -> (Vec<Window>, Vec<Workspace>) {
+        (
+            vec![mk_tiled(20, 1, 2, true), mk_tiled(10, 1, 1, false)],
+            vec![mk_workspace(1, CONNECTOR, true)],
+        )
+    }
+
     /// The chain Annika verified live (#1129 triage): focus the first
     /// column, move it to the end and back to the start twice, then restore
     /// whatever had focus before the nudge ran.
     #[test]
-    fn reflow_batch_is_the_verified_chain_ending_in_the_restored_focus() {
+    fn reflow_is_the_verified_chain_ending_in_the_restored_focus() {
         let windows = vec![
             mk_tiled(20, 1, 2, true), // focused, but NOT first in column order
             mk_tiled(10, 1, 1, false),
             mk_tiled(30, 1, 3, false),
         ];
+        let workspaces = vec![mk_workspace(1, CONNECTOR, true)];
+        let mut fake = Fake::default();
+        let (result, seen) = run_reflow(&mut fake, &windows, &workspaces);
+        result.expect("the nudge lands");
+        assert_eq!(fake.connects(), 1, "one socket for the whole nudge");
         assert_eq!(
-            reflow_batch(1, &windows),
-            vec![
-                WorkspaceAction::FocusWindow { window: 10 },
-                WorkspaceAction::MoveColumnToFirst,
-                WorkspaceAction::MoveColumnToLast,
-                WorkspaceAction::MoveColumnToFirst,
-                WorkspaceAction::FocusWindow { window: 20 },
-            ],
+            seen,
+            [FOCUS_10, TO_FIRST, TO_LAST, TO_FIRST, FOCUS_20],
             "leads with the first column in order, ends restoring the window \
              that was actually focused (20), not the one the nudge focused (10)"
         );
     }
 
-    /// Mutation guard: dropping the trailing restore-focus step must redden —
-    /// a batch that ends on `MoveColumnToFirst` leaves the user parked on
-    /// column 1 instead of back on whatever they had focused.
+    /// A workspace with no window at all, or only floating ones, has nothing to
+    /// reflow: no plan, so no `FocusWindow` to steal focus and no socket.
     #[test]
-    fn reflow_batch_ends_with_the_restore_focus_step() {
-        let windows = vec![mk_tiled(10, 1, 1, true)];
-        let batch = reflow_batch(1, &windows);
-        assert_eq!(
-            batch.last(),
-            Some(&WorkspaceAction::FocusWindow { window: 10 }),
-            "the batch must end by restoring focus, not on the bare move chain: {batch:?}"
-        );
+    fn reflow_plan_is_none_without_a_tiled_window() {
+        assert_eq!(reflow_plan(1, &[], &[]), None);
+        let floating = vec![mk_floating(10, 1, false), mk_floating(20, 1, true)];
+        assert_eq!(reflow_plan(1, &floating, &[]), None);
     }
 
-    /// A workspace with no window at all sends nothing — no `FocusWindow`
-    /// with an id that doesn't exist, and no socket for
-    /// [`send_actions_over`]/[`send_actions`] to open.
+    /// Windows on other workspaces must not leak into the column-order search;
+    /// the globally focused window (on workspace 2) is still what is restored.
     #[test]
-    fn reflow_batch_is_empty_for_a_workspace_with_no_window() {
-        assert!(reflow_batch(1, &[]).is_empty());
-    }
-
-    /// A workspace whose only windows are floating (no column at all) is the
-    /// same "nothing to reflow" case as no window: floating windows are
-    /// excluded from the column-order search entirely, so the batch must stay
-    /// empty rather than emitting a `FocusWindow` for one of them (which would
-    /// steal focus without anything actually reflowing).
-    #[test]
-    fn reflow_batch_is_empty_when_every_window_is_floating() {
-        let windows = vec![mk_floating(10, 1, false), mk_floating(20, 1, true)];
-        assert!(reflow_batch(1, &windows).is_empty());
-    }
-
-    /// Windows on other workspaces must not leak into either the column-order
-    /// search or the restore-focus lookup by id — only whether *some* window
-    /// is focused should matter for the restore, but the reflow's own target
-    /// column comes only from `workspace`'s own windows.
-    #[test]
-    fn reflow_batch_only_reflows_the_named_workspace() {
+    fn reflow_only_reflows_the_named_workspace() {
         let windows = vec![
             mk_tiled(10, 1, 1, false),
             mk_tiled(99, 2, 1, true), // different workspace, focused
         ];
         assert_eq!(
-            reflow_batch(1, &windows),
-            vec![
-                WorkspaceAction::FocusWindow { window: 10 },
-                WorkspaceAction::MoveColumnToFirst,
-                WorkspaceAction::MoveColumnToLast,
-                WorkspaceAction::MoveColumnToFirst,
-                WorkspaceAction::FocusWindow { window: 99 },
-            ],
-            "workspace 1 supplies the column target; the globally focused \
-             window (on workspace 2) is still what gets restored"
+            reflow_plan(1, &windows, &[]),
+            Some(ReflowPlan {
+                first: 10,
+                restore: Some(WorkspaceAction::FocusWindow { window: 99 }),
+            })
         );
     }
 
-    /// No window anywhere is focused: the batch ends on the move chain with
-    /// no restore step, rather than a `FocusWindow` for a nonexistent focus.
+    /// Whichever move niri refuses, the leftmost column goes back to the front
+    /// and focus goes back to window 20, and the error is niri's own text for
+    /// the refused step.
+    ///
+    /// Position 3 is the one that left real damage: `MoveColumnToLast` landed,
+    /// so before this the column stayed at the far end with focus stolen.
     #[test]
-    fn reflow_batch_has_no_restore_step_when_nothing_is_focused() {
+    fn a_reflow_refused_partway_still_puts_the_column_and_focus_back() {
+        for (position, step) in [
+            (1, "MoveColumnToFirst"),
+            (2, "MoveColumnToLast"),
+            (3, "MoveColumnToFirst"),
+        ] {
+            let (windows, workspaces) = focused_two_columns();
+            let mut fake = Fake::default();
+            fake.refuse_nth(position, &format!("refused {step}"));
+
+            let (result, seen) = run_reflow(&mut fake, &windows, &workspaces);
+
+            let err = result.expect_err("niri refused a move");
+            assert!(
+                err.contains(step) && err.ends_with(&format!("refused {step}")),
+                "position {position}: {err}"
+            );
+            assert_eq!(fake.connects(), 1, "position {position}: one socket");
+            assert_eq!(
+                seen.len(),
+                position + 1 + 2,
+                "position {position}: the chain stops at the refusal, then \
+                 exactly two put-back steps: {seen:?}"
+            );
+            assert_eq!(
+                seen[seen.len() - 2..],
+                [TO_FIRST, FOCUS_20],
+                "position {position}: one more move to the front, then the \
+                 original focus: {seen:?}"
+            );
+        }
+    }
+
+    /// A refused first `FocusWindow` has moved nothing, focus included, so
+    /// nothing follows it.
+    #[test]
+    fn a_refused_first_focus_sends_nothing_more() {
+        let (windows, workspaces) = focused_two_columns();
+        let mut fake = Fake::default();
+        fake.refuse_nth(0, "no such window");
+
+        let (result, seen) = run_reflow(&mut fake, &windows, &workspaces);
+
+        assert!(result.expect_err("refused").contains("no such window"));
+        assert_eq!(seen, [FOCUS_10], "only the refused focus: {seen:?}");
+    }
+
+    /// The moves landed but the restore was refused: that refusal is the error.
+    #[test]
+    fn a_refused_restore_is_the_error_when_the_moves_landed() {
+        let (windows, workspaces) = focused_two_columns();
+        let mut fake = Fake::default();
+        fake.refuse_nth(4, "refused FocusWindow");
+
+        let (result, seen) = run_reflow(&mut fake, &windows, &workspaces);
+
+        assert!(result.expect_err("refused").contains("refused FocusWindow"));
+        assert_eq!(seen.len(), 5, "{seen:?}");
+    }
+
+    /// A move, the put-back *and* the restore all refused: the move's error is
+    /// returned (it came first), and every later step was still attempted.
+    #[test]
+    fn the_first_reflow_error_wins_and_later_steps_are_still_attempted() {
+        let (windows, workspaces) = focused_two_columns();
+        let mut fake = Fake::default();
+        fake.0.borrow_mut().replies.extend([
+            Ok(Response::Handled),                  // 0 FocusWindow
+            Ok(Response::Handled),                  // 1 MoveColumnToFirst
+            Err("refused MoveColumnToLast".into()), // 2
+            Err("refused put-back".into()),         // 3
+            Err("refused FocusWindow".into()),      // 4 restore
+        ]);
+
+        let (result, seen) = run_reflow(&mut fake, &windows, &workspaces);
+
+        let err = result.expect_err("niri refused thrice");
+        assert!(err.contains("refused MoveColumnToLast"), "{err}");
+        assert_eq!(seen, [FOCUS_10, TO_FIRST, TO_LAST, TO_FIRST, FOCUS_20]);
+    }
+
+    /// Focus on an **empty** workspace on another screen: the nudge's
+    /// `FocusWindow` moves focus to the nudged screen, so the restore focuses
+    /// that workspace again, by id.
+    #[test]
+    fn focus_on_an_empty_workspace_elsewhere_is_restored_by_workspace_id() {
+        let windows = vec![mk_tiled(30, 2, 1, false)];
+        let empty = mk_workspace(1, CONNECTOR, true);
+        let mut nudged = mk_workspace(2, "HDMI-A-1", true);
+        nudged.is_focused = false;
+        let plan = reflow_plan(2, &windows, &[empty, nudged]).expect("workspace 2 has a column");
+        let mut fake = Fake::default();
+
+        reflow_over(&mut fake, &plan).expect("lands");
+
+        assert_eq!(
+            fake.seen().last().map(|(_, a)| a.as_str()),
+            Some(r#"{"FocusWorkspace":{"reference":{"Id":1}}}"#)
+        );
+    }
+
+    /// The back-and-forth guard: the focused workspace is the one the nudge
+    /// focuses and names no active window, so nothing is restored — a
+    /// `FocusWorkspace` there would switch to the *previous* workspace under
+    /// `workspace-auto-back-and-forth`.
+    ///
+    /// **Mutation:** drop the `!= nudged` filter and a `FocusWorkspace` lands
+    /// at the end of this chain.
+    #[test]
+    fn restore_never_targets_the_workspace_the_nudge_focused() {
         let windows = vec![mk_tiled(10, 1, 1, false), mk_tiled(20, 1, 2, false)];
+        let workspaces = vec![mk_workspace(1, CONNECTOR, true)];
+        let mut fake = Fake::default();
+        let (result, seen) = run_reflow(&mut fake, &windows, &workspaces);
+        result.expect("lands");
+        assert_eq!(seen, [FOCUS_10, TO_FIRST, TO_LAST, TO_FIRST], "{seen:?}");
+    }
+
+    /// No window has focus, but the focused workspace names an active one
+    /// (keyboard focus on a layer-shell surface): restore that column.
+    #[test]
+    fn a_workspaces_active_window_is_restored_when_no_window_has_focus() {
+        let windows = vec![
+            mk_tiled(10, 1, 1, false),
+            mk_tiled(20, 1, 2, false),
+            mk_tiled(30, 1, 3, false),
+        ];
+        let mut workspace = mk_workspace(1, CONNECTOR, true);
+        workspace.active_window_id = Some(30);
+        let mut fake = Fake::default();
+        let (result, seen) = run_reflow(&mut fake, &windows, &[workspace]);
+        result.expect("lands");
         assert_eq!(
-            reflow_batch(1, &windows),
-            vec![
-                WorkspaceAction::FocusWindow { window: 10 },
-                WorkspaceAction::MoveColumnToFirst,
-                WorkspaceAction::MoveColumnToLast,
-                WorkspaceAction::MoveColumnToFirst,
-            ]
+            seen.last().map(String::as_str),
+            Some(r#"{"FocusWindow":{"id":30}}"#)
         );
     }
 
-    /// [`reflow_batch`] rides one socket in order, over the same
-    /// [`send_actions_over`] property #1071 §3.4 pins for every other batch —
-    /// pinned here at the wire, the same way
-    /// `a_focus_and_its_column_move_ride_one_socket_in_order` pins
-    /// `MoveColumnToIndex`'s pairing.
+    /// A failed dial is the error, with nothing sent.
     #[test]
-    fn reflow_batch_rides_one_socket_in_order() {
-        let windows = vec![mk_tiled(10, 1, 1, true)];
+    fn a_failed_dial_is_an_error_with_nothing_sent() {
+        let (windows, workspaces) = focused_two_columns();
+        let plan = reflow_plan(1, &windows, &workspaces).expect("plan");
         let mut fake = Fake::default();
-        send_actions_over(&mut fake, reflow_batch(1, &windows)).expect("the batch lands");
-
-        assert_eq!(fake.connects(), 1, "one socket for the whole nudge");
-        assert_eq!(
-            fake.seen().into_iter().map(|(_, a)| a).collect::<Vec<_>>(),
-            vec![
-                r#"{"FocusWindow":{"id":10}}"#,
-                r#"{"MoveColumnToFirst":{}}"#,
-                r#"{"MoveColumnToLast":{}}"#,
-                r#"{"MoveColumnToFirst":{}}"#,
-                r#"{"FocusWindow":{"id":10}}"#,
-            ]
-        );
-    }
-
-    /// An empty batch (no tiled window on the workspace) opens no socket at
-    /// all — the same "empty batch connects nothing" contract every other
-    /// batch gets, restated here so a regression that stopped short-circuiting
-    /// empty reflows specifically would redden.
-    #[test]
-    fn an_empty_reflow_batch_connects_nothing() {
-        let mut fake = Fake::default();
-        send_actions_over(&mut fake, reflow_batch(1, &[])).expect("trivially lands");
-        assert_eq!(fake.connects(), 0);
+        fake.0.borrow_mut().connect_error = Some("no socket".to_owned());
+        assert_eq!(reflow_over(&mut fake, &plan), Err("no socket".to_owned()));
+        assert!(fake.seen().is_empty());
     }
 }

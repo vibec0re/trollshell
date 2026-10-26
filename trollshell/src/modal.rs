@@ -4594,4 +4594,52 @@ mod gtk_tests {
             .collect();
         assert_eq!(opened, ["test-b3-0"]);
     }
+
+    /// The Edit form's **Save**, landing after the user dismissed the drawer,
+    /// opens nothing — driven through the form's own outcome binding, so the
+    /// call site is pinned and not only `leave_workspace_edit`'s contract.
+    ///
+    /// **Falsification:** put `bind_save_outcome`'s success arm back on
+    /// `switch_active(Page::Workspaces)` → the #799 fallback opens the drawer
+    /// and this reds.
+    #[gtk::test]
+    fn a_save_landing_after_the_drawer_closed_opens_nothing() {
+        use crate::workspace_stacks::SaveOutcome;
+        use hytte::futures_signals::signal::Mutable;
+
+        const KEY: &str = "test-1547-save-site";
+        if !crate::plugins::host_is_live() {
+            crate::plugins::install_test_handles();
+        }
+        let panel = workspaces_drawer(KEY);
+        let _mounted = Mounted {
+            keys: &[KEY],
+            panels: vec![panel.clone()],
+        };
+        let save = gtk::Button::with_label("Save");
+        let refusal = gtk::Label::new(None);
+        let pending = Rc::new(std::cell::Cell::new(Some(1547)));
+        let outcomes: Mutable<Option<SaveOutcome>> = Mutable::new(None);
+        crate::panels::workspace_edit::bind_save_outcome_for_test(
+            &save,
+            outcomes.signal_cloned(),
+            &pending,
+            &refusal,
+        );
+        let pump = || while gtk::glib::MainContext::default().iteration(false) {};
+        pump();
+
+        outcomes.set(Some(SaveOutcome {
+            ticket: 1547,
+            error: None,
+        }));
+        pump();
+
+        assert_eq!(pending.get(), None, "premise: the outcome was taken");
+        assert!(
+            !panel.revealer.reveals_child(),
+            "a Save landing with the drawer dismissed reopened it"
+        );
+        assert_eq!(*panel.current.borrow(), None);
+    }
 }

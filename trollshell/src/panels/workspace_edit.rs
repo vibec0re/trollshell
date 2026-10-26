@@ -949,6 +949,21 @@ fn bind_save_outcome<S>(
     });
 }
 
+/// [`bind_save_outcome`] for `modal`'s drawer harness: the Save route's "opens
+/// no drawer" contract needs a mounted drawer, and only `modal::gtk_tests` can
+/// mount one.
+#[cfg(all(test, feature = "system-tests"))]
+pub(crate) fn bind_save_outcome_for_test<S>(
+    save: &gtk::Button,
+    outcomes: S,
+    pending: &Rc<std::cell::Cell<Option<u64>>>,
+    refusal_label: &gtk::Label,
+) where
+    S: Signal<Item = Option<workspace_stacks::SaveOutcome>> + 'static,
+{
+    bind_save_outcome(save, outcomes, pending, refusal_label);
+}
+
 /// The Save/Cancel row, and the label a refused Save writes under it.
 ///
 /// Returns both because the caller pins them **outside** the body scroller (see

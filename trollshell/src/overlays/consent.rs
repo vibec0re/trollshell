@@ -669,7 +669,7 @@ mod tests {
             );
             assert_eq!(output_for(&map, Some("eDP-1")), Some(&"eDP-1"));
         }
-        assert_eq!(output_for(&BTreeMap::<String, ()>::new(), None), None);
+        assert_eq!(output_for(&BTreeMap::<String, u8>::new(), None), None);
     }
 
     /// #1140 review, HIGH-1 — the reviewer's test, verbatim in substance.

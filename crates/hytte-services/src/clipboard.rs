@@ -313,11 +313,49 @@ fn truncate(s: &str, max: usize) -> String {
     out.push('\u{2026}');
     out
 }
+/// Upper bound on the bytes read back from `cliphist decode`. cliphist's
+/// own per-item store cap defaults to 5 MB, so 64 MiB is generous; it only
+/// exists so a misbehaving decoder cannot grow this buffer without limit.
+const DECODE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Run `cliphist decode <id> | wl-copy`. Plumbs cliphist's stdout into
-/// wl-copy's stdin via the standard library's `Stdio` pipe. Both children
-/// are spawned and waited on; if either fails the error surfaces.
+/// How long `cliphist decode` may take before it is killed.
+const DECODE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What to do with the outcome of `cliphist decode`.
+#[derive(Debug, PartialEq, Eq)]
+enum DecodeVerdict {
+    /// Decode succeeded with a payload: hand it to `wl-copy`.
+    Copy,
+    /// Decode exited cleanly but produced nothing; copying would blank
+    /// the live clipboard.
+    Empty,
+    /// Decode failed (non-zero exit, or killed on timeout).
+    Failed,
+    /// Output hit [`DECODE_MAX_BYTES`]; it is truncated, so do not copy.
+    TooLarge,
+}
+
+/// Pure decision for the paste path: only a successful, non-empty,
+/// untruncated decode may reach `wl-copy`. A stale or pruned id makes
+/// `cliphist decode` exit non-zero with empty stdout, and `wl-copy` on
+/// empty stdin would replace the user's live clipboard with nothing.
+fn decode_verdict(success: bool, output_len: usize) -> DecodeVerdict {
+    if !success {
+        DecodeVerdict::Failed
+    } else if output_len as u64 > DECODE_MAX_BYTES {
+        DecodeVerdict::TooLarge
+    } else if output_len == 0 {
+        DecodeVerdict::Empty
+    } else {
+        DecodeVerdict::Copy
+    }
+}
+
+/// Run `cliphist decode <id>` to completion (bounded in size and time),
+/// then, only if it produced a payload, feed that to `wl-copy` on stdin.
 fn run_decode_to_wlcopy(id: u64) -> anyhow::Result<()> {
+    use std::io::{Read, Write};
+
     let mut decoder = std::process::Command::new("cliphist")
         .arg("decode")
         .arg(id.to_string())
@@ -327,28 +365,67 @@ fn run_decode_to_wlcopy(id: u64) -> anyhow::Result<()> {
         .spawn()
         .map_err(|e| anyhow::anyhow!("spawn cliphist decode: {e}"))?;
 
-    let decoder_stdout = decoder
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("cliphist decode: no stdout pipe"))?;
+    let Some(stdout) = decoder.stdout.take() else {
+        let _ = decoder.kill();
+        let _ = decoder.wait();
+        return Err(anyhow::anyhow!("cliphist decode: no stdout pipe"));
+    };
+
+    // Read on a helper thread so the timeout can kill a stalled decoder
+    // (killing closes the pipe, which unblocks the reader with EOF).
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let r = stdout.take(DECODE_MAX_BYTES + 1).read_to_end(&mut buf);
+        let _ = tx.send(r.map(|_| buf));
+    });
+    let read = rx.recv_timeout(DECODE_TIMEOUT);
+    if read.is_err() || matches!(&read, Ok(Ok(b)) if b.len() as u64 > DECODE_MAX_BYTES) {
+        let _ = decoder.kill();
+    }
+    let dec_status = decoder
+        .wait()
+        .map_err(|e| anyhow::anyhow!("wait cliphist decode: {e}"))?;
+    let payload = match read {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) => return Err(anyhow::anyhow!("read cliphist decode: {e}")),
+        Err(_) => return Err(anyhow::anyhow!("cliphist decode timed out")),
+    };
+
+    match decode_verdict(dec_status.success(), payload.len()) {
+        DecodeVerdict::Copy => {}
+        DecodeVerdict::Empty => {
+            return Err(anyhow::anyhow!(
+                "cliphist decode produced no data; clipboard left untouched"
+            ));
+        }
+        DecodeVerdict::Failed => {
+            return Err(anyhow::anyhow!("cliphist decode exited {dec_status:?}"));
+        }
+        DecodeVerdict::TooLarge => {
+            return Err(anyhow::anyhow!(
+                "cliphist decode output exceeds {DECODE_MAX_BYTES} bytes"
+            ));
+        }
+    }
 
     let mut copier = std::process::Command::new("wl-copy")
-        .stdin(Stdio::from(decoder_stdout))
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| anyhow::anyhow!("spawn wl-copy: {e}"))?;
-
-    let dec_status = decoder
-        .wait()
-        .map_err(|e| anyhow::anyhow!("wait cliphist decode: {e}"))?;
+    if let Some(mut stdin) = copier.stdin.take() {
+        // `stdin` drops at the end of this block, closing the pipe (EOF).
+        if let Err(e) = stdin.write_all(&payload) {
+            let _ = copier.kill();
+            let _ = copier.wait();
+            return Err(anyhow::anyhow!("write wl-copy stdin: {e}"));
+        }
+    }
     let cp_status = copier
         .wait()
         .map_err(|e| anyhow::anyhow!("wait wl-copy: {e}"))?;
-
-    if !dec_status.success() {
-        return Err(anyhow::anyhow!("cliphist decode exited {dec_status:?}"));
-    }
     if !cp_status.success() {
         return Err(anyhow::anyhow!("wl-copy exited {cp_status:?}"));
     }
@@ -441,6 +518,17 @@ fn delete_stdin_payload(id: u64) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_verdict_copies_only_successful_nonempty() {
+        assert_eq!(decode_verdict(true, 5), DecodeVerdict::Copy);
+        // Stale id: non-zero exit, empty stdout.
+        assert_eq!(decode_verdict(false, 0), DecodeVerdict::Failed);
+        assert_eq!(decode_verdict(false, 5), DecodeVerdict::Failed);
+        assert_eq!(decode_verdict(true, 0), DecodeVerdict::Empty);
+        let over = usize::try_from(DECODE_MAX_BYTES).unwrap() + 1;
+        assert_eq!(decode_verdict(true, over), DecodeVerdict::TooLarge);
+    }
 
     #[test]
     fn parse_list_text_only() {

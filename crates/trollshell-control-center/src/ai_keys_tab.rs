@@ -5,8 +5,8 @@
 //! (wiping the entry once the shell has taken it, so the plaintext isn't
 //! retained in the widget — and **only** then: a call that fails keeps what
 //! was typed and says so under the rows, see [`apply_outcome`]); the trash
-//! button clears it. When the shell isn't running the calls fail and the rows
-//! show "Unavailable".
+//! button clears it. When the shell isn't running, or its keyring refuses the
+//! call (#1522), the calls fail and the rows show "Unavailable".
 //!
 //! Lives in its own module for the reason [`crate::places_tab`] and
 //! [`crate::plugins_tab`] do: a tab with its own state struct is a module, not
@@ -425,12 +425,10 @@ enum ApplyOutcome {
 /// [`ApplyOutcome`] for provider `label` from `SetAiKey`'s result. Pure, so
 /// the rule — wipe on `Ok` and only on `Ok` — is pinned without a bus.
 ///
-/// `Ok` is the shell's answer, not the keyring's: `SetAiKey` replies empty
-/// even when `secrets::set` fails shell-side (the shape #707 fixed for the
-/// plugin methods). That case still reads as stored here; only the status
-/// re-read that follows every apply can show it, and only when no older key
-/// is there to keep saying "Key stored". Making `SetAiKey` answer with the
-/// keyring's error is a shell change, not this tab's.
+/// Since #1522 `SetAiKey` answers with an error reply when the keyring (or
+/// the slot name) is refused, so `Err` covers a keyring failure as well as a
+/// missing shell, and the shell's message is shown as the reason. `Ok` means
+/// the shell stored the key.
 fn apply_outcome(label: &str, res: &Result<(), hytte_bus::BusError>) -> ApplyOutcome {
     match res {
         Ok(()) => ApplyOutcome::Stored,

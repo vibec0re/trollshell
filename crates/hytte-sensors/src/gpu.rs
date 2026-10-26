@@ -273,11 +273,22 @@ fn parse_nvidia_csv(s: &str) -> Option<GpuState> {
 /// Most killed children the reaper tracks at once.
 ///
 /// A child stuck in uninterruptible driver sleep stays on the reaper's list
-/// until the kernel lets it go. New ones arrive at most once per retry
-/// backoff (5 s at the very fastest, usually minutes), so 64 means a driver
-/// wedged for the better part of an hour of continuous failures. Past the cap
-/// a further child is dropped un-waited (a zombie until the process exits, the
-/// pre-reaper behaviour) so the list, and the memory behind it, stays bounded.
+/// until the kernel lets it go. How fast new ones can arrive depends on the
+/// caller:
+///
+/// - On the retry backoff alone, at most one per backoff
+///   ([`NVIDIA_BACKOFF_INITIAL`] doubling to [`NVIDIA_BACKOFF_MAX`]), so 64
+///   means about 4.8 h of continuous failures (5 + 10 + ... + 160 s, then
+///   57 x 300 s).
+/// - [`GpuCache::forget_readings`] clears that backoff, and
+///   `hytte-plugin-stats` calls it (`Sampler::reset`) when its sidebar
+///   reopens after a while. So with a wedged driver, each such reopen can add
+///   one more child (one [`NVIDIA_SMI_DEADLINE`] fork each), and the cap is
+///   what bounds that path.
+///
+/// Past the cap a further child is dropped un-waited (a zombie until the
+/// process exits, the pre-reaper behaviour) so the list, and the memory
+/// behind it, stays bounded.
 const REAPER_MAX_PENDING: usize = 64;
 
 /// How often the reaper re-polls its list while any child is still alive.
@@ -323,8 +334,11 @@ fn reaper_loop(rx: &std::sync::mpsc::Receiver<std::process::Child>) {
 fn reap_later(child: std::process::Child) {
     let tx = REAPER.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::channel();
-        // Spawn failure leaves `tx` with a dead receiver; `send` then errors
-        // and the child is dropped, the same as past the cap.
+        // If the spawn fails (a transient EAGAIN, say), `tx` is cached with a
+        // dead receiver and is never replaced: every later `send` errors and
+        // its child is dropped un-waited, so reaping stays off for the rest
+        // of the process (each later timeout leaves one zombie). Before this
+        // reaper, `thread::spawn` panicked on the same failure instead.
         let _ = std::thread::Builder::new()
             .name("nvidia-smi-reaper".into())
             .spawn(move || reaper_loop(&rx));

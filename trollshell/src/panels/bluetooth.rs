@@ -956,6 +956,11 @@ mod tests {
         let disc = build_discoverable_row(always(Some(hostile_adapter())));
         let device = build_device_row(&hostile_device(), false);
         pump();
-        drop((header, disc, device));
+        // The alias really reached all three rows (the two adapter rows only
+        // once the `bind` emission has been pumped), so a missing warning means
+        // something.
+        assert_shows(&header, HOSTILE_ALIAS);
+        assert_shows(&disc, &format!("Visible as \u{201c}{HOSTILE_ALIAS}\u{201d}"));
+        assert_shows(&device, HOSTILE_ALIAS);
     }
 }

@@ -100,6 +100,11 @@ pub(crate) mod test_support {
     /// it, `g_log_set_writer_func`, is a once-per-process global that would
     /// leak into every other test in the binary. A child's stderr is the
     /// observable the warning has, and the global state stays the child's.
+    ///
+    /// A missing warning proves nothing unless the child really put its
+    /// hostile text on a row, so every `*_child` body ends with
+    /// [`assert_shows`] on that text. A child whose text never reached a label
+    /// then fails, and this function's pass check fails the parent with it.
     #[track_caller]
     pub(crate) fn child_output(path: &str) -> String {
         let exe = std::env::current_exe().expect("the test binary's own path");
@@ -171,6 +176,7 @@ mod gtk_tests {
         adw::init().expect("libadwaita init");
         let row = adw::ActionRow::builder().title(PROBE).build();
         plain_text(&row);
+        assert_shows(&row, PROBE);
     }
 
     /// Child body: the **new** order (`plain_text` before any text).
@@ -184,6 +190,7 @@ mod gtk_tests {
         plain_text(&row);
         row.set_title(PROBE);
         row.set_subtitle(PROBE);
+        assert_shows(&row, PROBE);
     }
 
     /// **The premise of every no-warning pin in the panels**, so they cannot

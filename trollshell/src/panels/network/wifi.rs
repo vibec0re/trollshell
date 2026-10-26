@@ -599,6 +599,9 @@ mod markup_tests {
             ap_count: 1,
             active_signal_dbm: None,
         };
-        drop(build_network_row(&net));
+        let row = build_network_row(&net);
+        // The SSID really reached the title, so a missing warning means
+        // something.
+        assert_shows(&row, SSID);
     }
 }

@@ -98,8 +98,10 @@ pub fn socket_path(runtime_dir: Option<&Path>) -> Option<PathBuf> {
 /// so this one must stand down rather than unlink a working socket. A
 /// refused/failed connect means a stale socket file (a previous run left it) or
 /// no file at all — safe to reclaim. The probe connection is dropped
-/// immediately without sending a byte, so the incumbent reads EOF and answers
-/// it with the 400 its parser gives any empty request.
+/// immediately without sending a byte, so the incumbent reads EOF before any
+/// request and closes it unanswered and **uncounted** — a refused duplicate
+/// start must not paint a warning on the running bridge's chip
+/// (`http::read_request`'s `Ok(None)`).
 pub async fn socket_in_use(path: &Path) -> bool {
     UnixStream::connect(path).await.is_ok()
 }
@@ -595,7 +597,8 @@ mod tests {
             let (mut stream, _addr) = socket.accept().await.expect("accept");
             let (head, body) = crate::http::read_request(&mut stream)
                 .await
-                .expect("the client's request parses");
+                .expect("the client's request parses")
+                .expect("the client sent one");
             assert_eq!(head.path, crate::http::ROUTE, "the route survived");
             let (status, out) = bridge.handle(&head, &body).await;
             crate::http::write_response(&mut stream, status, &out).await;

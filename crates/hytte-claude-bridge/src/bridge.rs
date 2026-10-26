@@ -7,8 +7,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{Semaphore, watch};
+use tokio::time::Instant;
 
-use crate::backend::{Backend, Conversation as _, Turn};
+use crate::backend::{Backend, Conversation as _, REAP_GRACE, Turn, expired};
 use crate::http::{self, Failure, Head};
 use crate::session::{self, Key, Rotation, Titles};
 use crate::wire::{ChatRequest, ChatResponse, ErrorBody, Message};
@@ -51,7 +52,9 @@ impl Bridge {
     /// `budget` must stay **under** the client's global timeout
     /// (`hytte-ai-providers` uses 10s), so a slow turn reaches the caller as a
     /// clean 504 it can fall back from rather than as a connection-level
-    /// failure mid-read.
+    /// failure mid-read. A `claude` child still running at the budget is
+    /// killed and reaped before that 504 is sent, which can add up to
+    /// [`REAP_GRACE`] — so it is the sum that has to fit.
     ///
     /// `retired_store` is where the session retirements survive a restart
     /// (#855) — `None` keeps the whole title map in memory, which is what the
@@ -197,23 +200,35 @@ impl Bridge {
 
         // ONE budget for the whole request, rotation included: the client's own
         // global timeout does not restart just because the bridge retried.
-        match tokio::time::timeout(
-            self.budget,
-            self.answer(messages, delta, &title, user, max_tokens),
+        //
+        // It is a *deadline* handed down, not a timeout wrapped around
+        // `answer`, and that difference is the fix for a hung `claude` being
+        // orphaned: a wrapper's only move is to drop the future, which drops
+        // the `hive-claude` turn with no `kill_on_drop` on its child — and
+        // releases this permit and the title lock while that child still runs.
+        // With the deadline below, the backend kills and reaps its own child
+        // (`backend::run_until`), so by the time `answer` returns there is
+        // nothing left running, and only then does `_permit` drop.
+        let deadline = Instant::now() + self.budget;
+        // The backstop. Every wait inside `answer` is bounded by `deadline`
+        // itself, and the one that owns a child gives it at most `REAP_GRACE`
+        // past it to die, so this cannot fire while they hold — it is here so
+        // that an unbounded await added later costs one orphan, said loudly,
+        // rather than a permit wedged forever.
+        let backstop = deadline + REAP_GRACE * 2;
+        match tokio::time::timeout_at(
+            backstop,
+            self.answer(messages, delta, &title, user, max_tokens, deadline),
         )
         .await
         {
             Ok(reply) => reply,
             Err(_elapsed) => {
-                // The driver's own idle watchdog sits a second under this and
-                // kills the child on silence, so reaching here means the turn
-                // was still streaming — `hive-claude` sets no `kill_on_drop`,
-                // so that child may outlive this request. Said out loud rather
-                // than papered over.
-                tracing::warn!(
+                tracing::error!(
                     title = %title,
                     budget_s = self.budget.as_secs(),
-                    "budget expired while claude was still streaming; the child may still be running",
+                    "a turn outlived its deadline by more than the reap grace — something in it \
+                     is not deadline-bounded; any claude child it held may still be running",
                 );
                 Err(Failure::new(
                     504,
@@ -248,8 +263,12 @@ impl Bridge {
         title: &str,
         user: Option<&str>,
         max_tokens: Option<u32>,
+        deadline: Instant,
     ) -> Result<String, Failure> {
-        let failure = match self.respond(messages, delta, title, max_tokens).await {
+        let failure = match self
+            .respond(messages, delta, title, max_tokens, deadline)
+            .await
+        {
             Ok(reply) => return Ok(self.record(title, messages, user, reply)),
             Err(f) => f,
         };
@@ -272,11 +291,17 @@ impl Bridge {
 
         // Held across the replacement's first turn, not merely across the
         // decision — see the field docs. Only ever reached on an overflow.
-        let _rotating = self.rotation.lock().await;
+        // Waiting for it is bounded by the same deadline as everything else in
+        // the request; the holder's own turn is, too.
+        let Ok(_rotating) = tokio::time::timeout_at(deadline, self.rotation.lock()).await else {
+            return Err(expired());
+        };
         let Some(next) = self.retire(messages, user, title) else {
             return Err(failure);
         };
-        let reply = self.respond(messages, delta, &next, max_tokens).await?;
+        let reply = self
+            .respond(messages, delta, &next, max_tokens, deadline)
+            .await?;
         Ok(self.record(&next, messages, user, reply))
     }
 
@@ -287,6 +312,7 @@ impl Bridge {
         delta: &Message,
         title: &str,
         max_tokens: Option<u32>,
+        deadline: Instant,
     ) -> Result<String, Failure> {
         self.backend
             .respond(Turn {
@@ -294,6 +320,7 @@ impl Bridge {
                 transcript: messages,
                 delta,
                 max_tokens,
+                deadline,
             })
             .await
     }
@@ -419,19 +446,30 @@ fn error_response(status: u16, message: &str) -> (u16, Vec<u8>) {
 /// Generic over the stream since #993: the socket underneath is a
 /// [`UnixStream`](tokio::net::UnixStream) now rather than a `TcpStream`, and
 /// nothing above it changed — same protocol, same bytes, same statuses.
+///
+/// Two things are deliberately **not** counted as served:
+///
+/// - a connection that closed before sending a byte — no request was made, so
+///   it gets no response and no tally. That is a second bridge's startup probe
+///   ([`crate::socket::socket_in_use`]), which used to paint a warning on the
+///   incumbent's chip every time a duplicate start was refused;
+/// - a 2xx whose response never reached the client. The tally is taken *after*
+///   the bounded write (#1481) rather than before it, and an answer the client
+///   did not get is, from where the client sits, a failure — it fell back.
 pub async fn serve_connection(bridge: &Bridge, mut stream: impl http::Stream) {
     let (status, body) = match http::read_request(&mut stream).await {
-        Ok((head, body)) => bridge.handle(&head, &body).await,
+        Ok(Some((head, body))) => bridge.handle(&head, &body).await,
+        Ok(None) => return,
         Err(f) => error_response(f.status, &f.message),
     };
-    crate::status::record(status);
-    http::write_response(&mut stream, status, &body).await;
+    let delivered = http::write_response(&mut stream, status, &body).await;
+    crate::status::record(status, delivered);
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Bridge, error_response, ok_response};
-    use crate::backend::{Backend, Reprompt};
+    use crate::backend::{Backend, Reprompt, Subscription};
     use crate::http::Head;
     use crate::wire::Message;
     use std::time::Duration;
@@ -601,6 +639,147 @@ mod tests {
                 .resolve(&convo, None),
             first
         );
+    }
+
+    // ---- a hung claude is reaped before its permit and title are released ---
+
+    /// A subscription bridge whose `claude` is `backend::stand_in`'s silent
+    /// hang, writing its traces into `dir`.
+    fn hung_bridge(dir: &std::path::Path, budget: Duration) -> Bridge {
+        let config = hive_claude::Config {
+            program: Some(crate::backend::stand_in::hung_claude(dir)),
+            ..hive_claude::Config::default()
+        };
+        Bridge::new(
+            Backend::Subscription(Subscription::new(config)),
+            budget,
+            None,
+        )
+    }
+
+    /// One request under the identity `user` (#704), so two calls with the
+    /// same `user` and different `text` are one conversation — one title, one
+    /// title lock — but two flight keys, and single-flight does not merge them.
+    async fn ask(bridge: &Bridge, user: &str, text: &str) -> u16 {
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": text}],
+            "user": user,
+        })
+        .to_string();
+        bridge
+            .handle(&head("POST", crate::http::ROUTE), body.as_bytes())
+            .await
+            .0
+    }
+
+    /// **The title lock outlives the child, never the reverse.** Two turns of
+    /// one conversation: the first hangs; the second queues on its title.
+    ///
+    /// Before the fix the request budget dropped the first turn at the
+    /// deadline, which released its title lock with its `claude` still
+    /// running — so the second turn `--resume`d a session that the orphan
+    /// still had open, the transcript fork #693's lock exists to prevent.
+    /// Pinned here two ways: the first child is out of `/proc` (killed **and**
+    /// reaped) the moment its 504 is back, and the second child — which can
+    /// only start once the lock is free — found no trace of it when it did.
+    #[tokio::test]
+    async fn a_hung_turn_is_reaped_before_its_title_is_released() {
+        use crate::backend::stand_in;
+        use std::cell::Cell;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bridge = hung_bridge(dir.path(), Duration::from_secs(2));
+        let first_pid = Cell::new(None);
+
+        let first = async {
+            let status = ask(&bridge, "pet", "one").await;
+            let pid = first_pid.get().expect("the first child started");
+            assert!(
+                !stand_in::present(pid),
+                "the first child ({pid}) is still in /proc after its 504",
+            );
+            status
+        };
+        let second = async {
+            let [pid] = stand_in::wait_for(dir.path(), 1).await[..] else {
+                panic!("one child before the second turn is sent");
+            };
+            first_pid.set(Some(pid));
+            // Halfway into the first turn's budget: sent while its child is
+            // certainly still running, and early enough that this turn's own
+            // deadline leaves its child a whole second to start once the lock
+            // frees, however loaded the machine running the suite.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            ask(&bridge, "pet", "two").await
+        };
+        let (first, second) = tokio::join!(first, second);
+
+        assert_eq!((first, second), (504, 504));
+        let pids = stand_in::started(dir.path());
+        let first = first_pid.get().expect("set");
+        let [second] = pids[..]
+            .iter()
+            .copied()
+            .filter(|&p| p != first)
+            .collect::<Vec<_>>()[..]
+        else {
+            panic!("the second turn never started a child: {pids:?}");
+        };
+        assert!(
+            !stand_in::saw(dir.path(), second).contains(&first),
+            "the second turn's claude started while the first's was still in /proc",
+        );
+        assert_eq!(bridge.permits.available_permits(), super::PERMITS);
+    }
+
+    /// **The permit bounds live children again.** Fill both permits with hung
+    /// turns, then keep knocking with a third until one is free: the third
+    /// child must find fewer than [`PERMITS`](super::PERMITS) others still in
+    /// `/proc` when it starts.
+    ///
+    /// Before the fix a permit came back at the deadline while its child slept
+    /// on, so the third turn started beside **both** earlier children — and a
+    /// steady stream of stalled turns grew the population without bound.
+    #[tokio::test]
+    async fn hung_turns_never_leave_more_live_children_than_permits() {
+        use crate::backend::stand_in;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Two seconds, so every child — the third included, which starts only
+        // once a permit frees — has room to reach its marker before its kill.
+        let bridge = hung_bridge(dir.path(), Duration::from_secs(2));
+        let earlier = std::cell::RefCell::new(Vec::new());
+
+        let third = async {
+            *earlier.borrow_mut() = stand_in::wait_for(dir.path(), 2).await;
+            loop {
+                let status = ask(&bridge, "caw", "hi").await;
+                if status != 503 {
+                    return status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        let statuses = tokio::join!(ask(&bridge, "pet", "hi"), ask(&bridge, "cat", "hi"), third);
+
+        assert_eq!(statuses, (504, 504, 504));
+        let earlier = earlier.into_inner();
+        let pids = stand_in::started(dir.path());
+        let [third] = pids[..]
+            .iter()
+            .copied()
+            .filter(|p| !earlier.contains(p))
+            .collect::<Vec<_>>()[..]
+        else {
+            panic!("the third turn never started a child: {pids:?} after {earlier:?}");
+        };
+        let alongside = stand_in::saw(dir.path(), third);
+        assert!(
+            alongside.len() < super::PERMITS,
+            "the third claude started beside {alongside:?}: more than {} children at once",
+            super::PERMITS,
+        );
+        assert_eq!(bridge.permits.available_permits(), super::PERMITS);
     }
 
     /// Error bodies are the `OpenAI` error shape, so a client that parses errors

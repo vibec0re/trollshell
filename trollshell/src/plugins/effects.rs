@@ -4954,20 +4954,23 @@ mod tests {
     ///
     /// Nothing pinned that the broker forwards the effect's **own** `choices`:
     /// hardcoding `ConsentChoices::Grant` here shipped green, and would turn
-    /// every hive approval card into the four-button grant whose 60 s timeout
-    /// denies. The overlay's no-output arm is what makes the two cards
-    /// distinguishable on the channel without a display — a grant answers
-    /// `Deny` immediately, an approval answers nothing — so this asserts the
-    /// pass-through by its consequence rather than by reading a field back.
+    /// every hive approval card into the four-button grant. Until #1542 item 5
+    /// this told the two cards apart on the channel, through the overlay's
+    /// no-output arm: a grant answered `Deny` at once, an approval nothing.
+    /// Now neither card answers anything on silence, so the channel cannot
+    /// tell them apart, and this reads which card the overlay was asked to
+    /// draw from its test-only record (`consent::take_requested`) instead.
     ///
     /// Falsification: replace `*choices` with `ConsentChoices::Grant` in
-    /// `broker_effect`'s `RequestConsent` arm and the first assertion fails,
-    /// because the approval card would have been answered on the plugin's
-    /// behalf.
+    /// `broker_effect`'s `RequestConsent` arm and the record assertion fails,
+    /// because the approval effect would have reached the overlay as a grant
+    /// card.
     #[test]
     fn the_broker_passes_the_effects_own_choice_set_through() {
         let router = DatasourceRouter::default();
         let (tx, mut rx) = mpsc::channel::<HostMsg>(4);
+        // This thread's record starts empty unless the harness reused it.
+        let _ = crate::overlays::consent::take_requested();
 
         broker_effect(
             "agents",
@@ -4983,11 +4986,6 @@ mod tests {
             &tx,
             &router,
         );
-        assert!(
-            rx.try_recv().is_err(),
-            "an approval card must not be answered on the plugin's behalf (§6.5)"
-        );
-
         broker_effect(
             "infobroker",
             &Effect::RequestConsent {
@@ -5002,15 +5000,27 @@ mod tests {
             &tx,
             &router,
         );
+
+        let requested = crate::overlays::consent::take_requested();
+        assert_eq!(
+            requested,
+            vec![(1, ConsentChoices::Approval), (2, ConsentChoices::Grant)],
+            "the overlay must be asked for the card each effect named"
+        );
+        // With no output to draw on, neither card is answered on the
+        // plugin's behalf (§6.5; #1542 item 5 for the grant card), because
+        // neither card's silence rule names a decision.
+        for (request_id, choices) in &requested {
+            assert_eq!(
+                choices.unanswered(),
+                None::<ConsentDecision>,
+                "request {request_id}"
+            );
+        }
+        let sent = rx.try_recv();
         assert!(
-            matches!(
-                rx.try_recv(),
-                Ok(HostMsg::ConsentDecision {
-                    request_id: 2,
-                    decision: ConsentDecision::Deny
-                })
-            ),
-            "a grant card with no output still denies (#487)"
+            sent.is_err(),
+            "no card may be answered on the plugin's behalf, got {sent:?}"
         );
     }
 

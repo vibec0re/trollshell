@@ -273,6 +273,24 @@ thread_local! {
         const { RefCell::new(BTreeMap::new()) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Every `(request_id, choices)` [`request`] was called with on this
+    /// thread, oldest first. Test builds only.
+    ///
+    /// `plugins::effects`' pass-through test reads it: it has to show that
+    /// the effect broker hands the overlay the effect's **own** card, and since
+    /// #1542 item 5 the channel cannot show that — neither card sends anything
+    /// on silence, so with no output to draw on both answer nothing.
+    static REQUESTED: RefCell<Vec<(u64, ConsentChoices)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Drain what [`request`] has recorded on this thread (see `REQUESTED`).
+#[cfg(test)]
+pub(crate) fn take_requested() -> Vec<(u64, ConsentChoices)> {
+    REQUESTED.with(RefCell::take)
+}
+
 /// Register `monitor` as a candidate output for consent prompts. Called per
 /// monitor from `main.rs`'s `monitors_changed` loop. The focused-output *tracker*
 /// lives in the shared [`crate::components::focused_output`] cache (#496/#440/#517),
@@ -355,6 +373,9 @@ pub fn request(
     choices: ConsentChoices,
     outbound: mpsc::Sender<HostMsg>,
 ) {
+    #[cfg(test)]
+    REQUESTED.with(|r| r.borrow_mut().push((request_id, choices)));
+
     // Take any plugin dialog down FIRST (#1361 review, HIGH-1). Both surfaces
     // are `Layer::Overlay` + `KeyboardMode::Exclusive`, and within a layer
     // wlroots/niri stack by surface creation order — so a dialog already up

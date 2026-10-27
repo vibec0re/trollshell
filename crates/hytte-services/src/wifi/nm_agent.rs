@@ -145,7 +145,8 @@ impl NmAgent {
     /// the check refuses. NM's policy file lets only root send to this
     /// interface, so this stops a root process other than NM from reaching
     /// NM's requests **through this interface**. The iwd agent shares the
-    /// same prompt slot and waiters and is not checked yet (#1605).
+    /// same prompt slot and waiters; it answers only iwd, and its `Cancel`
+    /// reaches only the requests it raised itself (#1605).
     ///
     /// The owner is looked up per call ([`hytte_bus::CallerCheck`]), on `conn`,
     /// the connection the call arrived on: NM keeps its registry of agents in

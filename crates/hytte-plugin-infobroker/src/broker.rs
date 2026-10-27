@@ -4166,12 +4166,24 @@ mod tests {
     /// Falsification: have `on_deadline` resolve an expired knock with
     /// `apply_consent(…, ConsentDecision::Deny, …)` — the old "silence is a
     /// deny" outcome — and this reds: a standing deny is persisted, the reply
-    /// says "consent denied", and the retry is refused without a prompt.
+    /// says "consent denied", and the retry is refused without a prompt. Have
+    /// `next_deadline` look at parked queries only and the first assertion
+    /// reds: the loop would never wake for an unanswered knock.
     #[tokio::test]
     async fn an_unanswered_consent_knock_persists_nothing_and_is_refused_transiently() {
         let (out_tx, mut out_rx) = mpsc::unbounded_channel();
         let mut session = Session::new(BrokerState::new(store(Vec::new())), out_tx);
         let (mut agent, _prompt) = park_knock(&mut session, &mut out_rx, "claude").await;
+
+        // The loop sleeps until `next_deadline`, so a parked knock must be in
+        // it: since #1542 item 5 its park deadline is the only answer a silent
+        // card gets (#1601 review, LOW-1).
+        assert_eq!(
+            session.next_deadline(),
+            session.pending.values().map(|p| p.deadline).min(),
+            "the loop must wake for a parked knock: its deadline is the only answer silence gets"
+        );
+        assert!(session.next_deadline().is_some());
 
         // Nobody answers the card; the shell sends nothing.
         park_deadline_passes(&mut session).await;

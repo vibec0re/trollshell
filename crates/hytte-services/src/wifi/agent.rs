@@ -147,8 +147,8 @@ impl IwdAgent {
     /// policy lets through can call it, not only iwd. Unchecked, such a peer
     /// could raise a passphrase prompt that reads like iwd's and collect what
     /// the user types, or cancel iwd's real request. Every method checks
-    /// first and touches nothing (no prompt, no waiter, no cancel) when the
-    /// check refuses. A refusal is iwd's own [`CANCELED`].
+    /// first and touches nothing (no network read, no prompt, no waiter, no
+    /// cancel) when the check refuses. A refusal is iwd's own [`CANCELED`].
     ///
     /// The owner is looked up per call ([`hytte_bus::CallerCheck`]) on `conn`,
     /// the connection the call arrived on: iwd that restarts comes back under
@@ -713,7 +713,7 @@ mod tests {
 //   cargo test -p hytte-services --features system-tests --lib wifi::agent
 #[cfg(all(test, feature = "system-tests"))]
 mod system_tests {
-    use super::{IwdAgent, OwnRequests, PromptRequest};
+    use super::{IwdAgent, NetworkInfo, OwnRequests, PromptRequest};
     use crate::wifi::nm_agent::NmAgent;
     use crate::wifi::types::PromptKind;
     use crate::wifi::{AGENT_PATH, WaitersMap};
@@ -725,6 +725,7 @@ mod system_tests {
     use std::path::PathBuf;
     use std::process::Stdio;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::time::Duration;
     use tempfile::TempDir;
     use tokio::io::{AsyncBufReadExt, BufReader};
@@ -836,6 +837,19 @@ mod system_tests {
         Box::pin(async { (SSID.to_owned(), "psk".to_owned()) })
     }
 
+    /// How many times [`counted_network`] has been asked. Read only by the
+    /// one test that mounts with it, so it is a static of its own: the system
+    /// tests run in parallel in one binary, and a shared counter would count
+    /// the other tests' reads too.
+    static OUTSIDER_TEST_READS: AtomicUsize = AtomicUsize::new(0);
+
+    /// [`named_network`], counting each read into [`OUTSIDER_TEST_READS`], so
+    /// a test can tell whether a call got as far as reading the network.
+    fn counted_network(path: String) -> BoxFuture<'static, (String, String)> {
+        OUTSIDER_TEST_READS.fetch_add(1, AtomicOrdering::SeqCst);
+        named_network(path)
+    }
+
     /// Both agents, mounted on one connection, plus the slots they share and
     /// the iwd agent's own-request set.
     struct Mounted {
@@ -852,15 +866,15 @@ mod system_tests {
     /// waiters map, each built as production builds it (`IwdAgent::new`,
     /// `NmAgent::new`): their caller checks ask whatever bus a call arrives
     /// on, which here is this test's. Only the iwd agent's network read is
-    /// swapped ([`named_network`]). The agents are staged on the connection's
-    /// builder, so its object server dispatches before anything can be read
-    /// off the socket (`wifi::nm_agent`'s `mount_and_proxy` has the whole
-    /// argument, #756).
-    async fn mount(guard: &BusGuard) -> Mounted {
+    /// swapped, for `network_info` ([`named_network`] or [`counted_network`]).
+    /// The agents are staged on the connection's builder, so its object
+    /// server dispatches before anything can be read off the socket
+    /// (`wifi::nm_agent`'s `mount_and_proxy` has the whole argument, #756).
+    async fn mount(guard: &BusGuard, network_info: NetworkInfo) -> Mounted {
         let prompts: Mutable<Option<PromptRequest>> = Mutable::new(None);
         let waiters: WaitersMap = Arc::new(AsyncMutex::new(HashMap::new()));
         let iwd = IwdAgent {
-            network_info: named_network,
+            network_info,
             ..IwdAgent::new(prompts.clone(), waiters.clone())
         };
         let own = iwd.own.clone();
@@ -996,20 +1010,21 @@ mod system_tests {
     }
 
     /// Every agent method, called by a peer that is not iwd, is refused at
-    /// once with iwd's `Canceled`: no prompt raised, no waiter parked.
-    /// iwd's own request on the same agent is still asked and answered, and
-    /// its `Release` still accepted.
+    /// once with iwd's `Canceled`: no network read, no prompt raised, no
+    /// waiter parked. iwd's own request on the same agent is still asked and
+    /// answered, and its `Release` still accepted.
     ///
     /// **Falsification:** drop the `admit` call from `request_passphrase`
     /// and the outsider's request raises a prompt and waits on it, so its
-    /// "refused at once" expectation times out. Drop it from any of the
-    /// other five and that method answers with its old name (`Failed`, or
+    /// "refused at once" expectation times out. Move it below the network
+    /// read and the read count is 1, not 0. Drop it from any of the other
+    /// five and that method answers with its old name (`Failed`, or
     /// success), not `Canceled`. Check `org.freedesktop.NetworkManager`
     /// instead of `net.connman.iwd` and iwd's own request is refused.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_call_from_a_peer_that_is_not_iwd_is_refused_and_raises_no_prompt() {
         let guard = ephemeral_bus().await;
-        let mounted = mount(&guard).await;
+        let mounted = mount(&guard, counted_network).await;
         let outsider = iwd_agent(&guard, &mounted, None).await;
         let iwd = iwd_agent(&guard, &mounted, Some(IWD_BUS_NAME)).await;
 
@@ -1056,6 +1071,11 @@ mod system_tests {
                 "{method}: no request of the agent's own"
             );
         }
+        assert_eq!(
+            OUTSIDER_TEST_READS.load(AtomicOrdering::SeqCst),
+            0,
+            "a refused call must not read the network it names"
+        );
 
         // iwd, on the same agent, is asked as before.
         let call = tokio::spawn(async move {
@@ -1073,6 +1093,11 @@ mod system_tests {
             .expect("request task panicked")
             .expect("iwd's answered request returned an error");
         assert_eq!(passphrase, "hunter22");
+        assert_eq!(
+            OUTSIDER_TEST_READS.load(AtomicOrdering::SeqCst),
+            1,
+            "iwd's own request reads its network once"
+        );
 
         let iwd = iwd_agent(&guard, &mounted, Some(IWD_BUS_NAME)).await;
         tokio::time::timeout(DBUS_REPLY_BUDGET, iwd.call::<_, _, ()>("Release", &()))
@@ -1091,7 +1116,7 @@ mod system_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_cancel_from_a_peer_that_is_not_iwd_leaves_the_request_pending() {
         let guard = ephemeral_bus().await;
-        let mounted = mount(&guard).await;
+        let mounted = mount(&guard, named_network).await;
         let outsider = iwd_agent(&guard, &mounted, None).await;
         let iwd = iwd_agent(&guard, &mounted, Some(IWD_BUS_NAME)).await;
 
@@ -1140,7 +1165,7 @@ mod system_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn iwd_s_cancel_leaves_network_manager_s_request_pending() {
         let guard = ephemeral_bus().await;
-        let mounted = mount(&guard).await;
+        let mounted = mount(&guard, named_network).await;
         let iwd = iwd_agent(&guard, &mounted, Some(IWD_BUS_NAME)).await;
         let nm = proxy(&guard, &mounted, Some(NM_BUS_NAME), NM_AGENT_PATH, NM_IFACE).await;
 

@@ -1024,7 +1024,9 @@ mod system_tests {
     /// read and the read count is 1, not 0. Drop it from any of the other
     /// five and that method answers with its old name (`Failed`, or
     /// success), not `Canceled`. Check `org.freedesktop.NetworkManager`
-    /// instead of `net.connman.iwd` and iwd's own request is refused.
+    /// instead of `net.connman.iwd` and iwd's own request is refused. Drop
+    /// `await_passphrase`'s removal of its id and the answered request's id
+    /// stays in `own`.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_call_from_a_peer_that_is_not_iwd_is_refused_and_raises_no_prompt() {
         let guard = ephemeral_bus().await;
@@ -1101,6 +1103,12 @@ mod system_tests {
             OUTSIDER_TEST_READS.load(AtomicOrdering::SeqCst),
             1,
             "iwd's own request reads its network once"
+        );
+        // The reply goes out only after `await_passphrase` has returned, so
+        // by now the answered request has taken its id back out.
+        assert!(
+            mounted.own.lock().await.is_empty(),
+            "an answered request leaves the agent's own set"
         );
 
         let iwd = iwd_agent(&guard, &mounted, Some(IWD_BUS_NAME)).await;

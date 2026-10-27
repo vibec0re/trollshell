@@ -28,6 +28,7 @@ mod workspace_stacks;
 use std::cell::RefCell;
 
 use clap::{CommandFactory as _, Parser, Subcommand};
+use components::visible_while_occupied::show_while_a_child_is;
 use clap_complete::{Shell, generate};
 use hytte::futures_signals::map_ref;
 use hytte::futures_signals::signal::SignalExt;
@@ -853,18 +854,6 @@ fn group<const N: usize>(widgets: [gtk::Widget; N]) -> gtk::Widget {
     b.upcast()
 }
 
-/// Show `group` exactly while one of its children is marked visible.
-///
-/// Reads each child's own flag (`get_visible`), not `is_visible`, which is
-/// also false while an ancestor is hidden. `group` itself is hidden exactly
-/// when this has to bring it back, so `is_visible` would keep it hidden for
-/// good.
-fn show_while_a_child_is(group: &gtk::Box) {
-    let any = std::iter::successors(group.first_child(), WidgetExt::next_sibling)
-        .any(|child| child.get_visible());
-    group.set_visible(any);
-}
-
 #[cfg(test)]
 mod tests {
     use clap::{CommandFactory as _, Parser as _};
@@ -1145,7 +1134,7 @@ mod group_tests {
     /// it back hides all three again. Carried over from #1602's review (LOW),
     /// now against the bar's own `group`.
     ///
-    /// Falsified by deleting `bind_contention`'s `show_while_occupied` call:
+    /// Falsified by deleting `bind_contention`'s `show_while_a_child_is` call:
     /// the glyph turns on inside a tray that stays hidden, so its group stays
     /// hidden too.
     #[gtk::test]
@@ -1168,7 +1157,11 @@ mod group_tests {
         pump();
         assert!(glyph.get_visible(), "the glyph is on");
         assert!(g.get_visible(), "the tray's group shows");
-        assert!(width(&bar) > 46, "taking room in the bar");
+        assert_eq!(
+            width(&bar),
+            46 + 6 + width(&glyph),
+            "the group takes exactly its glyph plus the gap, not a visible-but-empty box"
+        );
         assert!(container.get_visible(), "because the tray shows");
 
         state.set(OwnState::Owned);

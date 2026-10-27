@@ -209,7 +209,7 @@ fn update_tray(
     // After the write-back, so a handler this sets off finds the map in
     // place: hiding or showing the tray runs its group's `notify::visible`
     // handler (`main.rs`'s `group`) synchronously.
-    show_while_a_child_is(container.upcast_ref());
+    show_while_a_child_is(container);
 }
 
 /// Create a tray button for `item_cell` and wire up click handlers.

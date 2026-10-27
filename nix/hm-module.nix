@@ -549,6 +549,11 @@ in
             PartOf = [ cfg.systemd.target ];
             After = [ cfg.systemd.target ];
             Requisite = [ cfg.systemd.target ];
+            # No start limit (#1542): RestartSec=2 would otherwise trip the default
+            # 5-in-10 s burst on a crash loop (niri socket not up yet) and leave
+            # the session with no bar. A shell that crashes forever restarts every
+            # 2 s; that is the accepted cost.
+            StartLimitIntervalSec = 0;
           };
           Service = {
             Type = "simple";

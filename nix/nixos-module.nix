@@ -140,6 +140,24 @@ in
     '';
   };
 
+  # The same two switches home-manager has, so the swaybg unit is gated the
+  # same way on both sides (#1542). The NixOS module has only the wallpaper
+  # daemon to switch, so `enableSessionExtras` here means just that.
+  options.programs.trollshell.enableSessionExtras = lib.mkEnableOption ''
+    the session-integration extras the NixOS module manages as a group.
+    Today that is the wallpaper daemon selected by
+    programs.trollshell.wallpaper.backend (default swaybg), the same switch
+    home-manager's module has. Set with mkDefault, so `swaybg.enable = false`
+    still wins'';
+
+  options.programs.trollshell.swaybg.enable = lib.mkEnableOption ''
+    the bundled swaybg wallpaper user unit, which reads its argument list from
+    ~/.config/trollshell/swaybg.args (the Appearance drawer page writes it).
+    `enableSessionExtras` turns this on when backend is "swaybg" and no
+    wallpaper.reloadCommand is set; set it true to run the unit without that
+    group. Same option as home-manager's. Don't set it true with
+    backend = "awww", or both daemons start'';
+
   options.programs.trollshell.enableRecommendedSoftware = lib.mkOption {
     type = lib.types.bool;
     default = true;
@@ -236,7 +254,14 @@ in
       # Also skip swaybg when an explicit reloadCommand is set: that's the
       # pre-enum way to drive another daemon, and a config that set it but not
       # `backend` (default "swaybg") must not get swaybg started over its daemon.
-      (lib.mkIf (backend == "swaybg" && cfg.wallpaper.reloadCommand == null) {
+      # Gated like home-manager's: the unit exists only under `swaybg.enable`,
+      # which `enableSessionExtras` sets by default in that same backend case.
+      (lib.mkIf cfg.enableSessionExtras {
+        programs.trollshell.swaybg.enable = lib.mkIf (
+          backend == "swaybg" && cfg.wallpaper.reloadCommand == null
+        ) (lib.mkDefault true);
+      })
+      (lib.mkIf cfg.swaybg.enable {
         systemd.user.services.swaybg = {
           description = "trollshell wallpaper daemon (swaybg)";
           wantedBy = [ "graphical-session.target" ];

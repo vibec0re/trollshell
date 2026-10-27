@@ -459,7 +459,19 @@
               # `commonArgs.cargoExtraArgs` already carries `--workspace
               # --locked` (#572), so only the lint-specific flags go here; the
               # effective command is unchanged.
-              cargoClippyExtraArgs = "--all-targets --features system-tests -- -D warnings";
+              #
+              # Two passes in this one derivation, on the same cargoArtifacts
+              # and target dir (#1542, #1563): with the feature, then without.
+              # A `#[cfg(feature = "system-tests")]` item can be the only user
+              # of a helper, so the feature-off build hits a dead-code error CI
+              # never saw (#1541, #1486). crane's cargoClippy builds one
+              # command line from `cargoClippyExtraArgs`, so the second pass is
+              # chained on with `&&` rather than added as a second check name
+              # (the workflow's layout guard diffs check names against jobs).
+              cargoClippyExtraArgs =
+                "--all-targets --features system-tests -- -D warnings"
+                + " && cargoWithProfile clippy ${trollshell.passthru.commonArgs.cargoExtraArgs}"
+                + " --all-targets -- -D warnings";
               # This is a leaf/terminal check — nothing chains off its target
               # dir as `cargoArtifacts` — so don't pack it. crane defaults
               # `doInstallCargoArtifacts = true`, which would tar the whole
@@ -1111,6 +1123,9 @@
                 # not auto-launched) rather than filtered out; and the demo
                 # entry's env still merges per-field across the two modules
                 # above (#355).
+                # #1542: swaybg follows enableSessionExtras (on in this fixture;
+                # nixos-module-nightlight below has it off and asserts absence).
+                assert units ? swaybg;
                 assert !(units ? trollshell-plugin-demo);
                 assert !(units ? trollshell-plugin-off);
                 assert pluginsState.plugins.demo.exec == pkgs.lib.getExe stubPlugin;
@@ -1195,6 +1210,9 @@
                 # whichever shape the merge produces.
                 # petBrain.model is a runtime path, so it gates the unit rather
                 # than entering the closure, and lands in llama-server's argv.
+                # #1542: the shell unit never hits systemd's default start limit
+                # (5 starts in 10 s), so a crash loop cannot leave no bar.
+                assert units.trollshell.Unit.StartLimitIntervalSec == 0;
                 assert
                   builtins.toString units.trollshell-pet-brain.Unit.ConditionPathExists == "/var/empty/brain.gguf";
                 assert
@@ -1669,6 +1687,8 @@
                     programs.trollshell = {
                       enable = true;
                       package = stubPackage;
+                      # The swaybg unit exists only with the extras group on (#1542).
+                      enableSessionExtras = true;
                       weather.fallbackCity = "Berlin";
                       # plugins (#350/#355, attrsOf keyed by id): `demo` is
                       # declared enabled; `off` must render declared-but-off.
@@ -1796,8 +1816,11 @@
               # into a maintenance trap unrelated to what it's meant to guard.
               # Asserting on *what* is false — that it's the night-light one,
               # by message content — is both narrower and more stable.
+              units = cfg.systemd.user.services;
               falsePredicates = builtins.filter (a: !a.assertion) cfg.assertions;
               probe =
+                # #1542: enableSessionExtras is off here, so no swaybg unit.
+                assert !(units ? swaybg);
                 assert builtins.length falsePredicates == 1;
                 assert pkgs.lib.hasInfix "nightlight" (builtins.head falsePredicates).message;
                 assert pkgs.lib.hasInfix "home-manager" (builtins.head falsePredicates).message;

@@ -4,6 +4,9 @@ Documentation=file://%h/.config/systemd/user/README.md
 PartOf=niri-session.target
 Requisite=graphical-session.target
 After=graphical-session.target
+# No start limit: quick crashes (niri socket not ready) must never leave the
+# session with no bar. See #1542.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple

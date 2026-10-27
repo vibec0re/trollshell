@@ -229,16 +229,37 @@ pub fn strip_accel(s: &str) -> String {
 
 // ── StatusNotifierItem registration argument ──────────────────────────────────
 
-/// Split the `RegisterStatusNotifierItem` argument into `(bus_name, object_path)`.
+/// One `RegisterStatusNotifierItem` call, as [`parse_service`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Registration {
+    /// The bus name the item lives under.
+    pub(super) bus_name: String,
+    /// The item's object path.
+    pub(super) object_path: String,
+    /// Unique bus name of the connection that made the call. Not always
+    /// `bus_name`: a call naming a well-known name keeps that name as the
+    /// item's address, and a caller may even name another connection's unique
+    /// name. This is what tells a repeat registration from a new owner (see
+    /// `Watchers::claim` in the parent module).
+    pub(super) registrant: String,
+}
+
+/// Read the `RegisterStatusNotifierItem` argument and the call's `sender`.
 ///
 /// Per the SNI spec the argument may be either an object path (starts with
 /// `/`) — in which case the bus name is the message sender — or a bus name,
 /// in which case the item lives at the well-known `/StatusNotifierItem` path.
-pub(super) fn parse_service(service: &str, sender: &str) -> (String, String) {
-    if service.starts_with('/') {
+/// Either way the registrant is the sender.
+pub(super) fn parse_service(service: &str, sender: &str) -> Registration {
+    let (bus_name, object_path) = if service.starts_with('/') {
         (sender.to_string(), service.to_string())
     } else {
         (service.to_string(), "/StatusNotifierItem".to_string())
+    };
+    Registration {
+        bus_name,
+        object_path,
+        registrant: sender.to_string(),
     }
 }
 
@@ -657,15 +678,21 @@ mod tests {
 
     #[test]
     fn parse_service_object_path_uses_sender_bus_name() {
-        let (bus, path) = parse_service("/org/ayatana/NotificationItem/foo", ":1.42");
-        assert_eq!(bus, ":1.42");
-        assert_eq!(path, "/org/ayatana/NotificationItem/foo");
+        let reg = parse_service("/org/ayatana/NotificationItem/foo", ":1.42");
+        assert_eq!(reg.bus_name, ":1.42");
+        assert_eq!(reg.object_path, "/org/ayatana/NotificationItem/foo");
+        assert_eq!(reg.registrant, ":1.42");
     }
 
+    /// The registrant is the caller, not the name the item lives under: a
+    /// well-known name that changes hands keeps its key, and only the
+    /// registrant says a different connection is behind it (#1602 review,
+    /// MED-2 C8).
     #[test]
     fn parse_service_bus_name_uses_default_path() {
-        let (bus, path) = parse_service("org.example.Item", ":1.42");
-        assert_eq!(bus, "org.example.Item");
-        assert_eq!(path, "/StatusNotifierItem");
+        let reg = parse_service("org.example.Item", ":1.42");
+        assert_eq!(reg.bus_name, "org.example.Item");
+        assert_eq!(reg.object_path, "/StatusNotifierItem");
+        assert_eq!(reg.registrant, ":1.42");
     }
 }

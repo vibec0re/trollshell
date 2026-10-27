@@ -2,7 +2,7 @@ use hytte::bus::OwnState;
 use hytte::futures_signals::signal::Signal;
 use hytte::gtk::{self, gdk, glib, prelude::*};
 use hytte::prelude::*;
-use hytte::services::tray::{self, MenuEntry, MenuItem, TrayItem};
+use hytte::services::tray::{self, ItemStatus, MenuEntry, MenuItem, TrayItem};
 
 use crate::components::cast;
 use crate::components::diff::{DiffOp, plan_diff};
@@ -28,8 +28,7 @@ const SUBJECT: Subject = Subject {
 };
 
 pub fn widget(monitor: &Monitor) -> gtk::Widget {
-    let container = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-    container.add_css_class("ts-tray");
+    let container = tray_container();
 
     // #747: tray apps look `org.kde.StatusNotifierWatcher` up once and
     // register with whoever answers, so losing that name to a second bar means
@@ -54,6 +53,9 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
             img.set_tooltip_text(None);
             img.set_visible(false);
         }
+        if let Some(container) = img.parent() {
+            show_while_occupied(&container);
+        }
     });
 
     // The map persists across signal emits on the GTK main thread.
@@ -63,6 +65,55 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     bind_tray_items(&container, tray::items(), &button_map, monitor.clone());
 
     container.upcast()
+}
+
+/// The tray's own box: hidden while nothing in it is visible, and taking the
+/// box it is packed in along with it (#1602 review, NIT-2).
+///
+/// With `Passive` items hidden (#1542), "no visible tray icon" is a common
+/// state rather than a rare one. The bar packs the tray into a group box of
+/// its own (`main.rs`'s `group`) inside a cluster that spaces its children
+/// 6 px apart, and a box spaces every **visible** child, even one with nothing
+/// visible inside it. So hiding the tray's buttons, or the tray itself, still
+/// leaves 6 px of bar where the tray was; the group has to go too. Its
+/// visibility follows the tray's whenever the tray is shown or hidden, or
+/// packed somewhere: visible while any of its children is. Starts hidden, so
+/// an empty tray never takes room, not even until the first item arrives.
+fn tray_container() -> gtk::Box {
+    let container = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    container.add_css_class("ts-tray");
+    container.set_visible(false);
+    container.connect_visible_notify(show_parent_while_occupied);
+    container.connect_parent_notify(show_parent_while_occupied);
+    container
+}
+
+/// Whether any child of `widget` is marked visible. Its own flag
+/// (`get_visible`), not `is_visible`, which is also false while an ancestor is
+/// hidden — and `widget` itself is hidden exactly when this is asked to bring
+/// it back.
+fn any_child_visible(widget: &gtk::Widget) -> bool {
+    let mut child = widget.first_child();
+    while let Some(c) = child {
+        if c.get_visible() {
+            return true;
+        }
+        child = c.next_sibling();
+    }
+    false
+}
+
+/// Show `widget` exactly while one of its children is visible: for the tray,
+/// an item button that is not `Passive`, or the contention glyph.
+fn show_while_occupied(widget: &gtk::Widget) {
+    widget.set_visible(any_child_visible(widget));
+}
+
+/// [`show_while_occupied`] for the box `container` is packed in.
+fn show_parent_while_occupied(container: &gtk::Box) {
+    if let Some(parent) = container.parent() {
+        show_while_occupied(&parent);
+    }
 }
 
 /// Diff `signal`'s tray items into `container`, reusing the buttons kept in
@@ -107,6 +158,9 @@ fn bind_tray_items<S>(
 /// They capture an `Rc<RefCell<TrayItem>>` and read it at activation time, so
 /// they act on current data without stale captures.  Handlers are never
 /// reconnected on reuse — the double-connect bug cannot occur here.
+///
+/// A `NewStatus` arrives as a reuse like any other change, so a `Passive`
+/// item ([`shown`]) keeps its button, hidden, rather than losing it.
 fn update_tray(
     container: &gtk::Box,
     button_map: &Rc<RefCell<ButtonMap>>,
@@ -166,6 +220,10 @@ fn update_tray(
     // The cell holds the empty `ButtonMap` `take()` left behind, so this
     // write-back drops nothing inside the borrow (#643).
     *button_map.borrow_mut() = map;
+
+    // After the write-back, so a handler this sets off finds the map in
+    // place: hiding the tray hides its group too (see `tray_container`).
+    show_while_occupied(container.upcast_ref());
 }
 
 /// Create a tray button for `item_cell` and wire up click handlers.
@@ -247,7 +305,22 @@ fn create_item_button(item_cell: &ItemCell, monitor: &Monitor) -> gtk::Button {
     btn
 }
 
-/// Apply (or re-apply) the icon and tooltip from `item` to `btn`.
+/// Whether `item` gets a visible button: every status but `Passive`.
+///
+/// The SNI spec calls `Passive` an idle status that a visualization is likely
+/// to hide, and this tray now does (#1542, from #1494's owner questions). The
+/// rule lives here and nowhere else: the service publishes every registered
+/// item with its status, and a status change re-applies the visuals of the
+/// item's existing button (see [`update_tray`]), so a flip between `Passive`
+/// and `Active`/`NeedsAttention` shows or hides that same button instead of
+/// destroying and rebuilding it — which is what filtering `Passive` out of the
+/// service's list would do on every flip. An item whose `Status` did not
+/// answer reads as `Active` in the service, so it stays visible.
+fn shown(item: &TrayItem) -> bool {
+    item.status != ItemStatus::Passive
+}
+
+/// Apply (or re-apply) the icon, tooltip and visibility from `item` to `btn`.
 ///
 /// Safe to call on both freshly-created and reused buttons.  When reusing,
 /// the old child widget is replaced and any previous tooltip is cleared if
@@ -260,6 +333,8 @@ fn create_item_button(item_cell: &ItemCell, monitor: &Monitor) -> gtk::Button {
 /// 3. Named icon best-effort (theme may resolve it later).
 /// 4. Generic symbolic fallback.
 fn apply_item_button_visuals(btn: &gtk::Button, item: &TrayItem) {
+    btn.set_visible(shown(item));
+
     let icon = gtk::Image::new();
 
     // Robust fallback chain:
@@ -493,19 +568,25 @@ mod tests {
     /// uses.
     type SharedMap = Rc<RefCell<ButtonMap>>;
 
-    /// A `TrayItem` distinguished only by `key` — the diff keys on it, and no
-    /// other field matters to either test below. Every field is `pub` (see
+    /// A visible (`Active`) `TrayItem` distinguished only by `key` — the diff
+    /// keys on it, and no other field matters to the reentrancy and binding
+    /// tests below. Every field is `pub` (see
     /// `hytte_services::tray::TrayItem`), so a struct literal needs no
     /// constructor of its own, exactly like `workspaces.rs`'s local `ws()`
     /// builds a `niri::Workspace` directly.
     fn item(key: &str) -> TrayItem {
+        item_in(key, ItemStatus::Active)
+    }
+
+    /// `item` with a given status, for the `Passive` test.
+    fn item_in(key: &str, status: ItemStatus) -> TrayItem {
         TrayItem {
             key: key.to_owned(),
             bus_name: String::new(),
             object_path: String::new(),
             title: String::new(),
             icon_name: String::new(),
-            status: ItemStatus::Passive,
+            status,
             icon_pixmap: None,
             tooltip_title: String::new(),
             tooltip_description: String::new(),
@@ -773,5 +854,161 @@ mod tests {
         // a dead weak ref: `bind` upgrades, gets `None`, and breaks its loop.
         items.set(vec![item("b")]);
         pump();
+    }
+
+    // ── #1542: `Passive` items are hidden ───────────────────────────────────
+
+    /// A `Passive` item's button is hidden, and a status flip shows or hides
+    /// that same button, live, with no new button per flip. The neighbour
+    /// stays visible throughout, so the rule is per item.
+    ///
+    /// Falsified by deleting `apply_item_button_visuals`' `set_visible` line:
+    /// the `Passive` button is then visible from the first pass.
+    #[gtk::test]
+    fn a_passive_item_is_hidden_and_a_status_flip_toggles_the_same_button() {
+        let monitor = test_monitor();
+        let (container, map) = strip(&monitor, &[item_in("a", ItemStatus::Passive), item("b")]);
+        let button = map.borrow()["a"].0.clone();
+        assert!(!button.is_visible(), "a Passive item's button is hidden");
+        assert_eq!(
+            button.parent(),
+            Some(container.clone().upcast::<gtk::Widget>()),
+            "hidden, not removed"
+        );
+
+        for (status, visible) in [
+            (ItemStatus::Active, true),
+            (ItemStatus::NeedsAttention, true),
+            (ItemStatus::Passive, false),
+            (ItemStatus::Active, true),
+        ] {
+            update_tray(
+                &container,
+                &map,
+                &[item_in("a", status), item("b")],
+                &monitor,
+            );
+            let now = map.borrow()["a"].0.clone();
+            assert_eq!(
+                now, button,
+                "{status:?}: a status flip must reuse the item's button"
+            );
+            assert_eq!(now.is_visible(), visible, "{status:?}");
+            assert!(map.borrow()["b"].0.is_visible(), "{status:?}: neighbour");
+        }
+    }
+
+    // ── #1602 review NIT-2: an empty tray takes no room ─────────────────────
+
+    /// Minimum width of `widget`, the room a box gives it.
+    fn width(widget: &impl IsA<gtk::Widget>) -> i32 {
+        widget.measure(gtk::Orientation::Horizontal, -1).0
+    }
+
+    /// A box with a fixed 20 px minimum width, standing in for a neighbour.
+    fn neighbour() -> gtk::Box {
+        let b = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        b.set_size_request(20, 10);
+        b
+    }
+
+    /// A tray with nothing visible in it takes no room in the bar: not its
+    /// own, and not the 6 px the bar's cluster puts between it and its
+    /// neighbours, which is what an empty but visible group box costs. Built
+    /// the way the bar packs the tray: the tray box inside a group box of its
+    /// own, between two neighbours of a 6 px-spaced cluster. A visible extra
+    /// child (the contention glyph's place) keeps the tray shown.
+    ///
+    /// Falsified by dropping the group's visibility sync from
+    /// `tray_container` (the empty tray costs 6 px), or the
+    /// `show_while_occupied` call from `update_tray` (the tray never shows).
+    #[gtk::test]
+    fn a_tray_with_nothing_visible_takes_no_room_in_the_bar() {
+        let monitor = test_monitor();
+        let container = super::tray_container();
+        let group = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        group.append(&container);
+        let cluster = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let (left, right) = (neighbour(), neighbour());
+        cluster.append(&left);
+        cluster.append(&group);
+        cluster.append(&right);
+        let without_tray = width(&left) + 6 + width(&right);
+        assert_eq!(width(&cluster), without_tray, "empty from the start");
+
+        let map: SharedMap = Rc::new(RefCell::new(HashMap::new()));
+        for (items, shown) in [
+            (vec![item_in("a", ItemStatus::Passive)], false),
+            (vec![item_in("a", ItemStatus::Active)], true),
+            (vec![item_in("a", ItemStatus::Passive)], false),
+            (vec![item_in("a", ItemStatus::NeedsAttention)], true),
+            (vec![], false),
+        ] {
+            update_tray(&container, &map, &items, &monitor);
+            assert_eq!(container.is_visible(), shown, "tray, {items:?}");
+            assert_eq!(group.is_visible(), shown, "group, {items:?}");
+            if shown {
+                assert!(width(&cluster) > without_tray, "{items:?}");
+            } else {
+                assert_eq!(width(&cluster), without_tray, "no gap, {items:?}");
+            }
+        }
+
+        let glyph = gtk::Image::from_icon_name("dialog-warning-symbolic");
+        container.prepend(&glyph);
+        update_tray(
+            &container,
+            &map,
+            &[item_in("a", ItemStatus::Passive)],
+            &monitor,
+        );
+        assert!(container.is_visible() && group.is_visible(), "glyph shown");
+    }
+}
+
+/// The hiding rule on its own, in the default (hermetic) bucket. The test that
+/// it reaches a real button is the `Passive` one in the display-gated module
+/// above.
+#[cfg(test)]
+mod passive_tests {
+    use super::shown;
+    use hytte::services::tray::{ItemStatus, TrayItem};
+
+    fn item(status: ItemStatus) -> TrayItem {
+        TrayItem {
+            key: ":1.5/StatusNotifierItem".to_owned(),
+            bus_name: ":1.5".to_owned(),
+            object_path: "/StatusNotifierItem".to_owned(),
+            title: String::new(),
+            icon_name: String::new(),
+            status,
+            icon_pixmap: None,
+            tooltip_title: String::new(),
+            tooltip_description: String::new(),
+            menu_path: None,
+            item_is_menu: false,
+        }
+    }
+
+    /// One item moving `Passive` → `Active` → `NeedsAttention` → `Passive` →
+    /// `Active`,
+    /// as successive `NewStatus` re-reads deliver it: hidden exactly while
+    /// it is `Passive`.
+    ///
+    /// Falsifiable: make `shown` answer `true` and the first and fourth steps
+    /// go red.
+    #[test]
+    fn an_item_is_hidden_exactly_while_it_is_passive() {
+        let seen: Vec<bool> = [
+            ItemStatus::Passive,
+            ItemStatus::Active,
+            ItemStatus::NeedsAttention,
+            ItemStatus::Passive,
+            ItemStatus::Active,
+        ]
+        .into_iter()
+        .map(|status| shown(&item(status)))
+        .collect();
+        assert_eq!(seen, [false, true, true, false, true]);
     }
 }

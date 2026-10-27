@@ -1973,10 +1973,11 @@ unsafe fn component_ical_string(comp: *mut sys::ICalComponent) -> String {
 ///   [`wall_clock_to_unix`], RFC 5545 §3.3.5's rule, over that zone's UTC →
 ///   offset map ([`IcalZone`]): the first occurrence in a fall-back fold, the
 ///   offset before the gap in a spring-forward gap. libical's own conversion
-///   (`i_cal_time_as_timet_with_zone` with that zone) gets both edges wrong,
-///   taking the later instant in a fold and the post-gap offset in a gap, so
-///   it is used only if the rule finds no instant at all (a zone whose
-///   offsets chrono cannot hold).
+///   (`i_cal_time_as_timet_with_zone` with that zone) does not follow it: it
+///   takes the post-gap offset in a gap, and in a fold the later instant in
+///   most zones (the earlier one only where winter is flagged daylight, as in
+///   `Europe/Dublin`). So it is used only if the rule finds no instant at
+///   all (a zone whose offsets chrono cannot hold).
 /// - **Genuinely floating DATE-TIME:** interpret the wall-clock fields in the
 ///   **local** system zone via chrono's `Local` (DST-correct), not UTC (#388).
 ///   A wall clock inside a DST fold or gap still names one instant, by RFC
@@ -2050,10 +2051,12 @@ unsafe fn ical_time_to_unix(tt: *mut sys::ICalTime) -> Option<i64> {
         // as UTC put a `TZID=Europe/Berlin` 12:30 at 14:30 CEST), and by RFC
         // 5545 §3.3.5's rule on a DST transition (#1590), which libical's own
         // `i_cal_time_as_timet_with_zone(tt, own_zone)` does not follow: it
-        // reads a fold's wall clock as the later instant and a gap's with the
-        // post-gap offset. So only the zone's UTC → offset map is taken from
-        // libical (`IcalZone`), and `wall_clock_to_unix`, the rule a floating
-        // time is read by, does the rest.
+        // reads a gap's wall clock with the post-gap offset, and a fold's as
+        // the later instant in most zones (the earlier only where winter is
+        // flagged daylight, e.g. `Europe/Dublin`). So only the zone's UTC →
+        // offset map is taken from libical (`IcalZone`), and
+        // `wall_clock_to_unix`, the rule a floating time is read by, does the
+        // rest.
         //
         // SAFETY: `own_zone` is non-null (this branch) and is a borrow `tt`
         // holds, so it lives at least as long as `tt`, which is live for this
@@ -2349,8 +2352,9 @@ fn local_offsets(
 /// every instant has one offset. The local → UTC direction is derived from
 /// it by [`local_offsets`] instead of asked of libical, whose own answer
 /// (`icaltimezone_get_utc_offset`, behind
-/// [`sys::i_cal_time_as_timet_with_zone`]) takes the later instant in a fold
-/// and the post-gap offset in a gap.
+/// [`sys::i_cal_time_as_timet_with_zone`]) takes the post-gap offset in a
+/// gap and, in a fold, the later instant in most zones (the earlier one only
+/// where winter is flagged daylight, as in `Europe/Dublin`).
 ///
 /// Holds raw pointers, so it is constructed only by [`IcalZone::new`], whose
 /// contract is that `raw` stays live for `'a`. The lifetime keeps the value
@@ -2415,9 +2419,11 @@ impl<'a> IcalZone<'a> {
         let secs = (!is_null_time).then(|| {
             // SAFETY: `self.raw` is live for `'a` (the contract of `new`, the
             // only constructor), and `self` exists only within `'a`; `tt` is
-            // the live time built above. The call reads both, writes nothing
-            // through the null `is_daylight` (an optional out-param) and
-            // allocates nothing.
+            // the live time built above. The call reads both and writes
+            // nothing through the null `is_daylight` (an optional out-param).
+            // It may extend libical's own per-zone change cache under
+            // libical's lock (`icaltimezone_ensure_coverage`), which holds no
+            // pointer into `tt` and hands nothing to us to free.
             unsafe { sys::i_cal_timezone_get_utc_offset_of_utc_time(self.raw, tt, ptr::null_mut()) }
         });
         // SAFETY: the new ref taken above, released exactly once and never
@@ -3871,10 +3877,13 @@ mod tests {
     //   hour *before* the gap: 02:30 Berlin on 2026-03-29 becomes 00:30Z,
     //   which reads 01:30 CET. The RFC takes the offset before the gap: 01:30Z,
     //   which reads 03:30 CEST;
-    // - in a **fold** its overlap branch (`:930-960`) keeps the
-    //   post-transition change unless the time's `is_daylight` bit asks for
-    //   the other one, and a parsed time never sets that bit. So it takes the
-    //   *later* instant, where the RFC takes the first occurrence.
+    // - in a **fold** its overlap branch (`:930-960`) takes whichever of the
+    //   two changes matches the time's `is_daylight` bit, and a parsed time
+    //   never sets that bit, so it takes the change flagged standard. In
+    //   Berlin and New York (every row below) that is the post-transition
+    //   one, i.e. the *later* instant, where the RFC takes the first
+    //   occurrence. Only where winter is flagged daylight (`Europe/Dublin`'s
+    //   negative DST) does libical happen to land on the earlier instant.
     //
     // The upper bound of a fold and of a gap it gets right. The rows below pin
     // libical's own answers (the probe) and the instants the expansion gives
@@ -4127,12 +4136,12 @@ mod tests {
     }
 
     /// The probe, kept as a test: what libical answers **on its own** for a
-    /// resolved `TZID` time on a transition. It takes the later instant in a
-    /// fold and the post-gap offset in a gap, on an inline `VTIMEZONE` and on
-    /// the builtin table alike, which is why `ical_time_to_unix` no longer
-    /// uses its answer. If a libical upgrade starts following RFC 5545 here,
-    /// this test fails and says so; `IcalZone` is then redundant, though still
-    /// correct.
+    /// resolved `TZID` time on a transition. In these zones it takes the
+    /// later instant in a fold and the post-gap offset in a gap, on an inline
+    /// `VTIMEZONE` and on the builtin table alike, which is why
+    /// `ical_time_to_unix` no longer uses its answer. If a libical upgrade
+    /// starts following RFC 5545 here, this test fails and says so;
+    /// `IcalZone` is then redundant, though still correct.
     #[test]
     fn libical_alone_takes_the_later_instant_in_a_fold_and_the_post_gap_offset() {
         let mut builtin_rows = 0;

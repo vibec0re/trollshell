@@ -478,9 +478,13 @@ unsafe extern "C" {
     /// for a DATE or a UTC (`…Z`) value. A resolved `TZID` time no longer
     /// goes through it except as a fallback (#1590): on a DST transition
     /// libical's local → UTC step (`icaltimezone_get_utc_offset`) takes the
-    /// later instant in a fold and the post-gap offset in a gap, against RFC
-    /// 5545 §3.3.5. See `lib.rs`'s `ical_time_to_unix`. Borrows `tt`/`zone`;
-    /// allocates nothing.
+    /// post-gap offset in a gap and, in a fold, the change flagged standard
+    /// time, against RFC 5545 §3.3.5. In most zones that is the later
+    /// instant; in a negative-DST zone such as `Europe/Dublin` (winter
+    /// flagged daylight) it is the earlier one. See `lib.rs`'s
+    /// `ical_time_to_unix`. Borrows `tt`/`zone`. With a zone other than UTC it
+    /// may extend libical's own per-zone change cache, under libical's lock;
+    /// it allocates nothing the caller owns.
     pub fn i_cal_time_as_timet_with_zone(tt: *const ICalTime, zone: *const ICalTimezone) -> TimeT;
 
     /// True iff the [`ICalTime`] is a DATE (no time-of-day) — i.e. the
@@ -688,7 +692,10 @@ unsafe extern "C" {
     /// Every instant has exactly one offset, so unlike the local-time
     /// direction this answer is never a choice (#1590). `is_daylight` is an
     /// optional out-param: pass null. A null `zone` answers 0. Borrows `zone`
-    /// and `tt`; allocates nothing.
+    /// and `tt`. It may extend libical's own per-zone change cache
+    /// (`icaltimezone_ensure_coverage` for `tt`'s year, which can also load
+    /// a builtin zone lazily), under libical's lock; it allocates nothing the
+    /// caller owns.
     pub fn i_cal_timezone_get_utc_offset_of_utc_time(
         zone: *mut ICalTimezone,
         tt: *mut ICalTime,

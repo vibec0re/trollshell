@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::task::AbortHandle;
 use zbus::object_server::SignalEmitter;
-use zbus::zvariant::OwnedValue;
+use zbus::zvariant::{OwnedValue, Value};
 
 // ── Cross-thread shared handle ────────────────────────────────────────────────
 //
@@ -79,8 +79,26 @@ struct NotificationsShared {
     /// controller calls [`pause_expiry`] / [`resume_expiry`]) and hytte-tokio
     /// (the sleep task, and [`dismiss`]'s cleanup) — a plain `std::sync::Mutex`
     /// suffices for the same reason as `local_actions`: every critical section
-    /// is non-async map surgery.
-    timers: Mutex<TimerMap>,
+    /// is non-async map surgery. The **same** `Arc` the D-Bus `Notify` handler
+    /// (`NotificationsIface::timers`) arms through, on `local_actions`'
+    /// precedent: the handler needs no registry lookup, and a test can read
+    /// the timer a post armed rather than only the `timeout` field (#1542).
+    timers: Arc<Mutex<TimerMap>>,
+}
+
+impl NotificationsShared {
+    /// The `Notify` handler's view of this live set: the same `active`,
+    /// `next_id`, `local_actions` and `timers` handles, so a post made
+    /// through it (see `NotificationsIface::post_local`) lands exactly where
+    /// a D-Bus `Notify` does.
+    fn iface(&self) -> NotificationsIface {
+        NotificationsIface {
+            active: self.active.clone(),
+            next_id: Arc::clone(&self.next_id),
+            local_actions: Arc::clone(&self.local_actions),
+            timers: Arc::clone(&self.timers),
+        }
+    }
 }
 
 // ── Public data shapes ────────────────────────────────────────────────────────
@@ -141,10 +159,15 @@ pub struct Notification {
     pub urgency: Urgency,
     /// Resolved timeout: `Some(Duration)` for finite, `None` for sticky.
     ///
-    /// Mapping from `expire_timeout`, per the freedesktop notification spec:
-    /// - `<0` (e.g. `-1`) → `Some(5s)` (server default)
+    /// For a D-Bus `Notify`, mapped from `expire_timeout` and `urgency` per
+    /// the freedesktop notification spec:
+    /// - `<0` (e.g. `-1`) → `Some(5s)` (server default), except
+    ///   [`Urgency::Critical`] → `None` (stays until dismissed)
     /// - `0`             → `None` (sticky / never expires)
-    /// - `>0`            → `Some(millis)` (as requested)
+    /// - `>0`            → `Some(millis)` (as requested, at any urgency)
+    ///
+    /// A [`post_local`] toast always carries the 5 s default, at every
+    /// urgency (see [`post_local`]).
     pub timeout: Option<Duration>,
     /// Action buttons to display below the notification body.
     pub actions: Vec<Action>,
@@ -212,11 +235,13 @@ impl Service for NotificationsService {
         let next_id = Arc::new(AtomicU32::new(1));
         let history = Mutable::new(Vec::new());
         let local_actions = Arc::new(Mutex::new(HashMap::new()));
+        let timers = Arc::new(Mutex::new(HashMap::new()));
 
         let iface = NotificationsIface {
             active: active.clone(),
             next_id: next_id.clone(),
             local_actions: local_actions.clone(),
+            timers: timers.clone(),
         };
 
         // Own the well-known name + mount the interface. The bus layer handles
@@ -241,7 +266,7 @@ impl Service for NotificationsService {
             next_id: next_id.clone(),
             ownership: ownership.clone(),
             local_actions,
-            timers: Mutex::new(HashMap::new()),
+            timers,
         });
 
         NotificationsHandles {
@@ -874,12 +899,12 @@ fn spawn_expiry(id: u32, dur: Duration, arming: u64) -> AbortHandle {
 /// hold to land on, so the next finite re-post minted a `hover_count: 0` entry
 /// under a hovered card.
 ///
-/// Callable from any thread; it only touches the cross-thread shared registry.
-fn set_expiry(id: u32, timeout: Option<Duration>) {
-    let Some(shared) = shared::get::<NotificationsShared>() else {
-        return;
-    };
-    if let Ok(mut timers) = shared.timers.lock() {
+/// `timers` is the caller's `NotificationsIface::timers`, the same `Arc` as
+/// `NotificationsShared::timers` in production. It is passed in rather than
+/// looked up so a test can drive the real `Notify` handler and then read the
+/// entry it armed (#1542). Callable from any thread.
+fn set_expiry(timers: &Mutex<TimerMap>, id: u32, timeout: Option<Duration>) {
+    if let Ok(mut timers) = timers.lock() {
         apply_expiry(&mut timers, id, timeout, Instant::now(), |dur, arming| {
             Some(spawn_expiry(id, dur, arming))
         });
@@ -1059,6 +1084,12 @@ fn rate_limit_allow(app_name: &str, summary: &str, body: &str) -> bool {
 /// user just triggered by clicking should not be silently eaten by DND, so the
 /// swept Wi-Fi/VPN error arms all pass `Critical`.
 ///
+/// Here `Critical` only bypasses those gates: a self-toast still expires after
+/// the 5 s server default at every urgency. That differs from a D-Bus client's
+/// `Critical` notification with `expire_timeout = -1`, which the `Notify`
+/// handler keeps on screen until dismissed (#1542). The shell's own error
+/// toasts were not part of that decision, so they keep expiring.
+///
 /// # Rate-limiting
 ///
 /// Identical `(app_name, summary, body)` toasts within
@@ -1105,63 +1136,9 @@ pub fn post_local_with_actions(
         return;
     }
 
-    // Allocate from the SAME atomic the D-Bus `Notify` handler uses — one
-    // monotonic sequence, so this id can never collide with a `Notify`-issued
-    // one (see `NotificationsShared::next_id`).
-    let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
-
-    // Register each action's callback under (id, key) and build the plain
-    // Action list the Notification carries for rendering. If the mutex is
-    // poisoned, fail safe by posting the toast with no action buttons rather
-    // than buttons that would dispatch to nothing.
-    let mut ui_actions = Vec::with_capacity(actions.len());
-    if let Ok(mut map) = shared.local_actions.lock() {
-        for action in actions {
-            let LocalAction {
-                key,
-                label,
-                callback,
-            } = action;
-            ui_actions.push(Action {
-                key: key.clone(),
-                label,
-            });
-            register_local_action(&mut map, id, key, callback);
-        }
-    } else {
-        tracing::warn!(
-            id,
-            "notifications: local_actions mutex poisoned, posting without actions"
-        );
-    }
-
-    let created_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    let notification = Notification {
-        id,
-        app_name: app_name.to_string(),
-        app_icon: String::new(),
-        summary: summary.to_string(),
-        body: strip_markup(body),
-        urgency,
-        timeout: Some(DEFAULT_TIMEOUT),
-        actions: ui_actions,
-        image: None,
-        created_at,
-    };
-
-    // Arm the hover-pausable auto-dismiss timer, then publish — both under the
-    // one `active` write guard, expiry first. See `notify` for why the order and
-    // the shared guard are both load-bearing (#619).
-    {
-        let mut list = shared.active.lock_mut();
-        set_expiry(id, Some(DEFAULT_TIMEOUT));
-        list.push(notification);
-    }
-    tracing::debug!(id, app_name, summary, "local notification posted");
+    shared
+        .iface()
+        .post_local(app_name, summary, body, urgency, actions);
 }
 
 // ── D-Bus interface ───────────────────────────────────────────────────────────
@@ -1181,6 +1158,92 @@ struct NotificationsIface {
     active: Mutable<Vec<Notification>>,
     next_id: Arc<AtomicU32>,
     local_actions: Arc<Mutex<LocalActionMap>>,
+    /// The per-id expiry timers `Notify` arms through: the same `Arc` as
+    /// `NotificationsShared::timers`, which `close` and the hover pause/resume
+    /// reach. See that field.
+    timers: Arc<Mutex<TimerMap>>,
+}
+
+impl NotificationsIface {
+    /// The body of [`post_local_with_actions`], past its registry lookup and
+    /// rate limit: post the shell's own toast into this live set and return
+    /// its id. A method here rather than inline there so a test can drive it
+    /// against its own handles and read the timer it armed, as the `Notify`
+    /// tests do. Not part of the D-Bus interface: this `impl` block carries no
+    /// `#[zbus::interface]`.
+    fn post_local(
+        &self,
+        app_name: &str,
+        summary: &str,
+        body: &str,
+        urgency: Urgency,
+        actions: Vec<LocalAction>,
+    ) -> u32 {
+        // Allocate from the SAME atomic the D-Bus `Notify` handler uses — one
+        // monotonic sequence, so this id can never collide with a
+        // `Notify`-issued one (see `NotificationsShared::next_id`).
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+
+        // Register each action's callback under (id, key) and build the plain
+        // Action list the Notification carries for rendering. If the mutex is
+        // poisoned, fail safe by posting the toast with no action buttons
+        // rather than buttons that would dispatch to nothing.
+        let mut ui_actions = Vec::with_capacity(actions.len());
+        if let Ok(mut map) = self.local_actions.lock() {
+            for action in actions {
+                let LocalAction {
+                    key,
+                    label,
+                    callback,
+                } = action;
+                ui_actions.push(Action {
+                    key: key.clone(),
+                    label,
+                });
+                register_local_action(&mut map, id, key, callback);
+            }
+        } else {
+            tracing::warn!(
+                id,
+                "notifications: local_actions mutex poisoned, posting without actions"
+            );
+        }
+
+        let created_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // The shell's own toasts expire after the default at every urgency,
+        // `Critical` included: here `Critical` is the DND/mute bypass, not a
+        // client leaving the timeout to us (see `post_local`). One binding, so
+        // the field and the timer cannot disagree.
+        let timeout = Some(DEFAULT_TIMEOUT);
+
+        let notification = Notification {
+            id,
+            app_name: app_name.to_string(),
+            app_icon: String::new(),
+            summary: summary.to_string(),
+            body: strip_markup(body),
+            urgency,
+            timeout,
+            actions: ui_actions,
+            image: None,
+            created_at,
+        };
+
+        // Arm the hover-pausable auto-dismiss timer, then publish — both under
+        // the one `active` write guard, expiry first. See `notify` for why the
+        // order and the shared guard are both load-bearing (#619).
+        {
+            let mut list = self.active.lock_mut();
+            set_expiry(&self.timers, id, timeout);
+            list.push(notification);
+        }
+        tracing::debug!(id, app_name, summary, "local notification posted");
+        id
+    }
 }
 
 // zbus's `#[interface]` macro requires every method to be `async fn` even
@@ -1194,8 +1257,9 @@ struct NotificationsIface {
 impl NotificationsIface {
     /// Show a notification. Returns the notification id.
     ///
-    /// `expire_timeout` (freedesktop notification spec):
-    ///   - `<0` (e.g. `-1`) → use server default (5s)
+    /// `expire_timeout` (freedesktop notification spec; see `resolve_timeout`):
+    ///   - `<0` (e.g. `-1`) → use server default: 5s, or sticky for a
+    ///     `Critical` urgency
     ///   - `0`             → notification is sticky (never auto-dismissed)
     ///   - `>0`            → milliseconds
     // Signature mirrors the `org.freedesktop.Notifications.Notify` D-Bus
@@ -1212,19 +1276,12 @@ impl NotificationsIface {
         hints: HashMap<String, OwnedValue>,
         expire_timeout: i32,
     ) -> u32 {
-        // Parse urgency from hints (key "urgency", type u8).
-        let urgency = hints
-            .get("urgency")
-            .and_then(|v| u8::try_from(v.try_clone().ok()?).ok())
-            .map(|b| match b {
-                0 => Urgency::Low,
-                2 => Urgency::Critical,
-                _ => Urgency::Normal,
-            })
-            .unwrap_or_default();
+        // Parse urgency from hints (key "urgency"; see `parse_urgency`).
+        let urgency = parse_urgency(&hints);
 
-        // Resolve timeout (see `resolve_timeout`).
-        let timeout = resolve_timeout(expire_timeout);
+        // Resolve timeout (see `resolve_timeout`). It needs the urgency: a
+        // `Critical` notification that leaves the timeout to us never expires.
+        let timeout = resolve_timeout(urgency, expire_timeout);
 
         // Strip any HTML-like markup from body conservatively.
         let body_clean = strip_markup(body);
@@ -1277,7 +1334,7 @@ impl NotificationsIface {
                 forget_replaced_local_actions(&mut map, &list, replaces_id);
             }
             let id = notify_id(&list, replaces_id, &self.next_id);
-            crate::notifications::set_expiry(id, timeout);
+            set_expiry(&self.timers, id, timeout);
             let notification = Notification {
                 id,
                 app_name: app_name.to_string(),
@@ -1404,25 +1461,42 @@ fn forget_replaced_local_actions(
 
 // ── Helper: resolve timeout ───────────────────────────────────────────────────
 
-/// Server default applied when an app delegates the timeout (`expire_timeout
-/// < 0`, conventionally `-1`).
+/// The server default timeout. On D-Bus `Notify`, it applies when a client
+/// leaves the timeout to us (`expire_timeout < 0`, conventionally `-1`) for a
+/// `Low` or `Normal` urgency notification; a `Critical` one that does so gets
+/// no timeout at all (see [`resolve_timeout`]). The shell's own toasts
+/// ([`post_local`]) carry it at every urgency, `Critical` included.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Resolve a freedesktop `expire_timeout` into a finite auto-dismiss duration
-/// (`Some`) or a sticky notification (`None`).
+/// Resolve a D-Bus `Notify` call's `expire_timeout` and urgency into a finite
+/// auto-dismiss duration (`Some`) or a sticky notification (`None`). This is
+/// the whole expiry rule **for `Notify`**: the handler stores the result on
+/// [`Notification::timeout`] and hands the same value to [`set_expiry`],
+/// which arms (or stands down) the auto-dismiss sleep. The shell's own toasts
+/// do not come through here; [`post_local`] gives them [`DEFAULT_TIMEOUT`] at
+/// every urgency.
 ///
 /// Per the [notification spec][spec]:
-/// - `< 0` (conventionally `-1`) → server decides; we apply [`DEFAULT_TIMEOUT`].
-/// - `0` → never expire (sticky).
-/// - `> 0` → that many milliseconds.
+/// - `< 0` (conventionally `-1`) → server decides. The spec lets that "vary
+///   for the type of notification", and says critical notifications "should
+///   not automatically expire" ([urgency levels][urgency]). So
+///   [`Urgency::Critical`] → `None`: it stays until the user dismisses it,
+///   or the client closes or replaces it. Every other urgency →
+///   [`DEFAULT_TIMEOUT`].
+/// - `0` → never expire (sticky), at any urgency.
+/// - `> 0` → that many milliseconds, at any urgency. A client that names a
+///   timeout for a critical notification gets the timeout it named.
 ///
 /// Note the `0` and `-1` cases are easy to invert — `-1` ("you decide") is by
 /// far the most common value (it's `notify-send`'s default), so mapping it to
-/// sticky makes ordinary toasts pile up forever (see issue #15).
+/// sticky makes ordinary toasts pile up forever (see issue #15). Only the
+/// critical arm of `-1` is sticky (#1542).
 ///
 /// [spec]: https://specifications.freedesktop.org/notification-spec/latest/protocol.html
-fn resolve_timeout(expire_timeout: i32) -> Option<Duration> {
+/// [urgency]: https://specifications.freedesktop.org/notification-spec/latest/urgency-levels.html
+fn resolve_timeout(urgency: Urgency, expire_timeout: i32) -> Option<Duration> {
     match expire_timeout.cmp(&0) {
+        std::cmp::Ordering::Less if urgency == Urgency::Critical => None,
         std::cmp::Ordering::Less => Some(DEFAULT_TIMEOUT),
         std::cmp::Ordering::Equal => None,
         std::cmp::Ordering::Greater => {
@@ -1430,6 +1504,41 @@ fn resolve_timeout(expire_timeout: i32) -> Option<Duration> {
             #[allow(clippy::cast_sign_loss)]
             Some(Duration::from_millis(expire_timeout as u64))
         }
+    }
+}
+
+// ── Helper: parse urgency ─────────────────────────────────────────────────────
+
+/// Read the `urgency` hint of a `Notify` call: `0` → [`Urgency::Low`], `2` →
+/// [`Urgency::Critical`], and anything else (no hint, `1`, an out-of-range
+/// number, a non-integer) → [`Urgency::Normal`].
+///
+/// The spec types the hint as a BYTE, but clients send other integer widths:
+/// Chromium sends a `uint32`, and an unannotated number in `GVariant` text
+/// (`gdbus call … "{'urgency': <2>}"`) or a plain `int` from dbus-python is an
+/// `int32`. mako reads `y`, `u` and `i` for that reason. Read as a byte only,
+/// those came in as `Normal`: no DND bypass and, since #1542, no "stays until
+/// dismissed" either. So every integer width is read by its value.
+///
+/// Out-of-range numbers are not clamped: a `3` or a `u32::MAX` stays `Normal`,
+/// as a byte `3` always has. Clamping would turn a malformed hint into
+/// `Critical`, which bypasses DND and mute and never expires. (mako does not
+/// clamp either; it keeps the raw number, which then matches no urgency.)
+fn parse_urgency(hints: &HashMap<String, OwnedValue>) -> Urgency {
+    let level = hints.get("urgency").and_then(|v| match &**v {
+        Value::U8(n) => Some(i64::from(*n)),
+        Value::I16(n) => Some(i64::from(*n)),
+        Value::U16(n) => Some(i64::from(*n)),
+        Value::I32(n) => Some(i64::from(*n)),
+        Value::U32(n) => Some(i64::from(*n)),
+        Value::I64(n) => Some(*n),
+        Value::U64(n) => i64::try_from(*n).ok(),
+        _ => None,
+    });
+    match level {
+        Some(0) => Urgency::Low,
+        Some(2) => Urgency::Critical,
+        _ => Urgency::Normal,
     }
 }
 
@@ -1698,7 +1807,8 @@ mod tests {
         NotificationImage, NotificationsIface, OwnedValue, RateLimitMap, TimerAction, TimerEntry,
         TimerMap, TimerState, Urgency, apply_expiry, apply_pause, clear_local_actions, clear_timer,
         closable, forget_replaced_local_actions, image_data_consistent, notify_id, parse_image,
-        rate_limit_check, register_local_action, resolve_timeout, strip_markup, take_local_action,
+        parse_urgency, rate_limit_check, register_local_action, resolve_timeout, strip_markup,
+        take_local_action,
     };
     use std::cell::Cell;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -1941,6 +2051,7 @@ mod tests {
             active: Mutable::new(Vec::new()),
             next_id: Arc::new(AtomicU32::new(1)),
             local_actions: Arc::new(Mutex::new(LocalActionMap::new())),
+            timers: Arc::new(Mutex::new(TimerMap::new())),
         };
         let caps = iface.get_capabilities();
         assert!(caps.iter().any(|c| c == "body"), "{caps:?}");
@@ -2135,28 +2246,298 @@ mod tests {
         );
     }
 
+    const ALL_URGENCIES: [Urgency; 3] = [Urgency::Low, Urgency::Normal, Urgency::Critical];
+
+    /// The four cases #1542 settled, with literal durations rather than
+    /// [`DEFAULT_TIMEOUT`], so a change to the constant shows up here too.
     #[test]
-    fn negative_timeout_uses_server_default() {
+    fn timeout_rule_by_urgency() {
+        let cases = [
+            // A critical that leaves the timeout to us never expires.
+            (Urgency::Critical, -1, None),
+            // A critical with a timeout of its own gets exactly that.
+            (Urgency::Critical, 3000, Some(Duration::from_secs(3))),
+            // Anything else that leaves it to us gets the 5 s default.
+            (Urgency::Normal, -1, Some(Duration::from_secs(5))),
+            // 0 means never, whatever the urgency.
+            (Urgency::Low, 0, None),
+        ];
+        for (urgency, expire_timeout, want) in cases {
+            assert_eq!(
+                resolve_timeout(urgency, expire_timeout),
+                want,
+                "({urgency:?}, {expire_timeout})"
+            );
+        }
+    }
+
+    #[test]
+    fn negative_timeout_uses_server_default_below_critical() {
         // -1 ("you decide") is notify-send's default and the common case;
         // it must NOT be sticky (regression test for issue #15).
-        assert_eq!(resolve_timeout(-1), Some(DEFAULT_TIMEOUT));
-        assert_eq!(resolve_timeout(i32::MIN), Some(DEFAULT_TIMEOUT));
+        for urgency in [Urgency::Low, Urgency::Normal] {
+            assert_eq!(resolve_timeout(urgency, -1), Some(DEFAULT_TIMEOUT));
+            assert_eq!(resolve_timeout(urgency, i32::MIN), Some(DEFAULT_TIMEOUT));
+        }
+    }
+
+    #[test]
+    fn negative_timeout_is_sticky_for_critical() {
+        // Any negative value delegates to the server, not just -1.
+        assert_eq!(resolve_timeout(Urgency::Critical, -1), None);
+        assert_eq!(resolve_timeout(Urgency::Critical, i32::MIN), None);
     }
 
     #[test]
     fn zero_timeout_is_sticky() {
         // Per spec, 0 means never expire.
-        assert_eq!(resolve_timeout(0), None);
+        for urgency in ALL_URGENCIES {
+            assert_eq!(resolve_timeout(urgency, 0), None, "{urgency:?}");
+        }
     }
 
     #[test]
     fn positive_timeout_is_exact_millis() {
-        assert_eq!(resolve_timeout(1), Some(Duration::from_millis(1)));
-        assert_eq!(resolve_timeout(2500), Some(Duration::from_millis(2500)));
+        // A timeout the client names is honoured at every urgency, critical
+        // included.
+        for urgency in ALL_URGENCIES {
+            assert_eq!(
+                resolve_timeout(urgency, 1),
+                Some(Duration::from_millis(1)),
+                "{urgency:?}"
+            );
+            assert_eq!(
+                resolve_timeout(urgency, 2500),
+                Some(Duration::from_millis(2500)),
+                "{urgency:?}"
+            );
+            assert_eq!(
+                resolve_timeout(urgency, i32::MAX),
+                Some(Duration::from_millis(i32::MAX as u64)),
+                "{urgency:?}"
+            );
+        }
+    }
+
+    // ── What a post arms: the timer, not only the field (#1542) ─────────────
+    //
+    // `Notification::timeout` is read by nothing on screen; what closes a
+    // toast is the sleep `set_expiry` arms. So these drive the real `Notify`
+    // handler / `post_local` against handles of their own and read the
+    // **timer entry** back. A finite post spawns a real sleep on the hytte
+    // runtime; when it fires, its `close` finds no `NotificationsShared`
+    // registered in a test binary and does nothing.
+
+    /// A `NotificationsIface` over fresh handles of its own, the way
+    /// `Service::start` builds one, minus the bus.
+    fn fresh_iface() -> NotificationsIface {
+        NotificationsIface {
+            active: Mutable::new(Vec::new()),
+            next_id: Arc::new(AtomicU32::new(1)),
+            local_actions: Arc::new(Mutex::new(LocalActionMap::new())),
+            timers: Arc::new(Mutex::new(TimerMap::new())),
+        }
+    }
+
+    /// What one post left for `id`: the timeout on the published notification,
+    /// the timeout its timer entry holds, and whether that timer is counting
+    /// down (a deadline **and** a live sleep).
+    #[derive(Debug, PartialEq)]
+    struct Posted {
+        field: Option<Duration>,
+        timer: Option<Duration>,
+        counting_down: bool,
+    }
+
+    impl Posted {
+        fn of(iface: &NotificationsIface, id: u32) -> Self {
+            let field = iface
+                .active
+                .lock_ref()
+                .iter()
+                .find(|n| n.id == id)
+                .expect("published")
+                .timeout;
+            let timers = iface.timers.lock().expect("not poisoned");
+            let entry = timers
+                .get(&id)
+                .expect("every live notification has a timer entry");
+            assert_eq!(
+                entry.state.deadline.is_some(),
+                entry.abort.is_some(),
+                "a deadline and a live sleep come and go together"
+            );
+            Self {
+                field,
+                timer: entry.state.timeout,
+                counting_down: entry.abort.is_some(),
+            }
+        }
+
+        /// Stays until dismissed: no timeout anywhere, nothing counting down.
+        const STAYS: Self = Self {
+            field: None,
+            timer: None,
+            counting_down: false,
+        };
+
+        /// Expires after `secs`, with the sleep that does it armed.
+        fn expires_after(secs: u64) -> Self {
+            Self {
+                field: Some(Duration::from_secs(secs)),
+                timer: Some(Duration::from_secs(secs)),
+                counting_down: true,
+            }
+        }
+    }
+
+    /// Drive the real `Notify` handler; `urgency` is the hint's value, `None`
+    /// for no hint.
+    fn post_notify(
+        iface: &NotificationsIface,
+        replaces_id: u32,
+        urgency: Option<OwnedValue>,
+        expire_timeout: i32,
+    ) -> u32 {
+        let hint_map = urgency
+            .map(|u| hints(&[("urgency", u)]))
+            .unwrap_or_default();
+        futures_executor::block_on(iface.notify(
+            "client",
+            replaces_id,
+            "",
+            "summary",
+            "",
+            Vec::new(),
+            hint_map,
+            expire_timeout,
+        ))
+    }
+
+    fn urgency_of(iface: &NotificationsIface, id: u32) -> Urgency {
+        iface
+            .active
+            .lock_ref()
+            .iter()
+            .find(|n| n.id == id)
+            .expect("published")
+            .urgency
+    }
+
+    /// The `Notify` handler hands [`set_expiry`] the timeout resolved at the
+    /// urgency it parsed, on a fresh post and on every replace. The pure
+    /// `resolve_timeout` tests above cannot see a handler that arms the timer
+    /// differently; this one reads the timer.
+    #[test]
+    fn notify_arms_the_timer_at_the_hinted_urgency() {
+        let iface = fresh_iface();
+
+        let critical = post_notify(&iface, 0, Some(OwnedValue::from(2_u8)), -1);
+        assert_eq!(urgency_of(&iface, critical), Urgency::Critical);
         assert_eq!(
-            resolve_timeout(i32::MAX),
-            Some(Duration::from_millis(i32::MAX as u64))
+            Posted::of(&iface, critical),
+            Posted::STAYS,
+            "a critical with the default timeout arms no timer"
         );
+
+        let critical_3s = post_notify(&iface, 0, Some(OwnedValue::from(2_u8)), 3000);
+        assert_eq!(Posted::of(&iface, critical_3s), Posted::expires_after(3));
+
+        let normal = post_notify(&iface, 0, None, -1);
+        assert_eq!(urgency_of(&iface, normal), Urgency::Normal);
+        assert_eq!(Posted::of(&iface, normal), Posted::expires_after(5));
+
+        let low_sticky = post_notify(&iface, 0, Some(OwnedValue::from(0_u8)), 0);
+        assert_eq!(urgency_of(&iface, low_sticky), Urgency::Low);
+        assert_eq!(Posted::of(&iface, low_sticky), Posted::STAYS);
+
+        // The client replaces the normal toast with a critical one: the 5 s
+        // sleep it had armed is stood down, and nothing counts down.
+        let id = post_notify(&iface, normal, Some(OwnedValue::from(2_u8)), -1);
+        assert_eq!(id, normal, "a replace of a live id keeps the id");
+        assert_eq!(
+            Posted::of(&iface, normal),
+            Posted::STAYS,
+            "Normal → Critical stands the countdown down"
+        );
+
+        // And the sticky critical replaced by a normal one expires again.
+        let id = post_notify(&iface, critical, Some(OwnedValue::from(1_u8)), -1);
+        assert_eq!(id, critical, "a replace of a live id keeps the id");
+        assert_eq!(
+            Posted::of(&iface, critical),
+            Posted::expires_after(5),
+            "Critical → Normal arms the default"
+        );
+    }
+
+    /// A client that sends the urgency as `uint32` (Chromium) or `int32`
+    /// (`gdbus call`'s text form, dbus-python's plain `int`) gets the
+    /// critical rule too: the hint is read by value, not only as a byte.
+    #[test]
+    fn notify_reads_a_uint32_or_int32_urgency() {
+        let iface = fresh_iface();
+        for hint in [OwnedValue::from(2_u32), OwnedValue::from(2_i32)] {
+            let shown = format!("{hint:?}");
+            let id = post_notify(&iface, 0, Some(hint), -1);
+            assert_eq!(urgency_of(&iface, id), Urgency::Critical, "{shown}");
+            assert_eq!(Posted::of(&iface, id), Posted::STAYS, "{shown}");
+        }
+    }
+
+    #[test]
+    fn parse_urgency_reads_every_integer_width_by_value() {
+        let cases = [
+            (OwnedValue::from(2_u8), Urgency::Critical),
+            (OwnedValue::from(2_i16), Urgency::Critical),
+            (OwnedValue::from(2_u16), Urgency::Critical),
+            (OwnedValue::from(2_i32), Urgency::Critical),
+            (OwnedValue::from(2_u32), Urgency::Critical),
+            (OwnedValue::from(2_i64), Urgency::Critical),
+            (OwnedValue::from(2_u64), Urgency::Critical),
+            (OwnedValue::from(0_u8), Urgency::Low),
+            (OwnedValue::from(0_u32), Urgency::Low),
+            (OwnedValue::from(0_i32), Urgency::Low),
+            (OwnedValue::from(1_u8), Urgency::Normal),
+            (OwnedValue::from(1_u32), Urgency::Normal),
+            // Out of range is Normal, not clamped into Critical or Low.
+            (OwnedValue::from(3_u8), Urgency::Normal),
+            (OwnedValue::from(255_u8), Urgency::Normal),
+            (OwnedValue::from(3_u32), Urgency::Normal),
+            (OwnedValue::from(u32::MAX), Urgency::Normal),
+            (OwnedValue::from(-1_i32), Urgency::Normal),
+            (OwnedValue::from(i64::MIN), Urgency::Normal),
+            (OwnedValue::from(u64::MAX), Urgency::Normal),
+            // Not an integer at all.
+            (str_hint("2"), Urgency::Normal),
+            (OwnedValue::from(true), Urgency::Normal),
+        ];
+        for (value, want) in cases {
+            let shown = format!("{value:?}");
+            assert_eq!(
+                parse_urgency(&hints(&[("urgency", value)])),
+                want,
+                "{shown}"
+            );
+        }
+        assert_eq!(parse_urgency(&HashMap::new()), Urgency::Normal, "no hint");
+    }
+
+    /// The shell's own toasts keep the 5 s default at every urgency, a
+    /// `Critical` one included (the owner decision #1542 left open; see
+    /// `post_local`). Driven through the real post, reading its timer.
+    #[test]
+    fn post_local_arms_the_default_timer_at_every_urgency() {
+        let iface = fresh_iface();
+        for urgency in ALL_URGENCIES {
+            let id = iface.post_local("Wi-Fi", "Wi-Fi connection failed", "", urgency, Vec::new());
+            assert_eq!(urgency_of(&iface, id), urgency);
+            assert_eq!(
+                Posted::of(&iface, id),
+                Posted::expires_after(5),
+                "{urgency:?}"
+            );
+        }
     }
 
     // ── Local action registry: insert / dispatch / cleanup ──────────────────
@@ -2266,6 +2647,7 @@ mod tests {
             active: Mutable::new(vec![live(1), live(2)]),
             next_id: Arc::new(AtomicU32::new(3)),
             local_actions: Arc::clone(&local_actions),
+            timers: Arc::new(Mutex::new(TimerMap::new())),
         };
 
         let id = futures_executor::block_on(iface.notify(

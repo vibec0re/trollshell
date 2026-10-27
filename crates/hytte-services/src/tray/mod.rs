@@ -455,12 +455,16 @@ impl Watchers {
     /// - **A slot from the same connection** — the watcher serving the key is
     ///   alive and is already watching this peer: `None`, start nothing. The
     ///   caller refreshes the row.
-    /// - **A slot from another connection** — the key is a well-known bus name
-    ///   that has changed hands (a unique name never does: when the key is
-    ///   built from the sender, the sender is part of it). The old peer is
-    ///   gone even if that watcher has not seen it yet — its `PeerGone` races
-    ///   this call — so replace it: dropping its slot stops it, and its later
-    ///   [`Self::release`] finds a different generation and touches nothing.
+    /// - **A slot from another connection** — usually a well-known bus name
+    ///   that has changed hands. The old peer is gone even if that watcher has
+    ///   not seen it yet — its `PeerGone` races this call — so replace it:
+    ///   dropping its slot stops it, and its later [`Self::release`] finds a
+    ///   different generation and touches nothing. The other way here is a
+    ///   key that names a connection other than its caller: a caller may pass
+    ///   another connection's unique name as `service`, and then that
+    ///   connection's own registration of the same key replaces the watcher.
+    ///   That costs a restart and nothing else, since the replacement watches
+    ///   the same key.
     fn claim(&mut self, key: &str, registrant: &str) -> Option<Watch> {
         if self
             .slots

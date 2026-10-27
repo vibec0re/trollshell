@@ -447,8 +447,11 @@ fn all_settled(left: bool, right: bool) -> bool {
 /// `sidebar::is_settled` for its own monitor.
 ///
 /// Split out of the tick closure, on [`redraw_arming_signal`]'s precedent, so a
-/// test can drive the exact decision `install` makes rather than a copy of it.
-/// `sidebar.rs`'s close sweep (#1456) calls it on every frame of a real
+/// test can drive the decision itself rather than a copy of it. What a test
+/// cannot reach is the closure `install` passes in (`|side|
+/// sidebar::is_settled(side, &monitor)`, which needs a `Monitor`): tests pass
+/// the keyed twin, so a wrong side or wrong argument in that one line is not
+/// caught. `sidebar.rs`'s close sweep (#1456) calls it on every frame of a real
 /// slide-out: the tick has to keep going until the revealer has collapsed,
 /// because the cutout follows the card the whole way out now and the last draw
 /// has to be the one that puts the strut back. A tick that stopped early would

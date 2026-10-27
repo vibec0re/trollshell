@@ -36,9 +36,15 @@
 //! exclusive zone and `current_visible_width` without the intent ever
 //! changing, so the two open signals alone would arm nothing for it (#1247
 //! review finding 1). A side
-//! that is closed, empty or never installed reports `FRAME_THICKNESS_I32`,
-//! which is the plain strut — so a shell with no right-mounted plugin draws
-//! exactly the frame it drew before this existed.
+//! that is settled closed, empty or never installed reports
+//! `FRAME_THICKNESS_I32`, which is the plain strut — so a shell with no
+//! right-mounted plugin draws exactly the frame it drew before this existed.
+//! A side that is sliding **closed** reports the width its card still paints,
+//! so the cutout follows the card out and the strut comes back on the frame
+//! the revealer collapses — not on the first frame of the close, which painted
+//! the strut over the card for the whole slide-out (#1456). The tick keeps
+//! running until then because `sidebar::is_settled` stays `false` for the
+//! whole slide; `redraw_tick` is that decision.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -201,14 +207,7 @@ pub fn install(monitor: &Monitor, bar: &BarHandle) {
                 // `a`, the closure's own parameter — never a captured clone of
                 // the area this is connected to (#224/#831).
                 a.queue_draw();
-                if all_settled(
-                    sidebar::is_settled(Side::Left, &monitor),
-                    sidebar::is_settled(Side::Right, &monitor),
-                ) {
-                    glib::ControlFlow::Break
-                } else {
-                    glib::ControlFlow::Continue
-                }
+                redraw_tick(|side| sidebar::is_settled(side, &monitor))
             });
             async {}
         }));
@@ -299,9 +298,11 @@ fn install_draw(area: &gtk::DrawingArea, monitor: Monitor, bar_window: gtk::Wind
         }
 
         // Each sidebar's current visible width drives the cutout edge on *its*
-        // side (#1247). When a side is closed (or, on the right, empty or never
-        // installed) its inset is FRAME_THICKNESS (8) — the plain strut, same as
-        // before the sidebars existed.
+        // side (#1247). When a side is settled closed (or, on the right, empty
+        // or never installed) its inset is FRAME_THICKNESS (8) — the plain
+        // strut, same as before the sidebars existed. While it slides closed the
+        // inset is what its card still paints, so the edge follows it out
+        // (#1456).
         let (left_inset, right_inset) = sidebar_insets(|side| {
             f64::from(sidebar::current_visible_width(side, &monitor_for_draw))
         });
@@ -438,6 +439,30 @@ pub(crate) fn redraw_arming_signal(
 /// cutout mid-way through a right slide.
 fn all_settled(left: bool, right: bool) -> bool {
     left && right
+}
+
+/// What [`install`]'s redraw tick returns after queueing its draw: `Continue`
+/// while either sidebar is still sliding, `Break` once [`all_settled`] says both
+/// are at rest. `settled` is asked once per [`Side`]; `install` passes
+/// `sidebar::is_settled` for its own monitor.
+///
+/// Split out of the tick closure, on [`redraw_arming_signal`]'s precedent, so a
+/// test can drive the exact decision `install` makes rather than a copy of it.
+/// `sidebar.rs`'s close sweep (#1456) calls it on every frame of a real
+/// slide-out: the tick has to keep going until the revealer has collapsed,
+/// because the cutout follows the card the whole way out now and the last draw
+/// has to be the one that puts the strut back. A tick that stopped early would
+/// leave the cutout frozen part-way, with nothing else to queue a draw.
+///
+/// **Falsification (run):** asking `settled(Side::Left)` for both sides turns
+/// that sweep red on the right, where the tick then stops on the first frame
+/// with the card still fully out.
+pub(crate) fn redraw_tick(settled: impl Fn(Side) -> bool) -> glib::ControlFlow {
+    if all_settled(settled(Side::Left), settled(Side::Right)) {
+        glib::ControlFlow::Break
+    } else {
+        glib::ControlFlow::Continue
+    }
 }
 
 /// Horizontal span of the frame's opaque paint rect: `(x, width)`.

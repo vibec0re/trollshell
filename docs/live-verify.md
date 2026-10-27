@@ -2480,15 +2480,24 @@ systemd-run --user --unit=trollshell-plugin-departures \
       sidebar and confirm: the dark frame stops at the sidebar's inner edge with
       **no** strut drawn over the card, the cutout's two right corners round off
       against that edge, and the tile beside it has a frame border there just
-      like the left one does. Watch the slide itself — the cutout's right edge
-      must track the card on the way **in**, not jump at the end or freeze
-      part-way, and must snap back to the 8 px strut the instant the close
-      starts rather than tracking the card out — the same way the left already
-      does (`current_visible_width` drops a side from the lookup as soon as
-      the close intent lands, with no reference to where the revealer
-      physically is, so the strut paints over the card for the rest of its
-      180 ms slide-out on both sides). One tick loop now serves both edges and
-      breaks only once **both** revealers are at rest.
+      like the left one does. Then watch the slide itself, on **both** sides
+      (the slide is 180 ms, so restart the shell with `GTK_SLOWDOWN=8` set,
+      e.g. `systemctl --user set-environment GTK_SLOWDOWN=8` before the
+      restart and `unset-environment` after, to see it frame by frame). **In:**
+      the cutout edge is at the open width from the first frame, where niri
+      has already moved the tiles, and the card slides into that gap; nothing
+      jumps at the end. **Out (#1456):** the cutout edge must follow the card's
+      inner edge the whole way, with the dark frame and its two rounded corners
+      just outside the card and never on top of it, and land on the plain 8 px
+      strut on the frame the card is gone. Two failures to look for: a dark
+      8 px strut with rounded corners appearing at the screen edge **over the
+      card** the moment the close starts (the pre-#1456 behaviour, where
+      `current_visible_width` answered the strut as soon as the close intent
+      landed), or the edge stopping part-way and staying there after the card
+      has gone (the tick stopped early; it should break only once **both**
+      revealers are at rest). Also do it with the right sidebar **open** and
+      its last card leaving (stop the plugin): the card collapses with the
+      edge following it, and the frame ends on the plain strut.
 - [ ] **(#1247)** **Both sidebars, both insets.** Open the left and the right
       together: the frame should be inset on both sides at once, the tiles
       framed between them, and toggling one must not move the other's edge.

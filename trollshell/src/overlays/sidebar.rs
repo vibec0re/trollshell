@@ -116,7 +116,10 @@
 //! [`current_visible_width`] each animation tick and shifts its cutout's
 //! left **and right** edges to match — the sidebar surface (below the frame)
 //! shows through the cutout. `open_width` is the authority on both sides, so
-//! neither cutout edge can disagree with the strip niri reserved.
+//! neither cutout edge can disagree with the strip niri reserved. On the way
+//! closed it is the revealer's own, shrinking width instead (`closing_width`),
+//! so the edge follows the card out rather than snapping to the strut on the
+//! first frame of the slide and painting over it (#1456).
 //!
 //! Since #1247 every frame-facing accessor here — [`current_visible_width`],
 //! [`is_settled`], [`open_signal_on`] — takes a [`Side`], because the frame has
@@ -165,8 +168,9 @@ use crate::scale::scale;
 /// **Design-baseline** width of the sidebar surface when fully open, in CSS px,
 /// authored at the 1x baseline `crate::scale` documents (font 11pt @ 96 DPI).
 /// Matches the "frame border ~320px" geometry from the spec; the frame's cutout
-/// left edge animates from `frame::FRAME_THICKNESS_I32` (8) up to the open
-/// width while the sidebar reveals.
+/// edge sits at the open width while the sidebar shows and follows the card
+/// back down to `frame::FRAME_THICKNESS_I32` (8) as it slides closed
+/// ([`current_visible_width`]).
 ///
 /// This is the **floor**, not the final width: it is `scale()`d into the card's
 /// `set_size_request` and the `AdwClamp` bounds, and the surface still measures
@@ -535,18 +539,32 @@ fn open_width_from_natural(natural: i32) -> i32 {
     natural.max(scale(SIDEBAR_WIDTH))
 }
 
-/// Currently visible width of `side`'s sidebar card on `monitor`, in CSS px —
-/// the measured `open_width` while that side is showing. Returns
-/// `frame::FRAME_THICKNESS_I32` when the sidebar is closed, empty, hasn't been
-/// installed yet, or the per-`(side, monitor)` panel is missing. The frame calls
-/// it **once per side** each animation tick to compute its two cutout edges
-/// (#1247).
+/// Currently visible width of `side`'s sidebar card on `monitor`, in CSS px. The
+/// frame calls it **once per side** each animation tick to compute its two
+/// cutout edges (#1247). Three answers:
+///
+/// * **Showing:** the measured `open_width`, from the first frame of the
+///   slide in. Niri moves the tiles to the reserved edge at once, so that is
+///   where the cutout belongs; the card slides in over a strip the frame does
+///   not paint.
+/// * **Not showing, revealer still sliding closed:** what the revealer paints
+///   *now* (`closing_width`), so the cutout edge follows the card out (#1456).
+///   Before that fix this case fell through to the strut on the first frame of
+///   the close, and the frame painted its opaque strut and corner fillets over
+///   the card for the whole 180 ms slide-out.
+/// * **Settled closed**, never installed, or no panel for this
+///   `(side, monitor)`: `frame::FRAME_THICKNESS_I32`, the plain strut. A
+///   collapsed slide revealer measures 0, so the middle case lands here on its
+///   own the frame the slide ends.
 ///
 /// "Showing" is `effective_open`, not the raw open flag: a right sidebar whose
 /// last card left is latched `open` with a collapsed revealer and a released
 /// exclusive zone, and the frame must draw its right strut against the screen
-/// edge for it, not against a 320 px strip nothing is painting. The left's
-/// `non_empty` is the constant `true`, so this is the same filter it had before.
+/// edge for it, not against a 320 px strip nothing is painting. That case is
+/// "not showing", and its revealer has collapsed, so it gets the strut: once a
+/// side is not showing, the inset comes from the revealer and never from the
+/// intent. The left's `non_empty` is the constant `true`, so this is the same
+/// filter it had before.
 pub fn current_visible_width(side: Side, monitor: &Monitor) -> i32 {
     current_visible_width_for_key(side, &monitor_key(monitor))
 }
@@ -555,18 +573,49 @@ pub fn current_visible_width(side: Side, monitor: &Monitor) -> i32 {
 fn current_visible_width_for_key(side: Side, key: &str) -> i32 {
     // Copy the revealer out and measure with no `PANELS` borrow live (#643) —
     // same shape, and the same reason, as `is_settled_for_key` just below:
-    // `open_width` walks a whole widget subtree's measure vfuncs, and this runs
-    // from `frame.rs`'s per-frame draw while `install`/`close_all` hold the
-    // `borrow_mut()` counterparties. (The `effective_open` filter reads two
-    // `Mutable`s, not GTK, so it is fine inside the borrow.)
-    let revealer = PANELS.with(|panels| {
-        panels
-            .borrow()
-            .get(&(side, key.to_owned()))
-            .filter(|p| effective_open(p.open_state.get(), p.non_empty.get()))
-            .map(|p| p.revealer.clone())
+    // `open_width` and `closing_width` walk a widget subtree's measure vfuncs,
+    // and this runs from `frame.rs`'s per-frame draw while `install`/`close_all`
+    // hold the `borrow_mut()` counterparties. (The `effective_open` fold reads
+    // two `Mutable`s, not GTK, so it is fine inside the borrow.)
+    let handles = PANELS.with(|panels| {
+        panels.borrow().get(&(side, key.to_owned())).map(|p| {
+            (
+                p.revealer.clone(),
+                effective_open(p.open_state.get(), p.non_empty.get()),
+            )
+        })
     });
-    revealer.map_or(frame::FRAME_THICKNESS_I32, |r| open_width(&r))
+    match handles {
+        None => frame::FRAME_THICKNESS_I32,
+        Some((revealer, true)) => open_width(&revealer),
+        Some((revealer, false)) => closing_width(&revealer),
+    }
+}
+
+/// What a revealer that is **not** showing still paints, in logical px, floored
+/// at the frame's strut — the [`current_visible_width`] answer for a sidebar on
+/// its way closed (#1456).
+///
+/// Measures the revealer itself, which is exactly what [`open_width`] must not
+/// do: `GtkRevealer` multiplies its sliding orientation by the animation
+/// position, so mid-slide this is the width of the card still on screen. That
+/// is the number the frame needs here and the wrong one for the exclusive zone.
+/// `natural.max(minimum)` for `open_width`'s reason: the clamp can report a
+/// natural below its minimum, and what gets allocated is the larger.
+///
+/// There is deliberately no "is it settled yet?" test in front of this. A
+/// settled-closed slide revealer (`build_revealer` only builds slide ones)
+/// measures 0, so the floor turns it into the strut with no branch of its own.
+/// The branch would also be wrong for one frame: a close that lands mid-*open*
+/// reads `is_child_revealed() == false` until the subscription has flipped
+/// `reveal_child`, and that would put the strut over a half-open card.
+///
+/// The floor is the strut and not 0 because the frame reads an inset at or under
+/// [`frame::FRAME_THICKNESS_I32`] as "nothing here" (`outer_span`), and the
+/// strut has to cover the last few pixels of the card anyway.
+fn closing_width(revealer: &gtk::Revealer) -> i32 {
+    let (minimum, natural, _, _) = revealer.measure(gtk::Orientation::Horizontal, -1);
+    natural.max(minimum).max(frame::FRAME_THICKNESS_I32)
 }
 
 /// True when `side`'s revealer animation is at rest on `monitor` (fully open or
@@ -584,8 +633,8 @@ fn is_settled_for_key(side: Side, key: &str) -> bool {
     // deliberately does not carve out getters, and this runs from `frame.rs`'s
     // per-frame tick callback while `install`/`close_all` hold the `borrow_mut()`
     // counterparties. Cheaper to settle it than to keep the exemption as
-    // folklore. (`current_visible_width_for_key` just above reads two
-    // `Mutable`s, not GTK, so it needs nothing.)
+    // folklore. (`current_visible_width_for_key` just above copies out the same
+    // two handles, for the same reason.)
     //
     // Compared against [`effective_open`], not the raw intent: the revealer is
     // driven by the effective value, so a right sidebar latched `open` with no
@@ -593,6 +642,12 @@ fn is_settled_for_key(side: Side, key: &str) -> bool {
     // which breaks on this, would spin for the rest of the session redrawing a
     // cutout that is not moving. The left's `non_empty` is the constant `true`,
     // so this is the same comparison it had before.
+    //
+    // On a close this is what keeps the frame redrawing to the end of the
+    // slide-out, which `current_visible_width` now tracks (#1456):
+    // `is_child_revealed()` stays `true` until a closing revealer reaches 0, so
+    // this answers `false` for the whole slide and `true` on the frame the
+    // revealer collapses — the frame that reads the strut.
     let handles = PANELS.with(|panels| {
         panels.borrow().get(&(side, key.to_owned())).map(|p| {
             (
@@ -2542,6 +2597,12 @@ mod gtk_tests {
             let left_with_both_open = current_visible_width_for_key(Side::Left, "DP-ONESIDE");
 
             sidebar_open_state(Side::Right, "DP-ONESIDE").set(false);
+            // What the open subscription does next. The panel is unmapped, so
+            // the revealer lands closed inside the call: this is the settled
+            // end of the close, which is the state the strut belongs to (#1456
+            // — mid-slide the inset follows the card instead, pinned by
+            // `a_closing_sidebar_reports_what_its_card_still_paints`).
+            parked_revealer_reveal(Side::Right, "DP-ONESIDE", false);
             assert_eq!(
                 current_visible_width_for_key(Side::Right, "DP-ONESIDE"),
                 frame::FRAME_THICKNESS_I32,
@@ -2590,14 +2651,19 @@ mod gtk_tests {
                 !effective_open(true, false),
                 "test setup: this is the open-but-empty case"
             );
+            // `sized_panel` leaves the revealer revealed; the open subscription
+            // collapses it, since the effective state is closed. Unmapped, so it
+            // lands inside the call: this is the steady state the case lives in.
+            // (Before it lands the card is still on screen, and since #1456 the
+            // inset follows it — `an_open_sidebar_that_loses_its_last_card_…`
+            // pins that slide.)
+            parked_revealer_reveal(Side::Right, "DP-EMPTYOPEN", false);
             assert_eq!(
                 current_visible_width_for_key(Side::Right, "DP-EMPTYOPEN"),
                 frame::FRAME_THICKNESS_I32,
                 "an empty right sidebar paints nothing, so the frame must not inset for it"
             );
-            // `sized_panel` leaves the revealer revealed; the effective state is
-            // closed, so a raw-intent settle check would answer `false` forever.
-            parked_revealer_reveal(Side::Right, "DP-EMPTYOPEN", false);
+            // A raw-intent settle check would answer `false` forever here.
             assert!(
                 is_settled_for_key(Side::Right, "DP-EMPTYOPEN"),
                 "a collapsed revealer under an open-but-empty intent is at rest — otherwise the \
@@ -2663,6 +2729,9 @@ mod gtk_tests {
                 panel.non_empty.clone()
             });
             sidebar_open_state(Side::Right, "DP-ARM").set(true);
+            // With no card the surface shows nothing, so its revealer sits
+            // collapsed (`sized_panel` parks it revealed).
+            parked_revealer_reveal(Side::Right, "DP-ARM", false);
 
             let arming = frame::redraw_arming_signal(
                 sidebar_open_state(Side::Left, "DP-ARM").signal(),
@@ -2845,5 +2914,346 @@ mod gtk_tests {
             !opened,
             "`toggle_right_on_focused`'s fallback must only consider Side::Right surfaces"
         );
+    }
+
+    // ── The slide, frame by frame (#1456) ────────────────────────────────────
+    //
+    // Every panel above is unmapped, and an unmapped `GtkRevealer` applies a new
+    // target inside `set_reveal_child` (`gtk_revealer_start_animation` only
+    // animates when the widget is mapped and `gtk-enable-animations` is on). So
+    // none of them can see a slide at all, which is how the cutout snapping to
+    // the strut at the start of every slide-out went unnoticed (#1269 review,
+    // LOW 2). These mount the revealer in a mapped toplevel and sample it on
+    // every main-loop turn while it really animates.
+
+    /// The slide's length in these tests. Longer than the shipped 180 ms so a
+    /// loaded CI runner still lands several frames inside it; the length is not
+    /// what is under test.
+    const SLIDE_MS: u32 = 600;
+
+    /// How long a sweep may run before it is called stuck.
+    const SWEEP_DEADLINE_MS: u64 = 5_000;
+
+    /// The strut, as the frame reads it.
+    const STRUT: i32 = frame::FRAME_THICKNESS_I32;
+
+    /// One observation, taken between two main-loop turns.
+    #[derive(Debug)]
+    struct Sample {
+        /// What the frame would draw this side's inset from.
+        width: i32,
+        /// The revealer's allocated width: what is actually on screen.
+        painted: i32,
+        /// `is_settled_for_key` for this side.
+        settled: bool,
+        /// What the frame's redraw tick would return now.
+        flow: glib::ControlFlow,
+    }
+
+    fn parked_revealer(side: Side, key: &str) -> gtk::Revealer {
+        PANELS.with(|panels| {
+            panels
+                .borrow()
+                .get(&(side, key.to_owned()))
+                .expect("test setup: the panel was just parked")
+                .revealer
+                .clone()
+        })
+    }
+
+    fn sample(side: Side, key: &str) -> Sample {
+        Sample {
+            width: current_visible_width_for_key(side, key),
+            painted: parked_revealer(side, key).width(),
+            settled: is_settled_for_key(side, key),
+            // The exact function `frame::install`'s tick callback returns, over
+            // the same per-side settle check it passes (keyed here, since there
+            // is no `Monitor`). The other side has no panel, so it answers
+            // "settled" and the tick hangs on this side alone.
+            flow: frame::redraw_tick(|s| is_settled_for_key(s, key)),
+        }
+    }
+
+    /// Sample `side` on every main-loop turn until the frame's tick would stop,
+    /// or [`SWEEP_DEADLINE_MS`] passes. The first sample is taken before any
+    /// turn, i.e. in the same state the caller left.
+    fn sweep(side: Side, key: &str) -> Vec<Sample> {
+        let expired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let flag = expired.clone();
+        let deadline = gtk::glib::timeout_add_local_once(
+            Duration::from_millis(SWEEP_DEADLINE_MS),
+            move || flag.set(true),
+        );
+        let mut samples = Vec::new();
+        loop {
+            let now = sample(side, key);
+            let done = matches!(now.flow, glib::ControlFlow::Break);
+            samples.push(now);
+            if done || expired.get() {
+                break;
+            }
+            gtk::glib::MainContext::default().iteration(true);
+        }
+        if !expired.get() {
+            deadline.remove();
+        }
+        let last = samples.last().expect("at least one sample");
+        assert!(
+            matches!(last.flow, glib::ControlFlow::Break),
+            "the slide never settled within {SWEEP_DEADLINE_MS} ms: {samples:?}"
+        );
+        samples
+    }
+
+    /// [`sized_panel`] with its revealer mounted in its own toplevel, the slide
+    /// at [`SLIDE_MS`], and the toplevel **mapped** — settled open, the way a
+    /// sidebar sits before the user closes it. Parked in [`PANELS`] for `body`,
+    /// and torn down after it.
+    fn with_mapped_panel(side: Side, key: &str, content_min: i32, body: impl FnOnce()) {
+        if let Some(settings) = gtk::Settings::default() {
+            // GTK's default; set because without it nothing here animates.
+            settings.set_gtk_enable_animations(true);
+        }
+        let parked = sized_panel(side, key, content_min);
+        parked.revealer.set_transition_duration(SLIDE_MS);
+        // Wider than the card, so the revealer is never squeezed: its
+        // allocation is then exactly what it asks for.
+        parked
+            .window
+            .set_default_size(scale(SIDEBAR_WIDTH) + content_min + 200, 300);
+        parked.window.set_child(Some(&parked.revealer));
+        parked.window.present();
+        let window = parked.window.clone();
+        let revealer = parked.revealer.clone();
+        PANELS.with(|panels| {
+            panels.borrow_mut().insert((side, key.to_owned()), parked);
+        });
+        sidebar_open_state(side, key).set(true);
+        settle(2_000, || {
+            window.is_mapped() && revealer.width() > 0 && revealer.is_child_revealed()
+        });
+        assert!(window.is_mapped(), "test setup: the toplevel must map");
+
+        body();
+
+        PANELS.with(|panels| panels.borrow_mut().clear());
+        window.destroy();
+        pump();
+        sidebar_open_state(side, key).set(false);
+    }
+
+    /// What every sample of a slide-**out** must satisfy, whatever started it
+    /// (the user closing it, or its last card leaving).
+    ///
+    /// * The inset is what the card paints on that very frame, floored at the
+    ///   strut, the whole way out — from the first frame, where the card is
+    ///   still fully out, to the last.
+    /// * The frame's tick keeps running until the revealer has collapsed, and
+    ///   its last frame is the one that reads the strut — so the cutout is
+    ///   tracked to the end and nothing is left frozen part-way.
+    /// * At least one frame was caught mid-slide, or none of this says anything.
+    fn assert_tracked_out(side: Side, key: &str, open: i32) {
+        let samples = sweep(side, key);
+        let (last, during) = samples.split_last().expect("sweep returns samples");
+        assert_eq!(
+            samples[0].width, open,
+            "{side:?}: on the first frame of the close the card is still fully out, so the \
+             inset must still be its open width — not the strut: {samples:?}"
+        );
+        for s in during {
+            assert_eq!(
+                s.width,
+                s.painted.max(STRUT),
+                "{side:?}: mid-slide the inset must be what the card still paints \
+                 (the revealer's own width), not the strut and not the open width: {samples:?}"
+            );
+            assert!(
+                !s.settled && matches!(s.flow, glib::ControlFlow::Continue),
+                "{side:?}: the frame's tick must keep running while the card is still \
+                 sliding, or the cutout freezes part-way: {samples:?}"
+            );
+        }
+        assert!(
+            samples
+                .windows(2)
+                .all(|pair| pair[1].width <= pair[0].width),
+            "{side:?}: a closing card only shrinks, and so must the inset: {samples:?}"
+        );
+        assert_eq!(
+            (last.painted, last.width),
+            (0, STRUT),
+            "{side:?}: the tick's last frame is the one the revealer has collapsed on, and \
+             it must draw the plain strut: {samples:?}"
+        );
+        assert!(
+            last.settled,
+            "{side:?}: the frame the tick stops on is settled"
+        );
+        assert!(
+            during.iter().any(|s| s.width > STRUT && s.width < open),
+            "{side:?}: no frame was caught mid-slide, so this asserted nothing: {samples:?}"
+        );
+    }
+
+    /// #1456 item 1, the headline: while a sidebar slides **closed**, the inset
+    /// the frame draws from is the width its card still paints — tracked frame
+    /// by frame, not dropped to the strut the moment the close lands. Both
+    /// sides, since the right is the left's mirror.
+    ///
+    /// **Falsification (run):** restoring the old early filter (a side that is
+    /// not `effective_open` answers `FRAME_THICKNESS_I32` at once) turns this
+    /// red on the first sample, with the card still fully out; answering
+    /// `open_width` (the child, which does not shrink) instead of
+    /// `closing_width` turns it red mid-slide. Settling on `reveals_child()`
+    /// instead of `is_child_revealed()` in `is_settled_for_key`, or making
+    /// `frame::redraw_tick` ask `Side::Left` twice, stops the tick on the first
+    /// frame and turns it red too (the latter on the right side).
+    #[gtk::test]
+    fn a_closing_sidebar_reports_what_its_card_still_paints() {
+        adw::init().expect("libadwaita init");
+        for (side, key) in [(Side::Left, "DP-OUT-L"), (Side::Right, "DP-OUT-R")] {
+            with_mapped_panel(side, key, 0, || {
+                let open = current_visible_width_for_key(side, key);
+                assert!(open > STRUT, "test setup: {side:?} starts open, got {open}");
+                // The two things `wire_open_subscription` does on a close, in
+                // its order: the intent flips, then the revealer is told.
+                sidebar_open_state(side, key).set(false);
+                parked_revealer(side, key).set_reveal_child(false);
+                assert_tracked_out(side, key, open);
+            });
+        }
+    }
+
+    /// …and once the revealer has **settled** closed, the inset is the plain
+    /// strut, and stays there with the tick stopped.
+    ///
+    /// **Falsification (run):** dropping `closing_width`'s strut floor turns
+    /// this red (a collapsed revealer measures 0, and the frame would draw a
+    /// 0 px strut); so does measuring `open_width` there (the open width, over
+    /// a strip nothing paints).
+    #[gtk::test]
+    fn a_closed_sidebar_reports_the_strut_once_its_revealer_settles() {
+        adw::init().expect("libadwaita init");
+        for (side, key) in [(Side::Left, "DP-SHUT-L"), (Side::Right, "DP-SHUT-R")] {
+            with_mapped_panel(side, key, 0, || {
+                sidebar_open_state(side, key).set(false);
+                parked_revealer(side, key).set_reveal_child(false);
+                let samples = sweep(side, key);
+                let last = samples.last().expect("sweep returns samples");
+                assert_eq!(last.width, STRUT, "{side:?}: settled closed is the strut");
+                // A few more turns: nothing moves any more, and the tick would
+                // stay stopped rather than spin redrawing a still cutout.
+                pump_until(200, || false);
+                let after = sample(side, key);
+                assert_eq!(
+                    (after.width, after.painted, after.settled),
+                    (STRUT, 0, true),
+                    "{side:?}: a settled-closed sidebar stays at the strut: {after:?}"
+                );
+                assert!(matches!(after.flow, glib::ControlFlow::Break));
+            });
+        }
+    }
+
+    /// The right sidebar whose last card leaves while it is **open** (#1160's
+    /// latched-open-empty case) is tracked closed like any other slide-out, and
+    /// then — intent still latched `open` — draws against the screen edge: the
+    /// strut, not the 320 px strip it no longer paints, and with the tick
+    /// stopped.
+    ///
+    /// This is the case the old early filter existed for, and the one a
+    /// "keep measuring while the intent says open" fix would bring back. Here
+    /// the intent never changes; only the revealer does.
+    ///
+    /// **Falsification (run):** folding the raw `open_state` in place of
+    /// `effective_open` in `current_visible_width_for_key` turns this red (the
+    /// open width, mid-slide and after it).
+    #[gtk::test]
+    fn an_open_sidebar_that_loses_its_last_card_is_tracked_out_then_draws_the_strut() {
+        adw::init().expect("libadwaita init");
+        let key = "DP-LASTCARD";
+        with_mapped_panel(Side::Right, key, 0, || {
+            let open = current_visible_width_for_key(Side::Right, key);
+            // The card leaves; the intent stays latched open (#1244 finding 1).
+            PANELS.with(|panels| {
+                panels
+                    .borrow()
+                    .get(&(Side::Right, key.to_owned()))
+                    .expect("test setup: the right panel was just parked")
+                    .non_empty
+                    .set(false);
+            });
+            parked_revealer(Side::Right, key).set_reveal_child(false);
+            assert!(
+                sidebar_open_state(Side::Right, key).get(),
+                "test setup: the intent stays open"
+            );
+
+            assert_tracked_out(Side::Right, key, open);
+
+            pump_until(200, || false);
+            let after = sample(Side::Right, key);
+            assert_eq!(
+                (after.width, after.settled),
+                (STRUT, true),
+                "an open-but-empty right sidebar draws the strut, at rest: {after:?}"
+            );
+        });
+    }
+
+    /// The other direction, for the tick: while a sidebar slides **open**, the
+    /// inset is its full open width from the first frame (where niri has
+    /// already put the tiles), and the tick keeps running until the card is
+    /// all the way out.
+    ///
+    /// **Falsification (run):** comparing `reveals_child()` instead of
+    /// `is_child_revealed()` in `is_settled_for_key` (settled as soon as the
+    /// target is set) turns this red: the tick stops on the first frame,
+    /// before the card has moved.
+    #[gtk::test]
+    fn an_opening_sidebar_is_at_its_open_width_and_ticks_until_the_card_is_out() {
+        adw::init().expect("libadwaita init");
+        for (side, key) in [(Side::Left, "DP-IN-L"), (Side::Right, "DP-IN-R")] {
+            with_mapped_panel(side, key, 0, || {
+                let open = current_visible_width_for_key(side, key);
+                // Shut it without a slide, then open it with one.
+                let revealer = parked_revealer(side, key);
+                sidebar_open_state(side, key).set(false);
+                revealer.set_transition_duration(0);
+                revealer.set_reveal_child(false);
+                revealer.set_transition_duration(SLIDE_MS);
+                pump_until(200, || false);
+                assert_eq!(
+                    current_visible_width_for_key(side, key),
+                    STRUT,
+                    "test setup: {side:?} starts shut"
+                );
+
+                sidebar_open_state(side, key).set(true);
+                revealer.set_reveal_child(true);
+                let samples = sweep(side, key);
+                let (last, during) = samples.split_last().expect("sweep returns samples");
+                assert!(
+                    samples.iter().all(|s| s.width == open),
+                    "{side:?}: an opening sidebar's inset is its open width throughout: \
+                     {samples:?}"
+                );
+                assert!(
+                    during
+                        .iter()
+                        .all(|s| !s.settled && matches!(s.flow, glib::ControlFlow::Continue)),
+                    "{side:?}: the tick keeps running while the card slides in: {samples:?}"
+                );
+                assert_eq!(
+                    last.painted, open,
+                    "{side:?}: the tick stops once the card is all the way out: {samples:?}"
+                );
+                assert!(
+                    during.iter().any(|s| s.painted > 0 && s.painted < open),
+                    "{side:?}: no frame was caught mid-slide, so this asserted nothing: \
+                     {samples:?}"
+                );
+            });
+        }
     }
 }

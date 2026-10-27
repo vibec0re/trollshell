@@ -34,9 +34,6 @@
 //!   output — because the shell sends **no** decision for any of them (#1542
 //!   item 5: silence decides nothing, so only a click on **Deny** persists a
 //!   standing no), as well as a wedged or pre-1b host that never shows one.
-//!   For `UNANSWERED_COOLDOWN` after that, the same pair's knocks are
-//!   refused at once, with when to retry, rather than raising a new card — in
-//!   memory only, cleared by a restart or a click on a card for the pair.
 //! - `get <datasource>` requires a valid token, and either an `always` grant
 //!   for `(agent, datasource)` or a token whose own [`TokenScope`] — a session,
 //!   or a single unspent once — names that datasource; anything else is denied
@@ -118,22 +115,6 @@ const MAX_CONCURRENT_READS: usize = 16;
 /// `(agent, datasource)` pair that already has one parked (see
 /// `Session::consent_refusal`).
 const MAX_PENDING_CONSENTS: usize = 8;
-
-/// How long an `(agent, datasource)` pair whose consent card went unanswered
-/// is refused without a new card (#1601 review, MED-2).
-///
-/// Since #1542 item 5 an unanswered card persists nothing, so before this an
-/// agent stuck in a loop — or a prompt-injected one, the threat this broker
-/// exists for — could re-knock the moment its refusal arrived and raise the
-/// same card, with `Always` focused and the keyboard taken, every ~65 s for as
-/// long as nobody answered. Inside this window such a knock is refused at once
-/// with a retryable refusal that says when to retry, and no card is raised.
-///
-/// It lives only in the session's memory (`Session::unanswered`): it is never
-/// written to `grants.toml`, a plugin restart clears it, and a click on any
-/// button of a card for the pair clears it too. A durable `always` grant still
-/// mints silently through it, since grants are decided before a knock parks.
-const UNANSWERED_COOLDOWN: std::time::Duration = std::time::Duration::from_mins(5);
 
 /// How long the broker holds a **parked** consent request before giving up and
 /// timing it out (#487 phase 1b).
@@ -2008,11 +1989,6 @@ struct Session {
     /// `Cmd::QueryResult` (or the query deadline elapses).
     pending_queries: HashMap<u64, PendingQuery>,
     next_request_id: u64,
-    /// `(agent, datasource)` pairs whose last card went unanswered, each
-    /// mapped to when its [`UNANSWERED_COOLDOWN`] ends. Memory only — see the
-    /// constant. Expired entries are pruned whenever one is added, so it holds
-    /// at most the pairs that went unanswered in the last few minutes.
-    unanswered: HashMap<(String, String), tokio::time::Instant>,
 }
 
 impl Session {
@@ -2023,19 +1999,7 @@ impl Session {
             pending: HashMap::new(),
             pending_queries: HashMap::new(),
             next_request_id: 1,
-            unanswered: HashMap::new(),
         }
-    }
-
-    /// Start `(agent, datasource)`'s [`UNANSWERED_COOLDOWN`]: its card ended
-    /// with nobody answering it.
-    fn note_unanswered(&mut self, agent: &str, datasource: &str) {
-        let now = tokio::time::Instant::now();
-        self.unanswered.retain(|_, until| *until > now);
-        self.unanswered.insert(
-            (agent.to_owned(), datasource.to_owned()),
-            now + UNANSWERED_COOLDOWN,
-        );
     }
 
     /// Push a fresh panel snapshot (+ optional toast) to the plugin.
@@ -2077,14 +2041,9 @@ impl Session {
                     {
                         // An older shell's own timeout, not a click: answer
                         // it as the silence it is (#1601 review, LOW-3).
-                        self.note_unanswered(&p.agent, &p.datasource);
                         self.state
                             .on_consent_timeout(&p.agent, &p.datasource, now_unix())
                     } else {
-                        // A click, so the human is there: whatever this pair's
-                        // last card went through, it is answered now.
-                        self.unanswered
-                            .remove(&(p.agent.clone(), p.datasource.clone()));
                         self.state
                             .apply_consent(&p.agent, &p.datasource, decision, now_unix())
                     };
@@ -2187,18 +2146,7 @@ impl Session {
     /// second.) And past [`MAX_PENDING_CONSENTS`] parked knocks
     /// any knock is refused, which bounds the open sockets a stream of knocks
     /// under fresh agent names can park.
-    ///
-    /// A third, for a pair whose last card went unanswered less than
-    /// [`UNANSWERED_COOLDOWN`] ago, is refused the same way — retryable,
-    /// unaudited, nothing persisted, no card — with when to retry (#1601
-    /// review, MED-2).
     fn consent_refusal(&self, agent: &str, datasource: &str) -> Option<Response> {
-        let now = tokio::time::Instant::now();
-        let cooling = self
-            .unanswered
-            .get(&(agent.to_owned(), datasource.to_owned()))
-            .and_then(|until| until.checked_duration_since(now))
-            .filter(|left| !left.is_zero());
         if self
             .pending
             .values()
@@ -2208,16 +2156,6 @@ impl Session {
                 "auth: a consent prompt for agent '{agent}' on '{datasource}' is already \
                  waiting on the human; retry once it is answered"
             )))
-        } else if let Some(left) = cooling {
-            // Rounded up, so "retry in N s" is never early.
-            let secs = left.as_secs() + u64::from(left.subsec_nanos() > 0);
-            Some(Response::denied(
-                format!(
-                    "auth: the last consent prompt for agent '{agent}' on '{datasource}' \
-                     went unanswered recently; not asking the human again for {secs} s"
-                ),
-                format!("retry in {secs} s, or {}", grant_hint(agent, datasource)),
-            ))
         } else if self.pending.len() >= MAX_PENDING_CONSENTS {
             Some(Response::error(format!(
                 "auth: {MAX_PENDING_CONSENTS} consent prompts are already waiting on the \
@@ -2241,7 +2179,6 @@ impl Session {
             .collect();
         for id in expired {
             if let Some(mut p) = self.pending.remove(&id) {
-                self.note_unanswered(&p.agent, &p.datasource);
                 let (resp, toast) =
                     self.state
                         .on_consent_timeout(&p.agent, &p.datasource, now_unix());
@@ -4314,10 +4251,8 @@ mod tests {
         );
         assert!(session.pending.is_empty(), "the knock is answered and gone");
 
-        // Retryable: once the pair's cooldown is over (cut short here; see
-        // the MED-2 tests below), the agent's next knock goes back to the
-        // human rather than meeting a standing no.
-        cooldown_passes(&mut session);
+        // Retryable: the agent's next knock goes back to the human rather
+        // than meeting a standing no.
         let (_again, prompt) = park_knock(&mut session, &mut out_rx, "claude").await;
         assert_eq!(
             (prompt.agent.as_str(), prompt.datasource.as_str()),
@@ -4457,172 +4392,6 @@ mod tests {
                 assert!(error.contains("timed out"), "{parked_secs} s: {error}");
                 assert_eq!(persisted, None, "{parked_secs} s: nothing persisted");
             }
-        }
-    }
-
-    // ── #1601 review, MED-2: the in-memory cooldown after an unanswered card ──
-
-    /// End every pair's [`UNANSWERED_COOLDOWN`] now, as if it had run out.
-    fn cooldown_passes(session: &mut Session) {
-        let now = tokio::time::Instant::now();
-        for until in session.unanswered.values_mut() {
-            *until = now;
-        }
-    }
-
-    /// Send an `auth` knock from `agent` (no datasource, so `departures`) that
-    /// the session answers at once rather than parking, and hand back the
-    /// reply.
-    async fn knock_answered_at_once(session: &mut Session, agent: &str) -> Response {
-        let (server, mut client) = UnixStream::pair().expect("a connected socketpair");
-        session
-            .on_request(
-                server,
-                Request::Auth {
-                    agent: agent.to_owned(),
-                    datasource: None,
-                },
-            )
-            .await;
-        reply_on(&mut client).await
-    }
-
-    /// Park a knock from `claude` for `departures` and let its card go
-    /// unanswered: the park deadline answers it.
-    async fn leave_unanswered(session: &mut Session, out: &mut mpsc::UnboundedReceiver<BrokerMsg>) {
-        let (mut agent, _prompt) = park_knock(session, out, "claude").await;
-        park_deadline_passes(session).await;
-        let reply = reply_on(&mut agent).await;
-        assert!(
-            reply
-                .error
-                .as_deref()
-                .is_some_and(|e| e.contains("timed out")),
-            "sanity: the card went unanswered: {reply:?}"
-        );
-    }
-
-    /// Inside the cooldown the same pair gets no card: its knock is refused
-    /// at once with a refusal that says it went unanswered and when to retry,
-    /// nothing is parked, and nothing is persisted.
-    ///
-    /// Falsification: drop the cooldown arm from `consent_refusal` and this
-    /// reds — the knock parks and raises a second card.
-    #[tokio::test]
-    async fn inside_the_cooldown_an_unanswered_pair_gets_no_card() {
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-        let mut session = Session::new(BrokerState::new(store(Vec::new())), out_tx);
-        leave_unanswered(&mut session, &mut out_rx).await;
-        let _ = queued_prompts(&mut out_rx);
-
-        let reply = knock_answered_at_once(&mut session, "claude").await;
-
-        assert!(!reply.ok, "{reply:?}");
-        let error = reply.error.unwrap_or_default();
-        assert!(error.contains("went unanswered recently"), "{error}");
-        assert!(error.contains("not asking the human again for"), "{error}");
-        assert!(
-            reply.hint.unwrap_or_default().starts_with("retry in "),
-            "the refusal says when to retry"
-        );
-        assert!(
-            queued_prompts(&mut out_rx).is_empty(),
-            "no second card inside the cooldown"
-        );
-        assert!(session.pending.is_empty(), "nothing parked");
-        assert_eq!(
-            session.state.grants.decision_for("claude", "departures"),
-            None,
-            "the cooldown is never persisted"
-        );
-    }
-
-    /// After the cooldown the card appears again.
-    ///
-    /// Falsification: make `consent_refusal` refuse whenever the pair has an
-    /// entry, ignoring when it ends, and this reds — no card ever comes back
-    /// for the rest of the session.
-    #[tokio::test]
-    async fn after_the_cooldown_the_card_appears_again() {
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-        let mut session = Session::new(BrokerState::new(store(Vec::new())), out_tx);
-        leave_unanswered(&mut session, &mut out_rx).await;
-        let _ = queued_prompts(&mut out_rx);
-
-        cooldown_passes(&mut session);
-        let (_again, prompt) = park_knock(&mut session, &mut out_rx, "claude").await;
-
-        assert_eq!(
-            (prompt.agent.as_str(), prompt.datasource.as_str()),
-            ("claude", "departures")
-        );
-    }
-
-    /// The cooldown holds only the pair whose card went unanswered: the same
-    /// agent asking for another datasource, and another agent asking for the
-    /// same one, are each put to the human as usual.
-    ///
-    /// Falsification: key the cooldown by agent alone and the first knock
-    /// below reds; by datasource alone and the second does.
-    #[tokio::test]
-    async fn the_cooldown_holds_only_its_own_pair() {
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-        let mut session = Session::new(BrokerState::new(store(Vec::new())), out_tx);
-        leave_unanswered(&mut session, &mut out_rx).await;
-        let _ = queued_prompts(&mut out_rx);
-
-        let (server, _weather) = UnixStream::pair().expect("a connected socketpair");
-        session
-            .on_request(
-                server,
-                Request::Auth {
-                    agent: "claude".to_owned(),
-                    datasource: Some("weather".to_owned()),
-                },
-            )
-            .await;
-        let prompt = next_prompt(&mut out_rx).await;
-        assert_eq!(
-            (prompt.agent.as_str(), prompt.datasource.as_str()),
-            ("claude", "weather")
-        );
-
-        let (_other, prompt) = park_knock(&mut session, &mut out_rx, "codex").await;
-        assert_eq!(
-            (prompt.agent.as_str(), prompt.datasource.as_str()),
-            ("codex", "departures")
-        );
-    }
-
-    /// A click on a card for the pair — allow or deny — ends its cooldown: the
-    /// human was there. Set up by hand, since a pair in its cooldown gets no
-    /// card to click; what this pins is that `on_cmd`'s click arm clears the
-    /// entry rather than leaving it to refuse the pair's next knock.
-    ///
-    /// Falsification: drop the `unanswered.remove` from `on_cmd`'s click arm
-    /// and this reds.
-    #[tokio::test]
-    async fn a_click_for_the_pair_ends_its_cooldown() {
-        for decision in [ConsentDecision::AllowOnce, ConsentDecision::Deny] {
-            let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-            let mut session = Session::new(BrokerState::new(store(Vec::new())), out_tx);
-            let (mut agent, prompt) = park_knock(&mut session, &mut out_rx, "claude").await;
-            session.note_unanswered("claude", "departures");
-
-            session
-                .on_cmd(Cmd::Decision {
-                    request_id: prompt.request_id,
-                    decision,
-                })
-                .await;
-            let _ = reply_on(&mut agent).await;
-
-            assert!(
-                !session
-                    .unanswered
-                    .contains_key(&("claude".to_owned(), "departures".to_owned())),
-                "{decision:?} is a click and ends the cooldown"
-            );
         }
     }
 }

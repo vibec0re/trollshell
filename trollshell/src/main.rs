@@ -1167,9 +1167,9 @@ mod group_tests {
         });
         pump();
         assert!(glyph.get_visible(), "the glyph is on");
-        assert!(container.get_visible(), "the tray shows");
-        assert!(g.get_visible(), "and so does its group");
+        assert!(g.get_visible(), "the tray's group shows");
         assert!(width(&bar) > 46, "taking room in the bar");
+        assert!(container.get_visible(), "because the tray shows");
 
         state.set(OwnState::Owned);
         pump();

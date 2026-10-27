@@ -407,28 +407,22 @@ fn read_nvidia_gpu() -> Result<GpuState, NvidiaFailure> {
 }
 
 /// How long a successful Nvidia reading stays valid before
-/// `read_nvidia_with_cache_at` forks `nvidia-smi` again.
+/// `read_nvidia_with_cache_at` forks `nvidia-smi` again: **2 s**.
 ///
-/// The samplers that drive [`read_gpu_with_cache`] tick at 1 Hz (#1249), so
-/// this is picked against that tick, not against how fast the GPU's own
-/// numbers actually move:
+/// The samplers that drive [`read_gpu_with_cache`] tick at 1 Hz (#1249), and
+/// `nvidia-smi` is a fork plus an NVML init, routinely 100-300 ms of CPU and
+/// a wake of the GPU driver. 2 s is the approved cadence (#1542, item 7): a
+/// healthy Nvidia GPU forks at most once every 2 s, not once per tick.
 ///
-/// - It must be **under one tick** (1000 ms): a TTL at or above the tick
-///   period would mean some ticks return the fork's normal cost while the
-///   next tick's answer is silently the same age. Staying under the tick
-///   means the constraint holds continuously, not "on average".
-/// - It must be **long enough to matter**: several concurrent callers on the
-///   same tick (a fresh cache handed to more than one poller in the same
-///   process, or two ticks that land within the same wall-clock window) all
-///   land on the one cached reading instead of each forking their own.
+/// This **deliberately gives up** the old "never serve a previous tick's
+/// reading" contract (500 ms, #1297). A reading up to 2 s old may be served,
+/// so on a 1 Hz tick the GPU line updates about every other tick. The bound
+/// is strict: a call exactly [`NVIDIA_READING_TTL`] after the reading forks
+/// again, and a call just inside it is served the cached one.
 ///
-/// 500 ms sits at half a tick — one `nvidia-smi` fork is guaranteed every
-/// tick (the cache can never coast for two consecutive 1 Hz ticks), while
-/// still collapsing any callers that land within the same half-second to
-/// that one fork. This is the issue's own suggestion (#1297); a shorter TTL
-/// buys nothing further since the tick, not the TTL, is now the fork rate's
-/// floor, and a longer one risks a 1 Hz sampler occasionally showing a
-/// reading from the *previous* tick.
+/// It still collapses several callers that land inside the same window (a
+/// fresh cache handed to more than one poller in the same process) onto the
+/// one cached reading.
 ///
 /// This bounds forks **within one process sharing one cache value** — three
 /// processes (the native sensors service, a bar `hytte-plugin-stats`
@@ -436,7 +430,7 @@ fn read_nvidia_gpu() -> Result<GpuState, NvidiaFailure> {
 /// and still fork independently. Collapsing that is #1252 (retire the native
 /// sampler) plus the sidebar instance's own parking, which already stops a
 /// closed sidebar from polling at all.
-pub const NVIDIA_READING_TTL: Duration = Duration::from_millis(500);
+pub const NVIDIA_READING_TTL: Duration = Duration::from_secs(2);
 
 /// Per-tick GPU cache state threaded through the poll loop.
 ///
@@ -465,9 +459,8 @@ pub struct GpuCache {
     /// The last successful Nvidia reading and the instant its fork was
     /// *started* (not when `nvidia-smi` returned — a cold CUDA/NVML init is
     /// routinely 100-300 ms, so a reading served at just under the TTL can
-    /// be measurably older in wall-clock terms; harmless at today's
-    /// cadences, since nothing calls this arm more than once a tick, but
-    /// worth knowing if the TTL is ever raised).
+    /// be measurably older in wall-clock terms than the TTL says; at the 2 s
+    /// TTL that is up to a few hundred ms on top of it).
     ///
     /// `None` until the first successful `nvidia-smi` fork, and reset to
     /// `None` whenever a fork fails (mirrors `nvidia_available` flipping to
@@ -804,7 +797,7 @@ mod tests {
         // Several more calls, at different instants strictly inside the TTL
         // window, must all be served the cached reading with no further fork.
         for step in 1..=5u64 {
-            let now = t0 + Duration::from_millis(step * 80); // up to 400ms, under the 500ms TTL
+            let now = t0 + Duration::from_millis(step * 80); // up to 400ms, well under the 2s TTL
             let (state, _) = read_nvidia_with_cache_at(cache.clone(), now, || {
                 fork_count.set(fork_count.get() + 1);
                 Ok(fake_reading("should not be forked"))
@@ -820,6 +813,40 @@ mod tests {
                 "call {step} inside the TTL must return the cached reading, not a fresh one"
             );
         }
+    }
+
+    /// The value is a product decision (#1542, item 7), so it is pinned as a
+    /// literal rather than through the constant: changing it must change this.
+    #[test]
+    fn nvidia_reading_ttl_is_two_seconds() {
+        assert_eq!(NVIDIA_READING_TTL, Duration::from_secs(2));
+    }
+
+    /// At 1.5 s the reading is served without forking; at 2 s it forks.
+    #[test]
+    fn nvidia_reading_is_served_at_1500ms_and_refreshed_at_2s() {
+        let fork_count = Cell::new(0u32);
+        let t0 = Instant::now();
+        let (_, cache) = read_nvidia_with_cache_at(GpuCache::default(), t0, || {
+            fork_count.set(fork_count.get() + 1);
+            Ok(fake_reading("first"))
+        });
+        assert_eq!(fork_count.get(), 1);
+
+        let (state, cache) =
+            read_nvidia_with_cache_at(cache, t0 + Duration::from_millis(1500), || {
+                fork_count.set(fork_count.get() + 1);
+                Ok(fake_reading("should not be forked"))
+            });
+        assert_eq!(fork_count.get(), 1, "1.5 s old must be served from cache");
+        assert_eq!(state.as_ref().map(|s| s.name.as_str()), Some("first"));
+
+        let (state, _) = read_nvidia_with_cache_at(cache, t0 + Duration::from_secs(2), || {
+            fork_count.set(fork_count.get() + 1);
+            Ok(fake_reading("second"))
+        });
+        assert_eq!(fork_count.get(), 2, "2 s after the reading must fork");
+        assert_eq!(state.as_ref().map(|s| s.name.as_str()), Some("second"));
     }
 
     #[test]
@@ -1064,7 +1091,7 @@ mod tests {
         });
 
         for step in 1..=5u64 {
-            let now = t0 + Duration::from_millis(step * 80); // up to 400ms, under the 500ms TTL
+            let now = t0 + Duration::from_millis(step * 80); // up to 400ms, well under the 2s TTL
             let (state, next) = read_nvidia_with_cache_at(cache, now, || {
                 fork_count.set(fork_count.get() + 1);
                 Ok(fake_reading("should not be forked"))

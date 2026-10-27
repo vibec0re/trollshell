@@ -1062,10 +1062,10 @@ fn rate_limit_allow(app_name: &str, summary: &str, body: &str) -> bool {
 /// swept Wi-Fi/VPN error arms all pass `Critical`.
 ///
 /// Here `Critical` only bypasses those gates: a self-toast still expires after
-/// [`DEFAULT_TIMEOUT`] at every urgency. That differs from a D-Bus client's
-/// `Critical` notification with `expire_timeout = -1`, which
-/// [`resolve_timeout`] keeps on screen until dismissed (#1542). The shell's
-/// own error toasts were not part of that decision, so they keep expiring.
+/// the 5 s server default at every urgency. That differs from a D-Bus client's
+/// `Critical` notification with `expire_timeout = -1`, which the `Notify`
+/// handler keeps on screen until dismissed (#1542). The shell's own error
+/// toasts were not part of that decision, so they keep expiring.
 ///
 /// # Rate-limiting
 ///

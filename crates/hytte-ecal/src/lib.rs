@@ -4237,6 +4237,38 @@ mod tests {
         assert_eq!(super::local_offsets(0, |_| None), Gap);
     }
 
+    /// `local_offsets` has to sample far enough out to straddle every instant
+    /// a wall clock can name, i.e. past the zone's own UTC offset. Berlin and
+    /// New York (at most 5 h from UTC) still pass with samples 6 h out;
+    /// Auckland's fold (+13:00 → +12:00) does not, so this pins
+    /// `LOCAL_OFFSET_SAMPLE_SECS` (the #1594 review measured 6 h and 12 h
+    /// both leaving every other test here green).
+    #[test]
+    fn local_offsets_sees_both_offsets_of_a_far_east_fold() {
+        use chrono::LocalResult::{Ambiguous, None as Gap, Single};
+
+        // `Pacific/Auckland` in 2026: NZDT (+13:00), except NZST (+12:00)
+        // from 2026-04-04T14:00Z to 2026-09-26T14:00Z. So local 2026-04-05
+        // 02:00–02:59 happens twice and local 2026-09-27 02:00–02:59 never.
+        let auckland = TwoOffsetZone {
+            base: 46_800,
+            shifted: 43_200,
+            from: utc(2026, 4, 4, 14, 0),
+            until: utc(2026, 9, 26, 14, 0),
+            closed_folds: false,
+        };
+        for (w, want) in [
+            (wall(2026, 4, 5, 2, 30), Ambiguous(46_800, 43_200)),
+            (wall(2026, 4, 5, 3, 0), Single(43_200)),
+            (wall(2026, 9, 27, 2, 30), Gap),
+        ] {
+            let got = super::local_offsets(naive_of(w).and_utc().timestamp(), |unix| {
+                Some(auckland.offset_at(unix))
+            });
+            assert_eq!(got, want, "{w:?}");
+        }
+    }
+
     /// A `VTIMEZONE` whose offset chrono cannot hold (+25:00, which only a
     /// malformed one can spell) leaves the rule no instant. The event then
     /// keeps libical's own answer, as before #1590, rather than being dropped

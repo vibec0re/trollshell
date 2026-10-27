@@ -530,10 +530,12 @@ in
             PartOf = [ cfg.systemd.target ];
             After = [ cfg.systemd.target ];
             Requisite = [ cfg.systemd.target ];
-            # No start limit (#1542): RestartSec=2 would otherwise trip the default
-            # 5-in-10 s burst on a crash loop (niri socket not up yet) and leave
-            # the session with no bar. A shell that crashes forever restarts every
-            # 2 s; that is the accepted cost.
+            # No start limit (#1542). systemd's default is 5 starts per 10 s. A
+            # crash loop alone never reaches it (RestartSec=2 keeps the 6th
+            # start outside the window), but back-to-back start requests do: a
+            # niri reload, a restart keybind or a script restarting the unit
+            # leave `start-limit-hit` and the session with no bar. A shell that
+            # crashes forever restarts every 2 s; that is the accepted cost.
             StartLimitIntervalSec = 0;
           };
           Service = {

@@ -465,13 +465,17 @@
               # A `#[cfg(feature = "system-tests")]` item can be the only user
               # of a helper, so the feature-off build hits a dead-code error CI
               # never saw (#1541, #1486). crane's cargoClippy builds one
-              # command line from `cargoClippyExtraArgs`, so the second pass is
-              # chained on with `&&` rather than added as a second check name
+              # command line from `cargoClippyExtraArgs`, so pass 2 is a
+              # `postBuild` command of its own rather than a second check name
               # (the workflow's layout guard diffs check names against jobs).
-              cargoClippyExtraArgs =
-                "--all-targets --features system-tests -- -D warnings"
-                + " && cargoWithProfile clippy ${trollshell.passthru.commonArgs.cargoExtraArgs}"
-                + " --all-targets -- -D warnings";
+              # Not chained with `&&`: stdenv runs phases under `set -e`, which
+              # ignores a failure on the left of `&&`, so a failing pass 1 would
+              # go green. `commonArgs` sets no `postBuild`, so nothing is
+              # clobbered.
+              cargoClippyExtraArgs = "--all-targets --features system-tests -- -D warnings";
+              postBuild = ''
+                cargoWithProfile clippy ${trollshell.passthru.commonArgs.cargoExtraArgs} --all-targets -- -D warnings
+              '';
               # This is a leaf/terminal check — nothing chains off its target
               # dir as `cargoArtifacts` — so don't pack it. crane defaults
               # `doInstallCargoArtifacts = true`, which would tar the whole
@@ -1118,14 +1122,14 @@
                 builtins.unsafeDiscardStringContext cfg.xdg.configFile."trollshell/plugins.json".text
               );
               probe =
+                # #1542: the extras bundle starts the swaybg unit under the
+                # default backend (the NixOS side is pinned in `nixos-module`).
+                assert units ? swaybg;
                 # plugins (#419): entries render to the launch-state file, not
                 # static units; enable = false is *declared disabled* (listed,
                 # not auto-launched) rather than filtered out; and the demo
                 # entry's env still merges per-field across the two modules
                 # above (#355).
-                # #1542: swaybg follows enableSessionExtras (on in this fixture;
-                # nixos-module-nightlight below has it off and asserts absence).
-                assert units ? swaybg;
                 assert !(units ? trollshell-plugin-demo);
                 assert !(units ? trollshell-plugin-off);
                 assert pluginsState.plugins.demo.exec == pkgs.lib.getExe stubPlugin;
@@ -1740,6 +1744,31 @@
               pluginsState = builtins.fromJSON (
                 builtins.unsafeDiscardStringContext cfg.environment.etc."xdg/trollshell/plugins.json".text
               );
+              # Whether a NixOS config with `extra` merged in gets the swaybg
+              # unit (#1542). Each call is a full module eval, so only the
+              # cases that pin a branch of nix/nixos-module.nix's gating are
+              # listed in the probe below.
+              swaybgFor =
+                extra:
+                (nixpkgs.lib.nixosSystem {
+                  inherit system;
+                  modules = [
+                    self.nixosModules.default
+                    {
+                      programs.trollshell = {
+                        enable = true;
+                        package = stubPackage;
+                      };
+                      boot.loader.grub.enable = false;
+                      fileSystems."/" = {
+                        device = "/dev/sda1";
+                        fsType = "ext4";
+                      };
+                      system.stateVersion = "24.11";
+                    }
+                    { programs.trollshell = extra; }
+                  ];
+                }).config.systemd.user.services ? swaybg;
               probe =
                 # plugins (#419): entries render to the launch-state file, not
                 # static units; enable = false is *declared disabled* (listed,
@@ -1753,6 +1782,29 @@
                 assert pluginsState.plugins.demo.env.DEMO_TOKEN == "hunter2";
                 assert pluginsState.plugins.demo.env.DEMO_EXTRA == "1";
                 assert !pluginsState.plugins.off.enabled;
+                # #1542: swaybg follows enableSessionExtras and swaybg.enable.
+                # This fixture has the extras on.
+                assert units ? swaybg;
+                # swaybg.enable alone runs the unit without the bundle.
+                assert swaybgFor { swaybg.enable = true; };
+                # Extras with another daemon (awww, or a hand-set
+                # reloadCommand) must not start swaybg next to it.
+                assert
+                  !(swaybgFor {
+                    enableSessionExtras = true;
+                    wallpaper.backend = "awww";
+                  });
+                assert
+                  !(swaybgFor {
+                    enableSessionExtras = true;
+                    wallpaper.reloadCommand = "x {}";
+                  });
+                # An explicit swaybg.enable = false beats the extras' mkDefault.
+                assert
+                  !(swaybgFor {
+                    enableSessionExtras = true;
+                    swaybg.enable = false;
+                  });
                 builtins.deepSeq {
                   userUnits = builtins.attrNames units;
                   swaybgExec = units.swaybg.serviceConfig.ExecStart;

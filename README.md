@@ -130,7 +130,11 @@ programs.trollshell.wallpaper.backend = "swaybg";  # the default — today's beh
 ```
 
 - **`swaybg`** (default): the bundled `swaybg` unit; the picker restarts it. No
-  reload command needed.
+  reload command needed. The unit exists only with
+  `programs.trollshell.enableSessionExtras = true` (or
+  `programs.trollshell.swaybg.enable = true`), on NixOS and home-manager alike;
+  without either, the picker has nothing to restart. If you run another daemon
+  (awww), set `backend` to match it, not `enableSessionExtras`.
 - **`awww`**: the swww successor (upstream renamed swww → awww at 0.12; swww
   itself is deprecated). Sets `wallpaper.reloadCommand` to `awww img {}`. The
   daemon is run by home-manager's `services.awww`; the NixOS module only exports
@@ -148,8 +152,8 @@ default; a `{}` in it is replaced with the chosen path (shell-quoted, **not** a
 programs.trollshell.wallpaper.reloadCommand = "awww img {}";
 ```
 
-The legacy home-manager `programs.trollshell.swaybg.enable` still works as a
-standalone swaybg toggle (gently deprecated in favor of `backend = "swaybg"`).
+`programs.trollshell.swaybg.enable` (NixOS and home-manager) runs the swaybg
+unit on its own, without the rest of `enableSessionExtras`.
 
 ## Repo layout
 

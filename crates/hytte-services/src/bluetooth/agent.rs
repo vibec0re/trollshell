@@ -19,7 +19,7 @@
 //! agent + anchor name both on the system bus.
 
 use super::shared_state;
-use super::trust::{self, DeviceBus};
+use super::trust::{self, DeviceBus, Pairings};
 use super::types::{AgentReply, PairPrompt, PromptKind};
 use crate::retry;
 use futures_signals::signal::Mutable;
@@ -58,26 +58,31 @@ pub(super) struct PairAgent {
     caller: hytte_bus::CallerCheck,
     pending: Arc<ReplySlot>,
     banner: Mutable<Option<PairPrompt>>,
-    /// Where an accepted pairing marks its device `Trusted`
-    /// ([`trust::trust_on_accept`]): the system bus in production, a
+    /// Where an accepted pairing's device is marked `Trusted` once it has
+    /// paired ([`trust::accepted`]): the system bus in production, a
     /// recorder in the tests.
     devices: Arc<dyn DeviceBus>,
+    /// The devices being paired, shared with `pair_device`. Their
+    /// `AuthorizeService` requests are let through without a prompt.
+    pairings: Pairings,
 }
 
 impl PairAgent {
     /// An agent answering only bluetoothd, raising its prompts on `banner`,
-    /// waiting for answers in `pending`, and trusting the device of an
-    /// accepted pairing through `devices`.
+    /// waiting for answers in `pending`, tracking pairings in `pairings`, and
+    /// trusting a paired device through `devices`.
     pub(super) fn new(
         pending: Arc<ReplySlot>,
         banner: Mutable<Option<PairPrompt>>,
         devices: Arc<dyn DeviceBus>,
+        pairings: Pairings,
     ) -> Self {
         Self {
             caller: hytte_bus::caller_check(BLUEZ_BUS_NAME),
             pending,
             banner,
             devices,
+            pairings,
         }
     }
 
@@ -119,21 +124,21 @@ impl PairAgent {
         await_reply_in(&self.pending, &self.banner, prompt).await
     }
 
-    /// Pass a pairing prompt's `result` through, first marking `device`
-    /// `Trusted` if the user accepted ([`trust::trust_on_accept`]).
+    /// Pass a pairing prompt's `result` through, first putting `device` in
+    /// progress if the user accepted ([`trust::accepted`]).
     ///
-    /// The trust is set before bluetoothd gets the reply, so the services the
-    /// device opens once it is paired are not asked about: bluetoothd runs
-    /// its queued authorizations as soon as the pairing's services resolve,
-    /// sooner than a `Set` made after the pairing could land. A rejected
-    /// prompt sets nothing.
-    async fn trusted_if_accepted<T>(
+    /// It goes in before bluetoothd gets the reply: bluetoothd sends the
+    /// service requests it queued during the pairing as soon as the pairing's
+    /// services resolve, and those must find the device in progress. Nothing
+    /// is set in bluetoothd until the device has paired. A rejected prompt
+    /// never enters the set.
+    fn in_progress_if_accepted<T>(
         &self,
         device: &OwnedObjectPath,
         result: Result<T, AgentError>,
     ) -> Result<T, AgentError> {
         if result.is_ok() {
-            trust::trust_on_accept(&self.devices, device.as_str()).await;
+            trust::accepted(&self.devices, &self.pairings, device.as_str());
         }
         result
     }
@@ -147,7 +152,7 @@ impl PairAgent {
             AgentReply::Pin(s) => Ok(s),
             _ => Err(AgentError::Rejected("user did not provide PIN".into())),
         };
-        self.trusted_if_accepted(device, result).await
+        self.in_progress_if_accepted(device, result)
     }
 
     /// `RequestPasskey` once the caller is admitted.
@@ -159,7 +164,7 @@ impl PairAgent {
             AgentReply::Passkey(p) => Ok(p),
             _ => Err(AgentError::Rejected("user did not provide passkey".into())),
         };
-        self.trusted_if_accepted(device, result).await
+        self.in_progress_if_accepted(device, result)
     }
 
     /// `RequestConfirmation` once the caller is admitted.
@@ -176,7 +181,7 @@ impl PairAgent {
             ))
             .await;
         let result = allow_or_reject(&reply, "user rejected pairing");
-        self.trusted_if_accepted(device, result).await
+        self.in_progress_if_accepted(device, result)
     }
 
     /// `RequestAuthorization` once the caller is admitted.
@@ -185,7 +190,7 @@ impl PairAgent {
             .ask(new_prompt(device, None, PromptKind::Authorize))
             .await;
         let result = allow_or_reject(&reply, "user rejected pairing");
-        self.trusted_if_accepted(device, result).await
+        self.in_progress_if_accepted(device, result)
     }
 
     /// `AuthorizeService` once the caller is admitted: ask the user whether
@@ -194,12 +199,13 @@ impl PairAgent {
     /// bluetoothd calls this only for a device that is **not** `Trusted`. Its
     /// authorization queue (`process_auth_queue` in `src/adapter.c`, `BlueZ`
     /// 5.87) accepts a trusted device's request itself and never reaches the
-    /// agent. A device the user pairs, from either side, is made trusted
-    /// ([`trust`]), so this is a device someone deliberately left untrusted
-    /// (or one never paired) asking to use audio, input or networking. It
-    /// used to be accepted without asking, on the reasoning that the requests
-    /// come from trusted devices, which is exactly the case bluetoothd never
-    /// sends.
+    /// agent. A device the user pairs, from either side, is made trusted once
+    /// it has paired, and while it is being paired its requests are let
+    /// through here without a prompt ([`trust`]). So what asks is a device
+    /// someone deliberately left untrusted (or one never paired) wanting
+    /// audio, input or networking. It used to be accepted without asking, on
+    /// the reasoning that the requests come from trusted devices, which is
+    /// exactly the case bluetoothd never sends.
     ///
     /// Allow answers `Ok`. Deny, a `Cancel` (including bluetoothd's own after
     /// its 60 s `REQUEST_TIMEOUT`, `src/agent.c`) and a second request while
@@ -210,6 +216,15 @@ impl PairAgent {
         device: &OwnedObjectPath,
         uuid: &str,
     ) -> Result<(), AgentError> {
+        if self.pairings.contains(device.as_str()) {
+            tracing::info!(
+                device = %device.as_str(),
+                uuid,
+                "bluetooth agent: a device being paired asks to use a service; allowed, \
+                 since the user started or accepted its pairing"
+            );
+            return Ok(());
+        }
         let prompt = PairPrompt {
             service: Some(service_label(uuid)),
             ..new_prompt(device, None, PromptKind::AuthorizeService)
@@ -1227,9 +1242,11 @@ mod authorize_service_tests {
         allow_or_reject, answer_in, cancel_in, service_label, service_name,
     };
     use crate::bluetooth::trust::fake::{Call, FakeBus};
+    use crate::bluetooth::trust::{PAIRING_WINDOW, Pairings, Shown};
     use futures_signals::signal::Mutable;
     use futures_util::FutureExt;
     use std::sync::Arc;
+    use std::time::Duration;
     use tokio::sync::Mutex as AsyncMutex;
     use zbus::zvariant::OwnedObjectPath;
 
@@ -1244,18 +1261,26 @@ mod authorize_service_tests {
         pending: Arc<ReplySlot>,
         banner: Mutable<Option<PairPrompt>>,
         devices: Arc<FakeBus>,
+        pairings: Pairings,
     }
 
     fn fixture() -> Fixture {
         let pending: Arc<ReplySlot> = Arc::new(AsyncMutex::new(None));
         let banner = Mutable::new(None);
         let devices = Arc::new(FakeBus::new());
-        let agent = PairAgent::new(pending.clone(), banner.clone(), devices.clone());
+        let pairings = Pairings::default();
+        let agent = PairAgent::new(
+            pending.clone(),
+            banner.clone(),
+            devices.clone(),
+            pairings.clone(),
+        );
         Fixture {
             agent,
             pending,
             banner,
             devices,
+            pairings,
         }
     }
 
@@ -1352,9 +1377,9 @@ mod authorize_service_tests {
     }
 
     /// Drive one pairing prompt of `kind` on a fresh agent, answer it with
-    /// `accept`, and return whether bluetoothd got `Ok` and every device-bus
-    /// call made by the time it did.
-    async fn answer_pairing(kind: PromptKind, accept: bool) -> (bool, Vec<Call>) {
+    /// `accept`, and return whether bluetoothd got `Ok`, every device-bus call
+    /// made by the time it did, and whether the device was in progress then.
+    async fn answer_pairing(kind: PromptKind, accept: bool) -> (bool, Vec<Call>, bool) {
         let f = fixture();
         let device = device();
         let mut asking: std::pin::Pin<Box<dyn std::future::Future<Output = bool> + '_>> = match kind
@@ -1384,7 +1409,7 @@ mod authorize_service_tests {
         };
         answer_in(&f.pending, shown.id, reply).await;
         let ok = asking.await;
-        (ok, f.devices.calls())
+        (ok, f.devices.calls(), f.pairings.contains(device.as_str()))
     }
 
     const PAIRING_PROMPTS: [PromptKind; 4] = [
@@ -1394,33 +1419,90 @@ mod authorize_service_tests {
         PromptKind::EnterPasskey,
     ];
 
-    /// Accepting a pairing the device started trusts it, and the trust is
-    /// set by the time bluetoothd has its reply: for every kind of pairing
-    /// prompt (#1603 review, MED-1).
+    /// Accepting a pairing the device started puts it in progress by the
+    /// time bluetoothd has its reply, for every kind of pairing prompt, and
+    /// sets nothing in bluetoothd yet: `Trusted` waits for the pairing to
+    /// succeed (#1603 review, MED-A).
     ///
-    /// **Falsification:** drop the `trust_on_accept` call from
-    /// `trusted_if_accepted`, or send it off in a task instead of awaiting
-    /// it, and no `SetTrusted(true)` is recorded by the reply.
+    /// **Falsification:** drop the `accepted` call from
+    /// `in_progress_if_accepted` and the device is not in progress; trust it
+    /// at once (the previous design) and a `SetTrusted(true)` shows up.
     #[tokio::test(flavor = "current_thread")]
-    async fn accepting_a_pairing_trusts_the_device_before_bluetoothd_hears() {
+    async fn accepting_a_pairing_puts_it_in_progress_and_trusts_nothing_yet() {
         for kind in PAIRING_PROMPTS {
-            let (ok, calls) = answer_pairing(kind, true).await;
+            let (ok, calls, in_progress) = answer_pairing(kind, true).await;
             assert!(ok, "{kind:?} accepted");
-            assert_eq!(calls, vec![Call::SetTrusted(true)], "{kind:?}");
+            assert!(in_progress, "{kind:?}: in progress by the reply");
+            assert!(calls.is_empty(), "{kind:?}: {calls:?}");
         }
     }
 
-    /// A rejected pairing prompt sets nothing.
+    /// A rejected pairing prompt never enters the set and sets nothing.
     ///
-    /// **Falsification:** trust on any answer (`trusted_if_accepted` ignoring
-    /// `result`) and a `SetTrusted(true)` shows up.
+    /// **Falsification:** put the device in progress on any answer
+    /// (`in_progress_if_accepted` ignoring `result`) and this fails.
     #[tokio::test(flavor = "current_thread")]
-    async fn rejecting_a_pairing_sets_nothing() {
+    async fn a_rejected_pairing_never_enters_the_set() {
         for kind in PAIRING_PROMPTS {
-            let (ok, calls) = answer_pairing(kind, false).await;
+            let (ok, calls, in_progress) = answer_pairing(kind, false).await;
             assert!(!ok, "{kind:?} rejected");
+            assert!(!in_progress, "{kind:?}: entered the set");
             assert!(calls.is_empty(), "{kind:?}: {calls:?}");
         }
+    }
+
+    /// While a device is being paired, its `AuthorizeService` is allowed at
+    /// once, with no prompt and nothing set.
+    ///
+    /// **Falsification:** drop the in-progress check from
+    /// `authorize_service_for` and the request raises a prompt and waits.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_service_request_during_a_pairing_is_allowed_without_a_prompt() {
+        let f = fixture();
+        let device = device();
+        f.pairings.begin(device.as_str());
+        let answered = f.agent.authorize_service_for(&device, A2DP).now_or_never();
+        assert!(
+            matches!(answered, Some(Ok(()))),
+            "allowed at once, got {answered:?}"
+        );
+        assert!(f.banner.get_cloned().is_none(), "no prompt");
+        assert!(f.devices.calls().is_empty(), "nothing set");
+    }
+
+    /// Once an accepted pairing's window has passed without it completing,
+    /// the device's service requests ask again.
+    ///
+    /// **Falsification:** let the in-progress entry outlive the window and
+    /// the request is still allowed without a prompt.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn after_the_pairing_window_a_service_request_asks_again() {
+        let f = fixture();
+        let device = device();
+        f.devices.show(Some(Shown::default()));
+        let mut asking = std::pin::pin!(f.agent.confirmation_for(&device, 123_456));
+        assert!(asking.as_mut().now_or_never().is_none());
+        let shown = f.banner.get_cloned().expect("a prompt is raised");
+        answer_in(&f.pending, shown.id, AgentReply::Confirm).await;
+        assert!(asking.await.is_ok());
+        assert!(f.pairings.contains(device.as_str()));
+
+        tokio::time::sleep(PAIRING_WINDOW + Duration::from_secs(1)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!f.pairings.contains(device.as_str()), "the window passed");
+
+        let mut asking = std::pin::pin!(f.agent.authorize_service_for(&device, A2DP));
+        assert!(
+            asking.as_mut().now_or_never().is_none(),
+            "the request asks the user again"
+        );
+        assert_eq!(
+            f.banner.get_cloned().map(|p| p.kind),
+            Some(PromptKind::AuthorizeService)
+        );
+        assert!(f.devices.calls().is_empty(), "nothing was trusted");
     }
 
     /// The mapping itself: only an explicit yes is `Ok`.
@@ -1873,6 +1955,7 @@ mod system_tests {
             pending.clone(),
             banner.clone(),
             Arc::new(crate::bluetooth::trust::fake::FakeBus::new()),
+            crate::bluetooth::trust::Pairings::default(),
         );
         let server = Builder::address(guard.address.as_str())
             .expect("parse ephemeral bus address")

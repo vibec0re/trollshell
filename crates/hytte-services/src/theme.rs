@@ -184,15 +184,18 @@ where
 /// call site added directly into `current()` or `set()` could reintroduce a
 /// blocking subprocess call on whatever thread calls them.
 async fn read_current() -> Theme {
-    read_current_from("gsettings").await
+    read_current_from("gsettings", &[]).await
 }
 
 /// [`read_current`] with the program spelled out, so a test can point it at
 /// a fake `gsettings` on an absolute path instead of mutating `PATH`
 /// (`std::env::set_var` is `unsafe`, and this crate `forbid`s unsafe).
-/// Production always passes `"gsettings"`.
-async fn read_current_from(program: &str) -> Theme {
+/// Production always passes `"gsettings"` and no leading args. `leading_args`
+/// lets a test run `sh <script>` instead of exec'ing a file it just wrote,
+/// which can fail with `ETXTBSY` (#1606).
+async fn read_current_from(program: &str, leading_args: &[&str]) -> Theme {
     let output = tokio::process::Command::new(program)
+        .args(leading_args)
         .args(["get", "org.gnome.desktop.interface", "color-scheme"])
         .output()
         .await;
@@ -501,19 +504,26 @@ mod tests {
         out
     }
 
-    /// Write an executable stand-in for `gsettings` that prints `value` the
-    /// way the real one does (a quoted string plus a newline) and exits 0.
-    /// Returns its absolute path.
+    /// Write a stand-in for `gsettings` that prints `value` the way the real one
+    /// does (a quoted string plus a newline) and exits 0. Returns its path.
+    ///
+    /// The file is deliberately NOT executable and is run as `sh <path>`
+    /// ([`run_fake`]): exec'ing a just-written file races with any sibling test
+    /// thread that forks while our write fd is open, and the kernel answers
+    /// `ETXTBSY` (rust-lang/rust#114554, #1606).
     fn fake_gsettings(value: &str) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
             "hytte-theme-fake-gsettings-{}-{n}",
             std::process::id()
         ));
         std::fs::write(&path, format!("#!/bin/sh\nprintf \"'{value}'\\n\"\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
+    }
+
+    /// [`read_current_from`] against a fake from [`fake_gsettings`], via `sh`.
+    async fn run_fake(script: &std::path::Path) -> Theme {
+        read_current_from("/bin/sh", &[&script.display().to_string()]).await
     }
 
     /// #1192 review, HIGH-1 — the regression that shipped a "Dark mode: on"
@@ -538,10 +548,7 @@ mod tests {
         let program = fake_gsettings("prefer-light");
         // Sanity: the fake really does read back as Light through the real
         // parser, so a failure below is about the *handle*, not the parse.
-        assert_eq!(
-            read_current_from(&program.display().to_string()).await,
-            Theme::Light,
-        );
+        assert_eq!(run_fake(&program).await, Theme::Light,);
 
         let handle = unseeded_handle();
         let mut signal = std::pin::pin!(handle.signal());
@@ -552,10 +559,11 @@ mod tests {
         // the seed landed would render.
         observed.push(next_value(&mut signal).await);
 
-        let seed_program = program.display().to_string();
-        spawn_seed(&handle, move || async move {
-            read_current_from(&seed_program).await
-        });
+        let seed_program = program.clone();
+        spawn_seed(
+            &handle,
+            move || async move { run_fake(&seed_program).await },
+        );
 
         observed.push(next_value(&mut signal).await);
         let _ = std::fs::remove_file(&program);

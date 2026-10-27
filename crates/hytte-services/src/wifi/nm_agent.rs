@@ -23,23 +23,42 @@ use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
 use super::types::{PromptKind, PromptRequest};
 use super::{NEXT_ID, WaitersMap};
+use crate::wifi_backend::NM_BUS_NAME;
 
 // ── Agent error ────────────────────────────────────────────────────────────────
 
 /// Errors returned to `NetworkManager` from the secret agent.
 ///
-/// The `#[zbus(prefix)]` maps each variant to a fully-qualified D-Bus error
-/// name under `org.freedesktop.NetworkManager.SecretAgent.Error`, matching the
-/// `NMSecretAgentError` quark NM expects:
-///   * `NoSecrets` → fall through to another agent / fail cleanly (we hold none).
-///   * `UserCanceled` → the user dismissed the passphrase prompt.
+/// The `#[zbus(prefix)]` maps each variant to the D-Bus error name NM
+/// registers for its `NMSecretAgentError` domain: the interface name, a dot,
+/// then the enum value's nick, with no `.Error` segment in between
+/// (`register_error_domain` in NM's `src/libnm-core-impl/nm-errors.c`, nicks
+/// in `src/libnm-core-public/nm-errors.h`, NM 1.58). `GDBus` maps a reply
+/// carrying one of those names back to the `NM_SECRET_AGENT_ERROR` code, and
+/// NM acts on the code:
+///   * `NoSecrets` → NM asks the next agent, or fails the request (we hold no
+///     secrets of our own).
+///   * `UserCanceled` → the user dismissed the prompt. NM stops asking other
+///     agents and fails the request as cancelled (`nm-agent-manager.c`,
+///     `_con_get_request_done`).
+///
+/// Until this was corrected the prefix read `…SecretAgent.Error`, a name NM
+/// has never registered. NM saw every one of these replies as an unknown
+/// error, so a dismissed prompt sent it on to the next agent instead of
+/// cancelling the request.
 #[derive(Debug, zbus::DBusError)]
-#[zbus(prefix = "org.freedesktop.NetworkManager.SecretAgent.Error")]
+#[zbus(prefix = "org.freedesktop.NetworkManager.SecretAgent")]
 enum NmAgentError {
     #[zbus(error)]
     ZBus(zbus::Error),
     NoSecrets(String),
     UserCanceled(String),
+    /// The call did not come from `NetworkManager`: its sender is not the
+    /// current owner of `org.freedesktop.NetworkManager`.
+    /// `NM_SECRET_AGENT_ERROR_PERMISSION_DENIED`, which `nm-errors.h`
+    /// describes as "the caller (ie, `NetworkManager`) is not authorized to
+    /// make this request".
+    PermissionDenied(String),
 }
 
 // ── Constants ──────────────────────────────────────────────────────────────────
@@ -97,18 +116,58 @@ pub(super) struct NmAgent {
     /// entries (see `get_secrets` and `cancel_get_secrets`), so a cancel never
     /// sees a waiter without its key or a key without its waiter.
     inflight: Arc<AsyncMutex<HashMap<u64, RequestKey>>>,
+    /// Admits a call only from `NetworkManager`: the current owner of
+    /// `org.freedesktop.NetworkManager`, looked up on the call's own
+    /// connection when it arrives.
+    caller: hytte_bus::CallerCheck,
 }
 
 impl NmAgent {
     /// An agent surfacing its prompts on `prompts` and parking their answers
     /// in `waiters` — the service-wide handles `submit_prompt`/`cancel_prompt`
-    /// resolve.
+    /// resolve — and answering only `NetworkManager`.
     pub(super) fn new(prompts: Mutable<Option<PromptRequest>>, waiters: WaitersMap) -> Self {
         Self {
             prompts,
             waiters,
             inflight: Arc::default(),
+            caller: hytte_bus::caller_check(NM_BUS_NAME),
         }
+    }
+
+    /// Answer a `method` call only if it came from `NetworkManager`.
+    ///
+    /// The agent is exported on our system connection's unique name, so any
+    /// peer the bus policy lets through can call it, not only NM. Unchecked,
+    /// such a peer could raise a passphrase prompt that reads like NM's and
+    /// collect what the user types, or cancel NM's real requests. Every
+    /// method checks first and touches nothing (no prompt, no waiter) when
+    /// the check refuses. NM's policy file lets only root send to this
+    /// interface, so this stops a root process other than NM from reaching
+    /// NM's requests **through this interface**. The iwd agent shares the
+    /// same prompt slot and waiters and is not checked yet (#1605).
+    ///
+    /// The owner is looked up per call ([`hytte_bus::CallerCheck`]), on `conn`,
+    /// the connection the call arrived on: NM keeps its registry of agents in
+    /// memory and re-learns it after a restart under a new unique name, and a
+    /// cached owner would refuse it.
+    async fn admit(
+        &self,
+        conn: &zbus::Connection,
+        header: &zbus::message::Header<'_>,
+        method: &str,
+    ) -> Result<(), NmAgentError> {
+        self.caller.check(conn, header).await.map_err(|refused| {
+            tracing::warn!(
+                method,
+                %refused,
+                "NM SecretAgent: refused a call that did not come from NetworkManager",
+            );
+            NmAgentError::PermissionDenied(format!(
+                "only {} may call this agent: {refused}",
+                self.caller.name()
+            ))
+        })
     }
 }
 
@@ -367,10 +426,9 @@ impl ReplyShape {
 
 // ── Interface ───────────────────────────────────────────────────────────────
 
-// zbus's `#[interface]` macro requires every method to be `async fn`; the
-// Save/Delete stubs and the no-op branches do not await. `unused_variables`
-// silences the deliberately-ignored connection dicts in the stubs.
-#[allow(clippy::unused_async, unused_variables)]
+// `unused_variables` silences the deliberately-ignored connection dicts in
+// the Save/Delete stubs, which only run the caller check.
+#[allow(unused_variables)]
 #[zbus::interface(name = "org.freedesktop.NetworkManager.SecretAgent")]
 impl NmAgent {
     /// Called by NM when it needs secrets it doesn't already hold.
@@ -382,6 +440,12 @@ impl NmAgent {
     /// wireless-security PSK case and the VPN-secret case interactively;
     /// everything else returns the NM "no secrets" error so NM can fall through
     /// to another agent or fail the activation cleanly.
+    ///
+    /// A call from anyone but `NetworkManager` is refused with
+    /// `PermissionDenied` before anything else happens ([`NmAgent::admit`]).
+    // NM's method has five arguments, and the caller check needs the two
+    // zbus hands in (the connection and the header); none of them can move.
+    #[allow(clippy::too_many_arguments)]
     async fn get_secrets(
         &self,
         connection: ConnectionDict,
@@ -389,7 +453,11 @@ impl NmAgent {
         setting_name: String,
         hints: Vec<String>,
         flags: u32,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> Result<ConnectionDict, NmAgentError> {
+        self.admit(conn, &header, "GetSecrets").await?;
+
         // Classify the request: wireless-security PSK, VPN secret, or neither.
         let wants_wireless =
             setting_name == WIRELESS_SECURITY_SETTING || hints.iter().any(|h| h == "psk");
@@ -520,7 +588,18 @@ impl NmAgent {
     /// map and cleared the prompt unconditionally, so NM cancelling one
     /// request (a VPN activation the user aborted) also failed another still
     /// waiting on the user (a Wi-Fi join), and took its prompt away.
-    async fn cancel_get_secrets(&self, connection_path: OwnedObjectPath, setting_name: String) {
+    ///
+    /// Only `NetworkManager` may cancel. Anyone else gets `PermissionDenied`
+    /// and every request stays pending ([`NmAgent::admit`]).
+    async fn cancel_get_secrets(
+        &self,
+        connection_path: OwnedObjectPath,
+        setting_name: String,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> Result<(), NmAgentError> {
+        self.admit(conn, &header, "CancelGetSecrets").await?;
+
         let key = RequestKey {
             connection_path: connection_path.as_str().to_string(),
             setting_name,
@@ -550,24 +629,31 @@ impl NmAgent {
             cancelled = cancelled.len(),
             "NM SecretAgent::CancelGetSecrets",
         );
+        Ok(())
     }
 
     /// No-op: we never persist secrets — NM stores its own connection profiles.
+    /// Checked all the same, so this interface answers no one but NM.
     async fn save_secrets(
         &self,
         connection: ConnectionDict,
         connection_path: OwnedObjectPath,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> Result<(), NmAgentError> {
-        Ok(())
+        self.admit(conn, &header, "SaveSecrets").await
     }
 
-    /// No-op: we hold no secrets of our own to delete.
+    /// No-op: we hold no secrets of our own to delete. Checked like
+    /// `SaveSecrets`.
     async fn delete_secrets(
         &self,
         connection: ConnectionDict,
         connection_path: OwnedObjectPath,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> Result<(), NmAgentError> {
-        Ok(())
+        self.admit(conn, &header, "DeleteSecrets").await
     }
 }
 
@@ -1080,6 +1166,30 @@ mod tests {
         clear_prompt_if_shown(&prompts, 2);
         assert!(prompts.get_cloned().is_none());
     }
+
+    // -- error names ------------------------------------------------------------
+
+    /// The names NM registers for its `NMSecretAgentError` domain, written
+    /// out as literals rather than built from the prefix, so a change to the
+    /// prefix cannot carry this expectation along with it. Source: NM 1.58,
+    /// `register_error_domain` (`src/libnm-core-impl/nm-errors.c`) joins
+    /// `NM_DBUS_INTERFACE_SECRET_AGENT` and each value's nick
+    /// (`src/libnm-core-public/nm-errors.h`).
+    ///
+    /// **Falsification:** put the old `…SecretAgent.Error` prefix back and
+    /// every assertion fails.
+    #[test]
+    fn errors_carry_the_names_nm_registers() {
+        use zbus::DBusError as _;
+        assert_eq!(
+            NmAgentError::NoSecrets(String::new()).name().as_str(),
+            "org.freedesktop.NetworkManager.SecretAgent.NoSecrets"
+        );
+        assert_eq!(
+            NmAgentError::UserCanceled(String::new()).name().as_str(),
+            "org.freedesktop.NetworkManager.SecretAgent.UserCanceled"
+        );
+    }
 }
 
 // ── System tests: dbus-daemon-backed GetSecrets round-trip ───────────────────
@@ -1258,6 +1368,9 @@ mod system_tests {
     /// Build a fresh `NmAgent` with empty handles; return it plus clones of its
     /// `prompts`/`waiters` so the test can drive the handshake after the agent
     /// is moved into the object server.
+    ///
+    /// Built exactly as production builds it: its caller check asks whatever
+    /// bus the call arrives on, which here is this test's.
     fn fresh_agent() -> (NmAgent, Mutable<Option<PromptRequest>>, WaitersMap) {
         let waiters: WaitersMap = Arc::new(AsyncMutex::new(HashMap::new()));
         let prompts: Mutable<Option<PromptRequest>> = Mutable::new(None);
@@ -1265,10 +1378,33 @@ mod system_tests {
         (agent, prompts, waiters)
     }
 
+    /// A proxy to the agent hosted on `server`, from a fresh connection to
+    /// the same bus that owns `name` (or nothing, for `None`).
+    async fn agent_proxy(
+        guard: &BusGuard,
+        server: &Connection,
+        name: Option<&str>,
+    ) -> zbus::Proxy<'static> {
+        let mut builder =
+            Builder::address(guard.address.as_str()).expect("parse ephemeral bus address");
+        if let Some(name) = name {
+            builder = builder.name(name).expect("a valid well-known name");
+        }
+        let client = builder.build().await.expect("connect a client to the bus");
+        let dest = server
+            .unique_name()
+            .expect("server has a unique name")
+            .to_string();
+        zbus::Proxy::new(&client, dest, AGENT_PATH, AGENT_IFACE)
+            .await
+            .expect("build SecretAgent proxy")
+    }
+
     /// Build the connection that hosts `agent`, open a second connection to the
-    /// same bus acting as "`NetworkManager`", and return both: the host
-    /// connection and a proxy targeting the agent by that connection's unique
-    /// name. Uses `Builder::address` (NOT the clippy-banned
+    /// same bus acting as "`NetworkManager`" (it owns [`NM_BUS_NAME`], so the
+    /// agent's caller check admits it), and return both: the host connection
+    /// and a proxy targeting the agent by that connection's unique name. Uses
+    /// `Builder::address` (NOT the clippy-banned
     /// `Connection::session`/`::system`).
     ///
     /// **Bind the returned connection, don't discard it** — `let (_server,
@@ -1348,21 +1484,7 @@ mod system_tests {
             .await
             .expect("connect agent host to ephemeral bus");
 
-        let dest = server
-            .unique_name()
-            .expect("server has a unique name")
-            .to_string();
-
-        let client = Builder::address(guard.address.as_str())
-            .expect("parse ephemeral bus address")
-            .build()
-            .await
-            .expect("connect client (NetworkManager) to ephemeral bus");
-
-        let proxy = zbus::Proxy::new(&client, dest, AGENT_PATH, AGENT_IFACE)
-            .await
-            .expect("build SecretAgent proxy");
-
+        let proxy = agent_proxy(guard, &server, Some(NM_BUS_NAME)).await;
         (server, proxy)
     }
 
@@ -1953,6 +2075,174 @@ mod system_tests {
         );
     }
 
+    // -- 4c. only NetworkManager is answered ----------------------------------
+    //
+    // The agent is reachable by any peer that can address our unique name.
+    // These call it from a peer that does not own `NM_BUS_NAME` and from one
+    // that does — the `mount_and_proxy` client, which every test above uses —
+    // on the same agent.
+
+    /// The exact name NM registers for `NM_SECRET_AGENT_ERROR_PERMISSION_DENIED`
+    /// (see `errors_carry_the_names_nm_registers`).
+    const PERMISSION_DENIED: &str = "org.freedesktop.NetworkManager.SecretAgent.PermissionDenied";
+
+    /// The `GetSecrets` arguments of an interactive WPA-PSK request for
+    /// `path`.
+    fn psk_request(path: &str) -> (ConnectionDict, OwnedObjectPath, String, Vec<String>, u32) {
+        (
+            wpa_connection(b"FRITZ!Box", "wpa-psk"),
+            OwnedObjectPath::try_from(path).unwrap(),
+            WIRELESS_SECURITY_SETTING.to_string(),
+            vec!["psk".to_string()],
+            FLAG_ALLOW_INTERACTION,
+        )
+    }
+
+    /// A `GetSecrets` from a peer that is not NM is refused with
+    /// `PermissionDenied`, raises no prompt and parks no waiter. NM's own
+    /// request on the same agent is still served.
+    ///
+    /// **Falsification:** drop the `admit` call from `get_secrets` and the
+    /// intruder's request raises a prompt and waits on it, so the
+    /// "returns at once" expectation times out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_secrets_from_a_peer_that_is_not_nm_is_refused_and_raises_no_prompt() {
+        let guard = ephemeral_bus().await;
+        let (agent, prompts, waiters) = fresh_agent();
+        let (server, nm) = mount_and_proxy(&guard, agent).await;
+        let intruder = agent_proxy(&guard, &server, None).await;
+
+        let refused: Result<ConnectionDict, zbus::Error> = tokio::time::timeout(
+            DBUS_REPLY_BUDGET,
+            intruder.call(
+                "GetSecrets",
+                &psk_request("/org/freedesktop/NetworkManager/Settings/1"),
+            ),
+        )
+        .await
+        .expect("a refused GetSecrets returns at once instead of waiting on a prompt");
+        assert_error_name_is(&refused, PERMISSION_DENIED);
+        assert!(
+            prompts.get_cloned().is_none(),
+            "a refused request must not raise a prompt"
+        );
+        assert!(
+            waiters.lock().await.is_empty(),
+            "a refused request must not park a waiter"
+        );
+
+        // NM, on the same agent, is answered as before.
+        let call: tokio::task::JoinHandle<Result<ConnectionDict, zbus::Error>> =
+            tokio::spawn(async move {
+                nm.call(
+                    "GetSecrets",
+                    &psk_request("/org/freedesktop/NetworkManager/Settings/1"),
+                )
+                .await
+            });
+        let req = await_prompt(&prompts, DBUS_REPLY_BUDGET).await;
+        waiters
+            .lock()
+            .await
+            .remove(&req.id)
+            .expect("NM's request parked a waiter")
+            .send(Ok(vec!["hunter2".to_string()]))
+            .expect("send passphrase to waiter");
+        let reply = tokio::time::timeout(DBUS_REPLY_BUDGET, call)
+            .await
+            .expect("NM's GetSecrets did not return in time")
+            .expect("GetSecrets task panicked")
+            .expect("NM's GetSecrets returned a D-Bus error");
+        assert!(reply.contains_key(WIRELESS_SECURITY_SETTING));
+    }
+
+    /// A `CancelGetSecrets` from a peer that is not NM is refused and cancels
+    /// nothing: NM's request for the very pair it names keeps its waiter and
+    /// its prompt, and still completes with the user's answer.
+    ///
+    /// **Falsification:** drop the `admit` call from `cancel_get_secrets` and
+    /// the intruder's cancel succeeds, failing NM's request with
+    /// `UserCanceled`, so the refusal assertion fails.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_from_a_peer_that_is_not_nm_leaves_the_request_pending() {
+        let guard = ephemeral_bus().await;
+        let (agent, prompts, waiters) = fresh_agent();
+        let (server, nm) = mount_and_proxy(&guard, agent).await;
+        let intruder = agent_proxy(&guard, &server, None).await;
+        let path = "/org/freedesktop/NetworkManager/Settings/1";
+
+        let call: tokio::task::JoinHandle<Result<ConnectionDict, zbus::Error>> =
+            tokio::spawn(async move { nm.call("GetSecrets", &psk_request(path)).await });
+        let req = await_prompt(&prompts, DBUS_REPLY_BUDGET).await;
+
+        let cancel: Result<(), zbus::Error> = tokio::time::timeout(
+            DBUS_REPLY_BUDGET,
+            intruder.call(
+                "CancelGetSecrets",
+                &(
+                    OwnedObjectPath::try_from(path).unwrap(),
+                    WIRELESS_SECURITY_SETTING.to_string(),
+                ),
+            ),
+        )
+        .await
+        .expect("CancelGetSecrets did not return in time");
+        assert_error_name_is(&cancel, PERMISSION_DENIED);
+
+        assert!(
+            waiters.lock().await.contains_key(&req.id),
+            "a refused cancel must leave NM's request waiting"
+        );
+        assert_eq!(
+            prompts.get_cloned().map(|shown| shown.id),
+            Some(req.id),
+            "a refused cancel must leave NM's prompt on screen"
+        );
+        assert!(!call.is_finished(), "NM's request is still pending");
+
+        waiters
+            .lock()
+            .await
+            .remove(&req.id)
+            .expect("NM's waiter is still registered")
+            .send(Ok(vec!["hunter2".to_string()]))
+            .expect("send passphrase to waiter");
+        let reply = tokio::time::timeout(DBUS_REPLY_BUDGET, call)
+            .await
+            .expect("NM's GetSecrets did not return in time")
+            .expect("GetSecrets task panicked")
+            .expect("NM's GetSecrets returned a D-Bus error");
+        assert!(reply.contains_key(WIRELESS_SECURITY_SETTING));
+    }
+
+    /// The two no-op methods are checked too: NM gets its empty reply, anyone
+    /// else `PermissionDenied`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn save_and_delete_answer_only_nm() {
+        let guard = ephemeral_bus().await;
+        let (agent, _prompts, _waiters) = fresh_agent();
+        let (server, nm) = mount_and_proxy(&guard, agent).await;
+        let intruder = agent_proxy(&guard, &server, None).await;
+        let args = (
+            wpa_connection(b"FRITZ!Box", "wpa-psk"),
+            OwnedObjectPath::try_from("/org/freedesktop/NetworkManager/Settings/1").unwrap(),
+        );
+
+        for method in ["SaveSecrets", "DeleteSecrets"] {
+            let from_nm: Result<(), zbus::Error> =
+                tokio::time::timeout(DBUS_REPLY_BUDGET, nm.call(method, &args))
+                    .await
+                    .expect("the call did not return in time");
+            from_nm.unwrap_or_else(|e| panic!("NM's {method} was refused: {e}"));
+
+            let from_intruder: Result<(), zbus::Error> =
+                tokio::time::timeout(DBUS_REPLY_BUDGET, intruder.call(method, &args))
+                    .await
+                    .expect("the call did not return in time");
+            assert_error_name_is(&from_intruder, PERMISSION_DENIED);
+        }
+    }
+
     // -- 5. staying registered: NM restarts, late NM, a reconnect -------------
     //
     // The agent only hears `GetSecrets` while NM holds a registration for it,
@@ -2424,7 +2714,8 @@ mod system_tests {
 
     /// Assert the result is a `MethodError` whose error name contains `needle`
     /// (e.g. `"NoSecrets"` / `"UserCanceled"`). The full name is
-    /// `org.freedesktop.NetworkManager.SecretAgent.Error.<variant>`.
+    /// `org.freedesktop.NetworkManager.SecretAgent.<variant>`, pinned as a
+    /// literal by `errors_carry_the_names_nm_registers`.
     fn assert_error_name_contains(result: &Result<ConnectionDict, zbus::Error>, needle: &str) {
         match result {
             Err(zbus::Error::MethodError(name, _detail, _reply)) => {
@@ -2436,6 +2727,17 @@ mod system_tests {
             }
             Err(other) => panic!("expected MethodError containing {needle:?}, got {other:?}"),
             Ok(dict) => panic!("expected MethodError containing {needle:?}, got Ok({dict:?})"),
+        }
+    }
+
+    /// Assert the result is a `MethodError` named exactly `expected`.
+    fn assert_error_name_is<T: std::fmt::Debug>(result: &Result<T, zbus::Error>, expected: &str) {
+        match result {
+            Err(zbus::Error::MethodError(name, _detail, _reply)) => {
+                assert_eq!(name.as_str(), expected);
+            }
+            Err(other) => panic!("expected MethodError {expected:?}, got {other:?}"),
+            Ok(value) => panic!("expected MethodError {expected:?}, got Ok({value:?})"),
         }
     }
 }

@@ -5,9 +5,13 @@
 //! user interaction (e.g. SSP numeric comparison). MVP scope:
 //!   * `RequestConfirmation`: user confirms the displayed code matches.
 //!   * `RequestAuthorization`: bare yes/no.
-//!   * `AuthorizeService`: auto-accept (typical for trusted devices reconnecting).
-//!   * PIN / Passkey entry methods: return Rejected (no text-input UI yet).
+//!   * `AuthorizeService`: "Allow X to use Y?", yes/no. bluetoothd asks only
+//!     for a device that is not `Trusted` ([`PairAgent::authorize_service_for`]).
+//!   * PIN / Passkey entry methods: the banner takes the PIN or passkey.
 //!   * Cancel: aborts the pending prompt.
+//!
+//! Every method answers only bluetoothd: the current owner of `org.bluez`
+//! ([`PairAgent::admit`]). Anyone else gets `org.bluez.Error.Rejected`.
 //!
 //! The agent is registered under `bus::own_name` on the SYSTEM bus. `BlueZ`
 //! records the system-bus unique name when we call `RegisterAgent`, then issues
@@ -15,11 +19,13 @@
 //! agent + anchor name both on the system bus.
 
 use super::shared_state;
+use super::trust::{self, DeviceBus, Pairings};
 use super::types::{AgentReply, PairPrompt, PromptKind};
 use crate::retry;
 use futures_signals::signal::Mutable;
 use futures_util::{Stream, StreamExt};
 use hytte_bus::{BusKind, SignalItem};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::oneshot;
@@ -27,6 +33,9 @@ use zbus::zvariant::OwnedObjectPath;
 
 pub(super) const AGENT_PATH: &str = "/com/trollshell/BluetoothAgent";
 pub(super) const AGENT_ANCHOR_NAME: &str = "mov.vibec0re.trollshell.bluez-agent";
+
+/// bluetoothd's well-known name. The agent answers only its current owner.
+pub(super) const BLUEZ_BUS_NAME: &str = "org.bluez";
 
 #[derive(Debug, zbus::DBusError)]
 #[zbus(prefix = "org.bluez.Error")]
@@ -37,77 +46,351 @@ enum AgentError {
     Canceled(String),
 }
 
+/// The `org.bluez.Agent1` object bluetoothd calls back on.
+///
+/// It raises each request's prompt on `banner` and waits for the user's
+/// answer in `pending`: the service's own handles, which the UI and the
+/// watcher's cleanup reach through [`shared_state`]. A test hands in its own.
 #[derive(Clone)]
-pub(super) struct PairAgent;
+pub(super) struct PairAgent {
+    /// Admits a call only from bluetoothd: the current owner of `org.bluez`,
+    /// looked up on the call's own connection when it arrives.
+    caller: hytte_bus::CallerCheck,
+    pending: Arc<ReplySlot>,
+    banner: Mutable<Option<PairPrompt>>,
+    /// Where an accepted pairing's device is marked `Trusted` once it has
+    /// paired ([`trust::accepted`]): the system bus in production, a
+    /// recorder in the tests.
+    devices: Arc<dyn DeviceBus>,
+    /// The devices being paired, shared with `pair_device`. Their
+    /// `AuthorizeService` requests are let through without a prompt.
+    pairings: Pairings,
+}
 
-// zbus's `#[interface]` macro requires every method to be `async fn` even
-// when the body doesn't await; display/authorize-service handlers also
-// receive owned values they only acknowledge. Allowing at the impl-block
-// keeps the noise out of each method.
-#[allow(clippy::unused_async, clippy::needless_pass_by_value)]
-#[zbus::interface(name = "org.bluez.Agent1")]
 impl PairAgent {
-    async fn release(&self) {
-        tracing::debug!("agent released");
-    }
-
-    async fn request_pin_code(&self, device: OwnedObjectPath) -> Result<String, AgentError> {
-        let reply = await_reply(new_prompt(&device, None, PromptKind::EnterPinCode)).await;
-        match reply {
-            AgentReply::Pin(s) => Ok(s),
-            _ => Err(AgentError::Rejected("user did not provide PIN".into())),
+    /// An agent answering only bluetoothd, raising its prompts on `banner`,
+    /// waiting for answers in `pending`, tracking pairings in `pairings`, and
+    /// trusting a paired device through `devices`.
+    pub(super) fn new(
+        pending: Arc<ReplySlot>,
+        banner: Mutable<Option<PairPrompt>>,
+        devices: Arc<dyn DeviceBus>,
+        pairings: Pairings,
+    ) -> Self {
+        Self {
+            caller: hytte_bus::caller_check(BLUEZ_BUS_NAME),
+            pending,
+            banner,
+            devices,
+            pairings,
         }
     }
 
-    async fn display_pin_code(&self, device: OwnedObjectPath, pincode: String) {
+    /// Answer a `method` call only if it came from bluetoothd.
+    ///
+    /// The agent is exported on our system connection, so any peer the bus
+    /// policy lets through can call it, not only bluetoothd. Unchecked, such
+    /// a peer could raise a pairing prompt for a device the user never chose,
+    /// or `Cancel` a real one. Every method checks first and touches nothing
+    /// (no banner, no reply slot) when the check refuses. `BlueZ`'s own policy
+    /// file (`src/bluetooth.conf`) lets only root send to `org.bluez.Agent1`,
+    /// so this stops a root process other than bluetoothd.
+    ///
+    /// The owner is looked up per call ([`hytte_bus::CallerCheck`]), on
+    /// `conn`, the connection the call arrived on: a restarted bluetoothd
+    /// comes back under a new unique name, and a cached owner would refuse
+    /// it.
+    async fn admit(
+        &self,
+        conn: &zbus::Connection,
+        header: &zbus::message::Header<'_>,
+        method: &str,
+    ) -> Result<(), AgentError> {
+        self.caller.check(conn, header).await.map_err(|refused| {
+            tracing::warn!(
+                method,
+                %refused,
+                "bluetooth agent: refused a call that did not come from bluetoothd",
+            );
+            AgentError::Rejected(format!(
+                "only {} may call this agent: {refused}",
+                self.caller.name()
+            ))
+        })
+    }
+
+    /// Raise `prompt` and wait for the user's answer ([`await_reply_in`]).
+    async fn ask(&self, prompt: PairPrompt) -> AgentReply {
+        await_reply_in(&self.pending, &self.banner, prompt).await
+    }
+
+    /// Pass a pairing prompt's `result` through, first putting `device` in
+    /// progress if the user accepted ([`trust::accepted`]).
+    ///
+    /// It goes in before bluetoothd gets the reply: bluetoothd sends the
+    /// service requests it queued during the pairing as soon as the pairing's
+    /// services resolve, and those must find the device in progress. Nothing
+    /// is set in bluetoothd until the device has paired. A rejected prompt
+    /// never enters the set.
+    fn in_progress_if_accepted<T>(
+        &self,
+        device: &OwnedObjectPath,
+        result: Result<T, AgentError>,
+    ) -> Result<T, AgentError> {
+        if result.is_ok() {
+            trust::accepted(&self.devices, &self.pairings, device.as_str());
+        }
+        result
+    }
+
+    /// `RequestPinCode` once the caller is admitted.
+    async fn pin_code_for(&self, device: &OwnedObjectPath) -> Result<String, AgentError> {
+        let reply = self
+            .ask(new_prompt(device, None, PromptKind::EnterPinCode))
+            .await;
+        let result = match reply {
+            AgentReply::Pin(s) => Ok(s),
+            _ => Err(AgentError::Rejected("user did not provide PIN".into())),
+        };
+        self.in_progress_if_accepted(device, result)
+    }
+
+    /// `RequestPasskey` once the caller is admitted.
+    async fn passkey_for(&self, device: &OwnedObjectPath) -> Result<u32, AgentError> {
+        let reply = self
+            .ask(new_prompt(device, None, PromptKind::EnterPasskey))
+            .await;
+        let result = match reply {
+            AgentReply::Passkey(p) => Ok(p),
+            _ => Err(AgentError::Rejected("user did not provide passkey".into())),
+        };
+        self.in_progress_if_accepted(device, result)
+    }
+
+    /// `RequestConfirmation` once the caller is admitted.
+    async fn confirmation_for(
+        &self,
+        device: &OwnedObjectPath,
+        passkey: u32,
+    ) -> Result<(), AgentError> {
+        let reply = self
+            .ask(new_prompt(
+                device,
+                Some(passkey),
+                PromptKind::ConfirmPasskey,
+            ))
+            .await;
+        let result = allow_or_reject(&reply, "user rejected pairing");
+        self.in_progress_if_accepted(device, result)
+    }
+
+    /// `RequestAuthorization` once the caller is admitted.
+    async fn authorization_for(&self, device: &OwnedObjectPath) -> Result<(), AgentError> {
+        let reply = self
+            .ask(new_prompt(device, None, PromptKind::Authorize))
+            .await;
+        let result = allow_or_reject(&reply, "user rejected pairing");
+        self.in_progress_if_accepted(device, result)
+    }
+
+    /// `AuthorizeService` once the caller is admitted: ask the user whether
+    /// `device` may use the service `uuid` names, and answer bluetoothd.
+    ///
+    /// bluetoothd calls this only for a device that is **not** `Trusted`. Its
+    /// authorization queue (`process_auth_queue` in `src/adapter.c`, `BlueZ`
+    /// 5.87) accepts a trusted device's request itself and never reaches the
+    /// agent. A device the user pairs, from either side, is made trusted once
+    /// it has paired, and while it is being paired its requests are let
+    /// through here without a prompt ([`trust`]). So what asks is a device
+    /// someone deliberately left untrusted (or one never paired) wanting
+    /// audio, input or networking. It used to be accepted without asking, on
+    /// the reasoning that the requests come from trusted devices, which is
+    /// exactly the case bluetoothd never sends.
+    ///
+    /// Allow answers `Ok`. Deny, a `Cancel` (including bluetoothd's own after
+    /// its 60 s `REQUEST_TIMEOUT`, `src/agent.c`) and a second request while
+    /// one is waiting are all `org.bluez.Error.Rejected`. Nothing is saved:
+    /// the device is not made `Trusted`, so it asks again next time.
+    async fn authorize_service_for(
+        &self,
+        device: &OwnedObjectPath,
+        uuid: &str,
+    ) -> Result<(), AgentError> {
+        if self.pairings.contains(device.as_str()) {
+            tracing::info!(
+                device = %device.as_str(),
+                uuid,
+                "bluetooth agent: a device being paired asks to use a service; allowed, \
+                 since the user started or accepted its pairing"
+            );
+            return Ok(());
+        }
+        let prompt = PairPrompt {
+            service: Some(service_label(uuid)),
+            ..new_prompt(device, None, PromptKind::AuthorizeService)
+        };
+        tracing::info!(
+            device = %device.as_str(),
+            uuid,
+            "bluetooth agent: an untrusted device asks to use a service; asking the user"
+        );
+        let reply = self.ask(prompt).await;
+        allow_or_reject(&reply, "user did not allow the service")
+    }
+}
+
+/// The Bluetooth Base UUID's fixed tail. Every 16-bit assigned number `xxxx`
+/// stands for `0000xxxx-0000-1000-8000-00805f9b34fb` (Bluetooth Core
+/// Specification, Vol 3, Part B, §2.5.1).
+const BASE_UUID_TAIL: &str = "-0000-1000-8000-00805f9b34fb";
+
+/// The 16-bit assigned number inside a 128-bit UUID string, if it is one
+/// built on the Bluetooth Base UUID. Case-insensitive.
+fn short_uuid(uuid: &str) -> Option<u16> {
+    let lower = uuid.to_ascii_lowercase();
+    let short = lower.strip_suffix(BASE_UUID_TAIL)?.strip_prefix("0000")?;
+    if short.len() != 4 || !short.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u16::from_str_radix(short, 16).ok()
+}
+
+/// A readable name for the services an `AuthorizeService` prompt is most
+/// likely to name, or `None` for anything else.
+///
+/// The numbers are the Bluetooth SIG's assigned numbers ("Service Class and
+/// Profile UUIDs", plus the GATT "Human Interface Device" service for HID
+/// over GATT), checked against `BlueZ` 5.87's `lib/bluetooth/uuid.h` and its
+/// name table in `src/shared/util.c`. bluetoothd authorizes A2DP under
+/// `ADVANCED_AUDIO_UUID` (`profiles/audio/a2dp.c`), AVRCP under
+/// `AVRCP_REMOTE_UUID` (`profiles/audio/avctp.c`), PAN under `BNEP_SVC_UUID`
+/// (`profiles/network/server.c`) and classic HID under `HID_UUID`
+/// (`profiles/input/server.c`). HFP and HSP come from external profiles
+/// (`PipeWire`, `oFono`), which bluetoothd authorizes under the profile's own
+/// UUID (`src/profile.c`).
+fn service_name(uuid: &str) -> Option<&'static str> {
+    Some(match short_uuid(uuid)? {
+        0x110a => "audio streaming (A2DP source)",
+        0x110b => "audio streaming (A2DP sink)",
+        0x110d => "audio streaming (A2DP)",
+        0x110c | 0x110e | 0x110f => "media controls (AVRCP)",
+        0x1108 | 0x1112 | 0x1131 => "headset audio (HSP)",
+        0x111e | 0x111f => "hands-free calling (HFP)",
+        0x1124 | 0x1812 => "keyboard and mouse input (HID)",
+        0x000f | 0x1115 | 0x1116 | 0x1117 => "network sharing (PAN)",
+        _ => return None,
+    })
+}
+
+/// What the prompt calls the service `uuid` names: its readable name, or
+/// the UUID itself when it is not one we name.
+fn service_label(uuid: &str) -> String {
+    service_name(uuid).map_or_else(|| uuid.to_owned(), str::to_owned)
+}
+
+/// Map a yes/no prompt's answer to the reply bluetoothd expects: `Confirm`
+/// is `Ok`, anything else (a rejection, a cancel, a timeout, no prompt slot)
+/// is `org.bluez.Error.Rejected` with `why`.
+fn allow_or_reject(reply: &AgentReply, why: &str) -> Result<(), AgentError> {
+    if matches!(reply, AgentReply::Confirm) {
+        Ok(())
+    } else {
+        Err(AgentError::Rejected(why.into()))
+    }
+}
+
+// Display-only handlers receive owned values they only acknowledge.
+#[allow(clippy::needless_pass_by_value)]
+#[zbus::interface(name = "org.bluez.Agent1")]
+impl PairAgent {
+    async fn release(
+        &self,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> Result<(), AgentError> {
+        self.admit(conn, &header, "Release").await?;
+        tracing::debug!("agent released");
+        Ok(())
+    }
+
+    async fn request_pin_code(
+        &self,
+        device: OwnedObjectPath,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> Result<String, AgentError> {
+        self.admit(conn, &header, "RequestPinCode").await?;
+        self.pin_code_for(&device).await
+    }
+
+    async fn display_pin_code(
+        &self,
+        device: OwnedObjectPath,
+        pincode: String,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> Result<(), AgentError> {
+        self.admit(conn, &header, "DisplayPinCode").await?;
         // Display-only acknowledgement — there is no return value to gate.
         // The user enters the PIN on the remote device. Nothing to do.
         let _ = (device, pincode);
+        Ok(())
     }
 
-    async fn request_passkey(&self, device: OwnedObjectPath) -> Result<u32, AgentError> {
-        let reply = await_reply(new_prompt(&device, None, PromptKind::EnterPasskey)).await;
-        match reply {
-            AgentReply::Passkey(p) => Ok(p),
-            _ => Err(AgentError::Rejected("user did not provide passkey".into())),
-        }
+    async fn request_passkey(
+        &self,
+        device: OwnedObjectPath,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> Result<u32, AgentError> {
+        self.admit(conn, &header, "RequestPasskey").await?;
+        self.passkey_for(&device).await
     }
 
-    async fn display_passkey(&self, device: OwnedObjectPath, passkey: u32, entered: u16) {
+    async fn display_passkey(
+        &self,
+        device: OwnedObjectPath,
+        passkey: u32,
+        entered: u16,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> Result<(), AgentError> {
+        self.admit(conn, &header, "DisplayPasskey").await?;
         // Same as DisplayPinCode — no input from us.
         let _ = (device, passkey, entered);
+        Ok(())
     }
 
     async fn request_confirmation(
         &self,
         device: OwnedObjectPath,
         passkey: u32,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> Result<(), AgentError> {
-        let reply = await_reply(new_prompt(
-            &device,
-            Some(passkey),
-            PromptKind::ConfirmPasskey,
-        ))
-        .await;
-        match reply {
-            AgentReply::Confirm => Ok(()),
-            _ => Err(AgentError::Rejected("user rejected pairing".into())),
-        }
+        self.admit(conn, &header, "RequestConfirmation").await?;
+        self.confirmation_for(&device, passkey).await
     }
 
-    async fn request_authorization(&self, device: OwnedObjectPath) -> Result<(), AgentError> {
-        let reply = await_reply(new_prompt(&device, None, PromptKind::Authorize)).await;
-        match reply {
-            AgentReply::Confirm => Ok(()),
-            _ => Err(AgentError::Rejected("user rejected pairing".into())),
-        }
+    async fn request_authorization(
+        &self,
+        device: OwnedObjectPath,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> Result<(), AgentError> {
+        self.admit(conn, &header, "RequestAuthorization").await?;
+        self.authorization_for(&device).await
     }
 
-    async fn authorize_service(&self, device: OwnedObjectPath, uuid: String) {
-        // Auto-accept service authorization. BlueZ asks per-service for
-        // unknown protocols; for trusted/already-paired devices this is
-        // generally fine and matches blueman-applet's default policy.
-        let _ = (device, uuid);
+    async fn authorize_service(
+        &self,
+        device: OwnedObjectPath,
+        uuid: String,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> Result<(), AgentError> {
+        self.admit(conn, &header, "AuthorizeService").await?;
+        self.authorize_service_for(&device, &uuid).await
     }
 
     /// Reject whichever request is waiting. Its banner is taken down by that
@@ -118,11 +401,18 @@ impl PairAgent {
     /// the sender and clearing the banner, the next request could already
     /// have raised its own banner, and that clear wiped it. The newer request
     /// would then wait out bluetoothd's minute with nothing on screen.
-    async fn cancel(&self) {
+    ///
+    /// Only bluetoothd may cancel: anyone else is refused and the waiting
+    /// request keeps waiting.
+    async fn cancel(
+        &self,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> Result<(), AgentError> {
+        self.admit(conn, &header, "Cancel").await?;
         tracing::debug!("agent cancel — aborting pending prompt");
-        if let Some(shared) = shared_state() {
-            cancel_in(&shared.pending_response).await;
-        }
+        cancel_in(&self.pending).await;
+        Ok(())
     }
 }
 
@@ -190,10 +480,39 @@ fn new_prompt(device: &OwnedObjectPath, passkey: Option<u32>, kind: PromptKind) 
     PairPrompt {
         id: NEXT_PROMPT_ID.fetch_add(1, Ordering::Relaxed),
         alias: lookup_alias(&device_path),
+        address: lookup_address(&device_path),
         device_path,
         passkey,
         kind,
+        service: None,
     }
+}
+
+/// The device's Bluetooth address (`AA:BB:CC:DD:EE:FF`): the snapshot's,
+/// else the one bluetoothd spells into the object path's last segment
+/// (`…/dev_AA_BB_CC_DD_EE_FF`), else empty.
+fn lookup_address(path: &str) -> String {
+    shared_state()
+        .and_then(|s| {
+            let devs = s.devices.lock_ref();
+            devs.iter()
+                .find(|d| d.path == path && !d.address.is_empty())
+                .map(|d| d.address.clone())
+        })
+        .or_else(|| address_from_path(path))
+        .unwrap_or_default()
+}
+
+/// The address in a `BlueZ` device path, `…/dev_AA_BB_CC_DD_EE_FF` →
+/// `AA:BB:CC:DD:EE:FF`, or `None` if the path does not end in one.
+fn address_from_path(path: &str) -> Option<String> {
+    let octets = path.rsplit('/').next()?.strip_prefix("dev_")?;
+    let parts: Vec<&str> = octets.split('_').collect();
+    let well_formed = parts.len() == 6
+        && parts
+            .iter()
+            .all(|p| p.len() == 2 && p.bytes().all(|b| b.is_ascii_hexdigit()));
+    well_formed.then(|| parts.join(":"))
 }
 
 /// Resolve a device path to a user-facing label. Prefers the `BlueZ` Alias,
@@ -217,18 +536,9 @@ fn lookup_alias(path: &str) -> String {
 }
 
 /// Suspend the calling Agent1 method until the user responds via the UI.
-/// Returns `AgentReply::Reject` if no prompt slot is available, the
-/// channel is dropped, or another pair is already in flight — callers
-/// pattern-match on the returned variant to shape their D-Bus return.
-async fn await_reply(prompt: PairPrompt) -> AgentReply {
-    let Some(shared) = shared_state() else {
-        return AgentReply::Reject;
-    };
-    await_reply_in(&shared.pending_response, &shared.pair_prompt, prompt).await
-}
-
-/// [`await_reply`] over explicit slots, so a test can drive it without the
-/// process-global shared state.
+/// Returns `AgentReply::Reject` if the channel is dropped or another pair is
+/// already in flight — callers pattern-match on the returned variant to shape
+/// their D-Bus return.
 ///
 /// `pending` holds the sender the UI answers through. `banner` holds the
 /// prompt the UI shows. This request puts its sender in `pending`, then
@@ -611,8 +921,10 @@ mod tests {
             id,
             device_path: "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF".to_owned(),
             alias: "Keyboard".to_owned(),
+            address: "AA:BB:CC:DD:EE:FF".to_owned(),
             passkey: Some(123_456),
             kind: PromptKind::ConfirmPasskey,
+            service: None,
         }
     }
 
@@ -917,6 +1229,374 @@ mod tests {
     }
 }
 
+/// `AuthorizeService` (#1491): what it asks, how the answer maps to the
+/// reply bluetoothd gets, and what the prompt calls each service; and what
+/// answering a pairing prompt does to the device's trust (#1603 review,
+/// MED-1). Hermetic: the agent is driven past its caller check (which the
+/// system tests cover), with its own banner, reply slot and a recording
+/// device bus.
+#[cfg(test)]
+mod authorize_service_tests {
+    use super::{
+        AgentError, AgentReply, PairAgent, PairPrompt, PromptKind, ReplySlot, address_from_path,
+        allow_or_reject, answer_in, cancel_in, service_label, service_name,
+    };
+    use crate::bluetooth::trust::fake::{Call, FakeBus};
+    use crate::bluetooth::trust::{PAIRING_WINDOW, Pairings, Shown};
+    use futures_signals::signal::Mutable;
+    use futures_util::FutureExt;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Mutex as AsyncMutex;
+    use zbus::zvariant::OwnedObjectPath;
+
+    /// What bluetoothd sends for an incoming A2DP stream
+    /// (`ADVANCED_AUDIO_UUID`).
+    const A2DP: &str = "0000110d-0000-1000-8000-00805f9b34fb";
+
+    /// An agent with its own slots and a recording device bus. Its caller
+    /// check is never run here.
+    struct Fixture {
+        agent: PairAgent,
+        pending: Arc<ReplySlot>,
+        banner: Mutable<Option<PairPrompt>>,
+        devices: Arc<FakeBus>,
+        pairings: Pairings,
+    }
+
+    fn fixture() -> Fixture {
+        let pending: Arc<ReplySlot> = Arc::new(AsyncMutex::new(None));
+        let banner = Mutable::new(None);
+        let devices = Arc::new(FakeBus::new());
+        let pairings = Pairings::default();
+        let agent = PairAgent::new(
+            pending.clone(),
+            banner.clone(),
+            devices.clone(),
+            pairings.clone(),
+        );
+        Fixture {
+            agent,
+            pending,
+            banner,
+            devices,
+            pairings,
+        }
+    }
+
+    /// [`fixture`] without the device bus.
+    fn agent() -> (PairAgent, Arc<ReplySlot>, Mutable<Option<PairPrompt>>) {
+        let f = fixture();
+        (f.agent, f.pending, f.banner)
+    }
+
+    fn device() -> OwnedObjectPath {
+        OwnedObjectPath::try_from("/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF").expect("object path")
+    }
+
+    /// The reply bluetoothd gets for `result`, by D-Bus error name.
+    fn reply_name(result: &Result<(), AgentError>) -> Option<String> {
+        use zbus::DBusError as _;
+        result.as_ref().err().map(|e| e.name().to_string())
+    }
+
+    /// `AuthorizeService` asks: the banner shows who wants what, and nothing
+    /// is answered until the user does. Allow admits the service.
+    ///
+    /// **Falsification:** answer `Ok(())` without asking (the old
+    /// auto-accept) and the "waits on the user" assertion fails.
+    #[tokio::test(flavor = "current_thread")]
+    async fn it_asks_the_user_and_allow_admits_the_service() {
+        let (agent, pending, banner) = agent();
+        let device = device();
+        let mut asking = std::pin::pin!(agent.authorize_service_for(&device, A2DP));
+        assert!(
+            asking.as_mut().now_or_never().is_none(),
+            "AuthorizeService waits on the user"
+        );
+
+        let shown = banner.get_cloned().expect("a prompt is raised");
+        assert_eq!(shown.kind, PromptKind::AuthorizeService);
+        assert_eq!(shown.service.as_deref(), Some("audio streaming (A2DP)"));
+        assert_eq!(shown.device_path, device.as_str());
+        assert_eq!(
+            shown.address, "AA:BB:CC:DD:EE:FF",
+            "read off the path when the snapshot has none"
+        );
+        assert_eq!(shown.passkey, None);
+
+        answer_in(&pending, shown.id, AgentReply::Confirm).await;
+        assert!(asking.await.is_ok(), "Allow admits the service");
+        assert!(banner.get_cloned().is_none(), "the prompt comes down");
+    }
+
+    /// Deny is `org.bluez.Error.Rejected`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn deny_rejects_the_service() {
+        let (agent, pending, banner) = agent();
+        let device = device();
+        let mut asking = std::pin::pin!(agent.authorize_service_for(&device, A2DP));
+        assert!(asking.as_mut().now_or_never().is_none());
+        let shown = banner.get_cloned().expect("a prompt is raised");
+
+        answer_in(&pending, shown.id, AgentReply::Reject).await;
+        assert_eq!(
+            reply_name(&asking.await).as_deref(),
+            Some("org.bluez.Error.Rejected")
+        );
+    }
+
+    /// A `Cancel` — bluetoothd's own once its 60 s are up, or the watcher's
+    /// cleanup after bluetoothd went away — is a rejection, not a default
+    /// yes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cancel_or_timeout_rejects_the_service() {
+        let (agent, pending, _banner) = agent();
+        let device = device();
+        let mut asking = std::pin::pin!(agent.authorize_service_for(&device, A2DP));
+        assert!(asking.as_mut().now_or_never().is_none());
+
+        cancel_in(&pending).await;
+        assert_eq!(
+            reply_name(&asking.await).as_deref(),
+            Some("org.bluez.Error.Rejected")
+        );
+    }
+
+    /// Allowing a service saves nothing: the device is not made trusted.
+    #[tokio::test(flavor = "current_thread")]
+    async fn allowing_a_service_does_not_trust_the_device() {
+        let f = fixture();
+        let device = device();
+        let mut asking = std::pin::pin!(f.agent.authorize_service_for(&device, A2DP));
+        assert!(asking.as_mut().now_or_never().is_none());
+        let shown = f.banner.get_cloned().expect("a prompt is raised");
+        answer_in(&f.pending, shown.id, AgentReply::Confirm).await;
+        assert!(asking.await.is_ok());
+        assert!(f.devices.calls().is_empty(), "{:?}", f.devices.calls());
+    }
+
+    /// Drive one pairing prompt of `kind` on a fresh agent, answer it with
+    /// `accept`, and return whether bluetoothd got `Ok`, every device-bus call
+    /// made by the time it did, and whether the device was in progress then.
+    async fn answer_pairing(kind: PromptKind, accept: bool) -> (bool, Vec<Call>, bool) {
+        let f = fixture();
+        let device = device();
+        let mut asking: std::pin::Pin<Box<dyn std::future::Future<Output = bool> + '_>> = match kind
+        {
+            PromptKind::ConfirmPasskey => {
+                Box::pin(async { f.agent.confirmation_for(&device, 123_456).await.is_ok() })
+            }
+            PromptKind::Authorize => {
+                Box::pin(async { f.agent.authorization_for(&device).await.is_ok() })
+            }
+            PromptKind::EnterPinCode => {
+                Box::pin(async { f.agent.pin_code_for(&device).await.is_ok() })
+            }
+            PromptKind::EnterPasskey => {
+                Box::pin(async { f.agent.passkey_for(&device).await.is_ok() })
+            }
+            PromptKind::AuthorizeService => unreachable!("not a pairing prompt"),
+        };
+        assert!(asking.as_mut().now_or_never().is_none(), "{kind:?} waits");
+        let shown = f.banner.get_cloned().expect("a prompt is raised");
+        assert_eq!(shown.kind, kind);
+        let reply = match (accept, kind) {
+            (false, _) => AgentReply::Reject,
+            (true, PromptKind::EnterPinCode) => AgentReply::Pin("0000".to_owned()),
+            (true, PromptKind::EnterPasskey) => AgentReply::Passkey(123_456),
+            (true, _) => AgentReply::Confirm,
+        };
+        answer_in(&f.pending, shown.id, reply).await;
+        let ok = asking.await;
+        (ok, f.devices.calls(), f.pairings.contains(device.as_str()))
+    }
+
+    const PAIRING_PROMPTS: [PromptKind; 4] = [
+        PromptKind::ConfirmPasskey,
+        PromptKind::Authorize,
+        PromptKind::EnterPinCode,
+        PromptKind::EnterPasskey,
+    ];
+
+    /// Accepting a pairing the device started puts it in progress by the
+    /// time bluetoothd has its reply, for every kind of pairing prompt, and
+    /// sets nothing in bluetoothd yet: `Trusted` waits for the pairing to
+    /// succeed (#1603 review, MED-A).
+    ///
+    /// **Falsification:** drop the `accepted` call from
+    /// `in_progress_if_accepted` and the device is not in progress; trust it
+    /// at once (the previous design) and a `SetTrusted(true)` shows up.
+    #[tokio::test(flavor = "current_thread")]
+    async fn accepting_a_pairing_puts_it_in_progress_and_trusts_nothing_yet() {
+        for kind in PAIRING_PROMPTS {
+            let (ok, calls, in_progress) = answer_pairing(kind, true).await;
+            assert!(ok, "{kind:?} accepted");
+            assert!(in_progress, "{kind:?}: in progress by the reply");
+            assert!(calls.is_empty(), "{kind:?}: {calls:?}");
+        }
+    }
+
+    /// A rejected pairing prompt never enters the set and sets nothing.
+    ///
+    /// **Falsification:** put the device in progress on any answer
+    /// (`in_progress_if_accepted` ignoring `result`) and this fails.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_rejected_pairing_never_enters_the_set() {
+        for kind in PAIRING_PROMPTS {
+            let (ok, calls, in_progress) = answer_pairing(kind, false).await;
+            assert!(!ok, "{kind:?} rejected");
+            assert!(!in_progress, "{kind:?}: entered the set");
+            assert!(calls.is_empty(), "{kind:?}: {calls:?}");
+        }
+    }
+
+    /// While a device is being paired, its `AuthorizeService` is allowed at
+    /// once, with no prompt and nothing set.
+    ///
+    /// **Falsification:** drop the in-progress check from
+    /// `authorize_service_for` and the request raises a prompt and waits.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_service_request_during_a_pairing_is_allowed_without_a_prompt() {
+        let f = fixture();
+        let device = device();
+        f.pairings.begin(device.as_str());
+        let answered = f.agent.authorize_service_for(&device, A2DP).now_or_never();
+        assert!(
+            matches!(answered, Some(Ok(()))),
+            "allowed at once, got {answered:?}"
+        );
+        assert!(f.banner.get_cloned().is_none(), "no prompt");
+        assert!(f.devices.calls().is_empty(), "nothing set");
+    }
+
+    /// Once an accepted pairing's window has passed without it completing,
+    /// the device's service requests ask again.
+    ///
+    /// **Falsification:** let the in-progress entry outlive the window and
+    /// the request is still allowed without a prompt.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn after_the_pairing_window_a_service_request_asks_again() {
+        let f = fixture();
+        let device = device();
+        f.devices.show(Some(Shown::default()));
+        let mut asking = std::pin::pin!(f.agent.confirmation_for(&device, 123_456));
+        assert!(asking.as_mut().now_or_never().is_none());
+        let shown = f.banner.get_cloned().expect("a prompt is raised");
+        answer_in(&f.pending, shown.id, AgentReply::Confirm).await;
+        assert!(asking.await.is_ok());
+        assert!(f.pairings.contains(device.as_str()));
+
+        tokio::time::sleep(PAIRING_WINDOW + Duration::from_secs(1)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!f.pairings.contains(device.as_str()), "the window passed");
+
+        let mut asking = std::pin::pin!(f.agent.authorize_service_for(&device, A2DP));
+        assert!(
+            asking.as_mut().now_or_never().is_none(),
+            "the request asks the user again"
+        );
+        assert_eq!(
+            f.banner.get_cloned().map(|p| p.kind),
+            Some(PromptKind::AuthorizeService)
+        );
+        assert!(f.devices.calls().is_empty(), "nothing was trusted");
+    }
+
+    /// The mapping itself: only an explicit yes is `Ok`.
+    #[test]
+    fn only_a_yes_is_allowed() {
+        assert!(allow_or_reject(&AgentReply::Confirm, "no").is_ok());
+        for reply in [
+            AgentReply::Reject,
+            AgentReply::Pin("0000".to_owned()),
+            AgentReply::Passkey(1),
+        ] {
+            assert_eq!(
+                reply_name(&allow_or_reject(&reply, "no")).as_deref(),
+                Some("org.bluez.Error.Rejected"),
+                "{reply:?} must reject"
+            );
+        }
+    }
+
+    /// The services a prompt names, by the UUID bluetoothd sends. The
+    /// numbers are the SIG's assigned numbers; see `service_name`.
+    #[test]
+    fn common_services_have_readable_names() {
+        let base = |short: &str| format!("0000{short}-0000-1000-8000-00805f9b34fb");
+        let cases = [
+            ("110a", "audio streaming (A2DP source)"),
+            ("110b", "audio streaming (A2DP sink)"),
+            ("110d", "audio streaming (A2DP)"),
+            ("110c", "media controls (AVRCP)"),
+            ("110e", "media controls (AVRCP)"),
+            ("110f", "media controls (AVRCP)"),
+            ("1108", "headset audio (HSP)"),
+            ("1112", "headset audio (HSP)"),
+            ("1131", "headset audio (HSP)"),
+            ("111e", "hands-free calling (HFP)"),
+            ("111f", "hands-free calling (HFP)"),
+            ("1124", "keyboard and mouse input (HID)"),
+            ("1812", "keyboard and mouse input (HID)"),
+            ("000f", "network sharing (PAN)"),
+            ("1115", "network sharing (PAN)"),
+            ("1116", "network sharing (PAN)"),
+            ("1117", "network sharing (PAN)"),
+        ];
+        for (short, name) in cases {
+            assert_eq!(service_name(&base(short)), Some(name), "0x{short}");
+        }
+        assert_eq!(
+            service_name("0000110B-0000-1000-8000-00805F9B34FB"),
+            Some("audio streaming (A2DP sink)"),
+            "UUIDs compare case-insensitively"
+        );
+    }
+
+    /// The address comes out of a `BlueZ` device path, and nothing comes out
+    /// of a path that does not end in one.
+    #[test]
+    fn the_address_is_read_off_the_device_path() {
+        assert_eq!(
+            address_from_path("/org/bluez/hci0/dev_0A_1b_2C_3d_4E_5f").as_deref(),
+            Some("0A:1b:2C:3d:4E:5f")
+        );
+        for path in [
+            "/org/bluez/hci0",
+            "/org/bluez/hci0/dev_AA_BB_CC_DD_EE",
+            "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/sep1",
+            "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_GG",
+            "",
+        ] {
+            assert_eq!(address_from_path(path), None, "{path:?}");
+        }
+    }
+
+    /// Anything else is shown as the UUID bluetoothd sent.
+    #[test]
+    fn any_other_service_is_shown_as_its_uuid() {
+        for uuid in [
+            // Serial Port: assigned, but not one we name.
+            "00001101-0000-1000-8000-00805f9b34fb",
+            // A vendor's own 128-bit UUID.
+            "d0611e78-bbb4-4591-a5f8-487910ae4366",
+            // Not hex where the short number goes.
+            "0000+10b-0000-1000-8000-00805f9b34fb",
+            "",
+        ] {
+            assert_eq!(service_name(uuid), None, "{uuid:?}");
+            assert_eq!(service_label(uuid), uuid);
+        }
+        assert_eq!(
+            service_label("0000110b-0000-1000-8000-00805f9b34fb"),
+            "audio streaming (A2DP sink)"
+        );
+    }
+}
+
 /// The registration loop (#1551): what wakes it, the retry, and when the
 /// retry stops. All under paused time, with the registration, the bus
 /// question and the owner stream scripted.
@@ -1134,6 +1814,416 @@ mod registration_tests {
         tokio::select! {
             () = looping => panic!("the loop never ends while its stream is open"),
             () = script => {}
+        }
+    }
+}
+
+// ── System tests: the agent's sender check over a real bus ───────────────────
+//
+// What only a broker can show: that each `Agent1` method reads its sender off
+// the call and answers bluetoothd — whoever owns `org.bluez` — and refuses
+// everyone else before raising a prompt or touching the reply slot. The agent
+// is mounted on an ephemeral `dbus-daemon`, one connection owns `org.bluez`
+// the way bluetoothd does, and another owns nothing. The `BusGuard` /
+// `ephemeral_bus` harness is `wifi::nm_agent`'s, copied per module as this
+// crate does (`devices.rs` and `screensaver.rs` carry the same copy). Run with:
+//   cargo test -p hytte-services --features system-tests --lib bluetooth::agent
+#[cfg(all(test, feature = "system-tests"))]
+mod system_tests {
+    use super::{
+        AGENT_PATH, AgentReply, BLUEZ_BUS_NAME, PairAgent, PairPrompt, ReplySlot, answer_in,
+    };
+    use futures_signals::signal::Mutable;
+    use std::path::PathBuf;
+    use std::process::Stdio;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tempfile::TempDir;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::{Child, Command};
+    use tokio::sync::Mutex as AsyncMutex;
+    use zbus::Connection;
+    use zbus::connection::Builder;
+    use zbus::zvariant::OwnedObjectPath;
+
+    /// Upper bound on any one round trip. A liveness guard, not a latency
+    /// assertion: the same number and the same reasoning as
+    /// `wifi::nm_agent`'s budget.
+    const DBUS_REPLY_BUDGET: Duration = Duration::from_secs(30);
+
+    const AGENT_IFACE: &str = "org.bluez.Agent1";
+    const DEVICE: &str = "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF";
+    const REJECTED: &str = "org.bluez.Error.Rejected";
+
+    /// Kills the spawned `dbus-daemon` on drop (see `wifi::nm_agent`).
+    struct BusGuard {
+        child: Option<Child>,
+        _tmp: TempDir,
+        address: String,
+    }
+
+    impl Drop for BusGuard {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                let _ = child.start_kill();
+                tokio::task::block_in_place(|| {
+                    let handle = tokio::runtime::Handle::current();
+                    let _ = handle.block_on(child.wait());
+                });
+            }
+        }
+    }
+
+    /// Spawn a fresh `dbus-daemon` and return a guard that kills it on drop.
+    async fn ephemeral_bus() -> BusGuard {
+        let tmp = TempDir::new().expect("create tempdir for dbus-daemon");
+        let socket: PathBuf = tmp.path().join("bus");
+        let address = format!("unix:path={}", socket.display());
+
+        let config = tmp.path().join("session.conf");
+        std::fs::write(
+            &config,
+            format!(
+                r#"<?xml version="1.0"?>
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>{address}</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+"#
+            ),
+        )
+        .expect("write dbus-daemon config");
+
+        let mut child = Command::new("dbus-daemon")
+            .arg("--config-file")
+            .arg(&config)
+            .arg("--print-address=1")
+            .arg("--nofork")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn dbus-daemon — install package `dbus` if missing");
+
+        let stdout = child.stdout.take().expect("dbus-daemon stdout");
+        let mut lines = BufReader::new(stdout).lines();
+        let printed = tokio::time::timeout(DBUS_REPLY_BUDGET, lines.next_line())
+            .await
+            .expect("dbus-daemon address timeout")
+            .expect("dbus-daemon read address")
+            .expect("dbus-daemon closed stdout");
+        assert!(
+            printed.contains("unix:path="),
+            "unexpected dbus-daemon address: {printed}"
+        );
+
+        BusGuard {
+            child: Some(child),
+            _tmp: tmp,
+            address,
+        }
+    }
+
+    /// The agent under test, mounted on the bus, plus the two slots it raises
+    /// prompts on and waits in.
+    struct Mounted {
+        /// Keeps the agent mounted; never read.
+        _server: Connection,
+        /// The agent's unique name, which every proxy addresses.
+        dest: String,
+        pending: Arc<ReplySlot>,
+        banner: Mutable<Option<PairPrompt>>,
+    }
+
+    /// Mount a `PairAgent`, built exactly as production builds it: its caller
+    /// check asks the bus each call arrives on, which here is this test's.
+    /// The agent is staged on the connection's builder, so its object server
+    /// dispatches before anything can be read off the socket
+    /// (`wifi::nm_agent`'s `mount_and_proxy` has the whole argument, #756).
+    async fn mount(guard: &BusGuard) -> Mounted {
+        let pending: Arc<ReplySlot> = Arc::new(AsyncMutex::new(None));
+        let banner: Mutable<Option<PairPrompt>> = Mutable::new(None);
+        let agent = PairAgent::new(
+            pending.clone(),
+            banner.clone(),
+            Arc::new(crate::bluetooth::trust::fake::FakeBus::new()),
+            crate::bluetooth::trust::Pairings::default(),
+        );
+        let server = Builder::address(guard.address.as_str())
+            .expect("parse ephemeral bus address")
+            .serve_at(AGENT_PATH, agent)
+            .expect("stage the agent")
+            .build()
+            .await
+            .expect("mount the agent");
+        let dest = server
+            .unique_name()
+            .expect("server has a unique name")
+            .to_string();
+        Mounted {
+            _server: server,
+            dest,
+            pending,
+            banner,
+        }
+    }
+
+    /// A proxy to the agent from a fresh connection that owns `name`
+    /// (`org.bluez` for bluetoothd, `None` for anyone else).
+    async fn proxy(
+        guard: &BusGuard,
+        mounted: &Mounted,
+        name: Option<&str>,
+    ) -> zbus::Proxy<'static> {
+        let mut builder =
+            Builder::address(guard.address.as_str()).expect("parse ephemeral bus address");
+        if let Some(name) = name {
+            builder = builder.name(name).expect("a valid well-known name");
+        }
+        let client = builder.build().await.expect("connect a client to the bus");
+        zbus::Proxy::new(&client, mounted.dest.clone(), AGENT_PATH, AGENT_IFACE)
+            .await
+            .expect("build Agent1 proxy")
+    }
+
+    fn device() -> OwnedObjectPath {
+        OwnedObjectPath::try_from(DEVICE).expect("a valid object path")
+    }
+
+    /// Wait until the banner shows a prompt, and return it.
+    async fn shown(banner: &Mutable<Option<PairPrompt>>) -> PairPrompt {
+        let end = tokio::time::Instant::now() + DBUS_REPLY_BUDGET;
+        while tokio::time::Instant::now() < end {
+            if let Some(prompt) = banner.get_cloned() {
+                return prompt;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("no prompt was raised within {DBUS_REPLY_BUDGET:?}");
+    }
+
+    /// Assert the result is a `MethodError` named exactly `expected`.
+    fn assert_error_name_is<T: std::fmt::Debug>(result: &Result<T, zbus::Error>, expected: &str) {
+        match result {
+            Err(zbus::Error::MethodError(name, _detail, _reply)) => {
+                assert_eq!(name.as_str(), expected);
+            }
+            Err(other) => panic!("expected MethodError {expected:?}, got {other:?}"),
+            Ok(value) => panic!("expected MethodError {expected:?}, got Ok({value:?})"),
+        }
+    }
+
+    /// Every method that raises a prompt, called by a peer that is not
+    /// bluetoothd, is rejected at once: no banner, nothing in the reply
+    /// slot. bluetoothd's own request on the same agent is still asked and
+    /// answered.
+    ///
+    /// **Falsification:** drop the `admit` call from any of
+    /// `request_pin_code`, `request_passkey`, `request_confirmation`,
+    /// `request_authorization` or `authorize_service`, and the intruder's
+    /// request raises a banner and waits on it, so its "rejected at once"
+    /// expectation times out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_request_from_a_peer_that_is_not_bluez_is_rejected_and_raises_no_prompt() {
+        const A2DP: &str = "0000110d-0000-1000-8000-00805f9b34fb";
+
+        let guard = ephemeral_bus().await;
+        let mounted = mount(&guard).await;
+        let intruder = proxy(&guard, &mounted, None).await;
+        let bluez = proxy(&guard, &mounted, Some(BLUEZ_BUS_NAME)).await;
+
+        for method in [
+            "RequestPinCode",
+            "RequestPasskey",
+            "RequestConfirmation",
+            "RequestAuthorization",
+            "AuthorizeService",
+        ] {
+            let asked = async {
+                match method {
+                    "RequestConfirmation" => {
+                        intruder.call_method(method, &(device(), 123_456_u32)).await
+                    }
+                    "AuthorizeService" => {
+                        intruder
+                            .call_method(method, &(device(), A2DP.to_string()))
+                            .await
+                    }
+                    _ => intruder.call_method(method, &(device(),)).await,
+                }
+            };
+            let refused = tokio::time::timeout(DBUS_REPLY_BUDGET, asked)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{method} from an intruder waited on a prompt instead of being rejected")
+                });
+            assert_error_name_is(&refused, REJECTED);
+            assert!(
+                mounted.banner.get_cloned().is_none(),
+                "{method}: no banner raised"
+            );
+            assert!(
+                mounted.pending.lock().await.is_none(),
+                "{method}: nothing put in the reply slot"
+            );
+        }
+
+        // bluetoothd, on the same agent, is asked as before.
+        let call = tokio::spawn(async move {
+            bluez
+                .call::<_, _, ()>("RequestConfirmation", &(device(), 123_456_u32))
+                .await
+        });
+        let prompt = shown(&mounted.banner).await;
+        assert_eq!(prompt.passkey, Some(123_456));
+        answer_in(&mounted.pending, prompt.id, AgentReply::Confirm).await;
+        tokio::time::timeout(DBUS_REPLY_BUDGET, call)
+            .await
+            .expect("bluetoothd's request did not return in time")
+            .expect("request task panicked")
+            .expect("bluetoothd's confirmed request returned an error");
+    }
+
+    /// A `Cancel` from a peer that is not bluetoothd is rejected and cancels
+    /// nothing: bluetoothd's waiting request keeps its banner and its reply
+    /// slot, and the user's answer still reaches it.
+    ///
+    /// **Falsification:** drop the `admit` call from `cancel` and the
+    /// intruder's cancel succeeds, rejecting bluetoothd's request, so the
+    /// refusal assertion fails.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancel_from_a_peer_that_is_not_bluez_leaves_the_request_waiting() {
+        let guard = ephemeral_bus().await;
+        let mounted = mount(&guard).await;
+        let intruder = proxy(&guard, &mounted, None).await;
+        let bluez = proxy(&guard, &mounted, Some(BLUEZ_BUS_NAME)).await;
+
+        let call = tokio::spawn(async move {
+            bluez
+                .call::<_, _, ()>("RequestAuthorization", &(device(),))
+                .await
+        });
+        let prompt = shown(&mounted.banner).await;
+
+        let cancel: Result<(), zbus::Error> =
+            tokio::time::timeout(DBUS_REPLY_BUDGET, intruder.call("Cancel", &()))
+                .await
+                .expect("Cancel did not return in time");
+        assert_error_name_is(&cancel, REJECTED);
+        assert_eq!(
+            mounted.banner.get_cloned().map(|p| p.id),
+            Some(prompt.id),
+            "a refused cancel leaves bluetoothd's banner up"
+        );
+        assert!(
+            mounted.pending.lock().await.is_some(),
+            "a refused cancel leaves bluetoothd's request waiting"
+        );
+        assert!(!call.is_finished(), "bluetoothd's request is still pending");
+
+        answer_in(&mounted.pending, prompt.id, AgentReply::Confirm).await;
+        tokio::time::timeout(DBUS_REPLY_BUDGET, call)
+            .await
+            .expect("bluetoothd's request did not return in time")
+            .expect("request task panicked")
+            .expect("bluetoothd's authorized request returned an error");
+    }
+
+    /// `AuthorizeService` over the wire: bluetoothd's request raises the
+    /// prompt with the service's name and gets `Ok` on Allow and `Rejected`
+    /// on Deny; anyone else's is rejected without a prompt.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn authorize_service_asks_for_bluez_and_refuses_anyone_else() {
+        const A2DP: &str = "0000110d-0000-1000-8000-00805f9b34fb";
+
+        let guard = ephemeral_bus().await;
+        let mounted = mount(&guard).await;
+        let intruder = proxy(&guard, &mounted, None).await;
+        let bluez = proxy(&guard, &mounted, Some(BLUEZ_BUS_NAME)).await;
+
+        let refused: Result<(), zbus::Error> = tokio::time::timeout(
+            DBUS_REPLY_BUDGET,
+            intruder.call("AuthorizeService", &(device(), A2DP.to_string())),
+        )
+        .await
+        .expect("a refused request is rejected at once");
+        assert_error_name_is(&refused, REJECTED);
+        assert!(mounted.banner.get_cloned().is_none(), "no banner raised");
+
+        for (answer, allowed) in [(AgentReply::Confirm, true), (AgentReply::Reject, false)] {
+            let call = {
+                let bluez = bluez.clone();
+                tokio::spawn(async move {
+                    bluez
+                        .call::<_, _, ()>("AuthorizeService", &(device(), A2DP.to_string()))
+                        .await
+                })
+            };
+            let prompt = shown(&mounted.banner).await;
+            assert_eq!(prompt.kind, super::PromptKind::AuthorizeService);
+            assert_eq!(prompt.service.as_deref(), Some("audio streaming (A2DP)"));
+            answer_in(&mounted.pending, prompt.id, answer).await;
+            let reply = tokio::time::timeout(DBUS_REPLY_BUDGET, call)
+                .await
+                .expect("AuthorizeService did not return in time")
+                .expect("request task panicked");
+            if allowed {
+                reply.expect("Allow admits the service");
+            } else {
+                assert_error_name_is(&reply, REJECTED);
+            }
+            // The request takes its prompt down before it replies, so the
+            // next round's prompt is its own.
+            assert!(
+                mounted.banner.get_cloned().is_none(),
+                "the prompt comes down with the reply"
+            );
+        }
+    }
+
+    /// The methods that raise no prompt are checked too: bluetoothd gets its
+    /// empty reply, anyone else `Rejected`.
+    ///
+    /// **Falsification:** drop the `admit` call from any of the three and
+    /// the intruder's call succeeds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_methods_without_a_prompt_answer_only_bluez() {
+        async fn all_three(proxy: &zbus::Proxy<'_>) -> [Result<(), zbus::Error>; 3] {
+            let release = proxy.call("Release", &()).await;
+            let pin = proxy
+                .call("DisplayPinCode", &(device(), "0000".to_string()))
+                .await;
+            let passkey = proxy
+                .call("DisplayPasskey", &(device(), 123_456_u32, 0_u16))
+                .await;
+            [release, pin, passkey]
+        }
+
+        let guard = ephemeral_bus().await;
+        let mounted = mount(&guard).await;
+        let intruder = proxy(&guard, &mounted, None).await;
+        let bluez = proxy(&guard, &mounted, Some(BLUEZ_BUS_NAME)).await;
+
+        let from_bluez = tokio::time::timeout(DBUS_REPLY_BUDGET, all_three(&bluez))
+            .await
+            .expect("the calls did not return in time");
+        for reply in &from_bluez {
+            assert!(reply.is_ok(), "bluetoothd was refused: {reply:?}");
+        }
+
+        let from_intruder = tokio::time::timeout(DBUS_REPLY_BUDGET, all_three(&intruder))
+            .await
+            .expect("the calls did not return in time");
+        for reply in &from_intruder {
+            assert_error_name_is(reply, REJECTED);
         }
     }
 }

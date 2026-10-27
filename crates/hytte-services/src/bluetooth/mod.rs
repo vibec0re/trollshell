@@ -29,6 +29,7 @@
 mod agent;
 mod devices;
 mod parse;
+mod trust;
 mod types;
 
 pub(crate) use types::AgentReply;
@@ -87,9 +88,10 @@ const PAIRING_CALL_TIMEOUT: Duration = Duration::from_mins(5);
 //     `submit_passkey`) spawns a task that signals `pending_response`; the
 //     pairing dialog hangs forever on a no-op.
 //   - `PairAgent` iface methods (`request_pin_code`, `request_passkey`,
-//     `request_confirmation`, `request_authorization`, `cancel`) call
-//     `lookup_alias`, `cancel_in` and `await_reply`, which reach
-//     the prompt slot; all of them once used `registry::with`.
+//     `request_confirmation`, `request_authorization`, `authorize_service`)
+//     call `lookup_alias`, which reads the device list; they once used
+//     `registry::with`. The prompt and reply slots they and `cancel` reach
+//     are clones the agent is built with, not lookups.
 //
 // The cross-thread-safe alternative is `hytte_reactive::shared` (the
 // process-global registry mirror): `Service::start` publishes this bag with
@@ -112,6 +114,9 @@ pub(super) struct BluetoothShared {
     /// This handle is never cleared, and that is deliberate — see
     /// [`ActionError::at`] for why staleness is handled by timestamp instead.
     pub(super) action_error: Mutable<Option<ActionError>>,
+    /// The devices being paired, the same set the agent holds: `pair_device`
+    /// puts a device in for the length of its `Pair` call.
+    pub(super) pairings: trust::Pairings,
 }
 
 /// A user-facing message describing why a connect/pair/disconnect action
@@ -225,19 +230,35 @@ impl Service for BluetoothService {
     type Handles = BluetoothHandles;
 
     fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
+        // The agent raises its prompts on these two handles, and the UI
+        // answers through them, so they exist before the agent does.
+        let pair_prompt = Mutable::new(None);
+        let pending_response: Arc<ReplySlot> = Arc::new(AsyncMutex::new(None));
+        // The devices being paired: `pair_device` and the agent's accepted
+        // prompts put them in, and the agent's `AuthorizeService` reads it.
+        let pairings = trust::Pairings::default();
+        // It answers only bluetoothd, whose unique name it looks up per
+        // call: the object is reachable by any peer on the system bus.
+        let agent = PairAgent::new(
+            pending_response.clone(),
+            pair_prompt.clone(),
+            Arc::new(trust::SystemBluez),
+            pairings.clone(),
+        );
+
         // Build the own_name handle first so it can be stored in Handles for
         // parity with other services (polkit, screensaver, etc.) and passed
         // into run_agent to keep the interface alive for its lifetime.
         let ownership = hytte_bus::own_name(BusKind::System, AGENT_ANCHOR_NAME)
-            .at_path(AGENT_PATH, PairAgent)
+            .at_path(AGENT_PATH, agent)
             .start();
 
         let handles = BluetoothHandles {
             adapter: Mutable::new(None),
             devices: Mutable::new(Vec::new()),
             device_actions: Mutable::new(HashSet::new()),
-            pair_prompt: Mutable::new(None),
-            pending_response: Arc::new(AsyncMutex::new(None)),
+            pair_prompt,
+            pending_response,
             action_error: Mutable::new(None),
             _ownership: ownership.clone(),
         };
@@ -247,6 +268,7 @@ impl Service for BluetoothService {
             pair_prompt: handles.pair_prompt.clone(),
             pending_response: handles.pending_response.clone(),
             action_error: handles.action_error.clone(),
+            pairings,
         });
 
         let adapter_mutable = handles.adapter.clone();
@@ -588,26 +610,30 @@ pub fn disconnect_device(device_path: &str) {
     });
 }
 
-/// Fire-and-forget: call `Pair` on the given device. On success, also marks
-/// the device trusted (so it auto-reconnects on next session) and starts a
-/// connection. The pair-then-trust-then-connect chain is what most users
-/// expect from a "tap to pair my headphones" interaction. For devices that
-/// require a PIN/passkey `BlueZ` delegates to a registered `Agent1`; without
-/// one such pairings will silently fail.
+/// Fire-and-forget: call `Pair` on the given device; once it succeeds, mark
+/// it trusted (so it auto-reconnects next session and never asks before using
+/// a service) and connect it. While the pairing runs, the agent lets the
+/// device's service requests through; a pairing that fails sets nothing
+/// (`trust::pair_then_trust`). The pair-trust-connect chain is what most
+/// users expect from a "tap to pair my headphones" interaction. For devices
+/// that require a PIN/passkey `BlueZ` delegates to a registered `Agent1`;
+/// without one such pairings will silently fail.
 pub fn pair_device(device_path: &str) {
     let path = device_path.to_string();
     mark_busy(&path);
+    // Shared with the agent, so its `AuthorizeService` sees this pairing.
+    let pairings = shared_state()
+        .map(|s| s.pairings.clone())
+        .unwrap_or_default();
     runtime::handle().spawn(async move {
-        let reply = do_device_call(&path, "Pair").await;
-        match pair_outcome(reply, is_paired_now(&path)) {
-            PairOutcome::Paired => trust_and_connect(&path).await,
+        match trust::pair_then_trust(&trust::SystemBluez, &pairings, &path).await {
+            PairOutcome::Paired => {}
             PairOutcome::PairedDespite(e) => {
                 tracing::info!(
                     error = %e,
                     path,
-                    "Pair answered an error but the device is paired; trusting and connecting"
+                    "Pair answered an error but the device is paired; trusted and connecting"
                 );
-                trust_and_connect(&path).await;
             }
             PairOutcome::Failed(e) => {
                 tracing::warn!(error = %e, path, "bluetooth pair_device failed");
@@ -616,17 +642,6 @@ pub fn pair_device(device_path: &str) {
         }
         mark_idle(&path);
     });
-}
-
-/// The follow-up to a successful pair: mark the device trusted so it
-/// reconnects by itself next session, then connect it now.
-async fn trust_and_connect(path: &str) {
-    if let Err(e) = do_set_device_bool(path, "Trusted", true).await {
-        tracing::warn!(error = %e, path, "auto-trust after pair failed");
-    }
-    if let Err(e) = do_device_call(path, "Connect").await {
-        tracing::warn!(error = %e, path, "auto-connect after pair failed");
-    }
 }
 
 /// What [`pair_device`] does once its `Pair` call has answered.
@@ -707,17 +722,6 @@ fn is_already_exists(e: &hytte_bus::BusError) -> bool {
         hytte_bus::BusError::Permanent { dbus_name: Some(name), .. }
             if name == "org.bluez.Error.AlreadyExists"
     )
-}
-
-/// Does the watcher's snapshot show `path` as paired? `false` before the
-/// service has started.
-fn is_paired_now(path: &str) -> bool {
-    shared_state().is_some_and(|s| {
-        s.devices
-            .lock_ref()
-            .iter()
-            .any(|d| d.path == path && d.paired)
-    })
 }
 
 /// Fire-and-forget: set the `Trusted` property on a device.

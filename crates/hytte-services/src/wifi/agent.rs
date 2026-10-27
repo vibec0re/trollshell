@@ -94,10 +94,14 @@ impl zbus::DBusError for IwdAgentError {
 
 /// The ids of the requests one iwd agent raised that may still be waiting.
 ///
-/// Only ever written **while holding the waiters lock** (see
-/// [`await_passphrase`] and [`cancel_waiting`]), so a `Cancel` never sees a
-/// waiter without its id or an id without its waiter. The `NetworkManager`
-/// agent's `inflight` map follows the same rule.
+/// An id is inserted (by [`await_passphrase`]) and drained (by
+/// [`cancel_waiting`]) **while holding the waiters lock**, so a `Cancel`
+/// never sees a waiter without its id. The request's own removal of its id
+/// once it has ended takes no waiters lock: by then its waiter is already
+/// out of the map, taken by a submit, a dismissal or a cancel. So a `Cancel`
+/// can find an id whose waiter is gone, and [`cancel_waiting`] skips it. Ids
+/// come from one counter shared with the `NetworkManager` agent and are
+/// never reused, so such an id can never name another request.
 type OwnRequests = Arc<AsyncMutex<HashSet<u64>>>;
 
 /// How the agent learns a network's name and security type for its prompt,
@@ -375,8 +379,8 @@ async fn cancel_waiting(
         let mut waiters = waiters.lock().await;
         let ids: Vec<u64> = own.lock().await.drain().collect();
         for id in &ids {
-            // Absent when the user's answer won the race: that request is
-            // completing anyway.
+            // Absent when the user's answer or dismissal won the race: that
+            // request is completing anyway (see `OwnRequests`).
             if let Some(tx) = waiters.remove(id) {
                 let _ = tx.send(Err("cancelled".into()));
             }

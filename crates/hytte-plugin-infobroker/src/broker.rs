@@ -4394,4 +4394,37 @@ mod tests {
             }
         }
     }
+
+    /// The guard is about `Deny` only: no shell's timer ever sent an allow,
+    /// so an allow that arrives 60 s or more after its knock parked is a
+    /// click on a card that went up late, and it still mints (#1601
+    /// re-review, NIT-1).
+    ///
+    /// Falsification: drop the `matches!(decision, ConsentDecision::Deny)`
+    /// half of the guard in `Session::on_cmd`, so every late decision is
+    /// answered as silence, and this reds: no token.
+    #[tokio::test]
+    async fn a_late_allow_still_mints() {
+        for decision in [
+            ConsentDecision::AllowOnce,
+            ConsentDecision::AllowSession,
+            ConsentDecision::AllowAlways,
+        ] {
+            let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+            let mut session = Session::new(BrokerState::new(store(Vec::new())), out_tx);
+            let (mut agent, prompt) = park_knock(&mut session, &mut out_rx, "claude").await;
+            knock_parked_for(&mut session, std::time::Duration::from_mins(1));
+
+            session
+                .on_cmd(Cmd::Decision {
+                    request_id: prompt.request_id,
+                    decision,
+                })
+                .await;
+
+            let reply = reply_on(&mut agent).await;
+            assert!(reply.ok, "{decision:?} at 60 s: {reply:?}");
+            assert!(reply.token.is_some(), "{decision:?} at 60 s mints a token");
+        }
+    }
 }

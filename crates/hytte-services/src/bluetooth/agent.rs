@@ -1715,32 +1715,60 @@ mod system_tests {
         }
     }
 
-    /// A `RequestConfirmation` from a peer that is not bluetoothd is
-    /// rejected at once: no banner, nothing in the reply slot. bluetoothd's
-    /// own request on the same agent is still asked and answered.
+    /// Every method that raises a prompt, called by a peer that is not
+    /// bluetoothd, is rejected at once: no banner, nothing in the reply
+    /// slot. bluetoothd's own request on the same agent is still asked and
+    /// answered.
     ///
-    /// **Falsification:** drop the `admit` call from `request_confirmation`
-    /// and the intruder's request raises a banner and waits on it, so the
-    /// "rejected at once" expectation times out.
+    /// **Falsification:** drop the `admit` call from any of
+    /// `request_pin_code`, `request_passkey`, `request_confirmation`,
+    /// `request_authorization` or `authorize_service`, and the intruder's
+    /// request raises a banner and waits on it, so its "rejected at once"
+    /// expectation times out.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_request_from_a_peer_that_is_not_bluez_is_rejected_and_raises_no_prompt() {
+        const A2DP: &str = "0000110d-0000-1000-8000-00805f9b34fb";
+
         let guard = ephemeral_bus().await;
         let mounted = mount(&guard).await;
         let intruder = proxy(&guard, &mounted, None).await;
         let bluez = proxy(&guard, &mounted, Some(BLUEZ_BUS_NAME)).await;
 
-        let refused: Result<(), zbus::Error> = tokio::time::timeout(
-            DBUS_REPLY_BUDGET,
-            intruder.call("RequestConfirmation", &(device(), 123_456_u32)),
-        )
-        .await
-        .expect("a refused request is rejected at once instead of waiting on a prompt");
-        assert_error_name_is(&refused, REJECTED);
-        assert!(mounted.banner.get_cloned().is_none(), "no banner raised");
-        assert!(
-            mounted.pending.lock().await.is_none(),
-            "nothing put in the reply slot"
-        );
+        for method in [
+            "RequestPinCode",
+            "RequestPasskey",
+            "RequestConfirmation",
+            "RequestAuthorization",
+            "AuthorizeService",
+        ] {
+            let asked = async {
+                match method {
+                    "RequestConfirmation" => {
+                        intruder.call_method(method, &(device(), 123_456_u32)).await
+                    }
+                    "AuthorizeService" => {
+                        intruder
+                            .call_method(method, &(device(), A2DP.to_string()))
+                            .await
+                    }
+                    _ => intruder.call_method(method, &(device(),)).await,
+                }
+            };
+            let refused = tokio::time::timeout(DBUS_REPLY_BUDGET, asked)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{method} from an intruder waited on a prompt instead of being rejected")
+                });
+            assert_error_name_is(&refused, REJECTED);
+            assert!(
+                mounted.banner.get_cloned().is_none(),
+                "{method}: no banner raised"
+            );
+            assert!(
+                mounted.pending.lock().await.is_none(),
+                "{method}: nothing put in the reply slot"
+            );
+        }
 
         // bluetoothd, on the same agent, is asked as before.
         let call = tokio::spawn(async move {

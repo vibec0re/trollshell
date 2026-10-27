@@ -43,62 +43,21 @@ use zbus::zvariant::{OwnedValue, Value};
 // `shared::get::<NotificationsShared>()` — `Mutable<T>`, `Arc<AtomicU32>`, and
 // `Mutex<…>` are all `Send + Sync`.
 struct NotificationsShared {
-    active: Mutable<Vec<Notification>>,
+    /// The daemon's live set: the live list, the id counter, the shell-local
+    /// action callbacks and the expiry timers. This is the **one**
+    /// [`NotificationsIface`] [`mount_live_set`] builds, and the bus serves a
+    /// clone of this very value. Every handle in it is an `Arc` or a
+    /// `Mutable`, so the D-Bus `Notify` handler, [`post_local`], [`close`] and
+    /// the hover [`pause_expiry`] / [`resume_expiry`] all reach the same four
+    /// (#1604). Before that, `Service::start` and an `iface()` view each
+    /// assembled the handles by hand, and handing either one a fresh timer map
+    /// left every test green while every expiry it armed would have been
+    /// refused.
+    iface: NotificationsIface,
     history: Mutable<Vec<HistoryEntry>>,
-    /// Shared id counter — the **same** `Arc<AtomicU32>` the D-Bus `Notify`
-    /// handler (`NotificationsIface::next_id`) allocates from. Stored here so
-    /// `post_local`, which runs on a hytte-tokio worker and can only reach the
-    /// shared registry (the thread-local counter is GTK-thread-only), draws ids
-    /// from that one monotonic sequence — a locally-posted toast can never
-    /// collide with a `Notify`-allocated id.
-    next_id: Arc<AtomicU32>,
     /// Ownership handle used to emit D-Bus signals directly on the owned
     /// connection without a round-trip method call.
     ownership: OwnNameSignal,
-    /// Local-dispatch callbacks for locally-posted notification actions,
-    /// keyed by `(notification id, action key)`. Populated by
-    /// [`post_local_with_actions`], consumed (removed + run) by
-    /// [`invoke_action`] on a matching `(id, key)`, and swept for a whole
-    /// `id` by [`dismiss`] whenever that notification closes — by any path
-    /// (auto-expiry, user dismiss, or `CloseNotification`) — so a
-    /// never-clicked action doesn't linger forever. Externally-posted
-    /// (D-Bus `Notify`) notifications never populate this map, so this
-    /// field has zero effect on their behaviour. A plain `std::sync::Mutex`
-    /// is fine here for the same reason as `POST_LOCAL_SEEN`: every
-    /// critical section is non-async map surgery. The **same** `Arc` the
-    /// D-Bus `Notify` handler (`NotificationsIface::local_actions`) clears a
-    /// replaced id's callbacks from, so that handler needs no registry lookup
-    /// and a test can drive it hermetically.
-    local_actions: Arc<Mutex<LocalActionMap>>,
-    /// Hover-pausable per-id expiry timers (#567). Keyed by notification id,
-    /// each entry pairs the pure [`TimerState`] bookkeeping with the live
-    /// `sleep → dismiss` task's abort handle. One entry per **live**
-    /// notification — sticky ones included, carrying `timeout: None` and no
-    /// abort handle, because the hover count has to survive a sticky phase
-    /// (#619). Reached from BOTH the GTK main thread (the overlay's motion
-    /// controller calls [`pause_expiry`] / [`resume_expiry`]) and hytte-tokio
-    /// (the sleep task, and [`dismiss`]'s cleanup) — a plain `std::sync::Mutex`
-    /// suffices for the same reason as `local_actions`: every critical section
-    /// is non-async map surgery. The **same** `Arc` the D-Bus `Notify` handler
-    /// (`NotificationsIface::timers`) arms through, on `local_actions`'
-    /// precedent: the handler needs no registry lookup, and a test can read
-    /// the timer a post armed rather than only the `timeout` field (#1542).
-    timers: Arc<Mutex<TimerMap>>,
-}
-
-impl NotificationsShared {
-    /// The `Notify` handler's view of this live set: the same `active`,
-    /// `next_id`, `local_actions` and `timers` handles, so a post made
-    /// through it (see `NotificationsIface::post_local`) lands exactly where
-    /// a D-Bus `Notify` does.
-    fn iface(&self) -> NotificationsIface {
-        NotificationsIface {
-            active: self.active.clone(),
-            next_id: Arc::clone(&self.next_id),
-            local_actions: Arc::clone(&self.local_actions),
-            timers: Arc::clone(&self.timers),
-        }
-    }
 }
 
 // ── Public data shapes ────────────────────────────────────────────────────────
@@ -231,51 +190,57 @@ impl Service for NotificationsService {
     type Handles = NotificationsHandles;
 
     fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
-        let active = Mutable::new(Vec::new());
-        let next_id = Arc::new(AtomicU32::new(1));
         let history = Mutable::new(Vec::new());
-        let local_actions = Arc::new(Mutex::new(HashMap::new()));
-        let timers = Arc::new(Mutex::new(HashMap::new()));
-
-        let iface = NotificationsIface {
-            active: active.clone(),
-            next_id: next_id.clone(),
-            local_actions: local_actions.clone(),
-            timers: timers.clone(),
-        };
 
         // Own the well-known name + mount the interface. The bus layer handles
         // connection lifecycle, RequestName retries, and per-owner back-off if
-        // mako/dunst is camping the name.
+        // mako/dunst is camping the name. The bus serves a clone of the one
+        // live set, and `NotificationsShared` below keeps the set itself (see
+        // `mount_live_set`).
         //
         // The OwnNameSignal is stored both in NotificationsHandles (process
         // lifetime keep-alive) and in the shared registry (so dismiss/invoke_action
         // can emit signals directly without a round-trip D-Bus call).
-        let ownership =
+        let (iface, ownership) = mount_live_set(|served| {
             hytte_bus::own_name(hytte_bus::BusKind::Session, "org.freedesktop.Notifications")
-                .at_path("/org/freedesktop/Notifications", iface)
-                .start();
+                .at_path("/org/freedesktop/Notifications", served)
+                .start()
+        });
 
         // Populate the cross-thread shared handle so `dismiss` / `clear_history`
         // can find these Mutables when called from a hytte-tokio worker (the
         // thread-local registry is GTK-only). Calling Service::start a second
         // time would `set` fail silently — services are registered once.
         shared::insert(NotificationsShared {
-            active: active.clone(),
+            iface: iface.clone(),
             history: history.clone(),
-            next_id: next_id.clone(),
             ownership: ownership.clone(),
-            local_actions,
-            timers,
         });
 
         NotificationsHandles {
-            active,
-            _next_id: next_id,
+            active: iface.active,
+            _next_id: iface.next_id,
             history,
             ownership,
         }
     }
+}
+
+/// Build the daemon's one live set and hand a clone of it to `mount`, which
+/// in production mounts it on the bus as the `org.freedesktop.Notifications`
+/// object and returns the ownership handle. Returns the live set itself, for
+/// [`NotificationsShared`], with whatever `mount` returned.
+///
+/// This is the only place the daemon's [`NotificationsIface`] is built, so it
+/// is the only place the D-Bus `Notify` handler and the shared registry could
+/// come to hold different handles (#1604). They cannot: the bus gets a clone,
+/// and a clone shares every handle. `mount` is a parameter, like
+/// [`apply_expiry`]'s `spawn`, so a test can keep the bus's clone instead of
+/// mounting it, and drive both halves with no bus.
+fn mount_live_set<M>(mount: impl FnOnce(NotificationsIface) -> M) -> (NotificationsIface, M) {
+    let iface = NotificationsIface::new();
+    let mounted = mount(iface.clone());
+    (iface, mounted)
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -387,32 +352,9 @@ fn close(id: u32, reason: u32, expiry: Option<u64>) {
         return;
     };
 
-    // Local state mutation. Synchronous — Mutable is thread-safe. The
-    // position is read through `Deref` and only a real removal goes through
-    // `DerefMut`, so a no-op close does not wake the toast consumer.
-    //
-    // `timers` is taken *inside* the `active` guard — the `active` → `timers`
-    // order `notify` / `post_local` already use for `set_expiry` — so the
-    // arming check and the removal are one step against every re-post: a
-    // re-post either ran entirely before this (and its re-arm makes a stale
-    // expiry's arming not current) or runs entirely after (and finds the id
-    // closed, so allocates fresh). The entry is reclaimed in the same step —
-    // no leaked entry or orphaned sleep task (#567) — and only on a real
-    // close: an entry exists exactly while its notification is live
-    // (`set_expiry` creates it under the guard that publishes the
-    // notification) and a non-live id is never re-created (`notify_id`), so a
-    // no-op close has nothing to reclaim. A poisoned `timers` lock is still
-    // read: every critical section on it is plain map surgery, and refusing
-    // here would leave every toast on screen forever.
-    let removed = {
-        let mut list = shared.active.lock_mut();
-        let mut timers = shared.timers.lock().unwrap_or_else(PoisonError::into_inner);
-        closable(&list, &timers, id, expiry).map(|at| {
-            clear_timer(&mut timers, id);
-            list.remove(at)
-        })
-    };
-    let Some(n) = removed else {
+    // The live-set half: the arming check, the removal and the timer entry's
+    // reclaim, as one step under the `active` guard (see `remove_closable`).
+    let Some(n) = shared.iface.remove_closable(id, expiry) else {
         tracing::debug!(
             id,
             reason,
@@ -450,7 +392,7 @@ fn close(id: u32, reason: u32, expiry: Option<u64>) {
     // into `dismiss`) means the action can never be invoked again. A
     // cheap no-op for externally-posted notifications, which never
     // populate this map.
-    if let Ok(mut map) = shared.local_actions.lock() {
+    if let Ok(mut map) = shared.iface.local_actions.lock() {
         clear_local_actions(&mut map, id);
     }
 
@@ -512,7 +454,13 @@ pub fn dismiss_all() {
     };
     // Snapshot ids first so we don't hold the read guard across a write
     // (`dismiss` takes its own `lock_mut`).
-    let ids: Vec<u32> = shared.active.lock_ref().iter().map(|n| n.id).collect();
+    let ids: Vec<u32> = shared
+        .iface
+        .active
+        .lock_ref()
+        .iter()
+        .map(|n| n.id)
+        .collect();
     for id in ids {
         dismiss(id, 2);
     }
@@ -543,7 +491,7 @@ pub fn dismiss_all() {
 /// Both the toast widget and the history page wire action buttons to this.
 pub fn invoke_action(id: u32, action_key: &str) {
     if let Some(shared) = shared::get::<NotificationsShared>()
-        && let Ok(mut map) = shared.local_actions.lock()
+        && let Ok(mut map) = shared.iface.local_actions.lock()
         && let Some(callback) = take_local_action(&mut map, id, action_key)
     {
         drop(map);
@@ -619,19 +567,19 @@ impl LocalAction {
 /// screenshot toast's Open/Copy callbacks do.
 ///
 /// The `Send` bound exists for **storage**, not dispatch: registered
-/// callbacks live in `NotificationsShared::local_actions`, a static also
-/// reached from hytte-tokio worker threads (the auto-expire timer, the
-/// D-Bus `close_notification` method), both of which only ever *drop* an
-/// unclicked callback via `clear_local_actions` — never call it. `Send`
-/// makes that cross-thread drop legal; it does not promise (and nothing
-/// requires) that the closure itself is safe to *run* off the GTK thread.
-/// A useful corollary: since GTK/GDK objects are not `Send`, a `Send`
-/// closure structurally cannot hold one across the boundary — it can only
-/// capture plain owned data (e.g. a screenshot's file path `String`) and
-/// resolve the GTK/GDK/GIO handle fresh when it actually runs.
+/// callbacks live in `NotificationsIface::local_actions`, held in the
+/// process-global shared registry and reached from hytte-tokio worker threads
+/// (the auto-expire timer, the D-Bus `close_notification` method), both of
+/// which only ever *drop* an unclicked callback via `clear_local_actions` —
+/// never call it. `Send` makes that cross-thread drop legal; it does not
+/// promise (and nothing requires) that the closure itself is safe to *run*
+/// off the GTK thread. A useful corollary: since GTK/GDK objects are not
+/// `Send`, a `Send` closure structurally cannot hold one across the boundary
+/// — it can only capture plain owned data (e.g. a screenshot's file path
+/// `String`) and resolve the GTK/GDK/GIO handle fresh when it actually runs.
 pub type LocalActionCallback = Box<dyn FnOnce() + Send + 'static>;
 
-/// Map backing [`NotificationsShared::local_actions`]; see that field's doc.
+/// Map backing [`NotificationsIface::local_actions`]; see that field's doc.
 type LocalActionMap = HashMap<(u32, String), LocalActionCallback>;
 
 /// Register `callback` for `(id, key)`. Pure map mutation, factored out of
@@ -866,7 +814,7 @@ impl TimerEntry {
     }
 }
 
-/// Per-id expiry timers backing [`NotificationsShared::timers`].
+/// Per-id expiry timers backing [`NotificationsIface::timers`].
 type TimerMap = HashMap<u32, TimerEntry>;
 
 /// Spawn the `sleep(dur) → close(id, 1 = expired)` task for `arming` and
@@ -899,10 +847,11 @@ fn spawn_expiry(id: u32, dur: Duration, arming: u64) -> AbortHandle {
 /// hold to land on, so the next finite re-post minted a `hover_count: 0` entry
 /// under a hovered card.
 ///
-/// `timers` is the caller's `NotificationsIface::timers`, the same `Arc` as
-/// `NotificationsShared::timers` in production. It is passed in rather than
-/// looked up so a test can drive the real `Notify` handler and then read the
-/// entry it armed (#1542). Callable from any thread.
+/// `timers` is the caller's `NotificationsIface::timers`: in production the
+/// one live set's map, which [`close`] and the hover pause/resume read too
+/// (see [`mount_live_set`]). It is passed in rather than looked up so a test
+/// can drive the real `Notify` handler and then read the entry it armed
+/// (#1542). Callable from any thread.
 fn set_expiry(timers: &Mutex<TimerMap>, id: u32, timeout: Option<Duration>) {
     if let Ok(mut timers) = timers.lock() {
         apply_expiry(&mut timers, id, timeout, Instant::now(), |dur, arming| {
@@ -978,9 +927,7 @@ pub fn pause_expiry(id: u32) {
     let Some(shared) = shared::get::<NotificationsShared>() else {
         return;
     };
-    if let Ok(mut timers) = shared.timers.lock() {
-        apply_pause(&mut timers, id, Instant::now());
-    }
+    shared.iface.pause_expiry(id);
 }
 
 /// Map-level half of [`pause_expiry`], factored out (like [`apply_expiry`])
@@ -1004,15 +951,7 @@ pub fn resume_expiry(id: u32) {
     let Some(shared) = shared::get::<NotificationsShared>() else {
         return;
     };
-    if let Ok(mut timers) = shared.timers.lock()
-        && let Some(entry) = timers.get_mut(&id)
-        && let TimerAction::Arm(dur) = entry.state.resume(Instant::now(), MIN_RESUME)
-    {
-        // Invariant: `abort` is None here (the matching pause cleared it).
-        // `arm` supersedes defensively regardless, so a logic drift can never
-        // strand a live task behind a freshly-armed one.
-        entry.arm(|arming| Some(spawn_expiry(id, dur, arming)));
-    }
+    shared.iface.resume_expiry(id);
 }
 
 /// Key for the [`post_local`] rate-limiter: `(app_name, summary, body)`.
@@ -1117,7 +1056,7 @@ pub fn post_local(app_name: &str, summary: &str, body: &str, urgency: Urgency) {
 /// skipped entirely rather than also firing.
 ///
 /// Registered callbacks are swept if the toast closes unclicked (expiry,
-/// dismiss, …) — see `NotificationsShared::local_actions`.
+/// dismiss, …) — see `NotificationsIface::local_actions`.
 ///
 /// No-op (actions dropped) if the notifications service isn't registered,
 /// mirroring [`post_local`].
@@ -1137,34 +1076,85 @@ pub fn post_local_with_actions(
     }
 
     shared
-        .iface()
+        .iface
         .post_local(app_name, summary, body, urgency, actions);
 }
 
 // ── D-Bus interface ───────────────────────────────────────────────────────────
 
-/// The mounted `org.freedesktop.Notifications` object. Closing goes through
-/// [`dismiss`] and the shared registry, like every other close path, so the
-/// interface holds only what `Notify` writes: the live list, the id counter,
-/// and the shell-local callback map a replace retires an id's entries from
-/// (the `Arc` `NotificationsShared::local_actions` also holds). (It used to
-/// carry the history too, for a `close_notification` that
-/// pulled the notification out itself before calling `dismiss` — which is
-/// what left `dismiss` emitting `NotificationClosed` for ids it had not
-/// removed, since from there it could not tell a close it was finishing from
-/// one for an id that was never live.)
+/// The daemon's live set, and the mounted `org.freedesktop.Notifications`
+/// object. It holds four handles: the live list (`active`), the id counter
+/// (`next_id`), the shell-local action callbacks (`local_actions`) and the
+/// per-id expiry timers (`timers`). Each is an `Arc` or a `Mutable`, so a
+/// clone shares all four. [`mount_live_set`] builds one value: the bus serves
+/// a clone of it and [`NotificationsShared`] holds the value itself, so the
+/// `Notify` handler and everything that reaches the daemon through the shared
+/// registry work on the same four handles (#1604).
+///
+/// Besides the D-Bus methods, it carries the shell's own post
+/// ([`post_local`](Self::post_local)) and the live-set half of [`close`],
+/// [`pause_expiry`] and [`resume_expiry`], in a plain `impl` block the
+/// interface macro does not export.
+///
+/// The history is not here: closing goes through [`dismiss`] and the shared
+/// registry, like every other close path, and that is where the history is
+/// written. (The interface used to carry the history too, for a
+/// `close_notification` that pulled the notification out itself before
+/// calling `dismiss` — which is what left `dismiss` emitting
+/// `NotificationClosed` for ids it had not removed, since from there it could
+/// not tell a close it was finishing from one for an id that was never live.)
 #[derive(Clone)]
 struct NotificationsIface {
+    /// The live notifications, in posting order: what the toast overlay
+    /// renders, through [`active()`].
     active: Mutable<Vec<Notification>>,
+    /// The id counter `Notify` and [`post_local`](Self::post_local) both
+    /// allocate from: one monotonic sequence, so a locally-posted toast can
+    /// never collide with a `Notify`-allocated id. `post_local` reaches it
+    /// through the shared registry, since it runs on hytte-tokio workers too
+    /// (the thread-local registry is GTK-thread-only).
     next_id: Arc<AtomicU32>,
+    /// Local-dispatch callbacks for locally-posted notification actions,
+    /// keyed by `(notification id, action key)`. Populated by
+    /// [`post_local_with_actions`], consumed (removed + run) by
+    /// [`invoke_action`] on a matching `(id, key)`, and swept for a whole
+    /// `id` by [`dismiss`] whenever that notification closes — by any path
+    /// (auto-expiry, user dismiss, or `CloseNotification`) — so a
+    /// never-clicked action doesn't linger forever. Externally-posted
+    /// (D-Bus `Notify`) notifications never populate this map; a `Notify`
+    /// that replaces a live id only clears that id's callbacks from it (see
+    /// [`forget_replaced_local_actions`]). A plain `std::sync::Mutex` is fine
+    /// here for the same reason as `POST_LOCAL_SEEN`: every critical section
+    /// is non-async map surgery.
     local_actions: Arc<Mutex<LocalActionMap>>,
-    /// The per-id expiry timers `Notify` arms through: the same `Arc` as
-    /// `NotificationsShared::timers`, which `close` and the hover pause/resume
-    /// reach. See that field.
+    /// Hover-pausable per-id expiry timers (#567). Keyed by notification id,
+    /// each entry pairs the pure [`TimerState`] bookkeeping with the live
+    /// `sleep → dismiss` task's abort handle. One entry per **live**
+    /// notification — sticky ones included, carrying `timeout: None` and no
+    /// abort handle, because the hover count has to survive a sticky phase
+    /// (#619). `Notify` and [`post_local`](Self::post_local) arm through it,
+    /// and [`close`] and the hover [`pause_expiry`] / [`resume_expiry`] read
+    /// it: one map, because there is one live set (#1542, #1604). Reached
+    /// from BOTH the GTK main thread (the overlay's motion controller) and
+    /// hytte-tokio (the `Notify` handler, the sleep task, and [`dismiss`]'s
+    /// cleanup) — a plain `std::sync::Mutex` suffices for the same reason as
+    /// `local_actions`: every critical section is non-async map surgery.
     timers: Arc<Mutex<TimerMap>>,
 }
 
 impl NotificationsIface {
+    /// A live set over fresh, empty handles: no notifications, ids from 1, no
+    /// callbacks, no timers. [`mount_live_set`] calls it once for the daemon;
+    /// every other `NotificationsIface` there is a clone of that one.
+    fn new() -> Self {
+        Self {
+            active: Mutable::new(Vec::new()),
+            next_id: Arc::new(AtomicU32::new(1)),
+            local_actions: Arc::new(Mutex::new(LocalActionMap::new())),
+            timers: Arc::new(Mutex::new(TimerMap::new())),
+        }
+    }
+
     /// The body of [`post_local_with_actions`], past its registry lookup and
     /// rate limit: post the shell's own toast into this live set and return
     /// its id. A method here rather than inline there so a test can drive it
@@ -1181,7 +1171,7 @@ impl NotificationsIface {
     ) -> u32 {
         // Allocate from the SAME atomic the D-Bus `Notify` handler uses — one
         // monotonic sequence, so this id can never collide with a
-        // `Notify`-issued one (see `NotificationsShared::next_id`).
+        // `Notify`-issued one (see `NotificationsIface::next_id`).
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
         // Register each action's callback under (id, key) and build the plain
@@ -1243,6 +1233,55 @@ impl NotificationsIface {
         }
         tracing::debug!(id, app_name, summary, "local notification posted");
         id
+    }
+
+    /// [`close`]'s step on this live set: remove `id` from the live list and
+    /// reclaim its timer entry, if [`closable`] lets the close go ahead, and
+    /// hand the removed notification back. `None` makes the close a no-op.
+    fn remove_closable(&self, id: u32, expiry: Option<u64>) -> Option<Notification> {
+        // Local state mutation. Synchronous — Mutable is thread-safe. The
+        // position is read through `Deref` and only a real removal goes through
+        // `DerefMut`, so a no-op close does not wake the toast consumer.
+        //
+        // `timers` is taken *inside* the `active` guard — the `active` → `timers`
+        // order `notify` / `post_local` already use for `set_expiry` — so the
+        // arming check and the removal are one step against every re-post: a
+        // re-post either ran entirely before this (and its re-arm makes a stale
+        // expiry's arming not current) or runs entirely after (and finds the id
+        // closed, so allocates fresh). The entry is reclaimed in the same step —
+        // no leaked entry or orphaned sleep task (#567) — and only on a real
+        // close: an entry exists exactly while its notification is live
+        // (`set_expiry` creates it under the guard that publishes the
+        // notification) and a non-live id is never re-created (`notify_id`), so a
+        // no-op close has nothing to reclaim. A poisoned `timers` lock is still
+        // read: every critical section on it is plain map surgery, and refusing
+        // here would leave every toast on screen forever.
+        let mut list = self.active.lock_mut();
+        let mut timers = self.timers.lock().unwrap_or_else(PoisonError::into_inner);
+        closable(&list, &timers, id, expiry).map(|at| {
+            clear_timer(&mut timers, id);
+            list.remove(at)
+        })
+    }
+
+    /// [`pause_expiry`]'s work on this live set's timers.
+    fn pause_expiry(&self, id: u32) {
+        if let Ok(mut timers) = self.timers.lock() {
+            apply_pause(&mut timers, id, Instant::now());
+        }
+    }
+
+    /// [`resume_expiry`]'s work on this live set's timers.
+    fn resume_expiry(&self, id: u32) {
+        if let Ok(mut timers) = self.timers.lock()
+            && let Some(entry) = timers.get_mut(&id)
+            && let TimerAction::Arm(dur) = entry.state.resume(Instant::now(), MIN_RESUME)
+        {
+            // Invariant: `abort` is None here (the matching pause cleared it).
+            // `arm` supersedes defensively regardless, so a logic drift can never
+            // strand a live task behind a freshly-armed one.
+            entry.arm(|arming| Some(spawn_expiry(id, dur, arming)));
+        }
     }
 }
 
@@ -1514,7 +1553,8 @@ fn resolve_timeout(urgency: Urgency, expire_timeout: i32) -> Option<Duration> {
 /// number, a non-integer) → [`Urgency::Normal`].
 ///
 /// The spec types the hint as a BYTE, but clients send other integer widths:
-/// Chromium sends a `uint32`, and an unannotated number in `GVariant` text
+/// older Chromium builds sent a `uint32` (current Chromium sends the byte),
+/// and an unannotated number in `GVariant` text
 /// (`gdbus call … "{'urgency': <2>}"`) or a plain `int` from dbus-python is an
 /// `int32`. mako reads `y`, `u` and `i` for that reason. Read as a byte only,
 /// those came in as `Normal`: no DND bypass and, since #1542, no "stays until
@@ -1806,9 +1846,9 @@ mod tests {
         DEFAULT_TIMEOUT, HashMap, LocalActionMap, MIN_RESUME, Mutable, Notification,
         NotificationImage, NotificationsIface, OwnedValue, RateLimitMap, TimerAction, TimerEntry,
         TimerMap, TimerState, Urgency, apply_expiry, apply_pause, clear_local_actions, clear_timer,
-        closable, forget_replaced_local_actions, image_data_consistent, notify_id, parse_image,
-        parse_urgency, rate_limit_check, register_local_action, resolve_timeout, strip_markup,
-        take_local_action,
+        closable, forget_replaced_local_actions, image_data_consistent, mount_live_set, notify_id,
+        parse_image, parse_urgency, rate_limit_check, register_local_action, resolve_timeout,
+        strip_markup, take_local_action,
     };
     use std::cell::Cell;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -2047,13 +2087,7 @@ mod tests {
         // the body is plain text by the spec, and stripping is a courtesy to
         // clients that send markup regardless. Advertising it would turn that
         // courtesy into a promise to *render* markup, which nothing does.
-        let iface = NotificationsIface {
-            active: Mutable::new(Vec::new()),
-            next_id: Arc::new(AtomicU32::new(1)),
-            local_actions: Arc::new(Mutex::new(LocalActionMap::new())),
-            timers: Arc::new(Mutex::new(TimerMap::new())),
-        };
-        let caps = iface.get_capabilities();
+        let caps = NotificationsIface::new().get_capabilities();
         assert!(caps.iter().any(|c| c == "body"), "{caps:?}");
         assert!(!caps.iter().any(|c| c == "body-markup"), "{caps:?}");
     }
@@ -2121,13 +2155,14 @@ mod tests {
 
     #[test]
     fn shared_atomic_ids_never_collide_across_allocators() {
-        // post_local (via SHARED) and the D-Bus Notify handler (via
-        // NotificationsIface) both fetch_add on the SAME Arc<AtomicU32>, so
-        // their id streams interleave without ever overlapping — the
-        // collision-safety invariant this feature depends on.
+        // post_local (through the live set the shared registry holds) and the
+        // D-Bus Notify handler (through the bus's clone of it) both fetch_add
+        // on the SAME Arc<AtomicU32>, so their id streams interleave without
+        // ever overlapping — the collision-safety invariant this feature
+        // depends on.
         let counter = Arc::new(AtomicU32::new(1));
-        let iface_side = counter.clone(); // NotificationsIface::next_id
-        let shared_side = counter.clone(); // NotificationsShared::next_id
+        let iface_side = counter.clone(); // the bus's NotificationsIface::next_id
+        let shared_side = counter.clone(); // NotificationsShared::iface.next_id
 
         let a = iface_side.fetch_add(1, Ordering::Relaxed); // a Notify
         let b = shared_side.fetch_add(1, Ordering::Relaxed); // a post_local
@@ -2328,17 +2363,6 @@ mod tests {
     // runtime; when it fires, its `close` finds no `NotificationsShared`
     // registered in a test binary and does nothing.
 
-    /// A `NotificationsIface` over fresh handles of its own, the way
-    /// `Service::start` builds one, minus the bus.
-    fn fresh_iface() -> NotificationsIface {
-        NotificationsIface {
-            active: Mutable::new(Vec::new()),
-            next_id: Arc::new(AtomicU32::new(1)),
-            local_actions: Arc::new(Mutex::new(LocalActionMap::new())),
-            timers: Arc::new(Mutex::new(TimerMap::new())),
-        }
-    }
-
     /// What one post left for `id`: the timeout on the published notification,
     /// the timeout its timer entry holds, and whether that timer is counting
     /// down (a deadline **and** a live sleep).
@@ -2389,6 +2413,15 @@ mod tests {
                 counting_down: true,
             }
         }
+
+        /// Expires after `secs` once released, but held by a hover: nothing
+        /// counting down.
+        fn held(secs: u64) -> Self {
+            Self {
+                counting_down: false,
+                ..Self::expires_after(secs)
+            }
+        }
     }
 
     /// Drive the real `Notify` handler; `urgency` is the hint's value, `None`
@@ -2430,7 +2463,7 @@ mod tests {
     /// differently; this one reads the timer.
     #[test]
     fn notify_arms_the_timer_at_the_hinted_urgency() {
-        let iface = fresh_iface();
+        let iface = NotificationsIface::new();
 
         let critical = post_notify(&iface, 0, Some(OwnedValue::from(2_u8)), -1);
         assert_eq!(urgency_of(&iface, critical), Urgency::Critical);
@@ -2471,12 +2504,12 @@ mod tests {
         );
     }
 
-    /// A client that sends the urgency as `uint32` (Chromium) or `int32`
-    /// (`gdbus call`'s text form, dbus-python's plain `int`) gets the
+    /// A client that sends the urgency as `uint32` (older Chromium builds) or
+    /// `int32` (`gdbus call`'s text form, dbus-python's plain `int`) gets the
     /// critical rule too: the hint is read by value, not only as a byte.
     #[test]
     fn notify_reads_a_uint32_or_int32_urgency() {
-        let iface = fresh_iface();
+        let iface = NotificationsIface::new();
         for hint in [OwnedValue::from(2_u32), OwnedValue::from(2_i32)] {
             let shown = format!("{hint:?}");
             let id = post_notify(&iface, 0, Some(hint), -1);
@@ -2528,7 +2561,7 @@ mod tests {
     /// `post_local`). Driven through the real post, reading its timer.
     #[test]
     fn post_local_arms_the_default_timer_at_every_urgency() {
-        let iface = fresh_iface();
+        let iface = NotificationsIface::new();
         for urgency in ALL_URGENCIES {
             let id = iface.post_local("Wi-Fi", "Wi-Fi connection failed", "", urgency, Vec::new());
             assert_eq!(urgency_of(&iface, id), urgency);
@@ -2538,6 +2571,139 @@ mod tests {
                 "{urgency:?}"
             );
         }
+    }
+
+    // ── One live set: the bus and the shared side share one timer map (#1604)
+    //
+    // `Service::start` takes both halves from `mount_live_set`: the bus serves
+    // one, and `NotificationsShared` keeps the other, which is how `close`,
+    // the hover `pause_expiry` / `resume_expiry` and `post_local` reach the
+    // daemon. These take the same two halves and cross them: arm through one,
+    // hold, expire and close through the other, and read the result back
+    // through the first. If the halves held different timer maps, every
+    // expiry would be refused and every hold would land nowhere, while every
+    // test above stayed green (M14/M15 in the #1599 review).
+
+    /// The two halves `Service::start` builds: the live set the shared
+    /// registry keeps, and the clone the bus serves.
+    fn live_set() -> (NotificationsIface, NotificationsIface) {
+        mount_live_set(|served| served)
+    }
+
+    /// The arming the live sleep for `id` presents when it fires, read from
+    /// the timer map `iface` holds.
+    fn arming_of(iface: &NotificationsIface, id: u32) -> u64 {
+        iface
+            .timers
+            .lock()
+            .expect("not poisoned")
+            .get(&id)
+            .expect("a live notification has a timer entry")
+            .arming
+    }
+
+    fn has_timer(iface: &NotificationsIface, id: u32) -> bool {
+        iface.timers.lock().expect("not poisoned").contains_key(&id)
+    }
+
+    /// Arm through the bus's `Notify`, then hold, release, expire and close
+    /// through the shared side, which is how the overlay's hover, the sleep
+    /// and a click reach the daemon.
+    #[test]
+    fn a_notify_on_the_bus_is_held_and_closed_by_the_shared_side() {
+        let (kept, served) = live_set();
+
+        let id = post_notify(&served, 0, None, -1);
+        assert_eq!(Posted::of(&served, id), Posted::expires_after(5));
+
+        // The pointer enters the toast, then leaves it.
+        kept.pause_expiry(id);
+        assert_eq!(
+            Posted::of(&served, id),
+            Posted::held(5),
+            "a hover on the shared side holds the countdown `Notify` armed"
+        );
+        kept.resume_expiry(id);
+        assert!(
+            Posted::of(&served, id).counting_down,
+            "and the pointer leaving re-arms it"
+        );
+
+        // The sleep fires and presents the arming it was given.
+        let fired = arming_of(&served, id);
+        assert_eq!(
+            kept.remove_closable(id, Some(fired)).map(|n| n.id),
+            Some(id),
+            "the shared side's close accepts the expiry `Notify` armed"
+        );
+        assert!(
+            !has_timer(&served, id),
+            "and reclaims the timer entry `Notify` made"
+        );
+
+        // A click on a sticky one: the entry `Notify` made goes with it.
+        let sticky = post_notify(&served, 0, None, 0);
+        assert_eq!(Posted::of(&served, sticky), Posted::STAYS);
+        assert_eq!(
+            kept.remove_closable(sticky, None).map(|n| n.id),
+            Some(sticky)
+        );
+        assert!(
+            !has_timer(&served, sticky),
+            "no timer entry outlives its toast"
+        );
+        assert!(served.active.lock_ref().is_empty());
+    }
+
+    /// Arm through `post_local`, which posts through the half the shared
+    /// registry keeps, then read and act from the bus's side: the bus sees
+    /// the timer `post_local` armed, and a client's `Notify` replacing the
+    /// shell's toast by id lands on that same entry, so a hover held on the
+    /// shared side holds the replacement too (#619).
+    #[test]
+    fn a_post_local_toast_is_seen_and_replaced_on_the_bus() {
+        let (kept, served) = live_set();
+
+        // Its own expiry: the bus side sees the timer, and the sleep's
+        // arming closes the toast.
+        let expiring = kept.post_local("Wi-Fi", "Connection failed", "", Urgency::Critical, Vec::new());
+        assert_eq!(
+            Posted::of(&served, expiring),
+            Posted::expires_after(5),
+            "the bus side sees the timer `post_local` armed"
+        );
+        let fired = arming_of(&served, expiring);
+        assert_eq!(
+            kept.remove_closable(expiring, Some(fired)).map(|n| n.id),
+            Some(expiring),
+            "the expiry `post_local` armed closes its toast"
+        );
+        assert!(!has_timer(&served, expiring));
+
+        // Held on the shared side, then replaced by a client with a 3 s
+        // timeout: the replace stays held, at the timeout it names.
+        let replaced = kept.post_local("VPN", "Connection failed", "", Urgency::Critical, Vec::new());
+        kept.pause_expiry(replaced);
+        assert_eq!(
+            post_notify(&served, replaced, None, 3000),
+            replaced,
+            "a replace of a live id keeps the id"
+        );
+        assert_eq!(
+            Posted::of(&served, replaced),
+            Posted::held(3),
+            "the replace lands on the entry `post_local` armed, hold and all"
+        );
+        kept.resume_expiry(replaced);
+        assert!(Posted::of(&served, replaced).counting_down);
+        assert_eq!(
+            kept.remove_closable(replaced, None).map(|n| n.id),
+            Some(replaced)
+        );
+        assert!(
+            !has_timer(&kept, replaced) && !has_timer(&served, replaced),
+            "no timer entry outlives its toast"
+        );
     }
 
     // ── Local action registry: insert / dispatch / cleanup ──────────────────
@@ -2633,8 +2799,8 @@ mod tests {
     /// `replaces_id` naming a live shell-local toast retires that toast's
     /// callbacks, so the replacement's `open` broadcasts `ActionInvoked`
     /// instead of running the shell's. Driven through the real `notify`
-    /// (#1572 review): with no `NotificationsShared` registered, its only
-    /// other side effect, `set_expiry`, is a no-op.
+    /// (#1572 review): its other side effect, `set_expiry`, arms in this
+    /// test's own timer map.
     #[test]
     fn notify_replacing_a_live_local_toast_forgets_its_callbacks() {
         let local_actions = Arc::new(Mutex::new(LocalActionMap::new()));

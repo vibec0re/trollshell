@@ -275,19 +275,24 @@ thread_local! {
 
 #[cfg(test)]
 thread_local! {
-    /// Every `(request_id, choices)` [`request`] was called with on this
-    /// thread, oldest first. Test builds only.
+    /// Every `(request_id, plan)` [`request`] resolved on this thread, oldest
+    /// first: the [`CardPlan`] it went on to draw, recorded **after** `plan`
+    /// is built, not the `choices` argument it was handed. Test builds only.
     ///
-    /// `plugins::effects`' pass-through test reads it: it has to show that
-    /// the effect broker hands the overlay the effect's **own** card, and since
-    /// #1542 item 5 the channel cannot show that — neither card sends anything
-    /// on silence, so with no output to draw on both answer nothing.
-    static REQUESTED: RefCell<Vec<(u64, ConsentChoices)>> = const { RefCell::new(Vec::new()) };
+    /// `plugins::effects`' pass-through test reads it. Since #1542 item 5 the
+    /// channel cannot tell the two cards apart (neither sends anything on
+    /// silence, so with no output to draw on both answer nothing), and this
+    /// record is what still can. Recording the plan rather than the argument
+    /// is the point: a `request` that ignored its `choices` — built the card
+    /// from `ConsentChoices::default()`, say, which is the grant card with
+    /// `Always` focused — would record the plan it actually drew (#1601
+    /// review, MED-1).
+    static REQUESTED: RefCell<Vec<(u64, CardPlan)>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Drain what [`request`] has recorded on this thread (see `REQUESTED`).
 #[cfg(test)]
-pub(crate) fn take_requested() -> Vec<(u64, ConsentChoices)> {
+pub(crate) fn take_requested() -> Vec<(u64, CardPlan)> {
     REQUESTED.with(RefCell::take)
 }
 
@@ -373,9 +378,6 @@ pub fn request(
     choices: ConsentChoices,
     outbound: mpsc::Sender<HostMsg>,
 ) {
-    #[cfg(test)]
-    REQUESTED.with(|r| r.borrow_mut().push((request_id, choices)));
-
     // Take any plugin dialog down FIRST (#1361 review, HIGH-1). Both surfaces
     // are `Layer::Overlay` + `KeyboardMode::Exclusive`, and within a layer
     // wlroots/niri stack by surface creation order — so a dialog already up
@@ -398,6 +400,8 @@ pub fn request(
     // The one place this function decides anything about the card. Every site
     // below reads `plan`; none names a decision of its own.
     let plan = plan(choices);
+    #[cfg(test)]
+    REQUESTED.with(|r| r.borrow_mut().push((request_id, plan)));
 
     let Some(monitor) = focused_monitor() else {
         // No output to prompt on — which is silence of the most literal kind,
@@ -752,9 +756,13 @@ mod tests {
     ///
     /// Its limit, stated rather than papered over: a mutation that reaches the
     /// same wrong outcome without naming a variant (say, hardcoding
-    /// `ConsentChoices::Grant` into the `plan(…)` call) is invisible here —
-    /// that one is caught by `the_no_monitor_arm_follows_the_silence_rule`
-    /// instead, which is why both exist.
+    /// `ConsentChoices::Grant` into the `plan(…)` call) is invisible here.
+    /// `the_no_monitor_arm_follows_the_silence_rule` used to catch that one,
+    /// while a grant card's silence still sent `Deny`; since #1542 item 5
+    /// neither card's does, so it is `plugins::effects`'
+    /// `the_broker_passes_the_effects_own_choice_set_through` that catches
+    /// it now, by reading the [`CardPlan`](super::CardPlan) `request` actually
+    /// resolved from `REQUESTED` (#1601 review, MED-1).
     #[test]
     fn request_never_names_a_decision_of_its_own() {
         let body = request_fn_body();

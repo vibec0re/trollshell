@@ -4958,13 +4958,15 @@ mod tests {
     /// this told the two cards apart on the channel, through the overlay's
     /// no-output arm: a grant answered `Deny` at once, an approval nothing.
     /// Now neither card answers anything on silence, so the channel cannot
-    /// tell them apart, and this reads which card the overlay was asked to
-    /// draw from its test-only record (`consent::take_requested`) instead.
+    /// tell them apart, and this reads the card plan the overlay actually
+    /// resolved from its test-only record (`consent::take_requested`) instead.
     ///
-    /// Falsification: replace `*choices` with `ConsentChoices::Grant` in
-    /// `broker_effect`'s `RequestConsent` arm and the record assertion fails,
-    /// because the approval effect would have reached the overlay as a grant
-    /// card.
+    /// Falsification, two ends of one wire: replace `*choices` with
+    /// `ConsentChoices::Grant` in `broker_effect`'s `RequestConsent` arm, or
+    /// `plan(choices)` with `plan(ConsentChoices::Grant)` in
+    /// `consent::request` (#1601 review, MED-1), and the record assertion
+    /// fails, because the approval effect would have been drawn as the
+    /// four-button grant card with `Always` focused.
     #[test]
     fn the_broker_passes_the_effects_own_choice_set_through() {
         let router = DatasourceRouter::default();
@@ -5004,16 +5006,18 @@ mod tests {
         let requested = crate::overlays::consent::take_requested();
         assert_eq!(
             requested,
-            vec![(1, ConsentChoices::Approval), (2, ConsentChoices::Grant)],
-            "the overlay must be asked for the card each effect named"
+            vec![
+                (1, crate::overlays::consent::plan(ConsentChoices::Approval)),
+                (2, crate::overlays::consent::plan(ConsentChoices::Grant)),
+            ],
+            "the overlay must resolve the card each effect named"
         );
         // With no output to draw on, neither card is answered on the
         // plugin's behalf (§6.5; #1542 item 5 for the grant card), because
-        // neither card's silence rule names a decision.
-        for (request_id, choices) in &requested {
+        // neither plan's silence rule names a decision.
+        for (request_id, plan) in &requested {
             assert_eq!(
-                choices.unanswered(),
-                None::<ConsentDecision>,
+                plan.on_silence, None::<ConsentDecision>,
                 "request {request_id}"
             );
         }

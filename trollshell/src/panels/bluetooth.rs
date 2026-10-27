@@ -337,23 +337,45 @@ where
     );
 }
 
+/// The banner's title and detail lines for `p`.
+fn prompt_copy(p: &PairPrompt) -> (String, String) {
+    let pair = || format!("Pair with {}?", p.alias);
+    match (p.kind, p.passkey) {
+        (PromptKind::AuthorizeService, _) => (
+            // The agent always names the service (or gives its raw UUID);
+            // "a service" only covers a prompt built without one.
+            format!(
+                "Allow {} to use {}?",
+                p.alias,
+                p.service.as_deref().unwrap_or("a service")
+            ),
+            "This device is not trusted, so it asks each time. Nothing is saved.".to_string(),
+        ),
+        (PromptKind::ConfirmPasskey, Some(code)) => (
+            pair(),
+            format!("Code: {code:06}\nMatch this on the other device, then Confirm."),
+        ),
+        (PromptKind::ConfirmPasskey, None) => (pair(), "Confirm pairing.".to_string()),
+        (PromptKind::Authorize, _) => (pair(), "Allow this device to pair with you.".to_string()),
+        (PromptKind::EnterPinCode, _) => (
+            pair(),
+            "Enter the PIN shown on the other device.".to_string(),
+        ),
+        (PromptKind::EnterPasskey, _) => (
+            pair(),
+            "Enter the numeric passkey shown on the other device.".to_string(),
+        ),
+    }
+}
+
 fn populate_pair_prompt(container: &gtk::Box, p: &PairPrompt) {
-    let title = gtk::Label::new(Some(&format!("Pair with {}?", p.alias)));
+    let (title_text, detail_text) = prompt_copy(p);
+    let title = gtk::Label::new(Some(&title_text));
     title.set_xalign(0.0);
+    title.set_wrap(true);
     title.add_css_class("ts-bluetooth-prompt-title");
     container.append(&title);
 
-    let detail_text = match (p.kind, p.passkey) {
-        (PromptKind::ConfirmPasskey, Some(code)) => {
-            format!("Code: {code:06}\nMatch this on the other device, then Confirm.")
-        }
-        (PromptKind::ConfirmPasskey, None) => "Confirm pairing.".to_string(),
-        (PromptKind::Authorize, _) => "Allow this device to pair with you.".to_string(),
-        (PromptKind::EnterPinCode, _) => "Enter the PIN shown on the other device.".to_string(),
-        (PromptKind::EnterPasskey, _) => {
-            "Enter the numeric passkey shown on the other device.".to_string()
-        }
-    };
     let detail = gtk::Label::new(Some(&detail_text));
     detail.set_xalign(0.0);
     detail.set_wrap(true);
@@ -365,7 +387,10 @@ fn populate_pair_prompt(container: &gtk::Box, p: &PairPrompt) {
     // rather than the newer request (#1551).
     match p.kind {
         PromptKind::ConfirmPasskey | PromptKind::Authorize => {
-            container.append(&build_yes_no_row(p.id));
+            container.append(&build_yes_no_row(p.id, "Confirm", "Reject"));
+        }
+        PromptKind::AuthorizeService => {
+            container.append(&build_yes_no_row(p.id, "Allow", "Deny"));
         }
         PromptKind::EnterPinCode => {
             container.append(&build_text_entry_row(false, p.id));
@@ -376,12 +401,12 @@ fn populate_pair_prompt(container: &gtk::Box, p: &PairPrompt) {
     }
 }
 
-fn build_yes_no_row(id: u64) -> gtk::Box {
+fn build_yes_no_row(id: u64, yes: &str, no: &str) -> gtk::Box {
     let btn_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    let confirm_btn = gtk::Button::with_label("Confirm");
+    let confirm_btn = gtk::Button::with_label(yes);
     confirm_btn.add_css_class("suggested-action");
     confirm_btn.connect_clicked(move |_| bluetooth::respond_to_prompt(id, true));
-    let reject_btn = gtk::Button::with_label("Reject");
+    let reject_btn = gtk::Button::with_label(no);
     reject_btn.add_css_class("destructive-action");
     reject_btn.connect_clicked(move |_| bluetooth::respond_to_prompt(id, false));
     btn_row.append(&confirm_btn);
@@ -601,6 +626,52 @@ fn build_device_menu(dev: &Device, is_busy: bool) -> gtk::MenuButton {
 /// tree underneath it cannot be freed, and a popover dismissed from a button
 /// inside itself is a cycle no `bind` is involved in at all — which is
 /// exactly why `nix/lint-bind-pins.py` could not see it before #1176.
+/// What the banner says, without a display.
+#[cfg(test)]
+mod copy_tests {
+    use super::prompt_copy;
+    use hytte::services::bluetooth::{PairPrompt, PromptKind};
+
+    fn prompt(kind: PromptKind, service: Option<&str>) -> PairPrompt {
+        PairPrompt {
+            id: 1,
+            device_path: "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF".to_owned(),
+            alias: "Pixel 7".to_owned(),
+            passkey: None,
+            kind,
+            service: service.map(str::to_owned),
+        }
+    }
+
+    /// `AuthorizeService` names the device and the service, not a pairing.
+    #[test]
+    fn a_service_prompt_asks_whether_the_device_may_use_the_service() {
+        let (title, detail) = prompt_copy(&prompt(
+            PromptKind::AuthorizeService,
+            Some("audio streaming (A2DP)"),
+        ));
+        assert_eq!(title, "Allow Pixel 7 to use audio streaming (A2DP)?");
+        assert!(detail.contains("Nothing is saved"), "{detail}");
+    }
+
+    /// A service without a name is shown as its raw UUID, as the agent hands
+    /// it over.
+    #[test]
+    fn a_service_without_a_name_shows_its_uuid() {
+        let uuid = "d0611e78-bbb4-4591-a5f8-487910ae4366";
+        let (title, _) = prompt_copy(&prompt(PromptKind::AuthorizeService, Some(uuid)));
+        assert_eq!(title, format!("Allow Pixel 7 to use {uuid}?"));
+    }
+
+    /// The pairing prompts keep their wording.
+    #[test]
+    fn pairing_prompts_still_ask_to_pair() {
+        let (title, detail) = prompt_copy(&prompt(PromptKind::Authorize, None));
+        assert_eq!(title, "Pair with Pixel 7?");
+        assert_eq!(detail, "Allow this device to pair with you.");
+    }
+}
+
 #[cfg(all(test, feature = "system-tests"))]
 mod tests {
     use super::{

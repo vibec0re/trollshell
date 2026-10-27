@@ -30,6 +30,11 @@ pub enum PromptKind {
     /// Legacy: the device wants the user to type a 0..=999999 numeric
     /// passkey. Pre-SSP path; rare on modern hardware.
     EnterPasskey,
+    /// "Allow X to use audio streaming?" A device that is not `Trusted`
+    /// wants to use one of this machine's services (`AuthorizeService`).
+    /// [`PairPrompt::service`] names the service. A yes/no answer, and
+    /// nothing is saved either way.
+    AuthorizeService,
 }
 
 /// A pending Bluetooth pairing prompt the user must accept or reject.
@@ -51,6 +56,11 @@ pub struct PairPrompt {
     pub alias: String,
     pub passkey: Option<u32>,
     pub kind: PromptKind,
+    /// For [`PromptKind::AuthorizeService`], the service the device wants to
+    /// use: a readable name such as `"audio streaming (A2DP)"`, or the raw
+    /// UUID bluetoothd sent when it is not one we have a name for. `None` for
+    /// every other kind.
+    pub service: Option<String>,
 }
 
 /// Snapshot of a single paired/nearby Bluetooth device.

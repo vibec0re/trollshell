@@ -5,8 +5,9 @@
 //! user interaction (e.g. SSP numeric comparison). MVP scope:
 //!   * `RequestConfirmation`: user confirms the displayed code matches.
 //!   * `RequestAuthorization`: bare yes/no.
-//!   * `AuthorizeService`: auto-accept (typical for trusted devices reconnecting).
-//!   * PIN / Passkey entry methods: return Rejected (no text-input UI yet).
+//!   * `AuthorizeService`: "Allow X to use Y?", yes/no. bluetoothd asks only
+//!     for a device that is not `Trusted` ([`PairAgent::authorize_service_for`]).
+//!   * PIN / Passkey entry methods: the banner takes the PIN or passkey.
 //!   * Cancel: aborts the pending prompt.
 //!
 //! Every method answers only bluetoothd: the current owner of `org.bluez`
@@ -108,6 +109,89 @@ impl PairAgent {
     async fn ask(&self, prompt: PairPrompt) -> AgentReply {
         await_reply_in(&self.pending, &self.banner, prompt).await
     }
+
+    /// `AuthorizeService` once the caller is admitted: ask the user whether
+    /// `device` may use the service `uuid` names, and answer bluetoothd.
+    ///
+    /// bluetoothd calls this only for a device that is **not** `Trusted`. Its
+    /// authorization queue (`process_auth_queue` in `src/adapter.c`, `BlueZ`
+    /// 5.87) accepts a trusted device's request itself and never reaches the
+    /// agent. So this is an untrusted device (paired elsewhere without being
+    /// trusted, or not paired at all) asking to use audio, input or
+    /// networking. It used to be accepted without asking, on the reasoning
+    /// that the requests come from trusted devices, which is exactly the case
+    /// bluetoothd never sends.
+    ///
+    /// Allow answers `Ok`. Deny, a `Cancel` (including bluetoothd's own after
+    /// its 60 s `REQUEST_TIMEOUT`, `src/agent.c`) and a second request while
+    /// one is waiting are all `org.bluez.Error.Rejected`. Nothing is saved:
+    /// the device is not made `Trusted`, so it asks again next time.
+    async fn authorize_service_for(
+        &self,
+        device: &OwnedObjectPath,
+        uuid: &str,
+    ) -> Result<(), AgentError> {
+        let prompt = PairPrompt {
+            service: Some(service_label(uuid)),
+            ..new_prompt(device, None, PromptKind::AuthorizeService)
+        };
+        tracing::info!(
+            device = %device.as_str(),
+            uuid,
+            "bluetooth agent: an untrusted device asks to use a service; asking the user"
+        );
+        let reply = self.ask(prompt).await;
+        allow_or_reject(&reply, "user did not allow the service")
+    }
+}
+
+/// The Bluetooth Base UUID's fixed tail. Every 16-bit assigned number `xxxx`
+/// stands for `0000xxxx-0000-1000-8000-00805f9b34fb` (Bluetooth Core
+/// Specification, Vol 3, Part B, §2.5.1).
+const BASE_UUID_TAIL: &str = "-0000-1000-8000-00805f9b34fb";
+
+/// The 16-bit assigned number inside a 128-bit UUID string, if it is one
+/// built on the Bluetooth Base UUID. Case-insensitive.
+fn short_uuid(uuid: &str) -> Option<u16> {
+    let lower = uuid.to_ascii_lowercase();
+    let short = lower.strip_suffix(BASE_UUID_TAIL)?.strip_prefix("0000")?;
+    if short.len() != 4 || !short.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u16::from_str_radix(short, 16).ok()
+}
+
+/// A readable name for the services an `AuthorizeService` prompt is most
+/// likely to name, or `None` for anything else.
+///
+/// The numbers are the Bluetooth SIG's assigned numbers ("Service Class and
+/// Profile UUIDs", plus the GATT "Human Interface Device" service for HID
+/// over GATT), checked against `BlueZ` 5.87's `lib/bluetooth/uuid.h` and its
+/// name table in `src/shared/util.c`. bluetoothd authorizes A2DP under
+/// `ADVANCED_AUDIO_UUID` (`profiles/audio/a2dp.c`), AVRCP under
+/// `AVRCP_REMOTE_UUID` (`profiles/audio/avctp.c`), PAN under `BNEP_SVC_UUID`
+/// (`profiles/network/server.c`) and classic HID under `HID_UUID`
+/// (`profiles/input/server.c`). HFP and HSP come from external profiles
+/// (`PipeWire`, `oFono`), which bluetoothd authorizes under the profile's own
+/// UUID (`src/profile.c`).
+fn service_name(uuid: &str) -> Option<&'static str> {
+    Some(match short_uuid(uuid)? {
+        0x110a => "audio streaming (A2DP source)",
+        0x110b => "audio streaming (A2DP sink)",
+        0x110d => "audio streaming (A2DP)",
+        0x110c | 0x110e | 0x110f => "media controls (AVRCP)",
+        0x1108 | 0x1112 | 0x1131 => "headset audio (HSP)",
+        0x111e | 0x111f => "hands-free calling (HFP)",
+        0x1124 | 0x1812 => "keyboard and mouse input (HID)",
+        0x000f | 0x1115 | 0x1116 | 0x1117 => "network sharing (PAN)",
+        _ => return None,
+    })
+}
+
+/// What the prompt calls the service `uuid` names: its readable name, or
+/// the UUID itself when it is not one we name.
+fn service_label(uuid: &str) -> String {
+    service_name(uuid).map_or_else(|| uuid.to_owned(), str::to_owned)
 }
 
 /// Map a yes/no prompt's answer to the reply bluetoothd expects: `Confirm`
@@ -226,11 +310,7 @@ impl PairAgent {
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> Result<(), AgentError> {
         self.admit(&header, "AuthorizeService").await?;
-        // Auto-accept service authorization. BlueZ asks per-service for
-        // unknown protocols; for trusted/already-paired devices this is
-        // generally fine and matches blueman-applet's default policy.
-        let _ = (device, uuid);
-        Ok(())
+        self.authorize_service_for(&device, &uuid).await
     }
 
     /// Reject whichever request is waiting. Its banner is taken down by that
@@ -322,6 +402,7 @@ fn new_prompt(device: &OwnedObjectPath, passkey: Option<u32>, kind: PromptKind) 
         device_path,
         passkey,
         kind,
+        service: None,
     }
 }
 
@@ -733,6 +814,7 @@ mod tests {
             alias: "Keyboard".to_owned(),
             passkey: Some(123_456),
             kind: PromptKind::ConfirmPasskey,
+            service: None,
         }
     }
 
@@ -1034,6 +1116,182 @@ mod tests {
         assert_eq!(shown(&banner), None);
         clear_banner_if(&banner, 2);
         assert_eq!(shown(&banner), None, "clearing an empty banner is a no-op");
+    }
+}
+
+/// `AuthorizeService` (#1491): what it asks, how the answer maps to the
+/// reply bluetoothd gets, and what the prompt calls each service. Hermetic:
+/// the agent is driven past its caller check (which the system tests cover),
+/// with its own banner and reply slot.
+#[cfg(test)]
+mod authorize_service_tests {
+    use super::{
+        AgentError, AgentReply, BLUEZ_BUS_NAME, PairAgent, PairPrompt, PromptKind, ReplySlot,
+        allow_or_reject, answer_in, cancel_in, service_label, service_name,
+    };
+    use futures_signals::signal::Mutable;
+    use futures_util::FutureExt;
+    use hytte_bus::BusKind;
+    use std::sync::Arc;
+    use tokio::sync::Mutex as AsyncMutex;
+    use zbus::zvariant::OwnedObjectPath;
+
+    /// What bluetoothd sends for an incoming A2DP stream
+    /// (`ADVANCED_AUDIO_UUID`).
+    const A2DP: &str = "0000110d-0000-1000-8000-00805f9b34fb";
+
+    /// An agent with its own slots. Its caller check is never run here and
+    /// opens no connection until it is.
+    fn agent() -> (PairAgent, Arc<ReplySlot>, Mutable<Option<PairPrompt>>) {
+        let pending: Arc<ReplySlot> = Arc::new(AsyncMutex::new(None));
+        let banner = Mutable::new(None);
+        let agent = PairAgent::new(
+            hytte_bus::caller_check(BusKind::System, BLUEZ_BUS_NAME),
+            pending.clone(),
+            banner.clone(),
+        );
+        (agent, pending, banner)
+    }
+
+    fn device() -> OwnedObjectPath {
+        OwnedObjectPath::try_from("/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF").expect("object path")
+    }
+
+    /// The reply bluetoothd gets for `result`, by D-Bus error name.
+    fn reply_name(result: &Result<(), AgentError>) -> Option<String> {
+        use zbus::DBusError as _;
+        result.as_ref().err().map(|e| e.name().to_string())
+    }
+
+    /// `AuthorizeService` asks: the banner shows who wants what, and nothing
+    /// is answered until the user does. Allow admits the service.
+    ///
+    /// **Falsification:** answer `Ok(())` without asking (the old
+    /// auto-accept) and the "waits on the user" assertion fails.
+    #[tokio::test(flavor = "current_thread")]
+    async fn it_asks_the_user_and_allow_admits_the_service() {
+        let (agent, pending, banner) = agent();
+        let device = device();
+        let mut asking = std::pin::pin!(agent.authorize_service_for(&device, A2DP));
+        assert!(
+            asking.as_mut().now_or_never().is_none(),
+            "AuthorizeService waits on the user"
+        );
+
+        let shown = banner.get_cloned().expect("a prompt is raised");
+        assert_eq!(shown.kind, PromptKind::AuthorizeService);
+        assert_eq!(shown.service.as_deref(), Some("audio streaming (A2DP)"));
+        assert_eq!(shown.device_path, device.as_str());
+        assert_eq!(shown.passkey, None);
+
+        answer_in(&pending, shown.id, AgentReply::Confirm).await;
+        assert!(asking.await.is_ok(), "Allow admits the service");
+        assert!(banner.get_cloned().is_none(), "the prompt comes down");
+    }
+
+    /// Deny is `org.bluez.Error.Rejected`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn deny_rejects_the_service() {
+        let (agent, pending, banner) = agent();
+        let device = device();
+        let mut asking = std::pin::pin!(agent.authorize_service_for(&device, A2DP));
+        assert!(asking.as_mut().now_or_never().is_none());
+        let shown = banner.get_cloned().expect("a prompt is raised");
+
+        answer_in(&pending, shown.id, AgentReply::Reject).await;
+        assert_eq!(
+            reply_name(&asking.await).as_deref(),
+            Some("org.bluez.Error.Rejected")
+        );
+    }
+
+    /// A `Cancel` — bluetoothd's own once its 60 s are up, or the watcher's
+    /// cleanup after bluetoothd went away — is a rejection, not a default
+    /// yes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cancel_or_timeout_rejects_the_service() {
+        let (agent, pending, _banner) = agent();
+        let device = device();
+        let mut asking = std::pin::pin!(agent.authorize_service_for(&device, A2DP));
+        assert!(asking.as_mut().now_or_never().is_none());
+
+        cancel_in(&pending).await;
+        assert_eq!(
+            reply_name(&asking.await).as_deref(),
+            Some("org.bluez.Error.Rejected")
+        );
+    }
+
+    /// The mapping itself: only an explicit yes is `Ok`.
+    #[test]
+    fn only_a_yes_is_allowed() {
+        assert!(allow_or_reject(&AgentReply::Confirm, "no").is_ok());
+        for reply in [
+            AgentReply::Reject,
+            AgentReply::Pin("0000".to_owned()),
+            AgentReply::Passkey(1),
+        ] {
+            assert_eq!(
+                reply_name(&allow_or_reject(&reply, "no")).as_deref(),
+                Some("org.bluez.Error.Rejected"),
+                "{reply:?} must reject"
+            );
+        }
+    }
+
+    /// The services a prompt names, by the UUID bluetoothd sends. The
+    /// numbers are the SIG's assigned numbers; see `service_name`.
+    #[test]
+    fn common_services_have_readable_names() {
+        let base = |short: &str| format!("0000{short}-0000-1000-8000-00805f9b34fb");
+        let cases = [
+            ("110a", "audio streaming (A2DP source)"),
+            ("110b", "audio streaming (A2DP sink)"),
+            ("110d", "audio streaming (A2DP)"),
+            ("110c", "media controls (AVRCP)"),
+            ("110e", "media controls (AVRCP)"),
+            ("110f", "media controls (AVRCP)"),
+            ("1108", "headset audio (HSP)"),
+            ("1112", "headset audio (HSP)"),
+            ("1131", "headset audio (HSP)"),
+            ("111e", "hands-free calling (HFP)"),
+            ("111f", "hands-free calling (HFP)"),
+            ("1124", "keyboard and mouse input (HID)"),
+            ("1812", "keyboard and mouse input (HID)"),
+            ("000f", "network sharing (PAN)"),
+            ("1115", "network sharing (PAN)"),
+            ("1116", "network sharing (PAN)"),
+            ("1117", "network sharing (PAN)"),
+        ];
+        for (short, name) in cases {
+            assert_eq!(service_name(&base(short)), Some(name), "0x{short}");
+        }
+        assert_eq!(
+            service_name("0000110B-0000-1000-8000-00805F9B34FB"),
+            Some("audio streaming (A2DP sink)"),
+            "UUIDs compare case-insensitively"
+        );
+    }
+
+    /// Anything else is shown as the UUID bluetoothd sent.
+    #[test]
+    fn any_other_service_is_shown_as_its_uuid() {
+        for uuid in [
+            // Serial Port: assigned, but not one we name.
+            "00001101-0000-1000-8000-00805f9b34fb",
+            // A vendor's own 128-bit UUID.
+            "d0611e78-bbb4-4591-a5f8-487910ae4366",
+            // Not hex where the short number goes.
+            "0000+10b-0000-1000-8000-00805f9b34fb",
+            "",
+        ] {
+            assert_eq!(service_name(uuid), None, "{uuid:?}");
+            assert_eq!(service_label(uuid), uuid);
+        }
+        assert_eq!(
+            service_label("0000110b-0000-1000-8000-00805f9b34fb"),
+            "audio streaming (A2DP sink)"
+        );
     }
 }
 
@@ -1552,6 +1810,58 @@ mod system_tests {
             .expect("bluetoothd's request did not return in time")
             .expect("request task panicked")
             .expect("bluetoothd's authorized request returned an error");
+    }
+
+    /// `AuthorizeService` over the wire: bluetoothd's request raises the
+    /// prompt with the service's name and gets `Ok` on Allow and `Rejected`
+    /// on Deny; anyone else's is rejected without a prompt.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn authorize_service_asks_for_bluez_and_refuses_anyone_else() {
+        const A2DP: &str = "0000110d-0000-1000-8000-00805f9b34fb";
+
+        let guard = ephemeral_bus().await;
+        let mounted = mount(&guard).await;
+        let intruder = proxy(&guard, &mounted, None).await;
+        let bluez = proxy(&guard, &mounted, Some(BLUEZ_BUS_NAME)).await;
+
+        let refused: Result<(), zbus::Error> = tokio::time::timeout(
+            DBUS_REPLY_BUDGET,
+            intruder.call("AuthorizeService", &(device(), A2DP.to_string())),
+        )
+        .await
+        .expect("a refused request is rejected at once");
+        assert_error_name_is(&refused, REJECTED);
+        assert!(mounted.banner.get_cloned().is_none(), "no banner raised");
+
+        for (answer, allowed) in [(AgentReply::Confirm, true), (AgentReply::Reject, false)] {
+            let call = {
+                let bluez = bluez.clone();
+                tokio::spawn(async move {
+                    bluez
+                        .call::<_, _, ()>("AuthorizeService", &(device(), A2DP.to_string()))
+                        .await
+                })
+            };
+            let prompt = shown(&mounted.banner).await;
+            assert_eq!(prompt.kind, super::PromptKind::AuthorizeService);
+            assert_eq!(prompt.service.as_deref(), Some("audio streaming (A2DP)"));
+            answer_in(&mounted.pending, prompt.id, answer).await;
+            let reply = tokio::time::timeout(DBUS_REPLY_BUDGET, call)
+                .await
+                .expect("AuthorizeService did not return in time")
+                .expect("request task panicked");
+            if allowed {
+                reply.expect("Allow admits the service");
+            } else {
+                assert_error_name_is(&reply, REJECTED);
+            }
+            // The request takes its prompt down before it replies, so the
+            // next round's prompt is its own.
+            assert!(
+                mounted.banner.get_cloned().is_none(),
+                "the prompt comes down with the reply"
+            );
+        }
     }
 
     /// The methods that raise no prompt are checked too: bluetoothd gets its

@@ -34,9 +34,9 @@ use hytte_plugin::proto::{
 use hytte_plugin::tokio_stream::wrappers::UnboundedReceiverStream;
 use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View};
 use hytte_plugin_infobroker::broker::{
-    AuditView, BrokerMsg, BrokerSnapshot, CONSENT_PARK_TIMEOUT, Cmd,
-    ConsentDecision as BrokerConsentDecision, DatasourceView, GrantView, Outcome, PendingView,
-    QueryOutcome, QueryRequest, TokenView,
+    AuditView, BrokerMsg, BrokerSnapshot, CONSENT_CARD_TIMEOUT, CONSENT_PARK_TIMEOUT,
+    CONSENT_PROMPT_GRACE, Cmd, ConsentDecision as BrokerConsentDecision, DatasourceView, GrantView,
+    Outcome, PendingView, QueryOutcome, QueryRequest, TokenView,
 };
 use hytte_plugin_infobroker::wire::CalendarEntry;
 use tokio::sync::{mpsc, oneshot};
@@ -73,6 +73,13 @@ std::thread_local! {
 const _: () = assert!(
     CONSENT_PARK_TIMEOUT.as_secs() >= CONSENT_PROMPT_TIMEOUT_SECS + CONSENT_PROMPT_GRACE_SECS
 );
+// The library's mirrors of those two constants must be them exactly: the
+// card's timeout is also where the broker stops taking a `Deny` for a click
+// (`deny_outlived_its_card`, #1601 review LOW-3), so a mirror that drifted
+// low would turn a real last-second Deny click into a transient answer, and
+// one that drifted high would let an older shell's timeout persist again.
+const _: () = assert!(CONSENT_CARD_TIMEOUT.as_secs() == CONSENT_PROMPT_TIMEOUT_SECS);
+const _: () = assert!(CONSENT_PROMPT_GRACE.as_secs() == CONSENT_PROMPT_GRACE_SECS);
 
 // Node ids. The chip button opens the panel; the per-row allow/revoke buttons
 // carry the `(agent, datasource)` pair their row names — see `row_action_id`.

@@ -128,15 +128,30 @@ const MAX_PENDING_CONSENTS: usize = 8;
 /// covers a wedged or pre-1b host that never surfaces the prompt at all.
 ///
 /// So it must outlast the card, or a click in the card's last seconds would
-/// land after the broker gave up and be dropped as late. It is the card's 60 s
-/// plus the proto's `CONSENT_PROMPT_GRACE_SECS` (5 s) race margin, spelled out
-/// rather than imported because this library stays SDK-free; the plugin
-/// binary, which links the proto, asserts the ordering at compile time.
+/// land after the broker gave up and be dropped as late. It is the card's
+/// [`CONSENT_CARD_TIMEOUT`] plus the [`CONSENT_PROMPT_GRACE`] race margin.
 ///
 /// Public because it is also the longest a well-behaved broker leaves a client
 /// waiting for its one reply line (an `auth` parked on the human), which is
 /// what the CLI sizes its own read timeout from.
-pub const CONSENT_PARK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(65);
+pub const CONSENT_PARK_TIMEOUT: std::time::Duration =
+    CONSENT_CARD_TIMEOUT.saturating_add(CONSENT_PROMPT_GRACE);
+
+/// How long the shell keeps a consent card on screen before it closes it: the
+/// proto's `CONSENT_PROMPT_TIMEOUT_SECS` (60 s).
+///
+/// Mirrored rather than imported because this library stays SDK-free; the
+/// plugin binary, which links the proto, asserts at compile time that the two
+/// are equal. Besides sizing [`CONSENT_PARK_TIMEOUT`], it is the line
+/// `deny_outlived_its_card` draws: no card can be clicked after it closes, so
+/// a `Deny` that arrives this long after its knock parked is a shell's own
+/// timeout, not a human.
+pub const CONSENT_CARD_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
+
+/// The proto's `CONSENT_PROMPT_GRACE_SECS` (5 s): how much longer than the
+/// card the broker waits, so a click in the card's last instant still lands.
+/// Mirrored and compile-time checked like [`CONSENT_CARD_TIMEOUT`].
+pub const CONSENT_PROMPT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long the session loop pauses after a failed `accept()` before it tries
 /// again. An accept error is usually a resource one — `EMFILE`/`ENFILE` with the
@@ -928,7 +943,10 @@ impl BrokerState {
     /// nobody answered (#1542 item 5), and [`Self::on_consent_timeout`]
     /// answers those instead. A shell from before that change still sends
     /// `Deny` on its own timeout, indistinguishable from a click on the wire;
-    /// see `ConsentChoices::unanswered`'s "Version skew".
+    /// `Session::on_cmd` routes such a `Deny` to `on_consent_timeout` when it
+    /// arrives after the card could have closed (`deny_outlived_its_card`),
+    /// but an older shell's `Deny` on `Esc` or with no output still lands
+    /// here. See `ConsentChoices::unanswered`'s "Version skew".
     ///
     /// `datasource` is the one the prompt named, and every arm is about it and
     /// nothing wider: the two persisted decisions write that pair's row, and the
@@ -1454,6 +1472,27 @@ async fn recv_shutdown(
         }
         None => std::future::pending().await,
     }
+}
+
+/// Whether a `Deny` for the knock parked until `deadline` arrived at or after
+/// the moment that knock's card closed — [`CONSENT_CARD_TIMEOUT`] after it
+/// parked — which no click can do (#1601 review, LOW-3).
+///
+/// Since #1542 item 5 a shell sends nothing for a card nobody answered. A
+/// shell from before that change still sends `Deny` from its card's own 60 s
+/// timer, and the frame carries nothing that tells it from a click; after a
+/// deploy the plugin restarts onto the new build while the shell often keeps
+/// running the old one. The card goes up after the knock parks and is torn
+/// down 60 s later, so a `Deny` at or past that point can only be that timer —
+/// or a click in the very last instant of a card that went up late, which this
+/// then answers transiently instead of persisting: the safe side to err on.
+///
+/// The knock parked at `deadline - CONSENT_PARK_TIMEOUT`, so no extra field is
+/// needed. What this cannot catch is an older shell's `Deny` on `Esc` or with
+/// no output to draw on: those arrive at once, like a click.
+fn deny_outlived_its_card(deadline: tokio::time::Instant, now: tokio::time::Instant) -> bool {
+    let parked_for = CONSENT_PARK_TIMEOUT.saturating_sub(deadline.saturating_duration_since(now));
+    parked_for >= CONSENT_CARD_TIMEOUT
 }
 
 /// Sleep until the nearest parked deadline, or forever when nothing is parked —
@@ -1997,9 +2036,17 @@ impl Session {
                 decision,
             } => {
                 if let Some(mut p) = self.pending.remove(&request_id) {
-                    let (resp, toast) =
+                    let (resp, toast) = if matches!(decision, ConsentDecision::Deny)
+                        && deny_outlived_its_card(p.deadline, tokio::time::Instant::now())
+                    {
+                        // An older shell's own timeout, not a click: answer
+                        // it as the silence it is (#1601 review, LOW-3).
                         self.state
-                            .apply_consent(&p.agent, &p.datasource, decision, now_unix());
+                            .on_consent_timeout(&p.agent, &p.datasource, now_unix())
+                    } else {
+                        self.state
+                            .apply_consent(&p.agent, &p.datasource, decision, now_unix())
+                    };
                     write_response(&mut p.stream, resp).await;
                     self.push_update(toast);
                 }
@@ -4264,5 +4311,87 @@ mod tests {
             queued_prompts(&mut out_rx).is_empty(),
             "a standing no is not put to the human again"
         );
+    }
+
+    // ── #1601 review, LOW-3: an older shell's timeout Deny ─────────────────────
+
+    /// Where the broker stops taking a `Deny` for a click: the moment the
+    /// knock's card closes, [`CONSENT_CARD_TIMEOUT`] after the knock parked.
+    /// No card can be clicked after that, so a `Deny` from then on is an
+    /// older shell's own timer.
+    ///
+    /// Falsification: `>=` → `>` in `deny_outlived_its_card` reds the 60 s
+    /// row; comparing against [`CONSENT_PARK_TIMEOUT`] instead reds it too.
+    #[test]
+    fn a_deny_counts_as_a_click_only_while_its_card_could_be_up() {
+        use std::time::Duration;
+        let parked = tokio::time::Instant::now();
+        let deadline = parked + CONSENT_PARK_TIMEOUT;
+        let at = |after: Duration| parked + after;
+        assert!(!deny_outlived_its_card(deadline, at(Duration::ZERO)));
+        assert!(!deny_outlived_its_card(
+            deadline,
+            at(Duration::from_secs(59))
+        ));
+        assert!(!deny_outlived_its_card(
+            deadline,
+            at(Duration::from_millis(59_999))
+        ));
+        assert!(
+            deny_outlived_its_card(deadline, at(Duration::from_mins(1))),
+            "the card is gone at 60 s: a Deny then is its timer"
+        );
+        assert!(deny_outlived_its_card(
+            deadline,
+            at(Duration::from_secs(64))
+        ));
+        assert!(
+            deny_outlived_its_card(deadline, at(Duration::from_secs(66))),
+            "past the park deadline too"
+        );
+    }
+
+    /// Make every parked knock look as if it parked `ago` before now.
+    fn knock_parked_for(session: &mut Session, ago: std::time::Duration) {
+        let deadline = tokio::time::Instant::now() + CONSENT_PARK_TIMEOUT - ago;
+        for parked in session.pending.values_mut() {
+            parked.deadline = deadline;
+        }
+    }
+
+    /// The guard end to end, on both sides of its line: a `Deny` 59 s after
+    /// the knock parked is a click and persists a standing no; one 60 s after
+    /// is an older shell's timeout and is answered like silence — the
+    /// transient "timed out" refusal, nothing persisted.
+    ///
+    /// Falsification: drop the guard from `Session::on_cmd` (always
+    /// `apply_consent`) and the 60 s row reds: a deny row is persisted.
+    #[tokio::test]
+    async fn a_deny_after_the_card_closed_is_answered_as_silence() {
+        for (parked_secs, persists) in [(59, true), (60, false)] {
+            let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+            let mut session = Session::new(BrokerState::new(store(Vec::new())), out_tx);
+            let (mut agent, prompt) = park_knock(&mut session, &mut out_rx, "claude").await;
+            knock_parked_for(&mut session, std::time::Duration::from_secs(parked_secs));
+
+            session
+                .on_cmd(Cmd::Decision {
+                    request_id: prompt.request_id,
+                    decision: ConsentDecision::Deny,
+                })
+                .await;
+
+            let reply = reply_on(&mut agent).await;
+            assert!(!reply.ok, "{parked_secs} s: {reply:?}");
+            let error = reply.error.unwrap_or_default();
+            let persisted = session.state.grants.decision_for("claude", "departures");
+            if persists {
+                assert!(error.contains("consent denied"), "{parked_secs} s: {error}");
+                assert_eq!(persisted, Some(Decision::Deny), "{parked_secs} s");
+            } else {
+                assert!(error.contains("timed out"), "{parked_secs} s: {error}");
+                assert_eq!(persisted, None, "{parked_secs} s: nothing persisted");
+            }
+        }
     }
 }

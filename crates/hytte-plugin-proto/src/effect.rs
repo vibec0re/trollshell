@@ -809,12 +809,16 @@ impl ConsentChoices {
     ///
     /// A host from before #1542 item 5 answers an unanswered **grant** card
     /// with `Some(Deny)`, and the frame carries nothing that tells that `Deny`
-    /// from a click. A requester that persists a `Deny` (the infobroker does)
-    /// will therefore still persist a timeout's under an older shell; there is
-    /// no defence on the requester's side short of a wire change, and the
-    /// window closes when the shell is restarted onto the same build. The
-    /// other skew is safe: an older *requester* under a newer host receives
-    /// nothing for a silent grant card, and its own deadline answers for it.
+    /// from a click. The infobroker, which persists a `Deny`, catches the
+    /// timeout case by its timing: no card can be clicked after it closes, so
+    /// it answers a `Deny` that arrives [`CONSENT_PROMPT_TIMEOUT_SECS`] or more
+    /// after the knock parked as silence, and persists nothing. An older
+    /// shell's `Deny` on `Esc` or with no output to draw on arrives at once,
+    /// like a click, and is still persisted; nothing short of a wire change
+    /// tells those apart, and that window closes when the shell is restarted
+    /// onto the same build. The other skew is safe: an older *requester* under
+    /// a newer host receives nothing for a silent grant card, and its own
+    /// deadline answers for it.
     #[must_use]
     pub fn unanswered(self) -> Option<ConsentDecision> {
         match self {

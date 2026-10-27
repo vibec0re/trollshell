@@ -4179,7 +4179,10 @@ mod tests {
         let reply = reply_on(&mut agent).await;
         assert!(!reply.ok, "{reply:?}");
         assert!(
-            reply.error.as_deref().is_some_and(|e| e.contains("timed out")),
+            reply
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("timed out")),
             "the agent hears the transient timeout refusal: {reply:?}"
         );
         assert_eq!(

@@ -437,9 +437,7 @@ impl Effect {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AudioAction, ConsentChoices, Effect, MediaAction, NiriAction, Page,
-    };
+    use super::{AudioAction, ConsentChoices, Effect, MediaAction, NiriAction, Page};
     use crate::manifest::Capability;
 
     /// #1058: every [`Effect`] variant maps to exactly the [`Capability`] its

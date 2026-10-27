@@ -34,7 +34,7 @@ mod types;
 pub(crate) use types::AgentReply;
 pub use types::{Adapter, Device, PairPrompt, PromptKind};
 
-use agent::{AGENT_ANCHOR_NAME, AGENT_PATH, PairAgent, ReplySlot, run_agent};
+use agent::{AGENT_ANCHOR_NAME, AGENT_PATH, BLUEZ_BUS_NAME, PairAgent, ReplySlot, run_agent};
 use devices::{ListenEnd, listen, wait_for_bluez};
 use futures_signals::signal::{Mutable, Signal};
 use hytte_bus::BusKind;
@@ -87,9 +87,10 @@ const PAIRING_CALL_TIMEOUT: Duration = Duration::from_mins(5);
 //     `submit_passkey`) spawns a task that signals `pending_response`; the
 //     pairing dialog hangs forever on a no-op.
 //   - `PairAgent` iface methods (`request_pin_code`, `request_passkey`,
-//     `request_confirmation`, `request_authorization`, `cancel`) call
-//     `lookup_alias`, `cancel_in` and `await_reply`, which reach
-//     the prompt slot; all of them once used `registry::with`.
+//     `request_confirmation`, `request_authorization`, `authorize_service`)
+//     call `lookup_alias`, which reads the device list; they once used
+//     `registry::with`. The prompt and reply slots they and `cancel` reach
+//     are clones the agent is built with, not lookups.
 //
 // The cross-thread-safe alternative is `hytte_reactive::shared` (the
 // process-global registry mirror): `Service::start` publishes this bag with
@@ -225,19 +226,31 @@ impl Service for BluetoothService {
     type Handles = BluetoothHandles;
 
     fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
+        // The agent raises its prompts on these two handles, and the UI
+        // answers through them, so they exist before the agent does.
+        let pair_prompt = Mutable::new(None);
+        let pending_response: Arc<ReplySlot> = Arc::new(AsyncMutex::new(None));
+        // It answers only bluetoothd, whose unique name it looks up per
+        // call: the object is reachable by any peer on the system bus.
+        let agent = PairAgent::new(
+            hytte_bus::caller_check(BusKind::System, BLUEZ_BUS_NAME),
+            pending_response.clone(),
+            pair_prompt.clone(),
+        );
+
         // Build the own_name handle first so it can be stored in Handles for
         // parity with other services (polkit, screensaver, etc.) and passed
         // into run_agent to keep the interface alive for its lifetime.
         let ownership = hytte_bus::own_name(BusKind::System, AGENT_ANCHOR_NAME)
-            .at_path(AGENT_PATH, PairAgent)
+            .at_path(AGENT_PATH, agent)
             .start();
 
         let handles = BluetoothHandles {
             adapter: Mutable::new(None),
             devices: Mutable::new(Vec::new()),
             device_actions: Mutable::new(HashSet::new()),
-            pair_prompt: Mutable::new(None),
-            pending_response: Arc::new(AsyncMutex::new(None)),
+            pair_prompt,
+            pending_response,
             action_error: Mutable::new(None),
             _ownership: ownership.clone(),
         };

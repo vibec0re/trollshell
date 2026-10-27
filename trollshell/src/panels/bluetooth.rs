@@ -349,7 +349,7 @@ fn device_label(p: &PairPrompt) -> String {
 
 /// The banner's title and detail lines for `p`.
 fn prompt_copy(p: &PairPrompt) -> (String, String) {
-    let pair = || format!("Pair with {}?", p.alias);
+    let pair = || format!("Pair with {}?", device_label(p));
     match (p.kind, p.passkey) {
         (PromptKind::AuthorizeService, _) => (
             // The alias is a name the device picks for itself, so the address
@@ -697,11 +697,25 @@ mod copy_tests {
         );
     }
 
-    /// The pairing prompts keep their wording.
+    /// The pairing prompts ask to pair, naming the device by its alias and
+    /// its address: accepting a pairing now makes the device trusted, so
+    /// the user should see which device that is, not only the name it
+    /// picked for itself.
+    ///
+    /// **Falsification:** build the pairing title from the alias alone and
+    /// this fails for every pairing kind.
     #[test]
-    fn pairing_prompts_still_ask_to_pair() {
-        let (title, detail) = prompt_copy(&prompt(PromptKind::Authorize, None));
-        assert_eq!(title, "Pair with Pixel 7?");
+    fn pairing_prompts_name_the_device_by_alias_and_address() {
+        for kind in [
+            PromptKind::ConfirmPasskey,
+            PromptKind::Authorize,
+            PromptKind::EnterPinCode,
+            PromptKind::EnterPasskey,
+        ] {
+            let (title, _) = prompt_copy(&prompt(kind, None));
+            assert_eq!(title, "Pair with Pixel 7 (AA:BB:CC:DD:EE:FF)?", "{kind:?}");
+        }
+        let (_, detail) = prompt_copy(&prompt(PromptKind::Authorize, None));
         assert_eq!(detail, "Allow this device to pair with you.");
     }
 }

@@ -427,7 +427,14 @@ mod tests {
     use futures_util::FutureExt;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::time::Duration;
     use tokio::sync::Mutex as AsyncMutex;
+
+    /// How long a test waits on a spawned request that a `Cancel` should have
+    /// resolved already. A bound, not a latency claim: it turns a regression
+    /// that leaves the request waiting into a failure instead of a hang, which
+    /// `checks.workspace-tests` would only report as a job timeout.
+    const RESOLVED_BUDGET: Duration = Duration::from_secs(5);
 
     fn prompt(id: u64) -> PromptRequest {
         PromptRequest {
@@ -499,8 +506,12 @@ mod tests {
         assert!(b.as_mut().now_or_never().is_none(), "B waits on the user");
         assert_eq!(shown(&prompts), Some(2), "B's prompt is up");
 
-        // A finally runs.
-        let a_reply = a.await.expect("request A panicked");
+        // A finally runs. Bounded: if the cancel never resolved A's waiter,
+        // A would wait forever.
+        let a_reply = tokio::time::timeout(RESOLVED_BUDGET, a)
+            .await
+            .expect("the cancel resolved request A")
+            .expect("request A panicked");
         assert!(a_reply.is_err(), "A was cancelled");
         assert_eq!(
             shown(&prompts),
@@ -582,8 +593,12 @@ mod tests {
 
         cancel_waiting(&prompts, &waiters, &own).await;
         assert_eq!(shown(&prompts), Some(9), "prompt 9 was not cancelled");
+        // One poll decides it: the cancel has either answered the waiter by
+        // now or never will.
         assert_eq!(
-            rx.await.expect("the waiter was answered"),
+            rx.now_or_never()
+                .expect("the cancel resolved the waiter")
+                .expect("the waiter was answered"),
             Err("cancelled".to_owned()),
             "the waiting request is cancelled"
         );
@@ -614,7 +629,14 @@ mod tests {
 
         cancel_waiting(&prompts, &waiters, &own).await;
 
-        assert!(iwd.await.is_err(), "iwd's own request is cancelled");
+        // One poll decides it, on this current-thread runtime: the cancel has
+        // either resolved iwd's request by now or never will.
+        assert!(
+            iwd.now_or_never()
+                .expect("the cancel resolved iwd's request")
+                .is_err(),
+            "iwd's own request is cancelled"
+        );
         assert!(
             waiters.lock().await.contains_key(&2),
             "NM's request must still be waiting"

@@ -28,8 +28,8 @@ mod workspace_stacks;
 use std::cell::RefCell;
 
 use clap::{CommandFactory as _, Parser, Subcommand};
-use components::visible_while_occupied::show_while_a_child_is;
 use clap_complete::{Shell, generate};
+use components::visible_while_occupied::show_while_a_child_is;
 use hytte::futures_signals::map_ref;
 use hytte::futures_signals::signal::SignalExt;
 use hytte::gtk;

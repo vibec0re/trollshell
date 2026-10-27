@@ -1630,7 +1630,11 @@ mod authorize_service_tests {
             .get_cloned()
             .expect("the prompt is on the shared banner");
         answer_in(&shared.pending_response, shown.id, AgentReply::Confirm).await;
-        assert!(asking.await.is_ok(), "answered through the shared slot");
+        let answered = asking.now_or_never();
+        assert!(
+            matches!(answered, Some(Ok(()))),
+            "answered through the shared slot, got {answered:?}"
+        );
     }
 
     /// A pairing the shell starts that fails reaches the toast through the

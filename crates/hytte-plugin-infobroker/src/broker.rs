@@ -26,10 +26,14 @@
 //!   parked request per `BrokerState::apply_consent`: `AllowAlways`/`Deny`
 //!   persist to grants.toml, `AllowSession` mints a session-scoped token,
 //!   `AllowOnce` a single-fetch token — both of the latter scoped to the
-//!   datasource the prompt named, and to nothing else. An unanswered prompt (a
-//!   pre-1b / wedged host, or a genuinely ignored one) times out to a
-//!   **transient** deny + the 1a toast — the phase-1a fallback
-//!   (`BrokerState::on_consent_timeout`).
+//!   datasource the prompt named, and to nothing else. An unanswered prompt
+//!   times out to a **transient** deny + the 1a toast, and persists nothing
+//!   (`BrokerState::on_consent_timeout`), so the agent may ask again. That
+//!   covers every way a card goes unanswered — ignored for its 60 s, dismissed
+//!   with `Esc`, superseded by another card, never drawn for want of an
+//!   output — because the shell sends **no** decision for any of them (#1542
+//!   item 5: silence decides nothing, so only a click on **Deny** persists a
+//!   standing no), as well as a wedged or pre-1b host that never shows one.
 //! - `get <datasource>` requires a valid token, and either an `always` grant
 //!   for `(agent, datasource)` or a token whose own [`TokenScope`] — a session,
 //!   or a single unspent once — names that datasource; anything else is denied
@@ -113,11 +117,21 @@ const MAX_CONCURRENT_READS: usize = 16;
 const MAX_PENDING_CONSENTS: usize = 8;
 
 /// How long the broker holds a **parked** consent request before giving up and
-/// timing it out (#487 phase 1b). Deliberately a touch longer than the shell's
-/// own 60 s prompt bound: the shell owns the user-facing countdown and always
-/// sends a decision within it (an explicit click, or `Deny` on its own timeout),
-/// so a live shell's answer reliably arrives first — this is the pure fallback
-/// for a wedged or pre-1b host that never surfaces the prompt at all.
+/// timing it out (#487 phase 1b).
+///
+/// This deadline is how an unanswered prompt ends. The shell owns the
+/// user-facing countdown (`CONSENT_PROMPT_TIMEOUT_SECS`, 60 s) and sends a
+/// decision only for a click: since #1542 item 5 a card that times out, is
+/// dismissed with `Esc`, is superseded or has no output to be drawn on sends
+/// nothing, and this timeout answers the agent instead — transiently, with
+/// nothing persisted (`BrokerState::on_consent_timeout`). It also still
+/// covers a wedged or pre-1b host that never surfaces the prompt at all.
+///
+/// So it must outlast the card, or a click in the card's last seconds would
+/// land after the broker gave up and be dropped as late. It is the card's 60 s
+/// plus the proto's `CONSENT_PROMPT_GRACE_SECS` (5 s) race margin, spelled out
+/// rather than imported because this library stays SDK-free; the plugin
+/// binary, which links the proto, asserts the ordering at compile time.
 ///
 /// Public because it is also the longest a well-behaved broker leaves a client
 /// waiting for its one reply line (an `auth` parked on the human), which is
@@ -910,6 +924,12 @@ impl BrokerState {
     /// session-scoped token; `AllowOnce` a single-fetch token. Every allow answers
     /// the parked `auth` with a fresh token; a deny persists a standing "no".
     ///
+    /// Only a click reaches here: the shell sends no decision for a card
+    /// nobody answered (#1542 item 5), and [`Self::on_consent_timeout`]
+    /// answers those instead. A shell from before that change still sends
+    /// `Deny` on its own timeout, indistinguishable from a click on the wire;
+    /// see `ConsentChoices::unanswered`'s "Version skew".
+    ///
     /// `datasource` is the one the prompt named, and every arm is about it and
     /// nothing wider: the two persisted decisions write that pair's row, and the
     /// two consent tokens carry it in their [`TokenScope`], which is the only
@@ -952,9 +972,11 @@ impl BrokerState {
     }
 
     /// A parked consent knock that ran out its [`CONSENT_PARK_TIMEOUT`] with no
-    /// decision (a pre-1b / wedged host, or a genuinely ignored prompt). Deny THIS
-    /// request **transiently** — no persisted "no", so the agent may re-ask — and
-    /// raise the 1a informational toast so the missed knock stays visible (the
+    /// decision: a prompt nobody answered (timed out, dismissed with `Esc`,
+    /// superseded, or never drawn — the shell sends nothing for any of them
+    /// since #1542 item 5), or a pre-1b / wedged host. Deny THIS request
+    /// **transiently** — no persisted "no", so the agent may re-ask — and raise
+    /// the 1a informational toast so the missed knock stays visible (the
     /// phase-1a fallback path).
     fn on_consent_timeout(
         &mut self,
@@ -2070,8 +2092,11 @@ impl Session {
     /// anything). A second knock for a pair that already has one parked is
     /// refused rather than prompted again: the shell's one consent card would
     /// supersede the first prompt with an identical second one, and the first
-    /// one's own countdown would still answer later, against a decision the
-    /// human made on the second. And past [`MAX_PENDING_CONSENTS`] parked knocks
+    /// knock would then wait out its whole [`CONSENT_PARK_TIMEOUT`] for an
+    /// answer the human gave on the second card. (Before #1542 item 5 and the
+    /// shell's supersede fix, the first card's own countdown sent a `Deny`
+    /// this broker persisted, against whatever the human clicked on the
+    /// second.) And past [`MAX_PENDING_CONSENTS`] parked knocks
     /// any knock is refused, which bounds the open sockets a stream of knocks
     /// under fresh agent names can park.
     fn consent_refusal(&self, agent: &str, datasource: &str) -> Option<Response> {
@@ -4083,5 +4108,146 @@ mod tests {
             drop(cmds_tx);
         };
         tokio::join!(session, drive);
+    }
+
+    // ── #1542 item 5: silence persists nothing, a Deny click does ──────────────
+    //
+    // These drive one `Session` directly rather than `run_session`, so the
+    // park deadline can be made to pass without a test waiting out the real
+    // `CONSENT_PARK_TIMEOUT` (65 s).
+
+    /// Park one `auth` knock from `agent` (no datasource, so `departures`) on
+    /// `session`, returning the agent's end of the socket and the prompt the
+    /// session raised for it.
+    async fn park_knock(
+        session: &mut Session,
+        out: &mut mpsc::UnboundedReceiver<BrokerMsg>,
+        agent: &str,
+    ) -> (UnixStream, ConsentPrompt) {
+        let (server, client) = UnixStream::pair().expect("a connected socketpair");
+        session
+            .on_request(
+                server,
+                Request::Auth {
+                    agent: agent.to_owned(),
+                    datasource: None,
+                },
+            )
+            .await;
+        (client, next_prompt(out).await)
+    }
+
+    /// The one response line the session wrote on `stream`, parsed.
+    async fn reply_on(stream: &mut UnixStream) -> Response {
+        let line = tokio::time::timeout(PROMPT, read_reply(stream))
+            .await
+            .expect("the session answered the parked agent");
+        serde_json::from_str(&line).expect("one response line")
+    }
+
+    /// Let every parked knock's park deadline pass, as the loop's deadline arm
+    /// does once [`CONSENT_PARK_TIMEOUT`] has elapsed with no decision.
+    async fn park_deadline_passes(session: &mut Session) {
+        let now = tokio::time::Instant::now();
+        for parked in session.pending.values_mut() {
+            parked.deadline = now;
+        }
+        session.on_deadline().await;
+    }
+
+    /// #1542 item 5, the broker's half. A grant card nobody answers — it times
+    /// out, or is dismissed with `Esc`, or is superseded, or has no output to
+    /// be drawn on — sends **no** decision, so no `Cmd::Decision` arrives and
+    /// the park deadline is what answers the knock: a transient refusal the
+    /// agent may retry, with nothing persisted. The plugin binary's
+    /// `an_unanswered_card_puts_no_decision_on_the_broker_lane` pins the other
+    /// half, that nothing does arrive.
+    ///
+    /// Falsification: have `on_deadline` resolve an expired knock with
+    /// `apply_consent(…, ConsentDecision::Deny, …)` — the old "silence is a
+    /// deny" outcome — and this reds: a standing deny is persisted, the reply
+    /// says "consent denied", and the retry is refused without a prompt.
+    #[tokio::test]
+    async fn an_unanswered_consent_knock_persists_nothing_and_is_refused_transiently() {
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let mut session = Session::new(BrokerState::new(store(Vec::new())), out_tx);
+        let (mut agent, _prompt) = park_knock(&mut session, &mut out_rx, "claude").await;
+
+        // Nobody answers the card; the shell sends nothing.
+        park_deadline_passes(&mut session).await;
+
+        let reply = reply_on(&mut agent).await;
+        assert!(!reply.ok, "{reply:?}");
+        assert!(
+            reply.error.as_deref().is_some_and(|e| e.contains("timed out")),
+            "the agent hears the transient timeout refusal: {reply:?}"
+        );
+        assert_eq!(
+            session.state.grants.decision_for("claude", "departures"),
+            None,
+            "an unanswered card persists nothing"
+        );
+        assert!(session.pending.is_empty(), "the knock is answered and gone");
+
+        // Retryable: the agent's next knock goes back to the human rather
+        // than meeting a standing no.
+        let (_again, prompt) = park_knock(&mut session, &mut out_rx, "claude").await;
+        assert_eq!(
+            (prompt.agent.as_str(), prompt.datasource.as_str()),
+            ("claude", "departures")
+        );
+    }
+
+    /// The control: a **click** on Deny is the one answer that persists a
+    /// standing no, and it still does — the reply says so, `grants.toml` gets
+    /// the row, and the agent's next knock is refused without a prompt.
+    ///
+    /// Falsification: skip the `grant_deny` in `apply_consent`'s `Deny` arm
+    /// (the over-correction: "a deny never persists") and this reds.
+    #[tokio::test]
+    async fn an_explicit_deny_click_persists_a_standing_no() {
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let mut session = Session::new(BrokerState::new(store(Vec::new())), out_tx);
+        let (mut agent, prompt) = park_knock(&mut session, &mut out_rx, "claude").await;
+
+        session
+            .on_cmd(Cmd::Decision {
+                request_id: prompt.request_id,
+                decision: ConsentDecision::Deny,
+            })
+            .await;
+
+        let reply = reply_on(&mut agent).await;
+        assert!(!reply.ok, "{reply:?}");
+        assert!(
+            reply
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("consent denied")),
+            "{reply:?}"
+        );
+        assert_eq!(
+            session.state.grants.decision_for("claude", "departures"),
+            Some(Decision::Deny),
+            "a Deny click persists a standing no"
+        );
+
+        // The next knock meets that standing no: refused, and not re-prompted.
+        let (server, mut again) = UnixStream::pair().expect("a connected socketpair");
+        session
+            .on_request(
+                server,
+                Request::Auth {
+                    agent: "claude".to_owned(),
+                    datasource: None,
+                },
+            )
+            .await;
+        let reply = reply_on(&mut again).await;
+        assert!(!reply.ok, "{reply:?}");
+        assert!(
+            queued_prompts(&mut out_rx).is_empty(),
+            "a standing no is not put to the human again"
+        );
     }
 }

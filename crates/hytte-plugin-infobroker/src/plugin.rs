@@ -27,14 +27,16 @@
 //!   as an interactive consent prompt via `Effect::RequestConsent`.
 
 use hytte_plugin::proto::{
-    Capability, ConsentDecision, DatasourceError, DatasourceOutcome, Dir, Effect, EventKind,
-    Manifest, Mount, Node, Page, StateKey, UpcomingEvent,
+    CONSENT_PROMPT_GRACE_SECS, CONSENT_PROMPT_TIMEOUT_SECS, Capability, ConsentDecision,
+    DatasourceError, DatasourceOutcome, Dir, Effect, EventKind, Manifest, Mount, Node, Page,
+    StateKey, UpcomingEvent,
 };
 use hytte_plugin::tokio_stream::wrappers::UnboundedReceiverStream;
 use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View};
 use hytte_plugin_infobroker::broker::{
-    AuditView, BrokerMsg, BrokerSnapshot, Cmd, ConsentDecision as BrokerConsentDecision,
-    DatasourceView, GrantView, Outcome, PendingView, QueryOutcome, QueryRequest, TokenView,
+    AuditView, BrokerMsg, BrokerSnapshot, CONSENT_PARK_TIMEOUT, Cmd,
+    ConsentDecision as BrokerConsentDecision, DatasourceView, GrantView, Outcome, PendingView,
+    QueryOutcome, QueryRequest, TokenView,
 };
 use hytte_plugin_infobroker::wire::CalendarEntry;
 use tokio::sync::{mpsc, oneshot};
@@ -59,6 +61,18 @@ std::thread_local! {
     static SHUTDOWN_RX: std::cell::RefCell<Option<oneshot::Receiver<oneshot::Sender<()>>>> =
         const { std::cell::RefCell::new(None) };
 }
+
+// The broker's park deadline is what answers a consent card nobody clicked: the
+// shell sends no decision for a timed-out, `Esc`-dismissed, superseded or
+// undrawn card (#1542 item 5), so the parked `auth` waits for this deadline and
+// gets a transient refusal. It must outlast the card by the proto's race
+// margin, or a click in the card's last seconds lands after the broker gave up
+// and is dropped as late. The library spells the number out (it stays
+// SDK-free), so the check lives here, where the proto's two constants are in
+// reach.
+const _: () = assert!(
+    CONSENT_PARK_TIMEOUT.as_secs() >= CONSENT_PROMPT_TIMEOUT_SECS + CONSENT_PROMPT_GRACE_SECS
+);
 
 // Node ids. The chip button opens the panel; the per-row allow/revoke buttons
 // carry the `(agent, datasource)` pair their row names — see `row_action_id`.
@@ -247,9 +261,12 @@ impl Plugin for Infobroker {
                     params,
                 }]
             }
-            // The human answered (or the host's 60 s timeout fired → `Deny`):
-            // forward the decision down the lane to the broker, which resolves the
-            // parked request. Fire-and-forget, no effect of its own.
+            // The human clicked a button: forward the decision down the lane
+            // to the broker, which resolves the parked request. Fire-and-forget,
+            // no effect of its own. A card nobody answered sends nothing
+            // (#1542 item 5), and the broker's own park deadline answers the
+            // agent transiently instead — so a `Deny` here is a click (on a
+            // current shell; see `ConsentChoices::unanswered`'s version skew).
             Input::ConsentDecision {
                 request_id,
                 decision,
@@ -1028,6 +1045,57 @@ mod tests {
             }
             other => panic!("expected one RequestConsent effect, got {other:?}"),
         }
+    }
+
+    /// #1542 item 5, the plugin's half: the card this plugin asks the shell for
+    /// sends nothing when nobody answers it (a timeout, an `Esc`), so nothing
+    /// reaches the broker's lane and the parked `auth` is left to the broker's
+    /// own park deadline — a transient refusal with nothing persisted, which
+    /// the library's `an_unanswered_consent_knock_persists_nothing_and_is_refused_transiently`
+    /// pins.
+    ///
+    /// The card is read off the effect this plugin actually emits and the
+    /// silence rule off the proto, so a change to either is seen here.
+    ///
+    /// Falsification: give `ConsentChoices::Grant` its `Some(Deny)` silence
+    /// rule back and this reds — the timeout's `Deny` rides the lane as a
+    /// `Cmd::Decision`, which the broker persists as a standing refusal.
+    #[test]
+    fn an_unanswered_card_puts_no_decision_on_the_broker_lane() {
+        let (mut m, mut rx) = model();
+        let fx = m.update(Input::App(BrokerMsg::RequestConsent(
+            hytte_plugin_infobroker::broker::ConsentPrompt {
+                request_id: 5,
+                agent: "claude".to_owned(),
+                datasource: "departures".to_owned(),
+                scope: "read access".to_owned(),
+                detail: "claude wants to read the departures board".to_owned(),
+            },
+        )));
+        let [
+            Effect::RequestConsent {
+                request_id,
+                choices,
+                ..
+            },
+        ] = fx.as_slice()
+        else {
+            panic!("expected one RequestConsent effect, got {fx:?}");
+        };
+
+        // What the shell sends for this card when nobody answers it.
+        if let Some(decision) = choices.unanswered() {
+            let _ = m.update(Input::ConsentDecision {
+                request_id: *request_id,
+                decision,
+            });
+        }
+
+        let lane = rx.try_recv();
+        assert!(
+            lane.is_err(),
+            "an unanswered card must put no decision on the broker's lane (#1542), got {lane:?}"
+        );
     }
 
     #[test]

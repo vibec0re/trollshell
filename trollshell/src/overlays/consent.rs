@@ -9,41 +9,50 @@
 //! and routes the choice back to the requesting plugin as
 //! `HostMsg::ConsentDecision` over its outbound channel.
 //!
-//! # Two cards, and the difference is what silence means (#947 P3)
+//! # Two cards, and silence sends nothing on either (#947 P3, #1542)
 //!
 //! The effect carries a [`ConsentChoices`], and this module is the only place
 //! that turns it into widgets:
 //!
-//! | [`ConsentChoices`] | buttons | 60 s / `Esc` | keyboard default |
+//! | [`ConsentChoices`] | buttons | 60 s / `Esc` / no output | keyboard default |
 //! | --- | --- | --- | --- |
-//! | `Grant` (default) | Allow once / This session / Always / Deny | [`ConsentDecision::Deny`] | `Always` |
+//! | `Grant` (default) | Allow once / This session / Always / Deny | **nothing is sent** | `Always` |
 //! | `Approval` | **Approve / Deny** | **nothing is sent** | none |
 //!
-//! `Grant` is #487 unchanged, down to the byte: `GRANT_CARD` is the same four
-//! labels in the same order with the same style classes, and `golden_card_*`
-//! pins that.
+//! `Grant`'s buttons are #487's, down to the byte: `GRANT_CARD` is the same
+//! four labels in the same order with the same style classes, and
+//! `golden_card_*` pins that.
 //!
 //! `Approval` (spec §6.5) is for a one-shot decision on a queued item — a
 //! hyperhive approval — where "This session" and "Always" would name a standing
-//! grant the requester cannot honour. Its silence rule is the load-bearing half:
-//! an unanswered prompt sends **no** decision, because a `Deny` there resolves
-//! the item durably on the far side and "nobody was at the screen" is not
-//! evidence for that. The requester keeps the item pending and re-raises on
-//! demand. See [`ConsentChoices::unanswered`], which is where that rule lives so
-//! both ends read it from one place.
+//! grant the requester cannot honour.
 //!
-//! For the same reason the `Approval` card focuses **no** button: the surface
-//! takes the keyboard exclusively, so a stray `Return` must not be able to
-//! answer it either way. `Esc` still dismisses (sending nothing), which is the
-//! deliberate no-op the card wants a key for.
+//! **Silence decides nothing**, on either card. A `Deny` is a durable answer
+//! on both requesters' far sides — the hive resolves the approval, and the
+//! infobroker persists a standing refusal to `grants.toml` — and "nobody was at
+//! the screen" is not evidence for either. So only a click on **Deny** sends
+//! `Deny`. A prompt that times out, is dismissed with `Esc`, or has no output
+//! to be drawn on sends no decision at all, and the requester's own deadline
+//! answers for it: the agents plugin keeps the approval pending and re-raises
+//! on demand, and the infobroker's park timeout answers the agent with a
+//! transient, retryable refusal and persists nothing. That was the approval
+//! card's rule from the start (#947 P3); the grant card denied on silence until
+//! #1542 item 5 (Annika, 2026-10-27, from #1489's owner question 2). See
+//! [`ConsentChoices::unanswered`], which is where the rule lives so both ends
+//! read it from one place.
+//!
+//! The `Approval` card focuses **no** button: the surface takes the keyboard
+//! exclusively, so a stray `Return` must not be able to answer it either way.
+//! `Esc` dismisses it, sending nothing. The `Grant` card keeps #487's
+//! keyboard default (`Always`, never `Deny`).
 //!
 //! **Bounded (60 s).** Every prompt tears down after `PROMPT_TIMEOUT`, so a
-//! wedged UI never leaves a card on screen; whether that teardown *sends* a
-//! decision is the table above. Every prompt resolves **exactly once** — the
-//! first of a button click, `Esc`, or the timeout wins and cancels the rest.
-//! A card taken off the screen unresolved — superseded by a newer request,
-//! closed by a hot-plug — sends **nothing**: its requester falls back to its
-//! own deadline, and no decision is made for a card nobody can see.
+//! wedged UI never leaves a card on screen; that teardown sends nothing (the
+//! table above). Every prompt resolves **exactly once** — the first of a
+//! button click, `Esc`, or the timeout wins and cancels the rest. A card taken
+//! off the screen unresolved — superseded by a newer request, closed by a
+//! hot-plug — sends **nothing** either: its requester falls back to its own
+//! deadline, and no decision is made for a card nobody can see.
 //!
 //! **Focused output.** [`install`] registers each monitor by connector;
 //! [`request`] picks the monitor for niri's focused output via the shared
@@ -72,13 +81,14 @@ use tokio::sync::mpsc;
 
 /// How long a prompt stays up unanswered before it tears itself down (#487).
 ///
-/// Read from the **proto**, not spelled here, since #1140: a requester using
-/// [`ConsentChoices::Approval`] receives nothing when this fires and must run
-/// its own deadline, so the number is one both processes read rather than two
-/// that happen to agree today ([`CONSENT_PROMPT_TIMEOUT_SECS`]).
+/// Read from the **proto**, not spelled here, since #1140: a requester
+/// receives nothing when this fires and must run its own deadline, so the
+/// number is one both processes read rather than two that happen to agree
+/// today ([`CONSENT_PROMPT_TIMEOUT_SECS`]).
 ///
 /// What the teardown *sends* is [`ConsentChoices::unanswered`]'s call, not this
-/// constant's: `Deny` for a grant, nothing at all for an approval.
+/// constant's: nothing at all, on either card (#1542 item 5 made that true of
+/// the grant card too).
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(CONSENT_PROMPT_TIMEOUT_SECS);
 
 /// The timeout [`request`] arms: [`PROMPT_TIMEOUT`], except under `gtk_tests`,
@@ -328,9 +338,10 @@ pub fn close_all() {
 ///
 /// `choices` picks the card — see the module docs' table. If no output is
 /// mounted there is nowhere to ask, and the fallback follows the same rule the
-/// timeout does ([`ConsentChoices::unanswered`]): a grant is denied immediately
-/// so the agent is never left hanging, an approval sends nothing and stays
-/// pending on the requester's side.
+/// timeout does ([`ConsentChoices::unanswered`]): nothing is sent, on either
+/// card, and the requester's own deadline answers for it — the infobroker's
+/// park timeout with a transient refusal, the agents plugin by keeping the
+/// approval pending.
 // One cohesive overlay-construction function (card + buttons + Esc + the
 // bounded-resolve wiring); the length is the widget count, not branching — like
 // `osd::build_osd_view`, splitting it would scatter the paired setup for no gain.
@@ -369,14 +380,14 @@ pub fn request(
 
     let Some(monitor) = focused_monitor() else {
         // No output to prompt on — which is silence of the most literal kind,
-        // so it follows the same rule the timeout does. A grant is denied
-        // straight away rather than stranding the agent; an approval sends
-        // nothing, because the whole point of `ConsentChoices::Approval` is
-        // that a decision nobody made is not a decision (spec §6.5) — the
-        // requester's own badge is what surfaces it instead.
+        // so it follows the same rule the timeout does: a decision nobody
+        // made is not a decision (spec §6.5, #1542 item 5), so nothing is
+        // sent on either card and the requester's own deadline answers. The
+        // `Some` arm is kept for a future card whose silence rule says
+        // otherwise; no card's does today.
         match plan.on_silence {
             Some(decision) => {
-                tracing::warn!(request_id, %agent, "consent prompt: no monitor to show on; denying");
+                tracing::warn!(request_id, %agent, ?decision, "consent prompt: no monitor to show on; sending the card's silence answer");
                 let _ = outbound.try_send(HostMsg::ConsentDecision {
                     request_id,
                     decision,
@@ -436,10 +447,10 @@ pub fn request(
     // the window, and cancels the timer. `done` is the guard.
     //
     // `resolve` takes an `Option`: `Some(d)` sends `d` back to the plugin,
-    // `None` tears the card down **silently**. Only the second exists because of
-    // `ConsentChoices::Approval` — see the module docs — and routing both
-    // through one closure is what keeps "exactly once" a single guard rather
-    // than two that could both fire.
+    // `None` tears the card down **silently**. A click is always the first;
+    // `Esc` and the timeout are the second on both cards (the module docs'
+    // silence rule) — and routing both through one closure is what keeps
+    // "exactly once" a single guard rather than two that could both fire.
     let done: Rc<Cell<bool>> = Rc::new(Cell::new(false));
     let timeout: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
 
@@ -545,6 +556,10 @@ pub fn request(
     // if it is still this card's (the compositor closing the surface on its
     // own would otherwise strand it). `resolve`'s own `close` lands here after
     // it has done all three — a no-op. The `prompt` overlay's teardown idiom.
+    //
+    // Since #1542 item 5 a late timer would send nothing anyway (no card's
+    // silence sends a decision), so for decisions this is the second of two
+    // guards; for the slot and the timer it is still the only one.
     {
         let done = done.clone();
         let timeout = timeout.clone();
@@ -680,22 +695,18 @@ mod tests {
     /// `MONITORS` empty (its state in any test thread) every call takes it.
     ///
     /// Falsification: make that arm deny unconditionally — the exact mutation
-    /// the review shipped green — and the second half fails, because an
-    /// approval nobody could be shown would answer `Deny { id }` to the hive.
+    /// the review shipped green — and both halves fail. For the approval, the
+    /// hive would hear `Deny { id }`; for the grant, the infobroker would
+    /// persist a standing refusal for an agent whose card was never drawn
+    /// (#1542: a session with every output gone, say a closed lid).
     #[test]
     fn the_no_monitor_arm_follows_the_silence_rule() {
         let (tx, mut rx) = mpsc::channel::<HostMsg>(4);
         request(1, "a", "", "s", "d", ConsentChoices::Grant, tx.clone());
-        match rx.try_recv() {
-            Ok(HostMsg::ConsentDecision {
-                request_id,
-                decision,
-            }) => {
-                assert_eq!(request_id, 1);
-                assert_eq!(decision, ConsentDecision::Deny);
-            }
-            other => panic!("a grant with no output must deny (#487), got {other:?}"),
-        }
+        assert!(
+            rx.try_recv().is_err(),
+            "a grant with no output must answer nothing: the infobroker persists a Deny (#1542)"
+        );
 
         request(2, "a", "", "s", "d", ConsentChoices::Approval, tx);
         assert!(
@@ -784,8 +795,14 @@ mod tests {
     /// added a second card; this is the assertion that the first one did not
     /// move by so much as a label, an order, a style class or a decision.
     ///
+    /// The last line is the one thing #1542 item 5 changed: an unanswered
+    /// grant card used to send `Some(Deny)`, which the infobroker persisted as
+    /// a standing refusal. The buttons, their order, their classes and the
+    /// keyboard default are #487's, unchanged.
+    ///
     /// Falsification: swap two labels, drop `destructive-action`, or re-order
-    /// the table, and this goes red with a diff naming the row.
+    /// the table, and this goes red with a diff naming the row; give the grant
+    /// card its `Some(Deny)` silence rule back and the last line does.
     #[test]
     fn golden_card_grant_is_487_unchanged() {
         assert_eq!(
@@ -796,7 +813,7 @@ Allow once|AllowOnce|
 This session|AllowSession|
 Always|AllowAlways|suggested-action
 keyboard_default=3
-unanswered=Some(Deny)
+unanswered=None
 "
         );
     }
@@ -1057,9 +1074,15 @@ pub(crate) mod gtk_tests {
     }
 
     /// The timer's resolution releases the slot too — the commonest way a
-    /// card ends, since an unanswered approval is the expected case.
+    /// card ends, since an unanswered card is the expected case — and, for a
+    /// grant card, sends nothing (#1542 item 5): the infobroker would persist
+    /// a `Deny` as a standing refusal, so 60 s with nobody at the screen must
+    /// leave the requester to its own park deadline and its transient answer.
+    ///
+    /// Falsification: give `ConsentChoices::Grant` its `Some(Deny)` silence
+    /// rule back and the last assertion reds with the timer's `Deny`.
     #[gtk::test]
-    fn a_timed_out_card_releases_its_slot() {
+    fn a_timed_out_card_releases_its_slot_and_sends_nothing() {
         let _mounted = Mounted::new();
         let (tx, mut rx) = mpsc::channel(4);
         TIMEOUT.set(Some(SHORT));
@@ -1070,17 +1093,20 @@ pub(crate) mod gtk_tests {
 
         assert!(!is_up(), "a timed-out card must give up the slot");
         assert!(a_dialog_may_raise());
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(HostMsg::ConsentDecision {
-                request_id: 1,
-                decision: ConsentDecision::Deny,
-            })
-        ));
+        let sent = rx.try_recv();
+        assert!(
+            sent.is_err(),
+            "a timed-out grant card must send nothing (#1542), got {sent:?}"
+        );
     }
 
     /// `Esc` — the same `resolve(plan.on_silence)` call the timer makes —
-    /// releases the slot on both cards, whatever it sends.
+    /// releases the slot on both cards and sends nothing on either: an `Esc`
+    /// is a dismissal, not a refusal (#1542 item 5 for the grant card, §6.5
+    /// for the approval card).
+    ///
+    /// Falsification: give `ConsentChoices::Grant` its `Some(Deny)` silence
+    /// rule back and the first card's assertion reds.
     #[gtk::test]
     fn an_unanswered_card_releases_its_slot() {
         let _mounted = Mounted::new();
@@ -1090,13 +1116,11 @@ pub(crate) mod gtk_tests {
         escape(&grant);
         assert!(!is_up());
         assert!(a_dialog_may_raise());
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(HostMsg::ConsentDecision {
-                request_id: 1,
-                decision: ConsentDecision::Deny,
-            })
-        ));
+        let sent = rx.try_recv();
+        assert!(
+            sent.is_err(),
+            "an Esc on a grant card must send nothing (#1542), got {sent:?}"
+        );
 
         let approval = raise(2, ConsentChoices::Approval, &tx);
         escape(&approval);
@@ -1108,14 +1132,41 @@ pub(crate) mod gtk_tests {
         );
     }
 
+    /// The control for the two tests above: with silence sending nothing, a
+    /// click on **Deny** is the one way a grant card refuses, and it still
+    /// does — the decision the infobroker persists as a standing no.
+    ///
+    /// Falsification: the over-correction — have `resolve` drop every `Deny`,
+    /// so that no card can ever refuse — and this reds (nothing arrives).
+    #[gtk::test]
+    fn a_deny_click_still_denies() {
+        let _mounted = Mounted::new();
+        let (tx, mut rx) = mpsc::channel(4);
+        let card = raise(1, ConsentChoices::Grant, &tx);
+
+        button(&card, "Deny").emit_clicked();
+
+        assert!(!is_up());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(HostMsg::ConsentDecision {
+                request_id: 1,
+                decision: ConsentDecision::Deny,
+            })
+        ));
+    }
+
     /// A superseded card is over when the newer one replaces it: its timer
     /// must neither send a late decision for the old request — a grant's
     /// `Deny`, which the infobroker persists, for a card nobody could still
     /// see — nor release the slot the replacement now holds, or a dialog could
     /// be raised over a live card (#1361 review, HIGH-1).
     ///
-    /// Falsified by deleting the `connect_unmap` teardown (the late `Deny`
-    /// arrives).
+    /// Two guards hold the first half since #1542 item 5: the `connect_unmap`
+    /// teardown disarms the timer, and the grant card's silence rule sends
+    /// nothing even if it fires. So this goes red only when **both** regress —
+    /// delete the teardown *and* give `ConsentChoices::Grant` its `Some(Deny)`
+    /// back, and the late `Deny` arrives; either mutation alone stays green.
     #[gtk::test]
     fn a_superseded_card_sends_nothing_and_keeps_the_live_cards_slot() {
         let _mounted = Mounted::new();

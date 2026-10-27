@@ -454,28 +454,9 @@ in
   # tool, drives that module with mkDefault values so you can still override any
   # individual setting. niri keybinds/session live in KDL and have no clean
   # home-manager path, so they stay manual — see etc/niri/.
-  options.programs.trollshell.enableSessionExtras = lib.mkEnableOption ''
-    all of the session-integration extras below (fuzzel, the wallpaper daemon,
-    cliphist, portals) as a group. Each is set with mkDefault, so you can still
-    flip an individual one off. The wallpaper daemon is the one selected by
-    programs.trollshell.wallpaper.backend (default swaybg), not hardcoded — set
-    backend = "none" to opt out of daemon management entirely'';
-
   options.programs.trollshell.fuzzel.enable = lib.mkEnableOption ''
     the bundled fuzzel launcher config via home-manager's programs.fuzzel.
     Bind Mod+D to `fuzzel` in niri yourself (etc/niri/binds.kdl)'';
-
-  options.programs.trollshell.swaybg.enable = lib.mkEnableOption ''
-    the bundled swaybg wallpaper user unit standalone, which reads its
-    argument list from ~/.config/trollshell/swaybg.args (the Appearance drawer
-    page writes it — per-output images and rotation supported). Gently deprecated in favor of
-    programs.trollshell.wallpaper.backend = "swaybg" + enableSessionExtras: the
-    extras bundle now starts the swaybg unit when backend is "swaybg" (the
-    default). This option is still honored — set it true to run the swaybg unit
-    without the rest of the bundle. Two wallpaper daemons can never run at once
-    because backend selects exactly one, but if you set this true AND
-    backend = "awww", swaybg and awww would both start; don't.
-    Leave it false unless you specifically want swaybg without the bundle'';
 
   options.programs.trollshell.cliphist.enable = lib.mkEnableOption ''
     clipboard history (text + images) via home-manager's services.cliphist,

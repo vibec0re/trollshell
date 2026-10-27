@@ -31,7 +31,7 @@ use std::time::Duration;
 
 /// How long the owner lookup may take before the call is refused. The bus
 /// driver answers `GetNameOwner` itself, so this only bounds a wedged
-/// connection. It matches [`call`](crate::call)'s default deadline, and it fits
+/// connection. It matches [`call()`](crate::call())'s default deadline, and it fits
 /// inside the time both daemons give their agents: bluetoothd waits 60 s for
 /// an `Agent1` reply (`REQUEST_TIMEOUT`, `src/agent.c`) and `NetworkManager`
 /// 120 s for `GetSecrets`.

@@ -605,7 +605,7 @@ pub fn disconnect_device(device_path: &str) {
 /// Fire-and-forget: call `Pair` on the given device, trusted first (so it
 /// auto-reconnects next session and never asks before using a service), and
 /// connect it once paired. A pairing that fails takes the trust back
-/// ([`trust::pair_trusting`]). The trust-pair-connect chain is what most
+/// (`trust::pair_trusting`). The trust-pair-connect chain is what most
 /// users expect from a "tap to pair my headphones" interaction. For devices
 /// that require a PIN/passkey `BlueZ` delegates to a registered `Agent1`;
 /// without one such pairings will silently fail.

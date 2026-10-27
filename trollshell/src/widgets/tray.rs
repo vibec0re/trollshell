@@ -868,7 +868,8 @@ mod passive_tests {
         }
     }
 
-    /// One item moving Passive → Active → NeedsAttention → Passive → Active,
+    /// One item moving `Passive` → `Active` → `NeedsAttention` → `Passive` →
+    /// `Active`,
     /// as successive `NewStatus` re-reads deliver it: hidden exactly while
     /// it is `Passive`.
     ///

@@ -1215,7 +1215,7 @@
                 # petBrain.model is a runtime path, so it gates the unit rather
                 # than entering the closure, and lands in llama-server's argv.
                 # #1542: the shell unit never hits systemd's default start limit
-                # (5 starts in 10 s), so a crash loop cannot leave no bar.
+                # (5 starts in 10 s), so back-to-back restarts cannot leave no bar.
                 assert units.trollshell.Unit.StartLimitIntervalSec == 0;
                 assert
                   builtins.toString units.trollshell-pet-brain.Unit.ConditionPathExists == "/var/empty/brain.gguf";

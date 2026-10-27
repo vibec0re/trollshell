@@ -76,16 +76,16 @@ pub type ICalComponent = c_void;
 /// return new refs).
 pub type ICalTime = c_void;
 
-/// `ICalTimezone *` — a libical timezone. Two of these reach us, and **both**
-/// are used as the *source zone* argument to
-/// [`i_cal_time_as_timet_with_zone`], not merely as a flag: the process-wide
-/// UTC singleton ([`i_cal_timezone_get_utc_timezone`]) for a DATE or a
-/// zone-less UTC value, and the zone an [`ICalTime`] itself carries
-/// ([`i_cal_time_get_timezone`]) for a resolved `TZID` — which is exactly what
-/// #522 fixed, and what the previous wording here ("purely to detect whether a
-/// time is absolute") described the pre-#522 behaviour of. See
-/// `lib.rs`'s `ical_time_to_unix` for the full three-way split. Both zones are
-/// owned by libical and must never be unref'd.
+/// `ICalTimezone *` — a libical timezone. Two of these reach us: the
+/// process-wide UTC singleton ([`i_cal_timezone_get_utc_timezone`]), the
+/// *source zone* argument to [`i_cal_time_as_timet_with_zone`] for a DATE or
+/// a UTC value, and the zone an [`ICalTime`] itself carries
+/// ([`i_cal_time_get_timezone`]) for a resolved `TZID`. That one was the
+/// source zone too from #522 until #1590; it is now read only through its
+/// UTC → offset map ([`i_cal_timezone_get_utc_offset_of_utc_time`]), and
+/// passed as a source zone only as a fallback. See `lib.rs`'s
+/// `ical_time_to_unix` for the split. Both zones are owned by libical and must
+/// never be unref'd.
 pub type ICalTimezone = c_void;
 
 /// `ICalProperty *` — one property of a component (e.g. an RRULE). Returned
@@ -474,10 +474,17 @@ unsafe extern "C" {
     pub fn i_cal_component_isa(comp: *mut ICalComponent) -> c_int;
 
     /// Convert a broken-down [`ICalTime`] to POSIX `time_t` (UTC seconds),
-    /// interpreting the value as being in `zone`. We always pass the UTC
-    /// singleton so DATE-TIME instances normalise to absolute UTC; for
-    /// floating/DATE values libical anchors them to that zone. Borrows
-    /// `tt`/`zone`; allocates nothing.
+    /// interpreting the value as being in `zone`. Passed the UTC singleton
+    /// for a DATE or a UTC (`…Z`) value. A resolved `TZID` time no longer
+    /// goes through it except as a fallback (#1590): on a DST transition
+    /// libical's local → UTC step (`icaltimezone_get_utc_offset`) takes the
+    /// post-gap offset in a gap and, in a fold, the change flagged standard
+    /// time, against RFC 5545 §3.3.5. In most zones that is the later
+    /// instant; in a negative-DST zone such as `Europe/Dublin` (winter
+    /// flagged daylight) it is the earlier one. See `lib.rs`'s
+    /// `ical_time_to_unix`. Borrows `tt`/`zone`. With a zone other than UTC it
+    /// may extend libical's own per-zone change cache, under libical's lock;
+    /// it allocates nothing the caller owns.
     pub fn i_cal_time_as_timet_with_zone(tt: *const ICalTime, zone: *const ICalTimezone) -> TimeT;
 
     /// True iff the [`ICalTime`] is a DATE (no time-of-day) — i.e. the
@@ -498,8 +505,9 @@ unsafe extern "C" {
     /// The [`ICalTimezone`] a resolved-`TZID` time carries, or `NULL` for a
     /// floating (zone-less) or DATE value. The returned pointer is a **borrow**
     /// (owned by the `ICalTime` / libical's builtin table) — never unref it.
-    /// A non-null result means the time already knows its absolute offset, so
-    /// [`i_cal_time_as_timet_with_zone`]'s zone argument is ignored for it.
+    /// A non-null result means the time names an absolute instant in that
+    /// zone; `lib.rs` reads it through the zone's UTC → offset map
+    /// ([`i_cal_timezone_get_utc_offset_of_utc_time`], #1590).
     pub fn i_cal_time_get_timezone(tt: *const ICalTime) -> *mut ICalTimezone;
 
     /// The broken-down wall-clock fields of an [`ICalTime`] (`gint` each).
@@ -676,6 +684,23 @@ unsafe extern "C" {
     /// The process-wide UTC [`ICalTimezone`] singleton. Owned by libical —
     /// never unref it. Passed to [`i_cal_time_as_timet_with_zone`].
     pub fn i_cal_timezone_get_utc_timezone() -> *mut ICalTimezone;
+
+    /// The UTC offset `zone` has at the **UTC** instant `tt` names, in
+    /// seconds east of UTC (`icaltimezone_get_utc_offset_of_utc_time`).
+    /// `tt`'s fields are read as UTC whatever zone it carries, so build it
+    /// with [`i_cal_time_new_from_timet_with_zone`] and the UTC singleton.
+    /// Every instant has exactly one offset, so unlike the local-time
+    /// direction this answer is never a choice (#1590). `is_daylight` is an
+    /// optional out-param: pass null. A null `zone` answers 0. Borrows `zone`
+    /// and `tt`. It may extend libical's own per-zone change cache
+    /// (`icaltimezone_ensure_coverage` for `tt`'s year, which can also load
+    /// a builtin zone lazily), under libical's lock; it allocates nothing the
+    /// caller owns.
+    pub fn i_cal_timezone_get_utc_offset_of_utc_time(
+        zone: *mut ICalTimezone,
+        tt: *mut ICalTime,
+        is_daylight: *mut c_int,
+    ) -> c_int;
 }
 
 // ── glib / gobject ──────────────────────────────────────────────────────────

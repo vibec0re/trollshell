@@ -3079,10 +3079,6 @@ mod gtk_tests {
                 .all(|pair| pair[1].width <= pair[0].width),
             "{side:?}: a closing card only shrinks, and so must the inset: {samples:?}"
         );
-        assert!(
-            during.iter().any(|s| s.width > STRUT && s.width < open),
-            "{side:?}: no frame was caught mid-slide, so this asserted nothing: {samples:?}"
-        );
         assert_eq!(
             (last.painted, last.width),
             (0, STRUT),
@@ -3090,6 +3086,10 @@ mod gtk_tests {
              it must draw the plain strut: {samples:?}"
         );
         assert!(last.settled, "{side:?}: the frame the tick stops on is settled");
+        assert!(
+            during.iter().any(|s| s.width > STRUT && s.width < open),
+            "{side:?}: no frame was caught mid-slide, so this asserted nothing: {samples:?}"
+        );
     }
 
     /// #1456 item 1, the headline: while a sidebar slides **closed**, the inset
@@ -3099,8 +3099,12 @@ mod gtk_tests {
     ///
     /// **Falsification (run):** restoring the old early filter (a side that is
     /// not `effective_open` answers `FRAME_THICKNESS_I32` at once) turns this
-    /// red on the first sample; measuring `open_width` (the child) instead of
-    /// the revealer in `closing_width` turns it red mid-slide.
+    /// red on the first sample, with the card still fully out; answering
+    /// `open_width` (the child, which does not shrink) instead of
+    /// `closing_width` turns it red mid-slide. Settling on `reveals_child()`
+    /// instead of `is_child_revealed()` in `is_settled_for_key`, or making
+    /// `frame::redraw_tick` ask `Side::Left` twice, stops the tick on the first
+    /// frame and turns it red too (the latter on the right side).
     #[gtk::test]
     fn a_closing_sidebar_reports_what_its_card_still_paints() {
         adw::init().expect("libadwaita init");
@@ -3199,7 +3203,7 @@ mod gtk_tests {
     /// already put the tiles), and the tick keeps running until the card is
     /// all the way out.
     ///
-    /// **Falsification (run):** comparing `reveal_child()` instead of
+    /// **Falsification (run):** comparing `reveals_child()` instead of
     /// `is_child_revealed()` in `is_settled_for_key` (settled as soon as the
     /// target is set) turns this red: the tick stops on the first frame,
     /// before the card has moved.
@@ -3237,14 +3241,14 @@ mod gtk_tests {
                         .all(|s| !s.settled && matches!(s.flow, glib::ControlFlow::Continue)),
                     "{side:?}: the tick keeps running while the card slides in: {samples:?}"
                 );
+                assert_eq!(
+                    last.painted, open,
+                    "{side:?}: the tick stops once the card is all the way out: {samples:?}"
+                );
                 assert!(
                     during.iter().any(|s| s.painted > 0 && s.painted < open),
                     "{side:?}: no frame was caught mid-slide, so this asserted nothing: \
                      {samples:?}"
-                );
-                assert_eq!(
-                    last.painted, open,
-                    "{side:?}: the tick stops once the card is all the way out: {samples:?}"
                 );
             });
         }

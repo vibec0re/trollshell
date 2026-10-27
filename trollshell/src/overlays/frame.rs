@@ -44,7 +44,7 @@
 //! the revealer collapses — not on the first frame of the close, which painted
 //! the strut over the card for the whole slide-out (#1456). The tick keeps
 //! running until then because `sidebar::is_settled` stays `false` for the
-//! whole slide; [`redraw_tick`] is that decision.
+//! whole slide; `redraw_tick` is that decision.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -453,6 +453,10 @@ fn all_settled(left: bool, right: bool) -> bool {
 /// because the cutout follows the card the whole way out now and the last draw
 /// has to be the one that puts the strut back. A tick that stopped early would
 /// leave the cutout frozen part-way, with nothing else to queue a draw.
+///
+/// **Falsification (run):** asking `settled(Side::Left)` for both sides turns
+/// that sweep red on the right, where the tick then stops on the first frame
+/// with the card still fully out.
 pub(crate) fn redraw_tick(settled: impl Fn(Side) -> bool) -> glib::ControlFlow {
     if all_settled(settled(Side::Left), settled(Side::Right)) {
         glib::ControlFlow::Break

@@ -3,13 +3,13 @@
 //! `CallerCheck` against a real `dbus-daemon`: the owner of a name is
 //! admitted, anyone else is refused, and the owner is looked up per call, so
 //! a daemon that comes back under a new unique name is checked against that
-//! one.
+//! one. The check asks on the connection it is handed, which in an interface
+//! method is the one the call arrived on (`check_reads_the_sender_off_a_real_call`).
 
 mod common;
 
 use common::{PROBE_BUDGET, ephemeral_bus};
-use hytte_bus::test_support::SharedConnection;
-use hytte_bus::{BusError, CallerCheck, CallerRefused, caller_check_with};
+use hytte_bus::{BusError, CallerCheck, CallerRefused, caller_check};
 use zbus::Connection;
 use zbus::connection::Builder;
 
@@ -43,24 +43,19 @@ fn unique(conn: &Connection) -> String {
         .to_string()
 }
 
-/// The check, asking over the test's own connection.
-fn check_on(conn: Connection) -> CallerCheck {
-    caller_check_with(&SharedConnection::for_test_session(conn), DAEMON)
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn the_owner_is_admitted_and_anyone_else_is_refused() {
     let (conn, guard) = ephemeral_bus().await;
-    let check = check_on(conn);
+    let check = caller_check(DAEMON);
     let owner = daemon(&guard.address).await;
     let intruder = peer(&guard.address).await;
 
     check
-        .check_sender(Some(&unique(&owner)))
+        .check_sender(&conn, Some(&unique(&owner)))
         .await
         .expect("the owner is admitted");
 
-    match check.check_sender(Some(&unique(&intruder))).await {
+    match check.check_sender(&conn, Some(&unique(&intruder))).await {
         Err(CallerRefused::NotOwner {
             name,
             sender,
@@ -83,12 +78,12 @@ async fn the_owner_is_admitted_and_anyone_else_is_refused() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_restarted_daemon_is_checked_under_its_new_name() {
     let (conn, guard) = ephemeral_bus().await;
-    let check = check_on(conn);
+    let check = caller_check(DAEMON);
 
     let first = daemon(&guard.address).await;
     let first_name = unique(&first);
     check
-        .check_sender(Some(&first_name))
+        .check_sender(&conn, Some(&first_name))
         .await
         .expect("the first daemon is admitted");
 
@@ -96,12 +91,12 @@ async fn a_restarted_daemon_is_checked_under_its_new_name() {
     let second = daemon(&guard.address).await;
 
     check
-        .check_sender(Some(&unique(&second)))
+        .check_sender(&conn, Some(&unique(&second)))
         .await
         .expect("the restarted daemon is admitted under its new name");
     assert!(
         matches!(
-            check.check_sender(Some(&first_name)).await,
+            check.check_sender(&conn, Some(&first_name)).await,
             Err(CallerRefused::NotOwner { .. })
         ),
         "the old daemon's name is refused once it no longer owns the name"
@@ -112,10 +107,10 @@ async fn a_restarted_daemon_is_checked_under_its_new_name() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_name_with_no_owner_admits_no_one() {
     let (conn, guard) = ephemeral_bus().await;
-    let check = check_on(conn);
+    let check = caller_check(DAEMON);
     let someone = peer(&guard.address).await;
 
-    match check.check_sender(Some(&unique(&someone))).await {
+    match check.check_sender(&conn, Some(&unique(&someone))).await {
         Err(CallerRefused::OwnerUnknown {
             name,
             error: BusError::Permanent { dbus_name, .. },
@@ -130,8 +125,8 @@ async fn a_name_with_no_owner_admits_no_one() {
     }
 }
 
-/// An interface guarded the way the agents guard theirs: the sender comes
-/// out of the call's own header.
+/// An interface guarded the way the agents guard theirs: the connection and
+/// the sender both come from the call itself.
 #[derive(Clone)]
 struct Gate {
     check: CallerCheck,
@@ -141,22 +136,23 @@ struct Gate {
 impl Gate {
     async fn knock(
         &self,
+        #[zbus(connection)] conn: &Connection,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> zbus::fdo::Result<()> {
         self.check
-            .check(&header)
+            .check(conn, &header)
             .await
             .map_err(|refused| zbus::fdo::Error::AccessDenied(refused.to_string()))
     }
 }
 
-/// `check` reads the sender out of a real call's header: the daemon's call is
-/// answered, an intruder's is refused.
+/// `check` reads the sender out of a real call's header and asks the bus the
+/// call arrived on: the daemon's call is answered, an intruder's is refused.
 #[tokio::test(flavor = "multi_thread")]
 async fn check_reads_the_sender_off_a_real_call() {
-    let (conn, guard) = ephemeral_bus().await;
+    let (_conn, guard) = ephemeral_bus().await;
     let gate = Gate {
-        check: check_on(conn),
+        check: caller_check(DAEMON),
     };
     // Staged on the builder, so the object server dispatches before anything
     // can be read off the socket (see `common::CALL_BUDGET`).

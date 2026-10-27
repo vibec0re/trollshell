@@ -16,35 +16,35 @@
 //! the owner is refused, and so is a call with no sender or a name the bus
 //! cannot resolve.
 //!
-//! The lookup is answered by the bus itself (`org.freedesktop.DBus`), never
-//! by the name's owner, so it starts no D-Bus-activatable daemon.
+//! The question goes to the bus on **the connection the call arrived on**,
+//! which an interface method takes with zbus's `#[zbus(connection)]`
+//! parameter. So the bus that names the owner is always the bus the sender's
+//! name belongs to, whichever pooled connection or generation delivered the
+//! call, and a test that mounts an agent on its own bus checks it exactly as
+//! production does. The lookup is answered by the bus itself
+//! (`org.freedesktop.DBus`), never by the name's owner, so it starts no
+//! D-Bus-activatable daemon. It reuses a connection zbus handed the method; it
+//! builds none.
 
-use crate::call::{RetryPolicy, call_with};
-use crate::connection::{BusKind, SharedConnection, for_kind};
 use crate::error::BusError;
+use std::time::Duration;
+
+/// How long the owner lookup may take before the call is refused. The bus
+/// driver answers `GetNameOwner` itself, so this only bounds a wedged
+/// connection. It matches [`call`](crate::call)'s default deadline, and it fits
+/// inside the time both daemons give their agents: bluetoothd waits 60 s for
+/// an `Agent1` reply (`REQUEST_TIMEOUT`, `src/agent.c`) and `NetworkManager`
+/// 120 s for `GetSecrets`.
+const OWNER_LOOKUP_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// Who may call an exported interface: whoever owns one well-known name on
 /// the bus when the call arrives. Built by [`caller_check`](crate::caller_check).
 ///
-/// Cheap to clone, so an interface struct can carry one into every clone the
-/// object server takes.
-#[derive(Clone)]
+/// Holds only the name, so it is cheap to clone into every copy of an
+/// interface struct the object server takes, and building one touches no bus.
+#[derive(Clone, Debug)]
 pub struct CallerCheck {
-    bus: Bus,
     name: String,
-}
-
-/// Where a [`CallerCheck`] asks who owns its name.
-///
-/// The pooled connection is looked up when a call is checked, not when the
-/// check is built, so building one opens no connection. That keeps an
-/// interface struct constructible in a hermetic test.
-#[derive(Clone)]
-enum Bus {
-    /// The process-wide pooled connection for this bus.
-    Pooled(BusKind),
-    /// A connection the caller supplied (tests).
-    Given(SharedConnection),
 }
 
 /// Why a [`CallerCheck`] refused a call.
@@ -77,24 +77,10 @@ pub enum CallerRefused {
     },
 }
 
-/// Build a [`CallerCheck`] that asks over `shared` instead of a pooled
-/// connection. Production callers use [`caller_check`](crate::caller_check).
-#[doc(hidden)]
-#[must_use]
-pub fn caller_check_with(shared: &SharedConnection, name: impl Into<String>) -> CallerCheck {
-    CallerCheck {
-        bus: Bus::Given(shared.clone()),
-        name: name.into(),
-    }
-}
-
 impl CallerCheck {
-    /// A check against `name` on the pooled connection for `bus`.
-    pub(crate) fn pooled(bus: BusKind, name: impl Into<String>) -> Self {
-        Self {
-            bus: Bus::Pooled(bus),
-            name: name.into(),
-        }
+    /// A check that admits the current owner of `name`.
+    pub(crate) fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into() }
     }
 
     /// The well-known name whose owner this check admits.
@@ -104,16 +90,22 @@ impl CallerCheck {
     }
 
     /// Admit the call whose header this is if, and only if, its sender owns
-    /// [`name`](Self::name) right now.
+    /// [`name`](Self::name) right now, asking on `conn`, the connection the
+    /// call arrived on.
     ///
-    /// Take the header with zbus's `#[zbus(header)]` method parameter.
+    /// In an interface method, take `conn` with `#[zbus(connection)]` and the
+    /// header with `#[zbus(header)]`.
     ///
     /// # Errors
     ///
     /// [`CallerRefused`] when the call must not be answered.
-    pub async fn check(&self, header: &zbus::message::Header<'_>) -> Result<(), CallerRefused> {
+    pub async fn check(
+        &self,
+        conn: &zbus::Connection,
+        header: &zbus::message::Header<'_>,
+    ) -> Result<(), CallerRefused> {
         let sender = header.sender().map(ToString::to_string);
-        self.check_sender(sender.as_deref()).await
+        self.check_sender(conn, sender.as_deref()).await
     }
 
     /// [`check`](Self::check) for a sender already read out of its message.
@@ -122,27 +114,43 @@ impl CallerCheck {
     ///
     /// [`CallerRefused`] when `sender` is `None`, is not the owner, or the bus
     /// cannot say who the owner is.
-    pub async fn check_sender(&self, sender: Option<&str>) -> Result<(), CallerRefused> {
-        let Some(sender) = sender else {
-            return Err(CallerRefused::NoSender);
-        };
-        let shared = match &self.bus {
-            Bus::Pooled(kind) => for_kind(*kind).clone(),
-            Bus::Given(shared) => shared.clone(),
-        };
-        // `Never`: the call being checked arrived on this connection. If the
-        // connection is dropping, its reply has nowhere to go either, so
-        // waiting out a reconnect only delays a refusal.
-        let owner = call_with(&shared, "org.freedesktop.DBus")
-            .at_path("/org/freedesktop/DBus")
-            .iface("org.freedesktop.DBus")
-            .method("GetNameOwner")
-            .args((self.name.clone(),))
-            .retry(RetryPolicy::Never)
-            .send::<String>()
-            .await;
+    pub async fn check_sender(
+        &self,
+        conn: &zbus::Connection,
+        sender: Option<&str>,
+    ) -> Result<(), CallerRefused> {
+        let sender = require_sender(sender)?;
+        let owner = name_owner(conn, &self.name).await;
         verdict(&self.name, sender, owner)
     }
+}
+
+/// The sender, or [`CallerRefused::NoSender`] before anything is asked.
+fn require_sender(sender: Option<&str>) -> Result<&str, CallerRefused> {
+    sender.ok_or(CallerRefused::NoSender)
+}
+
+/// Ask the bus on `conn` who owns `name`. A reply with no owner comes back
+/// as the bus's `NameHasNoOwner` error, carried in [`BusError::Permanent`]'s
+/// `dbus_name`.
+async fn name_owner(conn: &zbus::Connection, name: &str) -> Result<String, BusError> {
+    let args = (name,);
+    let asked = conn.call_method(
+        Some("org.freedesktop.DBus"),
+        "/org/freedesktop/DBus",
+        Some("org.freedesktop.DBus"),
+        "GetNameOwner",
+        &args,
+    );
+    let reply = tokio::time::timeout(OWNER_LOOKUP_TIMEOUT, asked)
+        .await
+        .map_err(|_| zbus::Error::Failure("GetNameOwner timed out".into()))
+        .and_then(|reply| reply)
+        .map_err(BusError::from_zbus)?;
+    reply
+        .body()
+        .deserialize::<String>()
+        .map_err(BusError::from_zbus)
 }
 
 /// The decision itself: admit `sender` only when it is `owner`, and refuse
@@ -164,8 +172,8 @@ fn verdict(name: &str, sender: &str, owner: Result<String, BusError>) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::{CallerCheck, CallerRefused, verdict};
-    use crate::{BusError, BusKind};
+    use super::{CallerRefused, require_sender, verdict};
+    use crate::BusError;
 
     const NM: &str = "org.freedesktop.NetworkManager";
 
@@ -203,14 +211,10 @@ mod tests {
         ));
     }
 
-    /// A call with no sender is refused before any lookup, so this needs no
-    /// bus: the pooled connection is never resolved.
-    #[tokio::test]
-    async fn a_call_with_no_sender_is_refused() {
-        let check = CallerCheck::pooled(BusKind::System, NM);
-        assert!(matches!(
-            check.check_sender(None).await,
-            Err(CallerRefused::NoSender)
-        ));
+    /// A call with no sender is refused before any lookup.
+    #[test]
+    fn a_call_with_no_sender_is_refused() {
+        assert!(matches!(require_sender(None), Err(CallerRefused::NoSender)));
+        assert_eq!(require_sender(Some(":1.7")).ok(), Some(":1.7"));
     }
 }

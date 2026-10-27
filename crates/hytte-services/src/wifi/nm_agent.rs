@@ -23,6 +23,7 @@ use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
 use super::types::{PromptKind, PromptRequest};
 use super::{NEXT_ID, WaitersMap};
+use crate::wifi_backend::NM_BUS_NAME;
 
 // ── Agent error ────────────────────────────────────────────────────────────────
 
@@ -116,24 +117,21 @@ pub(super) struct NmAgent {
     /// sees a waiter without its key or a key without its waiter.
     inflight: Arc<AsyncMutex<HashMap<u64, RequestKey>>>,
     /// Admits a call only from `NetworkManager`: the current owner of
-    /// `org.freedesktop.NetworkManager`, looked up when the call arrives.
+    /// `org.freedesktop.NetworkManager`, looked up on the call's own
+    /// connection when it arrives.
     caller: hytte_bus::CallerCheck,
 }
 
 impl NmAgent {
     /// An agent surfacing its prompts on `prompts` and parking their answers
     /// in `waiters` — the service-wide handles `submit_prompt`/`cancel_prompt`
-    /// resolve — and answering only calls `caller` admits.
-    pub(super) fn new(
-        prompts: Mutable<Option<PromptRequest>>,
-        waiters: WaitersMap,
-        caller: hytte_bus::CallerCheck,
-    ) -> Self {
+    /// resolve — and answering only `NetworkManager`.
+    pub(super) fn new(prompts: Mutable<Option<PromptRequest>>, waiters: WaitersMap) -> Self {
         Self {
             prompts,
             waiters,
             inflight: Arc::default(),
-            caller,
+            caller: hytte_bus::caller_check(NM_BUS_NAME),
         }
     }
 
@@ -145,17 +143,21 @@ impl NmAgent {
     /// collect what the user types, or cancel NM's real requests. Every
     /// method checks first and touches nothing (no prompt, no waiter) when
     /// the check refuses. NM's policy file lets only root send to this
-    /// interface, so this stops a root process other than NM.
+    /// interface, so this stops a root process other than NM from reaching
+    /// NM's requests **through this interface**. The iwd agent shares the
+    /// same prompt slot and waiters and is not checked yet (#1605).
     ///
-    /// The owner is looked up per call ([`hytte_bus::CallerCheck`]): NM keeps
-    /// its registry of agents in memory and re-learns it after a restart
-    /// under a new unique name, and a cached owner would refuse it.
+    /// The owner is looked up per call ([`hytte_bus::CallerCheck`]), on `conn`,
+    /// the connection the call arrived on: NM keeps its registry of agents in
+    /// memory and re-learns it after a restart under a new unique name, and a
+    /// cached owner would refuse it.
     async fn admit(
         &self,
+        conn: &zbus::Connection,
         header: &zbus::message::Header<'_>,
         method: &str,
     ) -> Result<(), NmAgentError> {
-        self.caller.check(header).await.map_err(|refused| {
+        self.caller.check(conn, header).await.map_err(|refused| {
             tracing::warn!(
                 method,
                 %refused,
@@ -441,6 +443,9 @@ impl NmAgent {
     ///
     /// A call from anyone but `NetworkManager` is refused with
     /// `PermissionDenied` before anything else happens ([`NmAgent::admit`]).
+    // NM's method has five arguments, and the caller check needs the two
+    // zbus hands in (the connection and the header); none of them can move.
+    #[allow(clippy::too_many_arguments)]
     async fn get_secrets(
         &self,
         connection: ConnectionDict,
@@ -448,9 +453,10 @@ impl NmAgent {
         setting_name: String,
         hints: Vec<String>,
         flags: u32,
+        #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> Result<ConnectionDict, NmAgentError> {
-        self.admit(&header, "GetSecrets").await?;
+        self.admit(conn, &header, "GetSecrets").await?;
 
         // Classify the request: wireless-security PSK, VPN secret, or neither.
         let wants_wireless =
@@ -589,9 +595,10 @@ impl NmAgent {
         &self,
         connection_path: OwnedObjectPath,
         setting_name: String,
+        #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> Result<(), NmAgentError> {
-        self.admit(&header, "CancelGetSecrets").await?;
+        self.admit(conn, &header, "CancelGetSecrets").await?;
 
         let key = RequestKey {
             connection_path: connection_path.as_str().to_string(),
@@ -631,9 +638,10 @@ impl NmAgent {
         &self,
         connection: ConnectionDict,
         connection_path: OwnedObjectPath,
+        #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> Result<(), NmAgentError> {
-        self.admit(&header, "SaveSecrets").await
+        self.admit(conn, &header, "SaveSecrets").await
     }
 
     /// No-op: we hold no secrets of our own to delete. Checked like
@@ -642,9 +650,10 @@ impl NmAgent {
         &self,
         connection: ConnectionDict,
         connection_path: OwnedObjectPath,
+        #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> Result<(), NmAgentError> {
-        self.admit(&header, "DeleteSecrets").await
+        self.admit(conn, &header, "DeleteSecrets").await
     }
 }
 
@@ -1360,22 +1369,12 @@ mod system_tests {
     /// `prompts`/`waiters` so the test can drive the handshake after the agent
     /// is moved into the object server.
     ///
-    /// The agent's caller check asks this test's bus who owns
-    /// [`NM_BUS_NAME`], over a connection of its own: the connection that
-    /// will host the agent does not exist yet (the agent is staged on its
-    /// builder, see [`mount_and_proxy`]), and any connection on the same bus
-    /// gets the same answer.
-    async fn fresh_agent(
-        guard: &BusGuard,
-    ) -> (NmAgent, Mutable<Option<PromptRequest>>, WaitersMap) {
-        let lookup = hytte_bus::test_support::connect(guard.address.as_str())
-            .await
-            .expect("connect the caller check's lookup connection");
-        let caller =
-            hytte_bus::caller_check_with(&SharedConnection::for_test_system(lookup), NM_BUS_NAME);
+    /// Built exactly as production builds it: its caller check asks whatever
+    /// bus the call arrives on, which here is this test's.
+    fn fresh_agent() -> (NmAgent, Mutable<Option<PromptRequest>>, WaitersMap) {
         let waiters: WaitersMap = Arc::new(AsyncMutex::new(HashMap::new()));
         let prompts: Mutable<Option<PromptRequest>> = Mutable::new(None);
-        let agent = NmAgent::new(prompts.clone(), waiters.clone(), caller);
+        let agent = NmAgent::new(prompts.clone(), waiters.clone());
         (agent, prompts, waiters)
     }
 
@@ -1546,7 +1545,7 @@ mod system_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn happy_path_returns_psk_over_the_bus() {
         let guard = ephemeral_bus().await;
-        let (agent, prompts, waiters) = fresh_agent(&guard).await;
+        let (agent, prompts, waiters) = fresh_agent();
         let (_server, proxy) = mount_and_proxy(&guard, agent).await;
 
         // Fire the GetSecrets call as a task — it blocks inside the agent
@@ -1617,7 +1616,7 @@ mod system_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn vpn_happy_path_returns_nested_secret_over_the_bus() {
         let guard = ephemeral_bus().await;
-        let (agent, prompts, waiters) = fresh_agent(&guard).await;
+        let (agent, prompts, waiters) = fresh_agent();
         let (_server, proxy) = mount_and_proxy(&guard, agent).await;
 
         let conn = vpn_connection_dict("Work VPN", "org.freedesktop.NetworkManager.openvpn");
@@ -1692,7 +1691,7 @@ mod system_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn vpn_multi_secret_round_answers_every_requested_key() {
         let guard = ephemeral_bus().await;
-        let (agent, prompts, waiters) = fresh_agent(&guard).await;
+        let (agent, prompts, waiters) = fresh_agent();
         let (_server, proxy) = mount_and_proxy(&guard, agent).await;
 
         let conn = vpn_connection_dict("Work VPN", "org.freedesktop.NetworkManager.openconnect");
@@ -1769,7 +1768,7 @@ mod system_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn wep_hint_returns_secret_under_wep_key0_over_the_bus() {
         let guard = ephemeral_bus().await;
-        let (agent, prompts, waiters) = fresh_agent(&guard).await;
+        let (agent, prompts, waiters) = fresh_agent();
         let (_server, proxy) = mount_and_proxy(&guard, agent).await;
 
         // Static WEP: key-mgmt "none", and NM names the wanted secret
@@ -1836,7 +1835,7 @@ mod system_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn no_interaction_flag_is_rejected() {
         let guard = ephemeral_bus().await;
-        let (agent, _prompts, _waiters) = fresh_agent(&guard).await;
+        let (agent, _prompts, _waiters) = fresh_agent();
         let (_server, proxy) = mount_and_proxy(&guard, agent).await;
 
         let conn = wpa_connection(b"FRITZ!Box", "wpa-psk");
@@ -1865,7 +1864,7 @@ mod system_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn non_wireless_setting_is_rejected() {
         let guard = ephemeral_bus().await;
-        let (agent, _prompts, _waiters) = fresh_agent(&guard).await;
+        let (agent, _prompts, _waiters) = fresh_agent();
         let (_server, proxy) = mount_and_proxy(&guard, agent).await;
 
         let conn = wpa_connection(b"FRITZ!Box", "wpa-psk");
@@ -1899,7 +1898,7 @@ mod system_tests {
         // its waiters with Err, so the in-flight GetSecrets resolves to the
         // UserCanceled error name.
         let guard = ephemeral_bus().await;
-        let (agent, prompts, _waiters) = fresh_agent(&guard).await;
+        let (agent, prompts, _waiters) = fresh_agent();
         let (_server, proxy) = mount_and_proxy(&guard, agent).await;
         let proxy_for_call = proxy.clone();
 
@@ -1968,7 +1967,7 @@ mod system_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn cancel_takes_only_the_request_it_names() {
         let guard = ephemeral_bus().await;
-        let (agent, prompts, waiters) = fresh_agent(&guard).await;
+        let (agent, prompts, waiters) = fresh_agent();
         let (_server, proxy) = mount_and_proxy(&guard, agent).await;
         let wifi_path = "/org/freedesktop/NetworkManager/Settings/1";
         let vpn_path = "/org/freedesktop/NetworkManager/Settings/2";
@@ -2109,7 +2108,7 @@ mod system_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn get_secrets_from_a_peer_that_is_not_nm_is_refused_and_raises_no_prompt() {
         let guard = ephemeral_bus().await;
-        let (agent, prompts, waiters) = fresh_agent(&guard).await;
+        let (agent, prompts, waiters) = fresh_agent();
         let (server, nm) = mount_and_proxy(&guard, agent).await;
         let intruder = agent_proxy(&guard, &server, None).await;
 
@@ -2167,7 +2166,7 @@ mod system_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn cancel_from_a_peer_that_is_not_nm_leaves_the_request_pending() {
         let guard = ephemeral_bus().await;
-        let (agent, prompts, waiters) = fresh_agent(&guard).await;
+        let (agent, prompts, waiters) = fresh_agent();
         let (server, nm) = mount_and_proxy(&guard, agent).await;
         let intruder = agent_proxy(&guard, &server, None).await;
         let path = "/org/freedesktop/NetworkManager/Settings/1";
@@ -2221,7 +2220,7 @@ mod system_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn save_and_delete_answer_only_nm() {
         let guard = ephemeral_bus().await;
-        let (agent, _prompts, _waiters) = fresh_agent(&guard).await;
+        let (agent, _prompts, _waiters) = fresh_agent();
         let (server, nm) = mount_and_proxy(&guard, agent).await;
         let intruder = agent_proxy(&guard, &server, None).await;
         let args = (

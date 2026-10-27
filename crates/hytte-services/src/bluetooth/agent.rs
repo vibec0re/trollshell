@@ -53,22 +53,18 @@ enum AgentError {
 #[derive(Clone)]
 pub(super) struct PairAgent {
     /// Admits a call only from bluetoothd: the current owner of `org.bluez`,
-    /// looked up when the call arrives.
+    /// looked up on the call's own connection when it arrives.
     caller: hytte_bus::CallerCheck,
     pending: Arc<ReplySlot>,
     banner: Mutable<Option<PairPrompt>>,
 }
 
 impl PairAgent {
-    /// An agent answering only calls `caller` admits, raising its prompts on
-    /// `banner` and waiting for answers in `pending`.
-    pub(super) fn new(
-        caller: hytte_bus::CallerCheck,
-        pending: Arc<ReplySlot>,
-        banner: Mutable<Option<PairPrompt>>,
-    ) -> Self {
+    /// An agent answering only bluetoothd, raising its prompts on `banner`
+    /// and waiting for answers in `pending`.
+    pub(super) fn new(pending: Arc<ReplySlot>, banner: Mutable<Option<PairPrompt>>) -> Self {
         Self {
-            caller,
+            caller: hytte_bus::caller_check(BLUEZ_BUS_NAME),
             pending,
             banner,
         }
@@ -84,15 +80,17 @@ impl PairAgent {
     /// file (`src/bluetooth.conf`) lets only root send to `org.bluez.Agent1`,
     /// so this stops a root process other than bluetoothd.
     ///
-    /// The owner is looked up per call ([`hytte_bus::CallerCheck`]): a
-    /// restarted bluetoothd comes back under a new unique name, and a cached
-    /// owner would refuse it.
+    /// The owner is looked up per call ([`hytte_bus::CallerCheck`]), on
+    /// `conn`, the connection the call arrived on: a restarted bluetoothd
+    /// comes back under a new unique name, and a cached owner would refuse
+    /// it.
     async fn admit(
         &self,
+        conn: &zbus::Connection,
         header: &zbus::message::Header<'_>,
         method: &str,
     ) -> Result<(), AgentError> {
-        self.caller.check(header).await.map_err(|refused| {
+        self.caller.check(conn, header).await.map_err(|refused| {
             tracing::warn!(
                 method,
                 %refused,
@@ -211,9 +209,10 @@ fn allow_or_reject(reply: &AgentReply, why: &str) -> Result<(), AgentError> {
 impl PairAgent {
     async fn release(
         &self,
+        #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> Result<(), AgentError> {
-        self.admit(&header, "Release").await?;
+        self.admit(conn, &header, "Release").await?;
         tracing::debug!("agent released");
         Ok(())
     }
@@ -221,9 +220,10 @@ impl PairAgent {
     async fn request_pin_code(
         &self,
         device: OwnedObjectPath,
+        #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> Result<String, AgentError> {
-        self.admit(&header, "RequestPinCode").await?;
+        self.admit(conn, &header, "RequestPinCode").await?;
         let reply = self
             .ask(new_prompt(&device, None, PromptKind::EnterPinCode))
             .await;
@@ -237,9 +237,10 @@ impl PairAgent {
         &self,
         device: OwnedObjectPath,
         pincode: String,
+        #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> Result<(), AgentError> {
-        self.admit(&header, "DisplayPinCode").await?;
+        self.admit(conn, &header, "DisplayPinCode").await?;
         // Display-only acknowledgement — there is no return value to gate.
         // The user enters the PIN on the remote device. Nothing to do.
         let _ = (device, pincode);
@@ -249,9 +250,10 @@ impl PairAgent {
     async fn request_passkey(
         &self,
         device: OwnedObjectPath,
+        #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> Result<u32, AgentError> {
-        self.admit(&header, "RequestPasskey").await?;
+        self.admit(conn, &header, "RequestPasskey").await?;
         let reply = self
             .ask(new_prompt(&device, None, PromptKind::EnterPasskey))
             .await;
@@ -266,9 +268,10 @@ impl PairAgent {
         device: OwnedObjectPath,
         passkey: u32,
         entered: u16,
+        #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> Result<(), AgentError> {
-        self.admit(&header, "DisplayPasskey").await?;
+        self.admit(conn, &header, "DisplayPasskey").await?;
         // Same as DisplayPinCode — no input from us.
         let _ = (device, passkey, entered);
         Ok(())
@@ -278,9 +281,10 @@ impl PairAgent {
         &self,
         device: OwnedObjectPath,
         passkey: u32,
+        #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> Result<(), AgentError> {
-        self.admit(&header, "RequestConfirmation").await?;
+        self.admit(conn, &header, "RequestConfirmation").await?;
         let reply = self
             .ask(new_prompt(
                 &device,
@@ -294,9 +298,10 @@ impl PairAgent {
     async fn request_authorization(
         &self,
         device: OwnedObjectPath,
+        #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> Result<(), AgentError> {
-        self.admit(&header, "RequestAuthorization").await?;
+        self.admit(conn, &header, "RequestAuthorization").await?;
         let reply = self
             .ask(new_prompt(&device, None, PromptKind::Authorize))
             .await;
@@ -307,9 +312,10 @@ impl PairAgent {
         &self,
         device: OwnedObjectPath,
         uuid: String,
+        #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> Result<(), AgentError> {
-        self.admit(&header, "AuthorizeService").await?;
+        self.admit(conn, &header, "AuthorizeService").await?;
         self.authorize_service_for(&device, &uuid).await
     }
 
@@ -326,9 +332,10 @@ impl PairAgent {
     /// request keeps waiting.
     async fn cancel(
         &self,
+        #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> Result<(), AgentError> {
-        self.admit(&header, "Cancel").await?;
+        self.admit(conn, &header, "Cancel").await?;
         tracing::debug!("agent cancel — aborting pending prompt");
         cancel_in(&self.pending).await;
         Ok(())
@@ -1126,12 +1133,11 @@ mod tests {
 #[cfg(test)]
 mod authorize_service_tests {
     use super::{
-        AgentError, AgentReply, BLUEZ_BUS_NAME, PairAgent, PairPrompt, PromptKind, ReplySlot,
-        allow_or_reject, answer_in, cancel_in, service_label, service_name,
+        AgentError, AgentReply, PairAgent, PairPrompt, PromptKind, ReplySlot, allow_or_reject,
+        answer_in, cancel_in, service_label, service_name,
     };
     use futures_signals::signal::Mutable;
     use futures_util::FutureExt;
-    use hytte_bus::BusKind;
     use std::sync::Arc;
     use tokio::sync::Mutex as AsyncMutex;
     use zbus::zvariant::OwnedObjectPath;
@@ -1140,16 +1146,11 @@ mod authorize_service_tests {
     /// (`ADVANCED_AUDIO_UUID`).
     const A2DP: &str = "0000110d-0000-1000-8000-00805f9b34fb";
 
-    /// An agent with its own slots. Its caller check is never run here and
-    /// opens no connection until it is.
+    /// An agent with its own slots. Its caller check is never run here.
     fn agent() -> (PairAgent, Arc<ReplySlot>, Mutable<Option<PairPrompt>>) {
         let pending: Arc<ReplySlot> = Arc::new(AsyncMutex::new(None));
         let banner = Mutable::new(None);
-        let agent = PairAgent::new(
-            hytte_bus::caller_check(BusKind::System, BLUEZ_BUS_NAME),
-            pending.clone(),
-            banner.clone(),
-        );
+        let agent = PairAgent::new(pending.clone(), banner.clone());
         (agent, pending, banner)
     }
 
@@ -1532,7 +1533,6 @@ mod system_tests {
         AGENT_PATH, AgentReply, BLUEZ_BUS_NAME, PairAgent, PairPrompt, ReplySlot, answer_in,
     };
     use futures_signals::signal::Mutable;
-    use hytte_bus::test_support::SharedConnection;
     use std::path::PathBuf;
     use std::process::Stdio;
     use std::sync::Arc;
@@ -1642,24 +1642,15 @@ mod system_tests {
         banner: Mutable<Option<PairPrompt>>,
     }
 
-    /// Mount a `PairAgent` whose caller check asks this test's bus who owns
-    /// `org.bluez`. The agent is staged on the connection's builder, so its
-    /// object server dispatches before anything can be read off the socket
+    /// Mount a `PairAgent`, built exactly as production builds it: its caller
+    /// check asks the bus each call arrives on, which here is this test's.
+    /// The agent is staged on the connection's builder, so its object server
+    /// dispatches before anything can be read off the socket
     /// (`wifi::nm_agent`'s `mount_and_proxy` has the whole argument, #756).
     async fn mount(guard: &BusGuard) -> Mounted {
-        let lookup = hytte_bus::test_support::connect(guard.address.as_str())
-            .await
-            .expect("connect the caller check's lookup connection");
         let pending: Arc<ReplySlot> = Arc::new(AsyncMutex::new(None));
         let banner: Mutable<Option<PairPrompt>> = Mutable::new(None);
-        let agent = PairAgent::new(
-            hytte_bus::caller_check_with(
-                &SharedConnection::for_test_system(lookup),
-                BLUEZ_BUS_NAME,
-            ),
-            pending.clone(),
-            banner.clone(),
-        );
+        let agent = PairAgent::new(pending.clone(), banner.clone());
         let server = Builder::address(guard.address.as_str())
             .expect("parse ephemeral bus address")
             .serve_at(AGENT_PATH, agent)

@@ -34,7 +34,7 @@ mod types;
 pub(crate) use types::AgentReply;
 pub use types::{Adapter, Device, PairPrompt, PromptKind};
 
-use agent::{AGENT_ANCHOR_NAME, AGENT_PATH, BLUEZ_BUS_NAME, PairAgent, ReplySlot, run_agent};
+use agent::{AGENT_ANCHOR_NAME, AGENT_PATH, PairAgent, ReplySlot, run_agent};
 use devices::{ListenEnd, listen, wait_for_bluez};
 use futures_signals::signal::{Mutable, Signal};
 use hytte_bus::BusKind;
@@ -232,11 +232,7 @@ impl Service for BluetoothService {
         let pending_response: Arc<ReplySlot> = Arc::new(AsyncMutex::new(None));
         // It answers only bluetoothd, whose unique name it looks up per
         // call: the object is reachable by any peer on the system bus.
-        let agent = PairAgent::new(
-            hytte_bus::caller_check(BusKind::System, BLUEZ_BUS_NAME),
-            pending_response.clone(),
-            pair_prompt.clone(),
-        );
+        let agent = PairAgent::new(pending_response.clone(), pair_prompt.clone());
 
         // Build the own_name handle first so it can be stored in Handles for
         // parity with other services (polkit, screensaver, etc.) and passed

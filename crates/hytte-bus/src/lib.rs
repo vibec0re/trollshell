@@ -19,7 +19,7 @@ mod ready;
 mod signals;
 
 pub use call::{CallBuilder, FdLease, RetryPolicy, call_with};
-pub use caller::{CallerCheck, CallerRefused, caller_check_with};
+pub use caller::{CallerCheck, CallerRefused};
 pub use connection::BusKind;
 pub use error::BusError;
 pub use export::{ExportBuilder, ExportHandle, export_object_with};
@@ -69,15 +69,16 @@ pub fn call(bus: BusKind, destination: impl Into<String>) -> CallBuilder<()> {
     call::call_with(connection::for_kind(bus), destination)
 }
 
-/// Build a [`CallerCheck`] that admits a call on `bus` only from the current
-/// owner of the well-known `name` — for an agent a daemon calls back on, such
-/// as `NetworkManager`'s secret agent or `BlueZ`'s `Agent1`.
+/// Build a [`CallerCheck`] that admits a call only from the current owner of
+/// the well-known `name` — for an agent a daemon calls back on, such as
+/// `NetworkManager`'s secret agent or `BlueZ`'s `Agent1`.
 ///
-/// Opens no connection: the pooled connection for `bus` is looked up when a
-/// call is checked.
+/// Unlike the other builders it takes no [`BusKind`]: it asks on the
+/// connection each call arrived on ([`CallerCheck::check`]), so the bus is
+/// whichever one delivered the call, and building one opens nothing.
 #[must_use]
-pub fn caller_check(bus: BusKind, name: impl Into<String>) -> CallerCheck {
-    CallerCheck::pooled(bus, name)
+pub fn caller_check(name: impl Into<String>) -> CallerCheck {
+    CallerCheck::new(name)
 }
 
 /// Build a [`PropertyBuilder`] against the given `bus`.

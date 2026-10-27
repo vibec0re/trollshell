@@ -1059,7 +1059,9 @@ mod tests {
     ///
     /// Falsification: give `ConsentChoices::Grant` its `Some(Deny)` silence
     /// rule back and this reds — the timeout's `Deny` rides the lane as a
-    /// `Cmd::Decision`, which the broker persists as a standing refusal.
+    /// `Cmd::Decision`, which the broker persists as a standing refusal. Have
+    /// this plugin ask with `ConsentChoices::Approval` instead and it reds on
+    /// the card assertion.
     #[test]
     fn an_unanswered_card_puts_no_decision_on_the_broker_lane() {
         let (mut m, mut rx) = model();
@@ -1082,6 +1084,10 @@ mod tests {
         else {
             panic!("expected one RequestConsent effect, got {fx:?}");
         };
+        // The broker's ask is a standing grant over a datasource, so it is the
+        // four-button card; an `Approval` card would lose Allow once, This
+        // session and Always (#1601 review, NIT-1).
+        assert_eq!(*choices, hytte_plugin::proto::ConsentChoices::Grant);
 
         // What the shell sends for this card when nobody answers it.
         if let Some(decision) = choices.unanswered() {

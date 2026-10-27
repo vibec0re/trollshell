@@ -3884,9 +3884,11 @@ mod tests {
     //
     // The inline-`VTIMEZONE` rows run everywhere. The builtin rows (a bare
     // `TZID=Europe/Berlin`, and the `/freeassociation.sourceforge.net/` form
-    // Evolution writes) need libical to find the host's zoneinfo, which the
-    // nix build sandbox does not have. There they are skipped with a message;
-    // libical then reads the `TZID` as floating, which is a different path.
+    // Evolution writes) need libical to find zoneinfo, which a nix build
+    // sandbox has only through `TZDIR`. Without it they are skipped with a
+    // message, since libical then reads the `TZID` as floating, which is a
+    // different path; with `TROLLSHELL_REQUIRE_TZDATA=1` (the test checks,
+    // #1595) they fail instead (`builtin_instant_or_skip`).
 
     /// An inline `America/New_York` `VTIMEZONE` (the 2007 US rules): EDT from
     /// the second Sunday of March at 02:00, EST from the first Sunday of
@@ -4084,6 +4086,28 @@ mod tests {
         inst[0].start_unix
     }
 
+    /// [`libical_own_instant`] for a builtin-`TZID` event, or `None` with a
+    /// skip line where libical finds no zoneinfo (no `TZDIR`, no system
+    /// zoneinfo). A skip reads as a pass, so the checks that export `TZDIR`
+    /// (#1595) also set `TROLLSHELL_REQUIRE_TZDATA=1`, and then this fails
+    /// instead, on the `TROLLSHELL_REQUIRE_GL` precedent. Unset, it skips as
+    /// before, so a bare `cargo test` on a host without zoneinfo still passes.
+    fn builtin_instant_or_skip(ical: &str, tzid: &str) -> Option<i64> {
+        let got = libical_own_instant(ical);
+        if got.is_none() {
+            let required =
+                std::env::var_os("TROLLSHELL_REQUIRE_TZDATA").is_some_and(|want| want == "1");
+            assert!(
+                !required,
+                "TROLLSHELL_REQUIRE_TZDATA=1, but libical cannot resolve the builtin \
+                 {tzid}: no zone.tab under TZDIR={:?} or the system zoneinfo paths",
+                std::env::var_os("TZDIR")
+            );
+            eprintln!("skipped: libical cannot resolve the builtin {tzid} here");
+        }
+        got
+    }
+
     /// Fixture sanity for a row: the model zone reports the case the row is
     /// about, and #1585's floating-time rule on that model gives the row's
     /// RFC instant. That rule is the oracle the `TZID` path is held to.
@@ -4124,8 +4148,8 @@ mod tests {
                     e.wall
                 );
                 for tzid in builtin_tzids(z.location) {
-                    let Some(got) = libical_own_instant(&tzid_event("", &tzid, e.wall)) else {
-                        eprintln!("skipped: libical cannot resolve the builtin {tzid} here");
+                    let ical = tzid_event("", &tzid, e.wall);
+                    let Some(got) = builtin_instant_or_skip(&ical, &tzid) else {
                         continue;
                     };
                     assert_eq!(got, e.libical, "builtin {tzid} {:?}", e.wall);
@@ -4164,7 +4188,8 @@ mod tests {
     /// back: its components carry no `VTIMEZONE`, so a `TZID` resolves
     /// against the builtin table, by its bare location or by the prefixed
     /// form Evolution writes. Skipped (with a message) where libical finds no
-    /// zoneinfo, as in the nix build sandbox.
+    /// zoneinfo, or failed under `TROLLSHELL_REQUIRE_TZDATA=1`
+    /// (`builtin_instant_or_skip`).
     #[test]
     fn a_builtin_tzid_time_on_a_transition_resolves_by_rfc_5545() {
         let mut checked = 0;
@@ -4172,8 +4197,7 @@ mod tests {
             for e in &z.rows {
                 for tzid in builtin_tzids(z.location) {
                     let ical = tzid_event("", &tzid, e.wall);
-                    if libical_own_instant(&ical).is_none() {
-                        eprintln!("skipped: libical cannot resolve the builtin {tzid} here");
+                    if builtin_instant_or_skip(&ical, &tzid).is_none() {
                         continue;
                     }
                     assert_eq!(

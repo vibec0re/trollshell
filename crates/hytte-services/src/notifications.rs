@@ -44,12 +44,12 @@ use zbus::zvariant::{OwnedValue, Value};
 // `Mutex<…>` are all `Send + Sync`.
 struct NotificationsShared {
     /// The daemon's live set: the live list, the id counter, the shell-local
-    /// action callbacks and the expiry timers. This is the **one**
-    /// [`NotificationsIface`] [`mount_live_set`] builds, and the bus serves a
-    /// clone of this very value. Every handle in it is an `Arc` or a
-    /// `Mutable`, so the D-Bus `Notify` handler, [`post_local`], [`close`] and
-    /// the hover [`pause_expiry`] / [`resume_expiry`] all reach the same four
-    /// (#1604). Before that, `Service::start` and an `iface()` view each
+    /// action callbacks and the expiry timers. A clone of the **one**
+    /// [`NotificationsIface`] [`mount_live_set`] builds, as is the value the
+    /// bus serves. Every handle in it is an `Arc` or a `Mutable`, so a clone
+    /// is the same set, and the D-Bus `Notify` handler, [`post_local`],
+    /// [`close`] and the hover [`pause_expiry`] / [`resume_expiry`] all reach
+    /// the same four (#1604). Before that, `Service::start` and an `iface()` view each
     /// assembled the handles by hand, and handing either one a fresh timer map
     /// left every test green while every expiry it armed would have been
     /// refused.
@@ -164,9 +164,6 @@ pub struct HistoryEntry {
 #[doc(hidden)]
 pub struct NotificationsHandles {
     pub(crate) active: Mutable<Vec<Notification>>,
-    /// Shared counter for allocating notification IDs. Stored here so that
-    /// `NotificationsIface` clones across reconnects share the same sequence.
-    pub(crate) _next_id: Arc<AtomicU32>,
     pub(crate) history: Mutable<Vec<HistoryEntry>>,
     /// The `own_name` task's live [`OwnState`], published by [`ownership()`]
     /// so a lost name race is visible in the UI rather than presenting as
@@ -209,8 +206,9 @@ fn start_on(own: OwnNameBuilder) -> NotificationsHandles {
     // Own the well-known name + mount the interface. The bus layer handles
     // connection lifecycle, RequestName retries, and per-owner back-off if
     // mako/dunst is camping the name. The bus serves a clone of the one
-    // live set, and `NotificationsShared` below keeps the set itself (see
-    // `mount_live_set`).
+    // live set, `NotificationsShared` below holds another, and the handles
+    // take the original's list: a clone shares every handle, so all three
+    // are the same set (see `mount_live_set`).
     //
     // The OwnNameSignal is stored both in NotificationsHandles (process
     // lifetime keep-alive) and in the shared registry (so dismiss/invoke_action
@@ -229,7 +227,6 @@ fn start_on(own: OwnNameBuilder) -> NotificationsHandles {
 
     NotificationsHandles {
         active: iface.active,
-        _next_id: iface.next_id,
         history,
         ownership,
     }
@@ -248,8 +245,9 @@ fn serve_live_set(own: OwnNameBuilder) -> (NotificationsIface, OwnNameSignal) {
 
 /// Build the daemon's one live set and hand a clone of it to `mount`, which
 /// in production mounts it on the bus as the `org.freedesktop.Notifications`
-/// object and returns the ownership handle. Returns the live set itself, for
-/// [`NotificationsShared`], with whatever `mount` returned.
+/// object and returns the ownership handle. Returns the live set with whatever
+/// `mount` returned; [`start_on`] puts a clone of it in
+/// [`NotificationsShared`] and hands its list to `NotificationsHandles`.
 ///
 /// This is the only place the daemon's [`NotificationsIface`] is built, so it
 /// is the only place the D-Bus `Notify` handler and the shared registry could
@@ -1106,8 +1104,8 @@ pub fn post_local_with_actions(
 /// object. It holds four handles: the live list (`active`), the id counter
 /// (`next_id`), the shell-local action callbacks (`local_actions`) and the
 /// per-id expiry timers (`timers`). Each is an `Arc` or a `Mutable`, so a
-/// clone shares all four. [`mount_live_set`] builds one value: the bus serves
-/// a clone of it and [`NotificationsShared`] holds the value itself, so the
+/// clone shares all four. [`mount_live_set`] builds one value, and the bus
+/// serves a clone of it and [`NotificationsShared`] holds another, so the
 /// `Notify` handler and everything that reaches the daemon through the shared
 /// registry work on the same four handles (#1604).
 ///

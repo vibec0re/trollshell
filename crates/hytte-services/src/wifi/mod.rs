@@ -603,11 +603,12 @@ fn start_iwd(
     if ownership_out.get().is_none() {
         // Mount the iwd Agent on the SYSTEM bus (same as iwd's AgentManager).
         // iwd records our system-bus unique name when we call RegisterAgent,
-        // then issues RequestPassphrase callbacks on the system bus.
-        let agent = agent::IwdAgent {
-            prompts: targets.prompts.clone(),
-            waiters,
-        };
+        // then issues RequestPassphrase callbacks on the system bus. The agent
+        // answers only iwd, whose unique name it looks up per call: the export
+        // is reachable by any peer on the system bus (#1605). It shares the
+        // prompt slot and waiters with the NM agent, but its `Cancel` reaches
+        // only the requests it raised itself.
+        let agent = agent::IwdAgent::new(targets.prompts.clone(), waiters);
         let own = hytte_bus::own_name(BusKind::System, ANCHOR_NAME)
             .at_path(AGENT_PATH, agent)
             .start();

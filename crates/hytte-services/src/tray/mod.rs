@@ -590,16 +590,32 @@ impl State {
     /// when the item should be removed: it answered none of its identifying
     /// properties (see [`read_item_props`]'s `# Errors`).
     async fn refresh_item(&self, bus_name: &str, object_path: &str) -> bool {
-        match read_item_props(bus_name, object_path).await {
+        let read = read_item_props(bus_name, object_path).await;
+        self.apply_resync_read(&format!("{bus_name}{object_path}"), read)
+            .await
+    }
+
+    /// [`Self::refresh_item`]'s write: overwrite `key`'s row with what
+    /// answered (`true`), or drop it if nothing did (`false`).
+    ///
+    /// Only a row that is still there is overwritten. The re-sync re-reads
+    /// keys it found present, and a read is up to eight round trips; a key
+    /// missing by the time it answers was removed meanwhile — by its watcher,
+    /// which has also announced it gone — and putting it back would leave a
+    /// row with no watcher and no slot until the next re-sync (#1602 review,
+    /// LOW-1). It still counts as answered, so the re-sync does not announce
+    /// it gone a second time.
+    async fn apply_resync_read(&self, key: &str, read: Result<TrayItem>) -> bool {
+        match read {
             Ok(item) => {
-                let mut map = self.registered.lock().await;
-                map.insert(item.key.clone(), item);
+                if let Some(row) = self.registered.lock().await.get_mut(key) {
+                    *row = item;
+                }
                 true
             }
             Err(e) => {
-                tracing::debug!(error = %e, bus_name, object_path, "item property read failed, removing");
-                let key = format!("{bus_name}{object_path}");
-                self.registered.lock().await.remove(&key);
+                tracing::debug!(error = %e, key, "item property read failed, removing");
+                self.registered.lock().await.remove(key);
                 false
             }
         }
@@ -2765,6 +2781,44 @@ mod tests {
             .unregister_if_current(WK.to_owned(), new.generation)
             .await;
         assert_eq!(announced(&captured, "emit_unregistered"), 1);
+    }
+
+    // ── #1602 review LOW-1: the re-sync's re-read ───────────────────────────
+
+    /// The re-sync's re-read answered after the item's watcher had already
+    /// retired its row. It must not put the row back; a row that is still
+    /// there is refreshed as before.
+    ///
+    /// Falsifiable: insert unconditionally in `apply_resync_read` and the
+    /// retired row comes back.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_resync_read_does_not_bring_back_a_row_its_watcher_retired() {
+        const KEY: &str = ":1.5/StatusNotifierItem";
+        const KEPT: &str = ":1.6/StatusNotifierItem";
+        let state = empty_state();
+        let watch = state
+            .admit_as(row(":1.5", "before", ItemStatus::Active), ":1.5")
+            .await
+            .watch
+            .expect("watcher");
+        state
+            .admit_as(row(":1.6", "before", ItemStatus::Active), ":1.6")
+            .await;
+        assert!(state.retire(KEY, watch.generation).await, "its peer left");
+
+        let answered = state
+            .apply_resync_read(KEY, Ok(row(":1.5", "late", ItemStatus::Active)))
+            .await;
+        assert!(
+            answered,
+            "it answered, so the re-sync announces nothing more"
+        );
+        assert_eq!(row_title(&state, KEY).await, None);
+
+        state
+            .apply_resync_read(KEPT, Ok(row(":1.6", "after", ItemStatus::Active)))
+            .await;
+        assert_eq!(row_title(&state, KEPT).await.as_deref(), Some("after"));
     }
 
     // ── #1542 item 6: the service side of hiding `Passive` ──────────────────

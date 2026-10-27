@@ -682,11 +682,9 @@ impl Watcher {
         let Admitted { new_row, watch } = self.state.admit(item, &sender).await;
 
         if new_row {
-            let _ = Self::status_notifier_item_registered(
-                &emitter,
-                format!("{bus_name}{object_path}"),
-            )
-            .await;
+            let _ =
+                Self::status_notifier_item_registered(&emitter, format!("{bus_name}{object_path}"))
+                    .await;
         }
 
         let Some(watch) = watch else {
@@ -2053,7 +2051,10 @@ mod tests {
 
         let published = state.items.get_cloned();
         assert_eq!(published.len(), 1);
-        assert_eq!(published[0].title, "after", "the repeat's read refreshed the row");
+        assert_eq!(
+            published[0].title, "after",
+            "the repeat's read refreshed the row"
+        );
     }
 
     /// The other case: the watcher is dead. The item went away — here its
@@ -2170,7 +2171,9 @@ mod tests {
         assert!(stopped(&watch));
         assert_eq!(row_title(&state, KEY).await.as_deref(), Some("t"));
 
-        let again = state.admit(row(":1.5", "t", ItemStatus::Active), ":1.5").await;
+        let again = state
+            .admit(row(":1.5", "t", ItemStatus::Active), ":1.5")
+            .await;
         assert!(!again.new_row);
         assert!(again.watch.is_some());
     }
@@ -2210,9 +2213,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_child_stops_when_its_watcher_run_ends() {
         let (tx, rx) = tokio::sync::mpsc::channel::<()>(4);
-        let child = tokio::spawn(async move {
-            while_open(&tx, std::future::pending::<()>()).await
-        });
+        let child =
+            tokio::spawn(async move { while_open(&tx, std::future::pending::<()>()).await });
         tokio::task::yield_now().await;
         drop(rx);
         let out = tokio::time::timeout(Duration::from_secs(5), child)

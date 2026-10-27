@@ -812,10 +812,7 @@ mod tests {
     #[gtk::test]
     fn a_passive_item_is_hidden_and_a_status_flip_toggles_the_same_button() {
         let monitor = test_monitor();
-        let (container, map) = strip(
-            &monitor,
-            &[item_in("a", ItemStatus::Passive), item("b")],
-        );
+        let (container, map) = strip(&monitor, &[item_in("a", ItemStatus::Passive), item("b")]);
         let button = map.borrow()["a"].0.clone();
         assert!(!button.is_visible(), "a Passive item's button is hidden");
         assert_eq!(

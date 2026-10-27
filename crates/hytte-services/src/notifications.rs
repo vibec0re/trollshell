@@ -14,7 +14,7 @@
 //! can say so; `trollshell`'s bell chip binds it (#747).
 
 use futures_signals::signal::{Mutable, Signal};
-use hytte_bus::{OwnNameSignal, OwnState};
+use hytte_bus::{OwnNameBuilder, OwnNameSignal, OwnState};
 use hytte_reactive::{Service, registry, runtime, shared};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -190,40 +190,60 @@ impl Service for NotificationsService {
     type Handles = NotificationsHandles;
 
     fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
-        let history = Mutable::new(Vec::new());
-
-        // Own the well-known name + mount the interface. The bus layer handles
-        // connection lifecycle, RequestName retries, and per-owner back-off if
-        // mako/dunst is camping the name. The bus serves a clone of the one
-        // live set, and `NotificationsShared` below keeps the set itself (see
-        // `mount_live_set`).
-        //
-        // The OwnNameSignal is stored both in NotificationsHandles (process
-        // lifetime keep-alive) and in the shared registry (so dismiss/invoke_action
-        // can emit signals directly without a round-trip D-Bus call).
-        let (iface, ownership) = mount_live_set(|served| {
-            hytte_bus::own_name(hytte_bus::BusKind::Session, "org.freedesktop.Notifications")
-                .at_path("/org/freedesktop/Notifications", served)
-                .start()
-        });
-
-        // Populate the cross-thread shared handle so `dismiss` / `clear_history`
-        // can find these Mutables when called from a hytte-tokio worker (the
-        // thread-local registry is GTK-only). Calling Service::start a second
-        // time would `set` fail silently — services are registered once.
-        shared::insert(NotificationsShared {
-            iface: iface.clone(),
-            history: history.clone(),
-            ownership: ownership.clone(),
-        });
-
-        NotificationsHandles {
-            active: iface.active,
-            _next_id: iface.next_id,
-            history,
-            ownership,
-        }
+        start_on(hytte_bus::own_name(
+            hytte_bus::BusKind::Session,
+            "org.freedesktop.Notifications",
+        ))
     }
+}
+
+/// `Service::start`'s body, on whatever name `own` owns. `start` hands it the
+/// session bus's `org.freedesktop.Notifications`; the system test
+/// `the_free_functions_act_on_the_registered_live_set` hands it an ephemeral
+/// bus's, so everything `start` wires except that one builder expression is
+/// what the test drives: the served object, the shared registry and the
+/// handles (#1609 review, LOW-2).
+fn start_on(own: OwnNameBuilder) -> NotificationsHandles {
+    let history = Mutable::new(Vec::new());
+
+    // Own the well-known name + mount the interface. The bus layer handles
+    // connection lifecycle, RequestName retries, and per-owner back-off if
+    // mako/dunst is camping the name. The bus serves a clone of the one
+    // live set, and `NotificationsShared` below keeps the set itself (see
+    // `mount_live_set`).
+    //
+    // The OwnNameSignal is stored both in NotificationsHandles (process
+    // lifetime keep-alive) and in the shared registry (so dismiss/invoke_action
+    // can emit signals directly without a round-trip D-Bus call).
+    let (iface, ownership) = serve_live_set(own);
+
+    // Populate the cross-thread shared handle so `dismiss` / `clear_history`
+    // can find these Mutables when called from a hytte-tokio worker (the
+    // thread-local registry is GTK-only). Calling Service::start a second
+    // time would `set` fail silently — services are registered once.
+    shared::insert(NotificationsShared {
+        iface: iface.clone(),
+        history: history.clone(),
+        ownership: ownership.clone(),
+    });
+
+    NotificationsHandles {
+        active: iface.active,
+        _next_id: iface.next_id,
+        history,
+        ownership,
+    }
+}
+
+/// [`start_on`]'s mount: the one live set, with a clone of it served at the
+/// spec's object path on whatever name `own` owns. The system test
+/// `a_notify_on_the_served_object_arms_the_kept_live_set` hands it an
+/// ephemeral bus, so the closure the bus mounts is the one that test drives.
+fn serve_live_set(own: OwnNameBuilder) -> (NotificationsIface, OwnNameSignal) {
+    mount_live_set(|served| {
+        own.at_path("/org/freedesktop/Notifications", served)
+            .start()
+    })
 }
 
 /// Build the daemon's one live set and hand a clone of it to `mount`, which
@@ -2364,7 +2384,12 @@ mod tests {
     // handler / `post_local` against handles of their own and read the
     // **timer entry** back. A finite post spawns a real sleep on the hytte
     // runtime; when it fires, its `close` finds no `NotificationsShared`
-    // registered in a test binary and does nothing.
+    // registered in a test binary and does nothing. The one exception is the
+    // `system-tests` build, where
+    // `system_tests::the_free_functions_act_on_the_registered_live_set`
+    // registers a live set for a moment, under `TEST_LOCK`. That set's ids
+    // start at `1 << 24`, above every id a test here counts up to from 1, so
+    // a stray expiry matches nothing in it.
 
     /// What one post left for `id`: the timeout on the published notification,
     /// the timeout its timer entry holds, and whether that timer is counting
@@ -3405,5 +3430,339 @@ mod tests {
         armed_with(&mut map, 7, Some(Duration::from_secs(5)), t0);
         armed_with(&mut map, 7, Some(Duration::from_secs(5)), t0);
         assert_eq!(closable(&[live(7)], &map, 7, None), Some(0));
+    }
+}
+
+// ── System tests: the served object, the registry and the handles ───────────
+//
+// The hermetic tests above take both halves from `mount_live_set` and never
+// run `serve_live_set`'s mount closure, `start_on`'s registry insert and
+// handles, or the free functions' registry lookups (`post_local_with_actions`,
+// `close`, `pause_expiry`, `resume_expiry`, `invoke_action`, `dismiss_all`).
+// Those need an `OwnNameSignal`, which needs a real connection, so these run
+// against an ephemeral `dbus-daemon` (#1609 review, LOW-2). The
+// `BusGuard`/`ephemeral_bus` harness is `screensaver.rs`'s, same shape.
+//
+// The second test registers a live set in the process-global shared map, as
+// `start()` does. It does so under `TEST_LOCK`, which every test that touches
+// that map takes, and starts the set's ids at `1 << 24`: the hermetic tests'
+// stray expiry sleeps call `close`, which reaches whatever set is registered
+// when they fire, and their ids count from 1. Run with:
+//   xvfb-run -a cargo test -p hytte-services --features system-tests --lib notifications
+#[cfg(all(test, feature = "system-tests"))]
+mod system_tests {
+    use super::{
+        LocalAction, NotificationsIface, NotificationsShared, Urgency, dismiss, dismiss_all,
+        invoke_action, pause_expiry, post_local, post_local_with_actions, resume_expiry,
+        serve_live_set, start_on,
+    };
+    use futures_signals::signal::SignalExt as _;
+    use futures_util::StreamExt as _;
+    use hytte_bus::test_support::{self, SharedConnection};
+    use hytte_bus::{OwnNameSignal, OwnState, own_name_with};
+    use hytte_reactive::shared;
+    use hytte_reactive::test_lock::TEST_LOCK;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::process::Stdio;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, PoisonError};
+    use std::time::Duration;
+    use tempfile::TempDir;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::{Child, Command};
+    use zbus::Connection;
+    use zbus::zvariant::OwnedValue;
+
+    /// Upper bound on any single round trip, or on owning the name. A
+    /// liveness guard, not a latency assertion: the same number and reasoning
+    /// as `screensaver.rs`'s budget.
+    const DBUS_REPLY_BUDGET: Duration = Duration::from_secs(30);
+
+    const NAME: &str = "org.freedesktop.Notifications";
+    const PATH: &str = "/org/freedesktop/Notifications";
+
+    /// Where the registered set's ids start: above every id a hermetic test
+    /// counts up to from 1, so their stray expiries match nothing in it.
+    const HIGH_IDS: u32 = 1 << 24;
+
+    /// Kills the spawned `dbus-daemon` on drop. Mirrors `screensaver.rs`'s
+    /// `BusGuard`: SIGKILL + a `block_in_place` wait so the socket `TempDir`
+    /// outlives the process (hence the multi-thread runtime on every test
+    /// here).
+    struct BusGuard {
+        child: Option<Child>,
+        _tmp: TempDir,
+        address: String,
+    }
+
+    impl Drop for BusGuard {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                let _ = child.start_kill();
+                tokio::task::block_in_place(|| {
+                    let handle = tokio::runtime::Handle::current();
+                    let _ = handle.block_on(child.wait());
+                });
+            }
+        }
+    }
+
+    /// Spawn a fresh `dbus-daemon` and return a guard that kills it on drop.
+    async fn ephemeral_bus() -> BusGuard {
+        let tmp = TempDir::new().expect("create tempdir for dbus-daemon");
+        let socket: PathBuf = tmp.path().join("bus");
+        let address = format!("unix:path={}", socket.display());
+
+        let config = tmp.path().join("session.conf");
+        std::fs::write(
+            &config,
+            format!(
+                r#"<?xml version="1.0"?>
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>{address}</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+"#
+            ),
+        )
+        .expect("write dbus-daemon config");
+
+        let mut child = Command::new("dbus-daemon")
+            .arg("--config-file")
+            .arg(&config)
+            .arg("--print-address=1")
+            .arg("--nofork")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn dbus-daemon — install package `dbus` if missing");
+
+        let stdout = child.stdout.take().expect("dbus-daemon stdout");
+        let mut lines = BufReader::new(stdout).lines();
+        let printed = tokio::time::timeout(DBUS_REPLY_BUDGET, lines.next_line())
+            .await
+            .expect("dbus-daemon address timeout")
+            .expect("dbus-daemon read address")
+            .expect("dbus-daemon closed stdout");
+        assert!(
+            printed.contains("unix:path="),
+            "unexpected dbus-daemon address: {printed}"
+        );
+
+        BusGuard {
+            child: Some(child),
+            _tmp: tmp,
+            address,
+        }
+    }
+
+    /// A connection to `bus` built the way the daemon's own is
+    /// (`test_support::connect`).
+    async fn connect(bus: &BusGuard) -> Connection {
+        test_support::connect(&bus.address)
+            .await
+            .expect("connect to the ephemeral bus")
+    }
+
+    /// Wait until `ownership` reports the name owned, so the object is served.
+    async fn owned(ownership: &OwnNameSignal) {
+        let mut states = ownership.signal_cloned().to_stream();
+        tokio::time::timeout(DBUS_REPLY_BUDGET, async {
+            while let Some(state) = states.next().await {
+                if state == OwnState::Owned {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("owned the name within budget");
+    }
+
+    /// A client's `Notify` over the bus, with the default timeout; the id it
+    /// returns.
+    async fn notify_over(client: &Connection, summary: &str) -> u32 {
+        let reply = tokio::time::timeout(
+            DBUS_REPLY_BUDGET,
+            client.call_method(
+                Some(NAME),
+                PATH,
+                Some(NAME),
+                "Notify",
+                &(
+                    "client",
+                    0_u32,
+                    "",
+                    summary,
+                    "",
+                    Vec::<String>::new(),
+                    HashMap::<String, OwnedValue>::new(),
+                    -1_i32,
+                ),
+            ),
+        )
+        .await
+        .expect("Notify answered within budget")
+        .expect("Notify succeeded");
+        reply.body().deserialize().expect("Notify returns a u32")
+    }
+
+    fn counting_down(iface: &NotificationsIface, id: u32) -> bool {
+        iface
+            .timers
+            .lock()
+            .expect("not poisoned")
+            .get(&id)
+            .is_some_and(|entry| entry.abort.is_some())
+    }
+
+    fn is_live(iface: &NotificationsIface, id: u32) -> bool {
+        iface.active.lock_ref().iter().any(|n| n.id == id)
+    }
+
+    /// `serve_live_set`'s mount closure: a client's `Notify` on the served
+    /// object lands in the live set `serve_live_set` returns, which is what
+    /// `start_on` registers, timer included.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_notify_on_the_served_object_arms_the_kept_live_set() {
+        let bus = ephemeral_bus().await;
+        let (kept, ownership) = serve_live_set(own_name_with(
+            &SharedConnection::for_test_session(connect(&bus).await),
+            NAME,
+        ));
+        owned(&ownership).await;
+
+        let id = notify_over(&connect(&bus).await, "over the bus").await;
+        assert!(
+            is_live(&kept, id),
+            "the bus's Notify lands in the kept list"
+        );
+        assert!(
+            counting_down(&kept, id),
+            "and arms in the kept timer map, which `close` reads"
+        );
+    }
+
+    /// `start_on`, which is `start()` minus the session bus, and the free
+    /// functions' registry lookups. `post_local_with_actions`,
+    /// `pause_expiry`, `resume_expiry`, `invoke_action`, `dismiss` and
+    /// `dismiss_all` all act on the live set `start_on` registers.
+    /// `NotificationsHandles` hands the toast overlay and the history page
+    /// that same set's list and history. A client's `Notify` on the served
+    /// object lands in it too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_free_functions_act_on_the_registered_live_set() {
+        let bus = ephemeral_bus().await;
+        let daemon = SharedConnection::for_test_session(connect(&bus).await);
+        let client = connect(&bus).await;
+
+        // Everything that reads the registry runs under `TEST_LOCK` with no
+        // `.await`: other tests clear the process-global map under it.
+        let (kept, handles) = {
+            let _guard = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+            let handles = start_on(own_name_with(&daemon, NAME));
+            let kept = shared::get::<NotificationsShared>()
+                .expect("start_on registers the live set")
+                .iface
+                .clone();
+            // The set is empty until here, so no stray expiry can match it
+            // before its ids move up.
+            kept.next_id.store(HIGH_IDS, Ordering::Relaxed);
+
+            let clicked = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&clicked);
+            post_local_with_actions(
+                "review-1609",
+                "posted through the registry",
+                "",
+                Urgency::Normal,
+                vec![
+                    LocalAction::new("open", "Open", move || {
+                        flag.store(true, Ordering::SeqCst);
+                    }),
+                    LocalAction::new("copy", "Copy", || {}),
+                ],
+            );
+            let id = handles
+                .active
+                .lock_ref()
+                .iter()
+                .find(|n| n.summary == "posted through the registry")
+                .map(|n| n.id)
+                .expect("post_local_with_actions posts into the list the handles hand the overlay");
+            assert!(id >= HIGH_IDS, "the registered set allocates the high ids");
+            assert!(
+                counting_down(&kept, id),
+                "post_local_with_actions arms in the registered timer map"
+            );
+            pause_expiry(id);
+            assert!(!counting_down(&kept, id), "pause_expiry holds it");
+            resume_expiry(id);
+            assert!(counting_down(&kept, id), "resume_expiry re-arms it");
+            invoke_action(id, "open");
+            assert!(
+                clicked.load(Ordering::SeqCst),
+                "invoke_action finds the callback"
+            );
+            dismiss(id, 2);
+            assert!(!is_live(&kept, id), "dismiss closes it");
+            assert!(
+                !kept.timers.lock().expect("not poisoned").contains_key(&id),
+                "and reclaims the timer entry"
+            );
+            assert!(
+                !kept
+                    .local_actions
+                    .lock()
+                    .expect("not poisoned")
+                    .contains_key(&(id, "copy".to_string())),
+                "and sweeps the callback nobody clicked"
+            );
+            assert!(
+                handles
+                    .history
+                    .lock_ref()
+                    .iter()
+                    .any(|h| h.id == id && h.reason == 2),
+                "and files it in the history the handles hand the history page"
+            );
+
+            post_local(
+                "review-1609",
+                "dismissed by dismiss_all",
+                "",
+                Urgency::Normal,
+            );
+            assert!(!handles.active.lock_ref().is_empty());
+            dismiss_all();
+            assert!(
+                handles.active.lock_ref().is_empty(),
+                "dismiss_all empties the registered list"
+            );
+
+            shared::reset_for_tests();
+            (kept, handles)
+        };
+
+        // The served object: the registry's set is the one the bus serves.
+        owned(&handles.ownership).await;
+        let id = notify_over(&client, "over the bus").await;
+        assert!(
+            is_live(&kept, id),
+            "a client's Notify lands in the registered list"
+        );
+        assert!(
+            counting_down(&kept, id),
+            "and arms in the registered timer map, which `close` reads"
+        );
     }
 }

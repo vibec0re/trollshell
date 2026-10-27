@@ -6,6 +6,7 @@ use hytte::services::tray::{self, ItemStatus, MenuEntry, MenuItem, TrayItem};
 
 use crate::components::cast;
 use crate::components::diff::{DiffOp, plan_diff};
+use crate::components::visible_while_occupied::show_while_a_child_is;
 use crate::widgets::contention::{self, Subject};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -64,7 +65,7 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
 /// LOW). It is the one path that shows the glyph in the case it exists for.
 /// With the name lost, no item ever registers here, so [`update_tray`] never
 /// runs again and the tray stays empty and hidden; only the
-/// [`show_while_occupied`] below brings it back, and the bar's group follows
+/// [`show_while_a_child_is`] below brings it back, and the bar's group follows
 /// the tray (`main.rs`'s `group`).
 pub(crate) fn bind_contention<S>(contended: &gtk::Image, signal: S)
 where
@@ -79,7 +80,7 @@ where
             img.set_visible(false);
         }
         if let Some(container) = img.parent() {
-            show_while_occupied(&container);
+            show_while_a_child_is(&container);
         }
     });
 }
@@ -98,27 +99,6 @@ pub(crate) fn tray_container() -> gtk::Box {
     container.add_css_class("ts-tray");
     container.set_visible(false);
     container
-}
-
-/// Whether any child of `widget` is marked visible. Its own flag
-/// (`get_visible`), not `is_visible`, which is also false while an ancestor is
-/// hidden — and `widget` itself is hidden exactly when this is asked to bring
-/// it back.
-fn any_child_visible(widget: &gtk::Widget) -> bool {
-    let mut child = widget.first_child();
-    while let Some(c) = child {
-        if c.get_visible() {
-            return true;
-        }
-        child = c.next_sibling();
-    }
-    false
-}
-
-/// Show `widget` exactly while one of its children is visible: for the tray,
-/// an item button that is not `Passive`, or the contention glyph.
-fn show_while_occupied(widget: &gtk::Widget) {
-    widget.set_visible(any_child_visible(widget));
 }
 
 /// Diff `signal`'s tray items into `container`, reusing the buttons kept in
@@ -229,7 +209,7 @@ fn update_tray(
     // After the write-back, so a handler this sets off finds the map in
     // place: hiding or showing the tray runs its group's `notify::visible`
     // handler (`main.rs`'s `group`) synchronously.
-    show_while_occupied(container.upcast_ref());
+    show_while_a_child_is(container);
 }
 
 /// Create a tray button for `item_cell` and wire up click handlers.
@@ -914,7 +894,7 @@ mod tests {
     /// `group_tests` measure (#1607).
     ///
     /// Falsified by dropping `tray_container`'s `set_visible(false)` (the
-    /// empty tray is visible from the start), or the `show_while_occupied`
+    /// empty tray is visible from the start), or the `show_while_a_child_is`
     /// call from `update_tray` (the tray never shows).
     #[gtk::test]
     fn a_tray_with_nothing_visible_hides_itself() {

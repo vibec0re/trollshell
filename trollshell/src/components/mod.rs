@@ -24,3 +24,4 @@ pub mod open_refresh;
 pub mod power_profile;
 pub mod reactive_list;
 pub mod visibility_gate;
+pub mod visible_while_occupied;

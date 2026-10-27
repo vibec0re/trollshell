@@ -71,15 +71,26 @@ std::thread_local! {
 // SDK-free), so the check lives here, where the proto's two constants are in
 // reach.
 const _: () = assert!(
-    CONSENT_PARK_TIMEOUT.as_secs() >= CONSENT_PROMPT_TIMEOUT_SECS + CONSENT_PROMPT_GRACE_SECS
+    CONSENT_PARK_TIMEOUT.as_nanos()
+        >= std::time::Duration::from_secs(CONSENT_PROMPT_TIMEOUT_SECS + CONSENT_PROMPT_GRACE_SECS)
+            .as_nanos()
 );
 // The library's mirrors of those two constants must be them exactly: the
 // card's timeout is also where the broker stops taking a `Deny` for a click
 // (`deny_outlived_its_card`, #1601 review LOW-3), so a mirror that drifted
 // low would turn a real last-second Deny click into a transient answer, and
 // one that drifted high would let an older shell's timeout persist again.
-const _: () = assert!(CONSENT_CARD_TIMEOUT.as_secs() == CONSENT_PROMPT_TIMEOUT_SECS);
-const _: () = assert!(CONSENT_PROMPT_GRACE.as_secs() == CONSENT_PROMPT_GRACE_SECS);
+// Compared as whole `Duration`s (nanoseconds), not seconds: a mirror of
+// 60.5 s would pass a seconds comparison and let a timeout `Deny` arriving
+// between 60.0 and 60.5 s persist (#1601 re-review, NIT-2).
+const _: () = assert!(
+    CONSENT_CARD_TIMEOUT.as_nanos()
+        == std::time::Duration::from_secs(CONSENT_PROMPT_TIMEOUT_SECS).as_nanos()
+);
+const _: () = assert!(
+    CONSENT_PROMPT_GRACE.as_nanos()
+        == std::time::Duration::from_secs(CONSENT_PROMPT_GRACE_SECS).as_nanos()
+);
 
 // Node ids. The chip button opens the panel; the per-row allow/revoke buttons
 // carry the `(agent, datasource)` pair their row names — see `row_action_id`.

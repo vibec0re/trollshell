@@ -887,7 +887,11 @@ mod system_tests {
     }
 
     /// A proxy to the iwd agent from a peer owning `name`.
-    async fn iwd_agent(guard: &BusGuard, mounted: &Mounted, name: Option<&str>) -> zbus::Proxy<'static> {
+    async fn iwd_agent(
+        guard: &BusGuard,
+        mounted: &Mounted,
+        name: Option<&str>,
+    ) -> zbus::Proxy<'static> {
         proxy(guard, mounted, name, AGENT_PATH, IWD_IFACE).await
     }
 
@@ -934,10 +938,7 @@ mod system_tests {
     /// `0x1`, `ALLOW_INTERACTION`.
     fn nm_psk_request() -> (ConnectionDict, OwnedObjectPath, String, Vec<String>, u32) {
         let owned = |v: Value<'static>| v.try_to_owned().expect("to OwnedValue");
-        let wireless = HashMap::from([(
-            "ssid".to_owned(),
-            owned(Value::from(b"NM-net".to_vec())),
-        )]);
+        let wireless = HashMap::from([("ssid".to_owned(), owned(Value::from(b"NM-net".to_vec())))]);
         let security = HashMap::from([(
             "key-mgmt".to_owned(),
             owned(Value::from("wpa-psk".to_owned())),

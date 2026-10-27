@@ -2488,16 +2488,19 @@ systemd-run --user --unit=trollshell-plugin-departures \
       has already moved the tiles, and the card slides into that gap; nothing
       jumps at the end. **Out (#1456):** the cutout edge must follow the card's
       inner edge the whole way, with the dark frame and its two rounded corners
-      just outside the card and never on top of it, and land on the plain 8 px
-      strut on the frame the card is gone. Two failures to look for: a dark
+      just outside the card and never on top of it. The plain 8 px strut
+      returns once the card paints 8 px or less, so it covers the last few
+      pixels for about a frame; that is intended. The frame and the sidebar are
+      separate toplevels with separate frame clocks, so the cutout can trail
+      the card by one frame. That shows as a sliver of uncovered tile between
+      the card's edge and the cutout corner, outside the card, and never as
+      frame painted over the card. Two failures to look for: a dark
       8 px strut with rounded corners appearing at the screen edge **over the
       card** the moment the close starts (the pre-#1456 behaviour, where
       `current_visible_width` answered the strut as soon as the close intent
       landed), or the edge stopping part-way and staying there after the card
       has gone (the tick stopped early; it should break only once **both**
-      revealers are at rest). Also do it with the right sidebar **open** and
-      its last card leaving (stop the plugin): the card collapses with the
-      edge following it, and the frame ends on the plain strut.
+      revealers are at rest).
 - [ ] **(#1247)** **Both sidebars, both insets.** Open the left and the right
       together: the frame should be inset on both sides at once, the tiles
       framed between them, and toggling one must not move the other's edge.
@@ -2508,8 +2511,9 @@ systemd-run --user --unit=trollshell-plugin-departures \
       `systemd-run` line above), the frame must be pixel-identical to what it
       was before #1247 — plain 8 px struts on both sides. Then the harder case,
       which is #1160's "open sidebar whose last card left": with the right
-      sidebar **open**, stop the plugin. The card goes, the strip is released,
-      and the frame's right edge must return to the screen edge rather than
+      sidebar **open**, stop the plugin. The card goes (with the cutout edge
+      following it out, as in the slide-out check above), the strip is
+      released, and the frame's right edge must return to the screen edge rather than
       staying inset by 320 px over nothing — and the frame must not keep
       redrawing every frame afterwards (check with `RUST_LOG` or just that the
       shell is not burning a core on an idle desktop).

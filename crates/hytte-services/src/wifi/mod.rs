@@ -673,7 +673,13 @@ fn start_network_manager(targets: &WatchTargets, waiters: WaitersMap) -> LiveBac
     // also retires the "exported twice" hazard the `OnceLock` was guarding —
     // there is exactly one live export because there is exactly one live
     // backend, and `tear_down` runs before the next `start_network_manager`.
-    let nm_agent = nm_agent::NmAgent::new(targets.prompts.clone(), waiters);
+    // The agent answers only `NetworkManager`, whose unique name it looks up
+    // per call: the export is reachable by any peer on the system bus.
+    let nm_agent = nm_agent::NmAgent::new(
+        targets.prompts.clone(),
+        waiters,
+        hytte_bus::caller_check(BusKind::System, crate::wifi_backend::NM_BUS_NAME),
+    );
     let export =
         hytte_bus::export_object(BusKind::System, crate::wifi_nm::NM_AGENT_PATH).start(nm_agent);
 

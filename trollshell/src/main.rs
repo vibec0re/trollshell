@@ -1140,7 +1140,10 @@ mod group_tests {
     #[gtk::test]
     fn the_contention_glyph_shows_an_otherwise_empty_tray_and_its_group() {
         let container = tray::tray_container();
+        // A real size, so the glyph has a width the assertion below can tell
+        // from an empty box.
         let glyph = gtk::Image::new();
+        glyph.set_pixel_size(16);
         glyph.set_visible(false);
         container.append(&glyph);
         let g = group([container.clone().upcast()]);
@@ -1156,10 +1159,12 @@ mod group_tests {
         });
         pump();
         assert!(glyph.get_visible(), "the glyph is on");
+        let glyph_width = width(&glyph);
+        assert!(glyph_width > 0, "the glyph has a width of its own");
         assert!(g.get_visible(), "the tray's group shows");
         assert_eq!(
             width(&bar),
-            46 + 6 + width(&glyph),
+            46 + 6 + glyph_width,
             "the group takes exactly its glyph plus the gap, not a visible-but-empty box"
         );
         assert!(container.get_visible(), "because the tray shows");

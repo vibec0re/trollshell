@@ -818,13 +818,51 @@ fn copy_recording_path(path: &str) {
 /// Wrap a set of related bar chips in a dark-pill subgroup. Rainbow from
 /// the outer `.hytte-bar-group-right` pill shows through the gap between
 /// adjacent groups.
+///
+/// The group is visible exactly while at least one of its chips is (#1607).
+/// The bar's cluster spaces its children 6 px apart, and a box spaces every
+/// **visible** child, even one with nothing visible inside it, so a group
+/// whose chips have all hidden themselves (the battery on a desktop, the
+/// screencast indicator with no cast running, a tray with no icon) would
+/// still leave a 6 px gap in the bar. The group works its visibility out
+/// once here, from the chips as built, and again on each chip's
+/// `notify::visible`. A chip's binding applies its first value on the main
+/// loop after the bar is built, which is that second path. A hot-plug
+/// rebuild calls this again with fresh chips, and the same two paths cover
+/// them.
+///
+/// Each chip's handler holds the group through a `WeakRef`: the group owns
+/// its chips, so a strong clone in their handlers would be a cycle that keeps
+/// a torn-down bar's groups and chips alive (#224). Nothing sets a chip's
+/// visibility from its group's, so the sync cannot feed back into itself.
+/// The chips are fixed for the group's life; nothing removes one, which is
+/// the one change this sync would not see.
 fn group<const N: usize>(widgets: [gtk::Widget; N]) -> gtk::Widget {
     let b = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     b.add_css_class("ts-bar-group");
     for w in widgets {
         b.append(&w);
+        let group = b.downgrade();
+        w.connect_visible_notify(move |_| {
+            if let Some(group) = group.upgrade() {
+                show_while_a_child_is(&group);
+            }
+        });
     }
+    show_while_a_child_is(&b);
     b.upcast()
+}
+
+/// Show `group` exactly while one of its children is marked visible.
+///
+/// Reads each child's own flag (`get_visible`), not `is_visible`, which is
+/// also false while an ancestor is hidden. `group` itself is hidden exactly
+/// when this has to bring it back, so `is_visible` would keep it hidden for
+/// good.
+fn show_while_a_child_is(group: &gtk::Box) {
+    let any = std::iter::successors(group.first_child(), WidgetExt::next_sibling)
+        .any(|child| child.get_visible());
+    group.set_visible(any);
 }
 
 #[cfg(test)]
@@ -957,5 +995,186 @@ mod tests {
     fn rust_log_override_still_wins() {
         let filter = build_env_filter(Some("trollshell=trace"));
         assert_eq!(filter.max_level_hint(), Some(LevelFilter::TRACE));
+    }
+}
+
+/// The bar's groups (#1607). Gated like every GTK test in this crate: they
+/// need a display server (`xvfb-run -a`).
+#[cfg(all(test, feature = "system-tests"))]
+mod group_tests {
+    use super::group;
+    use crate::widgets::tray;
+    use hytte::bus::OwnState;
+    use hytte::futures_signals::signal::Mutable;
+    use hytte::gtk::{self, prelude::*};
+    use hytte::prelude::*;
+
+    /// Minimum width of `widget`, the room a box gives it.
+    fn width(widget: &impl IsA<gtk::Widget>) -> i32 {
+        widget.measure(gtk::Orientation::Horizontal, -1).0
+    }
+
+    /// A box with a fixed minimum width of `px`, standing in for a chip.
+    fn sized(px: i32) -> gtk::Box {
+        let b = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        b.set_size_request(px, 10);
+        b
+    }
+
+    /// A 10 px chip that is hidden, as one is after hiding itself.
+    fn hidden_chip() -> gtk::Widget {
+        let chip = sized(10);
+        chip.set_visible(false);
+        chip.upcast()
+    }
+
+    /// A 10 px chip whose visibility a binding drives, the way the battery or
+    /// screencast chip hides itself through `bind_visible`.
+    fn bound_chip(shown: &Mutable<bool>) -> gtk::Widget {
+        let chip: gtk::Widget = sized(10).upcast();
+        bind_visible(shown.signal(), &chip);
+        chip
+    }
+
+    /// `middle` between two 20 px neighbours in a box that spaces its
+    /// children 6 px apart, as the bar's clusters do (`hytte-ui`'s
+    /// `bar.rs`, `group_box`). With `middle` taking no room this measures
+    /// 20 + 6 + 20 = 46 px.
+    fn cluster(middle: &gtk::Widget) -> gtk::Box {
+        let cluster = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        cluster.append(&sized(20));
+        cluster.append(middle);
+        cluster.append(&sized(20));
+        cluster
+    }
+
+    /// Run the GTK main loop until it has nothing left to dispatch.
+    fn pump() {
+        while gtk::glib::MainContext::default().iteration(false) {}
+    }
+
+    /// A group whose chips are all hidden takes no room in the bar. A visible
+    /// box with nothing visible in it still gets the cluster's 6 px between
+    /// it and its neighbour (#1602's measurement: 52 px against 46), so the
+    /// group has to hide.
+    ///
+    /// Falsified by dropping `group`'s closing `show_while_a_child_is(&b)`:
+    /// the group starts visible and the bar measures 52.
+    #[gtk::test]
+    fn a_group_whose_chips_are_all_hidden_takes_no_room() {
+        let plain = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        plain.append(&hidden_chip());
+        assert_eq!(
+            width(&cluster(plain.upcast_ref())),
+            52,
+            "the measurement sees the gap a visible empty box leaves"
+        );
+
+        let g = group([hidden_chip(), hidden_chip()]);
+        assert!(!g.get_visible(), "hidden from the start");
+        assert_eq!(width(&cluster(&g)), 46, "and no gap where it is");
+    }
+
+    /// Showing any one chip shows the group, and the group stays while any
+    /// chip is shown; hiding the last one hides the group again.
+    ///
+    /// Falsified by dropping `group`'s `connect_visible_notify` (the group
+    /// never comes back), or reading `is_visible` instead of `get_visible` in
+    /// `show_while_a_child_is` (a hidden group's chips all read hidden, so it
+    /// never comes back either).
+    #[gtk::test]
+    fn showing_one_chip_shows_the_group_and_hiding_it_hides_the_group_again() {
+        let (a, b) = (hidden_chip(), hidden_chip());
+        let g = group([a.clone(), b.clone()]);
+        let bar = cluster(&g);
+        assert_eq!(width(&bar), 46, "all hidden");
+
+        a.set_visible(true);
+        assert!(g.get_visible(), "one chip shown: the group shows");
+        assert_eq!(width(&bar), 62, "20 + 6 + 10 + 6 + 20");
+
+        b.set_visible(true);
+        a.set_visible(false);
+        assert!(g.get_visible(), "the second chip still shows");
+        assert_eq!(width(&bar), 62);
+
+        b.set_visible(false);
+        assert!(!g.get_visible(), "all hidden again: the group goes");
+        assert_eq!(width(&bar), 46, "and so does its gap");
+    }
+
+    /// The order a real bar runs in, through a monitor hot-plug. A chip's
+    /// binding applies its first value on the main loop after the bar is
+    /// built, and a rebuild builds fresh groups around fresh chips bound to
+    /// the same state, then drops the old bar. The new group follows its own
+    /// chip from the first value on, and the old group is freed, because its
+    /// chip's handler holds it only weakly.
+    ///
+    /// Falsified by capturing a strong clone of the group in the chip's
+    /// handler instead of the `WeakRef`: the old group and its chip form a
+    /// cycle and outlive the rebuild.
+    #[gtk::test]
+    fn a_rebuilt_group_follows_its_fresh_chip_and_the_old_one_is_freed() {
+        let present = Mutable::new(false);
+
+        let old = group([bound_chip(&present)]);
+        assert!(old.get_visible(), "shown until the chip's first value");
+        pump();
+        assert!(!old.get_visible(), "the chip hid itself, and the group too");
+        let old_weak = old.downgrade();
+
+        // The rebuild: fresh groups first, then the old bar goes.
+        let new = group([bound_chip(&present)]);
+        drop(old);
+        pump();
+        assert!(old_weak.upgrade().is_none(), "the old group is freed");
+        assert!(!new.get_visible(), "the new group starts from its chip");
+
+        present.set(true);
+        pump();
+        assert!(new.get_visible(), "and follows it");
+        present.set(false);
+        pump();
+        assert!(!new.get_visible(), "both ways");
+    }
+
+    /// #747's glyph is the only thing that tells "no tray apps" from "another
+    /// host owns the watcher name". With the name lost, no item ever arrives,
+    /// so the tray the glyph sits in is otherwise empty and hidden. Losing
+    /// the name must show the glyph, the tray and the tray's group; getting
+    /// it back hides all three again. Carried over from #1602's review (LOW),
+    /// now against the bar's own `group`.
+    ///
+    /// Falsified by deleting `bind_contention`'s `show_while_occupied` call:
+    /// the glyph turns on inside a tray that stays hidden, so its group stays
+    /// hidden too.
+    #[gtk::test]
+    fn the_contention_glyph_shows_an_otherwise_empty_tray_and_its_group() {
+        let container = tray::tray_container();
+        let glyph = gtk::Image::new();
+        glyph.set_visible(false);
+        container.append(&glyph);
+        let g = group([container.clone().upcast()]);
+        let bar = cluster(&g);
+        let state = Mutable::new(OwnState::Owned);
+        tray::bind_contention(&glyph, state.signal_cloned());
+        pump();
+        assert!(!g.get_visible(), "owned, no items: nothing shows");
+        assert_eq!(width(&bar), 46);
+
+        state.set(OwnState::PermanentlyTaken {
+            current_owner: ":1.99".to_owned(),
+        });
+        pump();
+        assert!(glyph.get_visible(), "the glyph is on");
+        assert!(container.get_visible(), "the tray shows");
+        assert!(g.get_visible(), "and so does its group");
+        assert!(width(&bar) > 46, "taking room in the bar");
+
+        state.set(OwnState::Owned);
+        pump();
+        assert!(!glyph.get_visible(), "the glyph is off");
+        assert!(!g.get_visible(), "and the empty tray's group goes again");
+        assert_eq!(width(&bar), 46);
     }
 }

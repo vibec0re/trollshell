@@ -1,7 +1,11 @@
 //! Process-wide shared D-Bus connections, one per `BusKind`, with a
 //! supervisor that owns reconnect with bounded exponential backoff.
 //!
-//! All five capability primitives sit on top of `SharedConnection`. No
+//! Six of the seven capability primitives (`own_name`, `signals`, `call`,
+//! `property`, `proxy`, `export_object`) sit on top of `SharedConnection`.
+//! The seventh, `caller_check`, asks on the connection an exported method's
+//! call arrived on, which zbus hands the method and which in production is
+//! one of these. No
 //! other code in the workspace should call `zbus::Connection::session()` /
 //! `system()`, or `zbus::connection::Builder::session()` / `system()`
 //! (`clippy.toml` bans all four; `open_connection` is the one allowed site).

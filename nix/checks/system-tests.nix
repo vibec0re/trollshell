@@ -293,6 +293,15 @@ craneLib.mkCargoDerivation (
       # assets dir) unless this is set — a skip reads as a pass, and this is
       # the build that means it to run, so a missing sheet fails it here.
       export TROLLSHELL_REQUIRE_SHELL_CSS=1
+      # #1595, on the `TROLLSHELL_REQUIRE_GL` precedent: the sandbox has no
+      # system zoneinfo, so a test needing libical's builtin zones or a named
+      # zone through the real `Local` skipped here and only ran on a dev
+      # machine. `TZDIR` names nixpkgs' `tzdata` for libical and glibc, and
+      # `TROLLSHELL_REQUIRE_TZDATA=1` turns such a test's skip into a failure
+      # (a skip reads as a pass). `workspace-tests` in flake.nix carries its
+      # own copy.
+      export TZDIR="${pkgs.tzdata}/share/zoneinfo"
+      export TROLLSHELL_REQUIRE_TZDATA=1
       # #1080, on the GL env above: `preem_gl_diff` (the #893 stage B
       # CPU/GL parity harness) runs through the same llvmpipe context
       # as the three `hytte-ui` GL tests. Under llvmpipe every *scope*

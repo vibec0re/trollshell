@@ -19,6 +19,7 @@
 //! agent + anchor name both on the system bus.
 
 use super::shared_state;
+use super::trust::{self, DeviceBus};
 use super::types::{AgentReply, PairPrompt, PromptKind};
 use crate::retry;
 use futures_signals::signal::Mutable;
@@ -57,16 +58,26 @@ pub(super) struct PairAgent {
     caller: hytte_bus::CallerCheck,
     pending: Arc<ReplySlot>,
     banner: Mutable<Option<PairPrompt>>,
+    /// Where an accepted pairing marks its device `Trusted`
+    /// ([`trust::trust_on_accept`]): the system bus in production, a
+    /// recorder in the tests.
+    devices: Arc<dyn DeviceBus>,
 }
 
 impl PairAgent {
-    /// An agent answering only bluetoothd, raising its prompts on `banner`
-    /// and waiting for answers in `pending`.
-    pub(super) fn new(pending: Arc<ReplySlot>, banner: Mutable<Option<PairPrompt>>) -> Self {
+    /// An agent answering only bluetoothd, raising its prompts on `banner`,
+    /// waiting for answers in `pending`, and trusting the device of an
+    /// accepted pairing through `devices`.
+    pub(super) fn new(
+        pending: Arc<ReplySlot>,
+        banner: Mutable<Option<PairPrompt>>,
+        devices: Arc<dyn DeviceBus>,
+    ) -> Self {
         Self {
             caller: hytte_bus::caller_check(BLUEZ_BUS_NAME),
             pending,
             banner,
+            devices,
         }
     }
 
@@ -108,17 +119,87 @@ impl PairAgent {
         await_reply_in(&self.pending, &self.banner, prompt).await
     }
 
+    /// Pass a pairing prompt's `result` through, first marking `device`
+    /// `Trusted` if the user accepted ([`trust::trust_on_accept`]).
+    ///
+    /// The trust is set before bluetoothd gets the reply, so the services the
+    /// device opens once it is paired are not asked about: bluetoothd runs
+    /// its queued authorizations as soon as the pairing's services resolve,
+    /// sooner than a `Set` made after the pairing could land. A rejected
+    /// prompt sets nothing.
+    async fn trusted_if_accepted<T>(
+        &self,
+        device: &OwnedObjectPath,
+        result: Result<T, AgentError>,
+    ) -> Result<T, AgentError> {
+        if result.is_ok() {
+            trust::trust_on_accept(&self.devices, device.as_str()).await;
+        }
+        result
+    }
+
+    /// `RequestPinCode` once the caller is admitted.
+    async fn pin_code_for(&self, device: &OwnedObjectPath) -> Result<String, AgentError> {
+        let reply = self
+            .ask(new_prompt(device, None, PromptKind::EnterPinCode))
+            .await;
+        let result = match reply {
+            AgentReply::Pin(s) => Ok(s),
+            _ => Err(AgentError::Rejected("user did not provide PIN".into())),
+        };
+        self.trusted_if_accepted(device, result).await
+    }
+
+    /// `RequestPasskey` once the caller is admitted.
+    async fn passkey_for(&self, device: &OwnedObjectPath) -> Result<u32, AgentError> {
+        let reply = self
+            .ask(new_prompt(device, None, PromptKind::EnterPasskey))
+            .await;
+        let result = match reply {
+            AgentReply::Passkey(p) => Ok(p),
+            _ => Err(AgentError::Rejected("user did not provide passkey".into())),
+        };
+        self.trusted_if_accepted(device, result).await
+    }
+
+    /// `RequestConfirmation` once the caller is admitted.
+    async fn confirmation_for(
+        &self,
+        device: &OwnedObjectPath,
+        passkey: u32,
+    ) -> Result<(), AgentError> {
+        let reply = self
+            .ask(new_prompt(
+                device,
+                Some(passkey),
+                PromptKind::ConfirmPasskey,
+            ))
+            .await;
+        let result = allow_or_reject(&reply, "user rejected pairing");
+        self.trusted_if_accepted(device, result).await
+    }
+
+    /// `RequestAuthorization` once the caller is admitted.
+    async fn authorization_for(&self, device: &OwnedObjectPath) -> Result<(), AgentError> {
+        let reply = self
+            .ask(new_prompt(device, None, PromptKind::Authorize))
+            .await;
+        let result = allow_or_reject(&reply, "user rejected pairing");
+        self.trusted_if_accepted(device, result).await
+    }
+
     /// `AuthorizeService` once the caller is admitted: ask the user whether
     /// `device` may use the service `uuid` names, and answer bluetoothd.
     ///
     /// bluetoothd calls this only for a device that is **not** `Trusted`. Its
     /// authorization queue (`process_auth_queue` in `src/adapter.c`, `BlueZ`
     /// 5.87) accepts a trusted device's request itself and never reaches the
-    /// agent. So this is an untrusted device (paired elsewhere without being
-    /// trusted, or not paired at all) asking to use audio, input or
-    /// networking. It used to be accepted without asking, on the reasoning
-    /// that the requests come from trusted devices, which is exactly the case
-    /// bluetoothd never sends.
+    /// agent. A device the user pairs, from either side, is made trusted
+    /// ([`trust`]), so this is a device someone deliberately left untrusted
+    /// (or one never paired) asking to use audio, input or networking. It
+    /// used to be accepted without asking, on the reasoning that the requests
+    /// come from trusted devices, which is exactly the case bluetoothd never
+    /// sends.
     ///
     /// Allow answers `Ok`. Deny, a `Cancel` (including bluetoothd's own after
     /// its 60 s `REQUEST_TIMEOUT`, `src/agent.c`) and a second request while
@@ -224,13 +305,7 @@ impl PairAgent {
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> Result<String, AgentError> {
         self.admit(conn, &header, "RequestPinCode").await?;
-        let reply = self
-            .ask(new_prompt(&device, None, PromptKind::EnterPinCode))
-            .await;
-        match reply {
-            AgentReply::Pin(s) => Ok(s),
-            _ => Err(AgentError::Rejected("user did not provide PIN".into())),
-        }
+        self.pin_code_for(&device).await
     }
 
     async fn display_pin_code(
@@ -254,13 +329,7 @@ impl PairAgent {
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> Result<u32, AgentError> {
         self.admit(conn, &header, "RequestPasskey").await?;
-        let reply = self
-            .ask(new_prompt(&device, None, PromptKind::EnterPasskey))
-            .await;
-        match reply {
-            AgentReply::Passkey(p) => Ok(p),
-            _ => Err(AgentError::Rejected("user did not provide passkey".into())),
-        }
+        self.passkey_for(&device).await
     }
 
     async fn display_passkey(
@@ -285,14 +354,7 @@ impl PairAgent {
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> Result<(), AgentError> {
         self.admit(conn, &header, "RequestConfirmation").await?;
-        let reply = self
-            .ask(new_prompt(
-                &device,
-                Some(passkey),
-                PromptKind::ConfirmPasskey,
-            ))
-            .await;
-        allow_or_reject(&reply, "user rejected pairing")
+        self.confirmation_for(&device, passkey).await
     }
 
     async fn request_authorization(
@@ -302,10 +364,7 @@ impl PairAgent {
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> Result<(), AgentError> {
         self.admit(conn, &header, "RequestAuthorization").await?;
-        let reply = self
-            .ask(new_prompt(&device, None, PromptKind::Authorize))
-            .await;
-        allow_or_reject(&reply, "user rejected pairing")
+        self.authorization_for(&device).await
     }
 
     async fn authorize_service(
@@ -1127,15 +1186,18 @@ mod tests {
 }
 
 /// `AuthorizeService` (#1491): what it asks, how the answer maps to the
-/// reply bluetoothd gets, and what the prompt calls each service. Hermetic:
-/// the agent is driven past its caller check (which the system tests cover),
-/// with its own banner and reply slot.
+/// reply bluetoothd gets, and what the prompt calls each service; and what
+/// answering a pairing prompt does to the device's trust (#1603 review,
+/// MED-1). Hermetic: the agent is driven past its caller check (which the
+/// system tests cover), with its own banner, reply slot and a recording
+/// device bus.
 #[cfg(test)]
 mod authorize_service_tests {
     use super::{
         AgentError, AgentReply, PairAgent, PairPrompt, PromptKind, ReplySlot, allow_or_reject,
         answer_in, cancel_in, service_label, service_name,
     };
+    use crate::bluetooth::trust::fake::{Call, FakeBus};
     use futures_signals::signal::Mutable;
     use futures_util::FutureExt;
     use std::sync::Arc;
@@ -1146,12 +1208,32 @@ mod authorize_service_tests {
     /// (`ADVANCED_AUDIO_UUID`).
     const A2DP: &str = "0000110d-0000-1000-8000-00805f9b34fb";
 
-    /// An agent with its own slots. Its caller check is never run here.
-    fn agent() -> (PairAgent, Arc<ReplySlot>, Mutable<Option<PairPrompt>>) {
+    /// An agent with its own slots and a recording device bus. Its caller
+    /// check is never run here.
+    struct Fixture {
+        agent: PairAgent,
+        pending: Arc<ReplySlot>,
+        banner: Mutable<Option<PairPrompt>>,
+        devices: Arc<FakeBus>,
+    }
+
+    fn fixture() -> Fixture {
         let pending: Arc<ReplySlot> = Arc::new(AsyncMutex::new(None));
         let banner = Mutable::new(None);
-        let agent = PairAgent::new(pending.clone(), banner.clone());
-        (agent, pending, banner)
+        let devices = Arc::new(FakeBus::new());
+        let agent = PairAgent::new(pending.clone(), banner.clone(), devices.clone());
+        Fixture {
+            agent,
+            pending,
+            banner,
+            devices,
+        }
+    }
+
+    /// [`fixture`] without the device bus.
+    fn agent() -> (PairAgent, Arc<ReplySlot>, Mutable<Option<PairPrompt>>) {
+        let f = fixture();
+        (f.agent, f.pending, f.banner)
     }
 
     fn device() -> OwnedObjectPath {
@@ -1221,6 +1303,91 @@ mod authorize_service_tests {
             reply_name(&asking.await).as_deref(),
             Some("org.bluez.Error.Rejected")
         );
+    }
+
+    /// Allowing a service saves nothing: the device is not made trusted.
+    #[tokio::test(flavor = "current_thread")]
+    async fn allowing_a_service_does_not_trust_the_device() {
+        let f = fixture();
+        let device = device();
+        let mut asking = std::pin::pin!(f.agent.authorize_service_for(&device, A2DP));
+        assert!(asking.as_mut().now_or_never().is_none());
+        let shown = f.banner.get_cloned().expect("a prompt is raised");
+        answer_in(&f.pending, shown.id, AgentReply::Confirm).await;
+        assert!(asking.await.is_ok());
+        assert!(f.devices.calls().is_empty(), "{:?}", f.devices.calls());
+    }
+
+    /// Drive one pairing prompt of `kind` on a fresh agent, answer it with
+    /// `accept`, and return whether bluetoothd got `Ok` and every device-bus
+    /// call made by the time it did.
+    async fn answer_pairing(kind: PromptKind, accept: bool) -> (bool, Vec<Call>) {
+        let f = fixture();
+        let device = device();
+        let mut asking: std::pin::Pin<Box<dyn std::future::Future<Output = bool> + '_>> = match kind
+        {
+            PromptKind::ConfirmPasskey => {
+                Box::pin(async { f.agent.confirmation_for(&device, 123_456).await.is_ok() })
+            }
+            PromptKind::Authorize => {
+                Box::pin(async { f.agent.authorization_for(&device).await.is_ok() })
+            }
+            PromptKind::EnterPinCode => {
+                Box::pin(async { f.agent.pin_code_for(&device).await.is_ok() })
+            }
+            PromptKind::EnterPasskey => {
+                Box::pin(async { f.agent.passkey_for(&device).await.is_ok() })
+            }
+            PromptKind::AuthorizeService => unreachable!("not a pairing prompt"),
+        };
+        assert!(asking.as_mut().now_or_never().is_none(), "{kind:?} waits");
+        let shown = f.banner.get_cloned().expect("a prompt is raised");
+        assert_eq!(shown.kind, kind);
+        let reply = match (accept, kind) {
+            (false, _) => AgentReply::Reject,
+            (true, PromptKind::EnterPinCode) => AgentReply::Pin("0000".to_owned()),
+            (true, PromptKind::EnterPasskey) => AgentReply::Passkey(123_456),
+            (true, _) => AgentReply::Confirm,
+        };
+        answer_in(&f.pending, shown.id, reply).await;
+        let ok = asking.await;
+        (ok, f.devices.calls())
+    }
+
+    const PAIRING_PROMPTS: [PromptKind; 4] = [
+        PromptKind::ConfirmPasskey,
+        PromptKind::Authorize,
+        PromptKind::EnterPinCode,
+        PromptKind::EnterPasskey,
+    ];
+
+    /// Accepting a pairing the device started trusts it, and the trust is
+    /// set by the time bluetoothd has its reply: for every kind of pairing
+    /// prompt (#1603 review, MED-1).
+    ///
+    /// **Falsification:** drop the `trust_on_accept` call from
+    /// `trusted_if_accepted`, or send it off in a task instead of awaiting
+    /// it, and no `SetTrusted(true)` is recorded by the reply.
+    #[tokio::test(flavor = "current_thread")]
+    async fn accepting_a_pairing_trusts_the_device_before_bluetoothd_hears() {
+        for kind in PAIRING_PROMPTS {
+            let (ok, calls) = answer_pairing(kind, true).await;
+            assert!(ok, "{kind:?} accepted");
+            assert_eq!(calls, vec![Call::SetTrusted(true)], "{kind:?}");
+        }
+    }
+
+    /// A rejected pairing prompt sets nothing.
+    ///
+    /// **Falsification:** trust on any answer (`trusted_if_accepted` ignoring
+    /// `result`) and a `SetTrusted(true)` shows up.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejecting_a_pairing_sets_nothing() {
+        for kind in PAIRING_PROMPTS {
+            let (ok, calls) = answer_pairing(kind, false).await;
+            assert!(!ok, "{kind:?} rejected");
+            assert!(calls.is_empty(), "{kind:?}: {calls:?}");
+        }
     }
 
     /// The mapping itself: only an explicit yes is `Ok`.
@@ -1650,7 +1817,11 @@ mod system_tests {
     async fn mount(guard: &BusGuard) -> Mounted {
         let pending: Arc<ReplySlot> = Arc::new(AsyncMutex::new(None));
         let banner: Mutable<Option<PairPrompt>> = Mutable::new(None);
-        let agent = PairAgent::new(pending.clone(), banner.clone());
+        let agent = PairAgent::new(
+            pending.clone(),
+            banner.clone(),
+            Arc::new(crate::bluetooth::trust::fake::FakeBus::new()),
+        );
         let server = Builder::address(guard.address.as_str())
             .expect("parse ephemeral bus address")
             .serve_at(AGENT_PATH, agent)

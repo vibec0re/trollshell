@@ -249,6 +249,29 @@ in
       description = "The trollshell package to install.";
     };
 
+    # Declared here, not per platform: the options-doc evaluation merges both
+    # platform modules, and both gate the bundled swaybg unit the same way
+    # (#1542).
+    enableSessionExtras = lib.mkEnableOption ''
+      the session-integration extras as a group. The home-manager module turns
+      on fuzzel, the wallpaper daemon, cliphist and portals; the NixOS module
+      manages only the swaybg unit (with `wallpaper.backend = "awww"` or
+      `"none"` it does nothing there). Each is set with mkDefault, so you can
+      still flip an individual one off. The wallpaper daemon is the one
+      selected by programs.trollshell.wallpaper.backend (default swaybg), not
+      hardcoded — set backend = "none" to opt out of daemon management
+      entirely'';
+
+    swaybg.enable = lib.mkEnableOption ''
+      the bundled swaybg wallpaper user unit, which reads its argument list
+      from ~/.config/trollshell/swaybg.args (the Appearance drawer page writes
+      it — per-output images and rotation supported). `enableSessionExtras`
+      starts the unit when wallpaper.backend is "swaybg" (the default) and no
+      wallpaper.reloadCommand is set; set this true to run the unit without
+      the rest of the bundle. If you set it true AND backend = "awww", swaybg
+      and awww would both start; don't. Leave it false unless you specifically
+      want swaybg without the bundle'';
+
     # The control-center companion app (#399): an external GTK4/libadwaita
     # settings & management UI (app-id mov.vibec0re.trollshell.ControlCenter)
     # that talks to the running shell's mov.vibec0re.trollshell.Control
@@ -498,9 +521,13 @@ in
         wiring and the `reloadCommand` default together, so two daemons can never
         run at once — backend selection is structural, not an assertion.
 
-        - `swaybg` (default — today's behavior): the bundled swaybg user unit;
-          the Appearance picker restarts it (the shell's built-in default), so
-          `reloadCommand` stays null.
+        - `swaybg` (default): the bundled swaybg user unit; the Appearance
+          picker restarts it (the shell's built-in default), so
+          `reloadCommand` stays null. The unit exists only with
+          `enableSessionExtras` (or `swaybg.enable`), on NixOS and
+          home-manager alike; without either, the picker has nothing to
+          restart. If you run another daemon such as awww, set `backend`
+          to match it instead, not `enableSessionExtras`.
         - `awww`: the swww successor (upstream renamed swww → awww at 0.12; swww
           itself is deprecated). Defaults `reloadCommand` to `awww img {}`. The
           daemon is run by home-manager's `services.awww`; the NixOS module only
@@ -510,9 +537,9 @@ in
           `~/.config/trollshell/wallpaper.path` (and runs `reloadCommand` if you
           set one yourself). Use this to wire your own daemon.
 
-        The legacy `programs.trollshell.swaybg.enable` (home-manager) and a
-        hand-set `wallpaper.reloadCommand` both still work and take precedence;
-        they are gently deprecated in favor of this enum.
+        `programs.trollshell.swaybg.enable` (both platforms) and a hand-set
+        `wallpaper.reloadCommand` both still work and take precedence over
+        this enum.
       '';
     };
 

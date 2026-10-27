@@ -236,7 +236,14 @@ in
       # Also skip swaybg when an explicit reloadCommand is set: that's the
       # pre-enum way to drive another daemon, and a config that set it but not
       # `backend` (default "swaybg") must not get swaybg started over its daemon.
-      (lib.mkIf (backend == "swaybg" && cfg.wallpaper.reloadCommand == null) {
+      # Gated like home-manager's: the unit exists only under `swaybg.enable`,
+      # which `enableSessionExtras` sets by default in that same backend case.
+      (lib.mkIf cfg.enableSessionExtras {
+        programs.trollshell.swaybg.enable = lib.mkIf (
+          backend == "swaybg" && cfg.wallpaper.reloadCommand == null
+        ) (lib.mkDefault true);
+      })
+      (lib.mkIf cfg.swaybg.enable {
         systemd.user.services.swaybg = {
           description = "trollshell wallpaper daemon (swaybg)";
           wantedBy = [ "graphical-session.target" ];

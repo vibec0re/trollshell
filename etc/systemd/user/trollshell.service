@@ -4,6 +4,11 @@ Documentation=file://%h/.config/systemd/user/README.md
 PartOf=niri-session.target
 Requisite=graphical-session.target
 After=graphical-session.target
+# No start limit (#1542): systemd's default of 5 starts per 10 s trips on
+# back-to-back start requests (a niri reload, a restart keybind, a script
+# restarting the unit) and would leave the session with no bar. A crash loop
+# alone never reaches it, since RestartSec=2 spaces the starts.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple

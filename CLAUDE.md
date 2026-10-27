@@ -125,7 +125,11 @@ inline in `flake.nix` as one-liners.
 - `cargo clippy --workspace --all-targets --features system-tests -- -D warnings`
   (the `system-tests` feature is enabled here so the gated integration tests
   and GTK `mod tests` blocks are lint-checked too, not just compiled once and
-  forgotten).
+  forgotten). Since #1542 the same derivation then runs
+  `cargo clippy --workspace --all-targets -- -D warnings` without the
+  feature, on the same `cargoArtifacts`, because an item used only by gated
+  code is dead code in the feature-off build that developers run (#1541,
+  #1486).
 - `treefmt` formatting (`nix/treefmt.nix`) — this is what `nix fmt` runs
   locally.
 - The full `system-tests` cargo-feature bucket, run for real

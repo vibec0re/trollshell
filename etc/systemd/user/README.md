@@ -678,9 +678,12 @@ journalctl --user -f -u niri-session.target \
 
 - **trollshell crashes on startup.** `systemctl --user status
 trollshell.service` shows the exit code; `journalctl --user -u
-trollshell.service -b` has the panic / log output. `Restart=on-failure`
-  - `RestartSec=2` will rate-limit retries; if it's a real bug, the unit
-    goes into `failed` state after systemd's default start-limit kicks in.
+trollshell.service -b` has the panic / log output. `Restart=on-failure` with
+  `RestartSec=2` spaces the retries, and the unit sets
+  `StartLimitIntervalSec=0`, so it never gives up: a real bug restarts the
+  shell every 2 s until fixed (look for the panic in the journal). The unset
+  limit also keeps back-to-back restart requests (a niri reload, a script)
+  from leaving `start-limit-hit`.
 - **swaybg restart-loops.** Almost always a bad / missing
   `~/.config/trollshell/wallpaper.path`. See `../../wallpaper/README.md`.
 - **The idle lock never fires.** The native idle manager runs inside

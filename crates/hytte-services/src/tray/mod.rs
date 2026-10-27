@@ -594,11 +594,28 @@ impl State {
         }
     }
 
-    /// Remove all items owned by `bus_name`.
-    async fn unregister_by_bus_name(&self, bus_name: &str) {
+    /// Remove the items under `bus_name`, which `old_owner` has just released.
+    ///
+    /// Except a row whose live watcher was started by a **different**
+    /// connection: that is a well-known name that changed hands, and the new
+    /// owner's registration reached us before this release did — the race
+    /// [`Watchers::claim`]'s replace branch exists for. The release is about
+    /// the old owner, so it must not take the new owner's row with it (#1602
+    /// review, MED-1). Such a row is not kept forever: it goes when its own
+    /// watcher sees its peer leave.
+    async fn unregister_by_bus_name(&self, bus_name: &str, old_owner: &str) {
         let mut map = self.registered.lock().await;
         let before = map.len();
-        map.retain(|_, v| v.bus_name != bus_name);
+        {
+            let watchers = self.watchers();
+            map.retain(|key, item| {
+                item.bus_name != bus_name
+                    || watchers
+                        .slots
+                        .get(key)
+                        .is_some_and(|slot| slot.registrant != old_owner)
+            });
+        }
         if map.len() != before {
             drop(map);
             self.rebuild_published_list().await;
@@ -1173,7 +1190,7 @@ where
                 resync().await;
             }
             SignalItem::Event(event) => {
-                let Ok((name, _old_owner, new_owner)) =
+                let Ok((name, old_owner, new_owner)) =
                     event.body.body().deserialize::<(String, String, String)>()
                 else {
                     tracing::debug!("NameOwnerChanged parse error");
@@ -1183,7 +1200,7 @@ where
                 // `new_owner` is empty → the bus name was released.
                 if new_owner.is_empty() {
                     tracing::debug!(name, "bus name released, pruning tray items");
-                    state.unregister_by_bus_name(&name).await;
+                    state.unregister_by_bus_name(&name, &old_owner).await;
                 }
             }
         }
@@ -2222,6 +2239,71 @@ mod tests {
             .expect("the child must stop once its watcher's receiver is dropped")
             .expect("the child must not panic");
         assert_eq!(out, None);
+    }
+
+    // ── #1602 review MED-1: the session-wide release prune ──────────────────
+
+    /// One `NameOwnerChanged(name, old, new)` as the session-wide watcher's
+    /// subscription delivers it.
+    fn name_owner_changed(name: &str, old: &str, new: &str) -> SignalItem {
+        let body = zbus::Message::signal(
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "NameOwnerChanged",
+        )
+        .expect("signal header")
+        .build(&(name, old, new))
+        .expect("signal body");
+        SignalItem::Event(hytte_bus::SignalEvent {
+            body,
+            sender: None,
+            timestamp: std::time::SystemTime::now(),
+        })
+    }
+
+    /// The replace race again, through the other door. `:1.5` leaves
+    /// `org.example.Tray`, `:1.9` takes it and registers before the tray
+    /// handles the release; the release then reaches the session-wide prune
+    /// as well as the old watcher's `PeerGone`. The prune must spare the new
+    /// owner's row, as `retire` does, while a plain unique-name release in
+    /// the same batch is still pruned.
+    ///
+    /// Falsifiable: drop the slot clause from `unregister_by_bus_name` and the
+    /// new owner's row goes (left: `None`); pass anything but the release's
+    /// old owner at the call site and the unique-name control stays.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_old_owners_release_keeps_the_new_owners_row() {
+        const KEY: &str = "org.example.Tray/StatusNotifierItem";
+        const GONE: &str = ":1.7/StatusNotifierItem";
+        let state = empty_state();
+        state
+            .admit(row("org.example.Tray", "old", ItemStatus::Active), ":1.5")
+            .await;
+        let new = state
+            .admit(row("org.example.Tray", "new", ItemStatus::Active), ":1.9")
+            .await
+            .watch
+            .expect("the new owner's watcher");
+        state
+            .admit(row(":1.7", "gone", ItemStatus::Active), ":1.7")
+            .await;
+
+        let releases = futures_util::stream::iter([
+            name_owner_changed("org.example.Tray", ":1.5", ""),
+            name_owner_changed(":1.7", ":1.7", ""),
+        ]);
+        run_owner_change_loop(&state, releases, || async {}).await;
+
+        assert!(state.watchers().is_current(KEY, new.generation));
+        assert_eq!(row_title(&state, KEY).await.as_deref(), Some("new"));
+        assert_eq!(row_title(&state, GONE).await, None, "the control is pruned");
+        let published: Vec<String> = state
+            .items
+            .get_cloned()
+            .into_iter()
+            .map(|i| i.key)
+            .collect();
+        assert_eq!(published, [KEY]);
     }
 
     // ── #1542 item 6: the service side of hiding `Passive` ──────────────────

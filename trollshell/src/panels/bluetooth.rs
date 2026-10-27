@@ -337,19 +337,33 @@ where
     );
 }
 
+/// The device as a prompt names it: its alias with its address beside it,
+/// or the alias alone when there is no address or the alias already is it.
+fn device_label(p: &PairPrompt) -> String {
+    if p.address.is_empty() || p.alias == p.address {
+        p.alias.clone()
+    } else {
+        format!("{} ({})", p.alias, p.address)
+    }
+}
+
 /// The banner's title and detail lines for `p`.
 fn prompt_copy(p: &PairPrompt) -> (String, String) {
     let pair = || format!("Pair with {}?", p.alias);
     match (p.kind, p.passkey) {
         (PromptKind::AuthorizeService, _) => (
-            // The agent always names the service (or gives its raw UUID);
-            // "a service" only covers a prompt built without one.
+            // The alias is a name the device picks for itself, so the address
+            // goes beside it. The agent always names the service (or gives
+            // its raw UUID); "a service" only covers a prompt built without
+            // one.
             format!(
                 "Allow {} to use {}?",
-                p.alias,
+                device_label(p),
                 p.service.as_deref().unwrap_or("a service")
             ),
-            "This device is not trusted, so it asks each time. Nothing is saved.".to_string(),
+            "This device is not trusted, so it asks each time. To stop asking, choose Trust \
+             in its ⋮ menu."
+                .to_string(),
         ),
         (PromptKind::ConfirmPasskey, Some(code)) => (
             pair(),
@@ -627,21 +641,30 @@ mod copy_tests {
             id: 1,
             device_path: "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF".to_owned(),
             alias: "Pixel 7".to_owned(),
+            address: "AA:BB:CC:DD:EE:FF".to_owned(),
             passkey: None,
             kind,
             service: service.map(str::to_owned),
         }
     }
 
-    /// `AuthorizeService` names the device and the service, not a pairing.
+    /// `AuthorizeService` names the device, with its address beside the
+    /// name it picked for itself, and the service, not a pairing; and it
+    /// says how to stop being asked.
+    ///
+    /// **Falsification:** drop the address from the title, or the Trust
+    /// hint from the detail, and this fails.
     #[test]
     fn a_service_prompt_asks_whether_the_device_may_use_the_service() {
         let (title, detail) = prompt_copy(&prompt(
             PromptKind::AuthorizeService,
             Some("audio streaming (A2DP)"),
         ));
-        assert_eq!(title, "Allow Pixel 7 to use audio streaming (A2DP)?");
-        assert!(detail.contains("Nothing is saved"), "{detail}");
+        assert_eq!(
+            title,
+            "Allow Pixel 7 (AA:BB:CC:DD:EE:FF) to use audio streaming (A2DP)?"
+        );
+        assert!(detail.contains("choose Trust in its ⋮ menu"), "{detail}");
     }
 
     /// A service without a name is shown as its raw UUID, as the agent hands
@@ -650,7 +673,28 @@ mod copy_tests {
     fn a_service_without_a_name_shows_its_uuid() {
         let uuid = "d0611e78-bbb4-4591-a5f8-487910ae4366";
         let (title, _) = prompt_copy(&prompt(PromptKind::AuthorizeService, Some(uuid)));
-        assert_eq!(title, format!("Allow Pixel 7 to use {uuid}?"));
+        assert_eq!(
+            title,
+            format!("Allow Pixel 7 (AA:BB:CC:DD:EE:FF) to use {uuid}?")
+        );
+    }
+
+    /// No address, or an alias that already is the address, shows the alias
+    /// alone rather than an empty or doubled pair of parentheses.
+    #[test]
+    fn the_address_is_not_shown_twice_or_empty() {
+        let mut p = prompt(PromptKind::AuthorizeService, Some("audio streaming (A2DP)"));
+        p.address = String::new();
+        assert_eq!(
+            prompt_copy(&p).0,
+            "Allow Pixel 7 to use audio streaming (A2DP)?"
+        );
+        p.alias = "AA:BB:CC:DD:EE:FF".to_owned();
+        p.address = "AA:BB:CC:DD:EE:FF".to_owned();
+        assert_eq!(
+            prompt_copy(&p).0,
+            "Allow AA:BB:CC:DD:EE:FF to use audio streaming (A2DP)?"
+        );
     }
 
     /// The pairing prompts keep their wording.

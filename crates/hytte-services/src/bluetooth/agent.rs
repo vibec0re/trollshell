@@ -465,11 +465,39 @@ fn new_prompt(device: &OwnedObjectPath, passkey: Option<u32>, kind: PromptKind) 
     PairPrompt {
         id: NEXT_PROMPT_ID.fetch_add(1, Ordering::Relaxed),
         alias: lookup_alias(&device_path),
+        address: lookup_address(&device_path),
         device_path,
         passkey,
         kind,
         service: None,
     }
+}
+
+/// The device's Bluetooth address (`AA:BB:CC:DD:EE:FF`): the snapshot's,
+/// else the one bluetoothd spells into the object path's last segment
+/// (`…/dev_AA_BB_CC_DD_EE_FF`), else empty.
+fn lookup_address(path: &str) -> String {
+    shared_state()
+        .and_then(|s| {
+            let devs = s.devices.lock_ref();
+            devs.iter()
+                .find(|d| d.path == path && !d.address.is_empty())
+                .map(|d| d.address.clone())
+        })
+        .or_else(|| address_from_path(path))
+        .unwrap_or_default()
+}
+
+/// The address in a `BlueZ` device path, `…/dev_AA_BB_CC_DD_EE_FF` →
+/// `AA:BB:CC:DD:EE:FF`, or `None` if the path does not end in one.
+fn address_from_path(path: &str) -> Option<String> {
+    let octets = path.rsplit('/').next()?.strip_prefix("dev_")?;
+    let parts: Vec<&str> = octets.split('_').collect();
+    let well_formed = parts.len() == 6
+        && parts
+            .iter()
+            .all(|p| p.len() == 2 && p.bytes().all(|b| b.is_ascii_hexdigit()));
+    well_formed.then(|| parts.join(":"))
 }
 
 /// Resolve a device path to a user-facing label. Prefers the `BlueZ` Alias,
@@ -878,6 +906,7 @@ mod tests {
             id,
             device_path: "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF".to_owned(),
             alias: "Keyboard".to_owned(),
+            address: "AA:BB:CC:DD:EE:FF".to_owned(),
             passkey: Some(123_456),
             kind: PromptKind::ConfirmPasskey,
             service: None,
@@ -1194,8 +1223,8 @@ mod tests {
 #[cfg(test)]
 mod authorize_service_tests {
     use super::{
-        AgentError, AgentReply, PairAgent, PairPrompt, PromptKind, ReplySlot, allow_or_reject,
-        answer_in, cancel_in, service_label, service_name,
+        AgentError, AgentReply, PairAgent, PairPrompt, PromptKind, ReplySlot, address_from_path,
+        allow_or_reject, answer_in, cancel_in, service_label, service_name,
     };
     use crate::bluetooth::trust::fake::{Call, FakeBus};
     use futures_signals::signal::Mutable;
@@ -1265,6 +1294,10 @@ mod authorize_service_tests {
         assert_eq!(shown.kind, PromptKind::AuthorizeService);
         assert_eq!(shown.service.as_deref(), Some("audio streaming (A2DP)"));
         assert_eq!(shown.device_path, device.as_str());
+        assert_eq!(
+            shown.address, "AA:BB:CC:DD:EE:FF",
+            "read off the path when the snapshot has none"
+        );
         assert_eq!(shown.passkey, None);
 
         answer_in(&pending, shown.id, AgentReply::Confirm).await;
@@ -1439,6 +1472,25 @@ mod authorize_service_tests {
             Some("audio streaming (A2DP sink)"),
             "UUIDs compare case-insensitively"
         );
+    }
+
+    /// The address comes out of a `BlueZ` device path, and nothing comes out
+    /// of a path that does not end in one.
+    #[test]
+    fn the_address_is_read_off_the_device_path() {
+        assert_eq!(
+            address_from_path("/org/bluez/hci0/dev_0A_1b_2C_3d_4E_5f").as_deref(),
+            Some("0A:1b:2C:3d:4E:5f")
+        );
+        for path in [
+            "/org/bluez/hci0",
+            "/org/bluez/hci0/dev_AA_BB_CC_DD_EE",
+            "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/sep1",
+            "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_GG",
+            "",
+        ] {
+            assert_eq!(address_from_path(path), None, "{path:?}");
+        }
     }
 
     /// Anything else is shown as the UUID bluetoothd sent.

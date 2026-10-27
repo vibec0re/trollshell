@@ -54,6 +54,11 @@ pub struct PairPrompt {
     /// Resolved alias from the `devices()` snapshot at prompt time.
     /// Falls back to the bare path if the device isn't yet in our cache.
     pub alias: String,
+    /// The device's Bluetooth address, `AA:BB:CC:DD:EE:FF`, or empty if
+    /// neither the snapshot nor the object path gives one. The alias is a
+    /// name the device picks for itself; the address is what tells two
+    /// devices with the same name apart.
+    pub address: String,
     pub passkey: Option<u32>,
     pub kind: PromptKind,
     /// For [`PromptKind::AuthorizeService`], the service the device wants to

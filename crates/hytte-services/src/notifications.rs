@@ -2666,7 +2666,13 @@ mod tests {
 
         // Its own expiry: the bus side sees the timer, and the sleep's
         // arming closes the toast.
-        let expiring = kept.post_local("Wi-Fi", "Connection failed", "", Urgency::Critical, Vec::new());
+        let expiring = kept.post_local(
+            "Wi-Fi",
+            "Connection failed",
+            "",
+            Urgency::Critical,
+            Vec::new(),
+        );
         assert_eq!(
             Posted::of(&served, expiring),
             Posted::expires_after(5),
@@ -2682,7 +2688,13 @@ mod tests {
 
         // Held on the shared side, then replaced by a client with a 3 s
         // timeout: the replace stays held, at the timeout it names.
-        let replaced = kept.post_local("VPN", "Connection failed", "", Urgency::Critical, Vec::new());
+        let replaced = kept.post_local(
+            "VPN",
+            "Connection failed",
+            "",
+            Urgency::Critical,
+            Vec::new(),
+        );
         kept.pause_expiry(replaced);
         assert_eq!(
             post_notify(&served, replaced, None, 3000),

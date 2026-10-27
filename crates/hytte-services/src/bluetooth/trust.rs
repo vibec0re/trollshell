@@ -827,7 +827,10 @@ mod tests {
         let first = pairings.begin_accepted(DEVICE).expect("no Pair running");
         let second = pairings.begin_accepted(DEVICE).expect("no Pair running");
         pairings.end(DEVICE, first);
-        assert!(pairings.contains(DEVICE), "a retried accept outlives the first");
+        assert!(
+            pairings.contains(DEVICE),
+            "a retried accept outlives the first"
+        );
         pairings.end(DEVICE, second);
         assert!(!pairings.contains(DEVICE));
 

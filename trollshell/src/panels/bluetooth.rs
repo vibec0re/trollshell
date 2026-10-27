@@ -616,16 +616,6 @@ fn build_device_menu(dev: &Device, is_busy: bool) -> gtk::MenuButton {
     menu_btn
 }
 
-/// #772 regression coverage: the two hand-rolled `bind` call sites in this
-/// file (device groups, pair-prompt banner) must hold their container only
-/// weakly, exactly like `reactive_list`'s own #761/#771 regression test.
-///
-/// Since #1176 it also covers the **other** direction of the same contract:
-/// a `connect_*` handler on a widget that captures a strong clone of one of
-/// that widget's own ancestors. `bind`'s `WeakRef` is useless if the widget
-/// tree underneath it cannot be freed, and a popover dismissed from a button
-/// inside itself is a cycle no `bind` is involved in at all — which is
-/// exactly why `nix/lint-bind-pins.py` could not see it before #1176.
 /// What the banner says, without a display.
 #[cfg(test)]
 mod copy_tests {
@@ -672,6 +662,16 @@ mod copy_tests {
     }
 }
 
+/// #772 regression coverage: the two hand-rolled `bind` call sites in this
+/// file (device groups, pair-prompt banner) must hold their container only
+/// weakly, exactly like `reactive_list`'s own #761/#771 regression test.
+///
+/// Since #1176 it also covers the **other** direction of the same contract:
+/// a `connect_*` handler on a widget that captures a strong clone of one of
+/// that widget's own ancestors. `bind`'s `WeakRef` is useless if the widget
+/// tree underneath it cannot be freed, and a popover dismissed from a button
+/// inside itself is a cycle no `bind` is involved in at all — which is
+/// exactly why `nix/lint-bind-pins.py` could not see it before #1176.
 #[cfg(all(test, feature = "system-tests"))]
 mod tests {
     use super::{

@@ -248,7 +248,47 @@ mod tests {
             let mut perms = std::fs::metadata(&path).unwrap().permissions();
             perms.set_mode(mode);
             std::fs::set_permissions(&path, perms).unwrap();
+            wait_until_unwritten(&path);
             path
+        }
+    }
+
+    /// Block until no process holds `path` open (#1606).
+    ///
+    /// `std::fs::write` opens `O_CLOEXEC`, but a sibling test thread that
+    /// forks while our write fd is open hands the child a copy that lives
+    /// until the child execs. While any copy exists the kernel refuses to
+    /// exec `path` (`ETXTBSY`, rust-lang/rust#114554), and production `run`
+    /// execs the hook directly. So the helper that wrote the script waits
+    /// out those copies by scanning `/proc/*/fd`, twice in a row (a child
+    /// mid-fork is not listed yet), before the test is allowed to run it.
+    /// Test setup only: a real hook is never being written by this process.
+    fn wait_until_unwritten(path: &std::path::Path) {
+        let held = || {
+            let Ok(procs) = std::fs::read_dir("/proc") else {
+                return false;
+            };
+            procs.flatten().any(|p| {
+                std::fs::read_dir(p.path().join("fd")).is_ok_and(|fds| {
+                    fds.flatten()
+                        .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|l| l == path))
+                })
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut clear = 0;
+        while clear < 2 {
+            if held() {
+                clear = 0;
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "a forked child still holds {} open",
+                    path.display()
+                );
+            } else {
+                clear += 1;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
 

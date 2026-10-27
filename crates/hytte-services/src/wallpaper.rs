@@ -729,22 +729,37 @@ impl Default for WallpaperHandles {
     }
 }
 
-/// Render the current `state`, deduping against `last_args`. Persists nothing —
-/// callers that mutate state persist separately; this is the render side only,
-/// shared by mutations, the initial apply, and the rotation tick.
-fn render(state: &WallpaperState, last_args: &RefCell<Option<Vec<String>>>) {
-    let hour = Local::now().hour();
+/// The pure half of [`render`]: decide what, if anything, to apply. `None` when
+/// the render is refused or unchanged; otherwise `last_args` is updated and the
+/// args to apply are returned. Touches no file and spawns nothing, so a test can
+/// pin the refusal without reaching the user's real config or wallpaper daemon.
+fn render_plan(
+    state: &WallpaperState,
+    hour: u32,
+    last_args: &RefCell<Option<Vec<String>>>,
+) -> Option<Vec<String>> {
     let args = swaybg_args(state, hour);
     // Defence at the sink: no argument may carry a newline or NUL, whatever
     // the source, since the args file is newline-delimited.
     if args.iter().any(|a| a.contains(['\n', '\r', '\0'])) {
         tracing::warn!("wallpaper: refusing to render an argument containing a newline or NUL");
-        return;
+        return None;
     }
     if last_args.borrow().as_deref() == Some(args.as_slice()) {
-        return;
+        return None;
     }
     *last_args.borrow_mut() = Some(args.clone());
+    Some(args)
+}
+
+/// Render the current `state`, deduping against `last_args`. Persists nothing —
+/// callers that mutate state persist separately; this is the render side only,
+/// shared by mutations, the initial apply, and the rotation tick.
+fn render(state: &WallpaperState, last_args: &RefCell<Option<Vec<String>>>) {
+    let hour = Local::now().hour();
+    let Some(args) = render_plan(state, hour, last_args) else {
+        return;
+    };
     let primary = primary_image(state, hour);
     runtime::handle().spawn_blocking(move || apply_render(&args, primary.as_deref()));
 }
@@ -1727,13 +1742,30 @@ mod tests {
     fn render_sink_refuses_a_splitting_argument() {
         // Defence at the sink: a state that bypassed every loader still
         // cannot reach the args file.
+        // Calls the pure plan only: `render` itself would spawn `apply_render`,
+        // which writes the real config and restarts the wallpaper daemon.
+        for bad in ["/a\n-i\n/b", "/a\r/b", "/a\0/b"] {
+            let state = WallpaperState {
+                default: Some(bad.into()),
+                ..WallpaperState::default()
+            };
+            let last = std::cell::RefCell::new(None);
+            assert_eq!(super::render_plan(&state, 12, &last), None, "{bad:?}");
+            assert_eq!(*last.borrow(), None, "{bad:?}: nothing may be cached");
+        }
+    }
+
+    #[test]
+    fn render_plan_applies_a_clean_state_once() {
         let state = WallpaperState {
-            default: Some("/a\n-i\n/b".into()),
+            default: Some("/a.png".into()),
             ..WallpaperState::default()
         };
         let last = std::cell::RefCell::new(None);
-        super::render(&state, &last);
-        assert_eq!(*last.borrow(), None, "nothing may be cached or spawned");
+        let first = super::render_plan(&state, 12, &last).expect("clean state renders");
+        assert!(first.iter().any(|a| a == "/a.png"), "{first:?}");
+        assert_eq!(last.borrow().as_deref(), Some(first.as_slice()));
+        assert_eq!(super::render_plan(&state, 12, &last), None, "deduped");
     }
 
     #[test]

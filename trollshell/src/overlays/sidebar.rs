@@ -3085,7 +3085,10 @@ mod gtk_tests {
             "{side:?}: the tick's last frame is the one the revealer has collapsed on, and \
              it must draw the plain strut: {samples:?}"
         );
-        assert!(last.settled, "{side:?}: the frame the tick stops on is settled");
+        assert!(
+            last.settled,
+            "{side:?}: the frame the tick stops on is settled"
+        );
         assert!(
             during.iter().any(|s| s.width > STRUT && s.width < open),
             "{side:?}: no frame was caught mid-slide, so this asserted nothing: {samples:?}"

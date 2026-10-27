@@ -178,7 +178,9 @@ range above is a floor, not a ceiling.
       the CLI gets a retryable "timed out" refusal with a denied toast; nothing
       is written to `grants.toml`, and the next `auth` prompts again (#1542
       item 5: only a **Deny** click persists a no). Restart the shell first if
-      it predates #1542, or its timeout still sends a persisted Deny.
+      it predates #1542: the broker answers such a shell's _timeout_ Deny as
+      silence (it arrives after the card closed), but its Deny on `Esc` or
+      with no output arrives at once, like a click, and is still persisted.
       Multi-monitor: the prompt lands on the focused output; hot-plug re-keys
       cleanly.
 - [ ] **(#996)** Two shells racing for the socket. With the deployed unit up,

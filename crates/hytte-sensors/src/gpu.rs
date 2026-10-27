@@ -407,28 +407,35 @@ fn read_nvidia_gpu() -> Result<GpuState, NvidiaFailure> {
 }
 
 /// How long a successful Nvidia reading stays valid before
-/// `read_nvidia_with_cache_at` forks `nvidia-smi` again.
+/// `read_nvidia_with_cache_at` forks `nvidia-smi` again: **1.5 s**.
 ///
-/// The samplers that drive [`read_gpu_with_cache`] tick at 1 Hz (#1249), so
-/// this is picked against that tick, not against how fast the GPU's own
-/// numbers actually move:
+/// The samplers that drive [`read_gpu_with_cache`] tick at 1 Hz (#1249), and
+/// `nvidia-smi` is a fork plus an NVML init, routinely 100-300 ms of CPU and
+/// a wake of the GPU driver. The approved intent (#1542, item 7) is to sample
+/// the GPU about every 2 s, less often than the CPU.
 ///
-/// - It must be **under one tick** (1000 ms): a TTL at or above the tick
-///   period would mean some ticks return the fork's normal cost while the
-///   next tick's answer is silently the same age. Staying under the tick
-///   means the constraint holds continuously, not "on average".
-/// - It must be **long enough to matter**: several concurrent callers on the
-///   same tick (a fresh cache handed to more than one poller in the same
-///   process, or two ticks that land within the same wall-clock window) all
-///   land on the one cached reading instead of each forking their own.
+/// This **deliberately gives up** the old "never serve a previous tick's
+/// reading" contract (500 ms, #1297). A served reading is under 1.5 s old
+/// plus the fork's own time.
 ///
-/// 500 ms sits at half a tick — one `nvidia-smi` fork is guaranteed every
-/// tick (the cache can never coast for two consecutive 1 Hz ticks), while
-/// still collapsing any callers that land within the same half-second to
-/// that one fork. This is the issue's own suggestion (#1297); a shorter TTL
-/// buys nothing further since the tick, not the TTL, is now the fork rate's
-/// floor, and a longer one risks a 1 Hz sampler occasionally showing a
-/// reading from the *previous* tick.
+/// Why 1.5 s and not the literal 2 s: the TTL must stay away from every
+/// caller's call period, for the same reason the old 500 ms stayed away from
+/// the 1 s tick. `sampled_at` is the instant the fork *started*, inside a
+/// tick whose own start jitters (a slow `statvfs` alone can add up to 1 s),
+/// so a TTL equal to a 2-tick period would sometimes serve the reading from
+/// two ticks ago and only fork two ticks later. 1.5 s sits half a tick from
+/// both 1 s and 2 s, so +-0.5 s of jitter cannot change which tick forks:
+///
+/// - the native sampler reads the GPU every 2nd tick (`do_gpu`): its calls
+///   land ~2 s apart, always past the TTL, so it forks every time, every
+///   2 s, unchanged;
+/// - the `hytte-plugin-stats` sampler reads every 1 Hz tick: a call ~1 s
+///   after a fork is served, the one ~2 s after forks, so it now forks
+///   every other tick (it forked every tick before).
+///
+/// It still collapses several callers that land inside the same window (a
+/// fresh cache handed to more than one poller in the same process) onto the
+/// one cached reading.
 ///
 /// This bounds forks **within one process sharing one cache value** — three
 /// processes (the native sensors service, a bar `hytte-plugin-stats`
@@ -436,7 +443,7 @@ fn read_nvidia_gpu() -> Result<GpuState, NvidiaFailure> {
 /// and still fork independently. Collapsing that is #1252 (retire the native
 /// sampler) plus the sidebar instance's own parking, which already stops a
 /// closed sidebar from polling at all.
-pub const NVIDIA_READING_TTL: Duration = Duration::from_millis(500);
+pub const NVIDIA_READING_TTL: Duration = Duration::from_millis(1500);
 
 /// Per-tick GPU cache state threaded through the poll loop.
 ///
@@ -465,9 +472,8 @@ pub struct GpuCache {
     /// The last successful Nvidia reading and the instant its fork was
     /// *started* (not when `nvidia-smi` returned — a cold CUDA/NVML init is
     /// routinely 100-300 ms, so a reading served at just under the TTL can
-    /// be measurably older in wall-clock terms; harmless at today's
-    /// cadences, since nothing calls this arm more than once a tick, but
-    /// worth knowing if the TTL is ever raised).
+    /// be measurably older in wall-clock terms than the TTL says; at the 1.5 s
+    /// TTL that is up to a few hundred ms on top of it).
     ///
     /// `None` until the first successful `nvidia-smi` fork, and reset to
     /// `None` whenever a fork fails (mirrors `nvidia_available` flipping to
@@ -804,7 +810,7 @@ mod tests {
         // Several more calls, at different instants strictly inside the TTL
         // window, must all be served the cached reading with no further fork.
         for step in 1..=5u64 {
-            let now = t0 + Duration::from_millis(step * 80); // up to 400ms, under the 500ms TTL
+            let now = t0 + Duration::from_millis(step * 80); // up to 400ms, well under the 1.5s TTL
             let (state, _) = read_nvidia_with_cache_at(cache.clone(), now, || {
                 fork_count.set(fork_count.get() + 1);
                 Ok(fake_reading("should not be forked"))
@@ -819,6 +825,59 @@ mod tests {
                 Some("fake nvidia"),
                 "call {step} inside the TTL must return the cached reading, not a fresh one"
             );
+        }
+    }
+
+    /// The value is a product decision (#1542, item 7), so it is pinned as a
+    /// literal rather than through the constant: changing it must change this.
+    #[test]
+    fn nvidia_reading_ttl_is_one_and_a_half_seconds() {
+        assert_eq!(NVIDIA_READING_TTL, Duration::from_millis(1500));
+    }
+
+    /// Run one scenario from a fresh fork at `t0`: a second call `after_ms`
+    /// later, returning whether that call forked.
+    fn forks_after(after_ms: u64) -> bool {
+        let fork_count = Cell::new(0u32);
+        let t0 = Instant::now();
+        let (_, cache) = read_nvidia_with_cache_at(GpuCache::default(), t0, || {
+            fork_count.set(fork_count.get() + 1);
+            Ok(fake_reading("first"))
+        });
+        assert_eq!(fork_count.get(), 1);
+        let (state, _) =
+            read_nvidia_with_cache_at(cache, t0 + Duration::from_millis(after_ms), || {
+                fork_count.set(fork_count.get() + 1);
+                Ok(fake_reading("second"))
+            });
+        let forked = fork_count.get() == 2;
+        let want = if forked { "second" } else { "first" };
+        assert_eq!(state.as_ref().map(|s| s.name.as_str()), Some(want));
+        forked
+    }
+
+    /// The 1 Hz caller (`hytte-plugin-stats`): a call ~1 s after a fork is
+    /// served from cache and one ~2 s after forks, with +-0.4 s of tick
+    /// jitter either way, so it forks every other tick.
+    #[test]
+    fn a_one_hz_caller_forks_every_other_tick_despite_jitter() {
+        for ms in [600, 1000, 1400] {
+            assert!(
+                !forks_after(ms),
+                "a call {ms} ms after a fork must be served"
+            );
+        }
+        for ms in [1600, 2000, 2400] {
+            assert!(forks_after(ms), "a call {ms} ms after a fork must fork");
+        }
+    }
+
+    /// The 2-tick caller (the native sampler's `do_gpu`): its calls land
+    /// ~2 s apart, so with jitter each one is past the TTL and forks.
+    #[test]
+    fn a_two_tick_caller_forks_every_call_despite_jitter() {
+        for ms in [1600, 2400] {
+            assert!(forks_after(ms), "a call {ms} ms after a fork must fork");
         }
     }
 
@@ -1064,7 +1123,7 @@ mod tests {
         });
 
         for step in 1..=5u64 {
-            let now = t0 + Duration::from_millis(step * 80); // up to 400ms, under the 500ms TTL
+            let now = t0 + Duration::from_millis(step * 80); // up to 400ms, well under the 1.5s TTL
             let (state, next) = read_nvidia_with_cache_at(cache, now, || {
                 fork_count.set(fork_count.get() + 1);
                 Ok(fake_reading("should not be forked"))

@@ -956,14 +956,19 @@ mod system_tests {
         )
     }
 
-    /// Assert the result is a `MethodError` named exactly `expected`.
-    fn assert_error_name_is<T: std::fmt::Debug>(result: &Result<T, zbus::Error>, expected: &str) {
+    /// Assert the reply to `method` is a `MethodError` named exactly
+    /// `expected`.
+    fn assert_error_name_is<T: std::fmt::Debug>(
+        method: &str,
+        result: &Result<T, zbus::Error>,
+        expected: &str,
+    ) {
         match result {
             Err(zbus::Error::MethodError(name, _detail, _reply)) => {
-                assert_eq!(name.as_str(), expected);
+                assert_eq!(name.as_str(), expected, "{method}: wrong error");
             }
-            Err(other) => panic!("expected MethodError {expected:?}, got {other:?}"),
-            Ok(value) => panic!("expected MethodError {expected:?}, got Ok({value:?})"),
+            Err(other) => panic!("{method}: expected MethodError {expected:?}, got {other:?}"),
+            Ok(value) => panic!("{method}: expected MethodError {expected:?}, got Ok({value:?})"),
         }
     }
 
@@ -1014,7 +1019,7 @@ mod system_tests {
                 .unwrap_or_else(|_| {
                     panic!("{method} from an outsider waited on a prompt instead of being refused")
                 });
-            assert_error_name_is(&refused, CANCELED);
+            assert_error_name_is(method, &refused, CANCELED);
             assert!(
                 mounted.prompts.get_cloned().is_none(),
                 "{method}: no prompt raised"
@@ -1079,7 +1084,7 @@ mod system_tests {
         )
         .await
         .expect("Cancel did not return in time");
-        assert_error_name_is(&cancel, CANCELED);
+        assert_error_name_is("Cancel", &cancel, CANCELED);
 
         assert!(
             mounted.waiters.lock().await.contains_key(&prompt.id),
@@ -1146,7 +1151,7 @@ mod system_tests {
             .await
             .expect("iwd's request did not return in time")
             .expect("request task panicked");
-        assert_error_name_is(&iwd_reply, FAILED);
+        assert_error_name_is("RequestPassphrase", &iwd_reply, FAILED);
 
         assert!(
             mounted.waiters.lock().await.contains_key(&nm_prompt.id),

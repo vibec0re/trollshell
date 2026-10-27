@@ -45,7 +45,32 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     contended.set_pixel_size(crate::scale::scale(16));
     contended.set_visible(false);
     container.append(&contended);
-    bind(tray::ownership(), &contended, |img, state: OwnState| {
+    bind_contention(&contended, tray::ownership());
+
+    // The map persists across signal emits on the GTK main thread.
+    // Rc is fine here — bind() drives the closure via spawn_local.
+    let button_map: Rc<RefCell<ButtonMap>> = Rc::new(RefCell::new(HashMap::new()));
+
+    bind_tray_items(&container, tray::items(), &button_map, monitor.clone());
+
+    container.upcast()
+}
+
+/// Show the contention glyph `contended`, and the tray it sits in, while
+/// `signal` says another host holds the watcher name (#747).
+///
+/// Split out of [`widget`] for the same reason as [`bind_tray_items`]: so the
+/// binding can be driven with a synthetic signal in a test (#1602 review,
+/// LOW). It is the one path that shows the glyph in the case it exists for.
+/// With the name lost, no item ever registers here, so [`update_tray`] never
+/// runs again and the tray stays empty and hidden; only the
+/// [`show_while_occupied`] below brings it back, and the bar's group follows
+/// the tray (`main.rs`'s `group`).
+pub(crate) fn bind_contention<S>(contended: &gtk::Image, signal: S)
+where
+    S: Signal<Item = OwnState> + 'static,
+{
+    bind(signal, contended, |img, state: OwnState| {
         if let Some(msg) = contention::notice(&state, &SUBJECT) {
             img.set_tooltip_text(Some(&msg));
             img.set_visible(true);
@@ -57,34 +82,21 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
             show_while_occupied(&container);
         }
     });
-
-    // The map persists across signal emits on the GTK main thread.
-    // Rc is fine here — bind() drives the closure via spawn_local.
-    let button_map: Rc<RefCell<ButtonMap>> = Rc::new(RefCell::new(HashMap::new()));
-
-    bind_tray_items(&container, tray::items(), &button_map, monitor.clone());
-
-    container.upcast()
 }
 
-/// The tray's own box: hidden while nothing in it is visible, and taking the
-/// box it is packed in along with it (#1602 review, NIT-2).
+/// The tray's own box, hidden while nothing in it is visible.
 ///
 /// With `Passive` items hidden (#1542), "no visible tray icon" is a common
-/// state rather than a rare one. The bar packs the tray into a group box of
-/// its own (`main.rs`'s `group`) inside a cluster that spaces its children
-/// 6 px apart, and a box spaces every **visible** child, even one with nothing
-/// visible inside it. So hiding the tray's buttons, or the tray itself, still
-/// leaves 6 px of bar where the tray was; the group has to go too. Its
-/// visibility follows the tray's whenever the tray is shown or hidden, or
-/// packed somewhere: visible while any of its children is. Starts hidden, so
-/// an empty tray never takes room, not even until the first item arrives.
-fn tray_container() -> gtk::Box {
+/// state rather than a rare one. A box with nothing visible in it is still a
+/// visible child of its parent, so the box hides itself. The bar packs it into
+/// a group box of its own (`main.rs`'s `group`), which hides while none of its
+/// chips is visible (#1607), so a hidden tray leaves no gap in the bar. Starts
+/// hidden, so an empty tray never takes room, not even until the first item
+/// arrives.
+pub(crate) fn tray_container() -> gtk::Box {
     let container = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     container.add_css_class("ts-tray");
     container.set_visible(false);
-    container.connect_visible_notify(show_parent_while_occupied);
-    container.connect_parent_notify(show_parent_while_occupied);
     container
 }
 
@@ -107,13 +119,6 @@ fn any_child_visible(widget: &gtk::Widget) -> bool {
 /// an item button that is not `Passive`, or the contention glyph.
 fn show_while_occupied(widget: &gtk::Widget) {
     widget.set_visible(any_child_visible(widget));
-}
-
-/// [`show_while_occupied`] for the box `container` is packed in.
-fn show_parent_while_occupied(container: &gtk::Box) {
-    if let Some(parent) = container.parent() {
-        show_while_occupied(&parent);
-    }
 }
 
 /// Diff `signal`'s tray items into `container`, reusing the buttons kept in
@@ -222,7 +227,8 @@ fn update_tray(
     *button_map.borrow_mut() = map;
 
     // After the write-back, so a handler this sets off finds the map in
-    // place: hiding the tray hides its group too (see `tray_container`).
+    // place: hiding or showing the tray runs its group's `notify::visible`
+    // handler (`main.rs`'s `group`) synchronously.
     show_while_occupied(container.upcast_ref());
 }
 
@@ -898,43 +904,23 @@ mod tests {
         }
     }
 
-    // ── #1602 review NIT-2: an empty tray takes no room ─────────────────────
+    // ── #1602 review NIT-2: an empty tray hides itself ──────────────────────
 
-    /// Minimum width of `widget`, the room a box gives it.
-    fn width(widget: &impl IsA<gtk::Widget>) -> i32 {
-        widget.measure(gtk::Orientation::Horizontal, -1).0
-    }
-
-    /// A box with a fixed 20 px minimum width, standing in for a neighbour.
-    fn neighbour() -> gtk::Box {
-        let b = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        b.set_size_request(20, 10);
-        b
-    }
-
-    /// A tray with nothing visible in it takes no room in the bar: not its
-    /// own, and not the 6 px the bar's cluster puts between it and its
-    /// neighbours, which is what an empty but visible group box costs. Built
-    /// the way the bar packs the tray: the tray box inside a group box of its
-    /// own, between two neighbours of a 6 px-spaced cluster. A visible extra
-    /// child (the contention glyph's place) keeps the tray shown.
+    /// A tray with nothing visible in it hides itself, from the start and
+    /// after every diff, and shows exactly while an item that is not
+    /// `Passive`, or some other child (the contention glyph's place), is
+    /// visible. Hiding the tray is half of "an empty tray takes no room in
+    /// the bar"; the other half is its group following it, which `main.rs`'s
+    /// `group_tests` measure (#1607).
     ///
-    /// Falsified by dropping the group's visibility sync from
-    /// `tray_container` (the empty tray costs 6 px), or the
-    /// `show_while_occupied` call from `update_tray` (the tray never shows).
+    /// Falsified by dropping `tray_container`'s `set_visible(false)` (the
+    /// empty tray is visible from the start), or the `show_while_occupied`
+    /// call from `update_tray` (the tray never shows).
     #[gtk::test]
-    fn a_tray_with_nothing_visible_takes_no_room_in_the_bar() {
+    fn a_tray_with_nothing_visible_hides_itself() {
         let monitor = test_monitor();
         let container = super::tray_container();
-        let group = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        group.append(&container);
-        let cluster = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        let (left, right) = (neighbour(), neighbour());
-        cluster.append(&left);
-        cluster.append(&group);
-        cluster.append(&right);
-        let without_tray = width(&left) + 6 + width(&right);
-        assert_eq!(width(&cluster), without_tray, "empty from the start");
+        assert!(!container.get_visible(), "empty from the start");
 
         let map: SharedMap = Rc::new(RefCell::new(HashMap::new()));
         for (items, shown) in [
@@ -945,13 +931,7 @@ mod tests {
             (vec![], false),
         ] {
             update_tray(&container, &map, &items, &monitor);
-            assert_eq!(container.is_visible(), shown, "tray, {items:?}");
-            assert_eq!(group.is_visible(), shown, "group, {items:?}");
-            if shown {
-                assert!(width(&cluster) > without_tray, "{items:?}");
-            } else {
-                assert_eq!(width(&cluster), without_tray, "no gap, {items:?}");
-            }
+            assert_eq!(container.get_visible(), shown, "{items:?}");
         }
 
         let glyph = gtk::Image::from_icon_name("dialog-warning-symbolic");
@@ -962,7 +942,7 @@ mod tests {
             &[item_in("a", ItemStatus::Passive)],
             &monitor,
         );
-        assert!(container.is_visible() && group.is_visible(), "glyph shown");
+        assert!(container.get_visible(), "glyph shown");
     }
 }
 

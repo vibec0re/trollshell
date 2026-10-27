@@ -41,6 +41,13 @@
 //! A newer pairing for the same device replaces the older one's entry
 //! (generations), so a retry is never ended by the attempt before it.
 //!
+//! **A new pairing is a new decision.** If the user set a device to Untrust
+//! in its menu and later pairs it again (accepting the device's pairing
+//! prompt, or choosing Pair here), it ends up trusted again. Accepting a
+//! pairing means trusting the device, whichever side starts it and whatever
+//! was chosen for it before. To keep a device untrusted, reject its pairing,
+//! or set it to Untrust again afterwards.
+//!
 //! `AuthorizeService` itself still saves nothing: Allow answers one request.
 
 use super::{PairOutcome, pair_outcome};
@@ -557,9 +564,9 @@ mod tests {
     /// window. The older pairing's deadline must not end the newer one, and
     /// the device ends trusted.
     ///
-    /// **Falsification:** let `end` drop the entry whatever its generation
-    /// and the device leaves the set at the incoming pairing's deadline,
-    /// while the shell's `Pair` is still running.
+    /// **Falsification:** drop the generations (`is_current` always true and
+    /// `end` removing whatever entry is there) and the incoming pairing's
+    /// deadline ends the shell's pairing while its `Pair` is still running.
     #[tokio::test(start_paused = true)]
     async fn clicking_pair_during_an_incoming_pairing_ends_trusted() {
         let bus = FakeBus::new();

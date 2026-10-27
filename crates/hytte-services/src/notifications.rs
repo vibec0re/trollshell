@@ -141,10 +141,12 @@ pub struct Notification {
     pub urgency: Urgency,
     /// Resolved timeout: `Some(Duration)` for finite, `None` for sticky.
     ///
-    /// Mapping from `expire_timeout`, per the freedesktop notification spec:
-    /// - `<0` (e.g. `-1`) → `Some(5s)` (server default)
+    /// Mapping from `expire_timeout` and `urgency`, per the freedesktop
+    /// notification spec (the whole rule is `resolve_timeout`):
+    /// - `<0` (e.g. `-1`) → `Some(5s)` (server default), except
+    ///   [`Urgency::Critical`] → `None` (stays until dismissed)
     /// - `0`             → `None` (sticky / never expires)
-    /// - `>0`            → `Some(millis)` (as requested)
+    /// - `>0`            → `Some(millis)` (as requested, at any urgency)
     pub timeout: Option<Duration>,
     /// Action buttons to display below the notification body.
     pub actions: Vec<Action>,
@@ -1059,6 +1061,12 @@ fn rate_limit_allow(app_name: &str, summary: &str, body: &str) -> bool {
 /// user just triggered by clicking should not be silently eaten by DND, so the
 /// swept Wi-Fi/VPN error arms all pass `Critical`.
 ///
+/// Here `Critical` only bypasses those gates: a self-toast still expires after
+/// [`DEFAULT_TIMEOUT`] at every urgency. That differs from a D-Bus client's
+/// `Critical` notification with `expire_timeout = -1`, which
+/// [`resolve_timeout`] keeps on screen until dismissed (#1542). The shell's
+/// own error toasts were not part of that decision, so they keep expiring.
+///
 /// # Rate-limiting
 ///
 /// Identical `(app_name, summary, body)` toasts within
@@ -1194,8 +1202,9 @@ struct NotificationsIface {
 impl NotificationsIface {
     /// Show a notification. Returns the notification id.
     ///
-    /// `expire_timeout` (freedesktop notification spec):
-    ///   - `<0` (e.g. `-1`) → use server default (5s)
+    /// `expire_timeout` (freedesktop notification spec; see `resolve_timeout`):
+    ///   - `<0` (e.g. `-1`) → use server default: 5s, or sticky for a
+    ///     `Critical` urgency
     ///   - `0`             → notification is sticky (never auto-dismissed)
     ///   - `>0`            → milliseconds
     // Signature mirrors the `org.freedesktop.Notifications.Notify` D-Bus
@@ -1223,8 +1232,9 @@ impl NotificationsIface {
             })
             .unwrap_or_default();
 
-        // Resolve timeout (see `resolve_timeout`).
-        let timeout = resolve_timeout(expire_timeout);
+        // Resolve timeout (see `resolve_timeout`). It needs the urgency: a
+        // `Critical` notification that leaves the timeout to us never expires.
+        let timeout = resolve_timeout(urgency, expire_timeout);
 
         // Strip any HTML-like markup from body conservatively.
         let body_clean = strip_markup(body);
@@ -1405,24 +1415,38 @@ fn forget_replaced_local_actions(
 // ── Helper: resolve timeout ───────────────────────────────────────────────────
 
 /// Server default applied when an app delegates the timeout (`expire_timeout
-/// < 0`, conventionally `-1`).
+/// < 0`, conventionally `-1`) for a `Low` or `Normal` urgency notification.
+/// A `Critical` one that delegates it gets no timeout at all; see
+/// [`resolve_timeout`].
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Resolve a freedesktop `expire_timeout` into a finite auto-dismiss duration
-/// (`Some`) or a sticky notification (`None`).
+/// Resolve a freedesktop `expire_timeout` and the notification's `urgency`
+/// into a finite auto-dismiss duration (`Some`) or a sticky notification
+/// (`None`). This is the whole expiry rule: the D-Bus `Notify` handler stores
+/// the result on [`Notification::timeout`] and hands the same value to
+/// [`set_expiry`], which arms (or stands down) the auto-dismiss sleep.
 ///
 /// Per the [notification spec][spec]:
-/// - `< 0` (conventionally `-1`) → server decides; we apply [`DEFAULT_TIMEOUT`].
-/// - `0` → never expire (sticky).
-/// - `> 0` → that many milliseconds.
+/// - `< 0` (conventionally `-1`) → server decides. The spec lets that "vary
+///   for the type of notification", and says critical notifications "should
+///   not automatically expire" ([urgency levels][urgency]). So
+///   [`Urgency::Critical`] → `None`: it stays until the user dismisses it,
+///   or the client closes or replaces it. Every other urgency →
+///   [`DEFAULT_TIMEOUT`].
+/// - `0` → never expire (sticky), at any urgency.
+/// - `> 0` → that many milliseconds, at any urgency. A client that names a
+///   timeout for a critical notification gets the timeout it named.
 ///
 /// Note the `0` and `-1` cases are easy to invert — `-1` ("you decide") is by
 /// far the most common value (it's `notify-send`'s default), so mapping it to
-/// sticky makes ordinary toasts pile up forever (see issue #15).
+/// sticky makes ordinary toasts pile up forever (see issue #15). Only the
+/// critical arm of `-1` is sticky (#1542).
 ///
 /// [spec]: https://specifications.freedesktop.org/notification-spec/latest/protocol.html
-fn resolve_timeout(expire_timeout: i32) -> Option<Duration> {
+/// [urgency]: https://specifications.freedesktop.org/notification-spec/latest/urgency-levels.html
+fn resolve_timeout(urgency: Urgency, expire_timeout: i32) -> Option<Duration> {
     match expire_timeout.cmp(&0) {
+        std::cmp::Ordering::Less if urgency == Urgency::Critical => None,
         std::cmp::Ordering::Less => Some(DEFAULT_TIMEOUT),
         std::cmp::Ordering::Equal => None,
         std::cmp::Ordering::Greater => {
@@ -2135,28 +2159,132 @@ mod tests {
         );
     }
 
+    const ALL_URGENCIES: [Urgency; 3] = [Urgency::Low, Urgency::Normal, Urgency::Critical];
+
+    /// The four cases #1542 settled, with literal durations rather than
+    /// [`DEFAULT_TIMEOUT`], so a change to the constant shows up here too.
     #[test]
-    fn negative_timeout_uses_server_default() {
+    fn timeout_rule_by_urgency() {
+        let cases = [
+            // A critical that leaves the timeout to us never expires.
+            (Urgency::Critical, -1, None),
+            // A critical with a timeout of its own gets exactly that.
+            (Urgency::Critical, 3000, Some(Duration::from_secs(3))),
+            // Anything else that leaves it to us gets the 5 s default.
+            (Urgency::Normal, -1, Some(Duration::from_secs(5))),
+            // 0 means never, whatever the urgency.
+            (Urgency::Low, 0, None),
+        ];
+        for (urgency, expire_timeout, want) in cases {
+            assert_eq!(
+                resolve_timeout(urgency, expire_timeout),
+                want,
+                "({urgency:?}, {expire_timeout})"
+            );
+        }
+    }
+
+    #[test]
+    fn negative_timeout_uses_server_default_below_critical() {
         // -1 ("you decide") is notify-send's default and the common case;
         // it must NOT be sticky (regression test for issue #15).
-        assert_eq!(resolve_timeout(-1), Some(DEFAULT_TIMEOUT));
-        assert_eq!(resolve_timeout(i32::MIN), Some(DEFAULT_TIMEOUT));
+        for urgency in [Urgency::Low, Urgency::Normal] {
+            assert_eq!(resolve_timeout(urgency, -1), Some(DEFAULT_TIMEOUT));
+            assert_eq!(resolve_timeout(urgency, i32::MIN), Some(DEFAULT_TIMEOUT));
+        }
+    }
+
+    #[test]
+    fn negative_timeout_is_sticky_for_critical() {
+        // Any negative value delegates to the server, not just -1.
+        assert_eq!(resolve_timeout(Urgency::Critical, -1), None);
+        assert_eq!(resolve_timeout(Urgency::Critical, i32::MIN), None);
     }
 
     #[test]
     fn zero_timeout_is_sticky() {
         // Per spec, 0 means never expire.
-        assert_eq!(resolve_timeout(0), None);
+        for urgency in ALL_URGENCIES {
+            assert_eq!(resolve_timeout(urgency, 0), None, "{urgency:?}");
+        }
     }
 
     #[test]
     fn positive_timeout_is_exact_millis() {
-        assert_eq!(resolve_timeout(1), Some(Duration::from_millis(1)));
-        assert_eq!(resolve_timeout(2500), Some(Duration::from_millis(2500)));
-        assert_eq!(
-            resolve_timeout(i32::MAX),
-            Some(Duration::from_millis(i32::MAX as u64))
-        );
+        // A timeout the client names is honoured at every urgency, critical
+        // included.
+        for urgency in ALL_URGENCIES {
+            assert_eq!(
+                resolve_timeout(urgency, 1),
+                Some(Duration::from_millis(1)),
+                "{urgency:?}"
+            );
+            assert_eq!(
+                resolve_timeout(urgency, 2500),
+                Some(Duration::from_millis(2500)),
+                "{urgency:?}"
+            );
+            assert_eq!(
+                resolve_timeout(urgency, i32::MAX),
+                Some(Duration::from_millis(i32::MAX as u64)),
+                "{urgency:?}"
+            );
+        }
+    }
+
+    /// The `Notify` handler passes the urgency it parsed from the hints to
+    /// [`resolve_timeout`]. Driven through the real `notify`, like
+    /// `notify_replacing_a_live_local_toast_forgets_its_callbacks`: with no
+    /// `NotificationsShared` registered, `set_expiry` is a no-op, and the
+    /// handler stores the same `timeout` it hands `set_expiry` on the
+    /// notification it publishes. The pure tests above cannot see a handler
+    /// that resolves with the wrong urgency; this one can.
+    #[test]
+    fn notify_resolves_the_timeout_with_the_hinted_urgency() {
+        let iface = NotificationsIface {
+            active: Mutable::new(Vec::new()),
+            next_id: Arc::new(AtomicU32::new(1)),
+            local_actions: Arc::new(Mutex::new(LocalActionMap::new())),
+        };
+        let post = |replaces_id: u32, urgency: Option<u8>, expire_timeout: i32| {
+            let hint_map = urgency
+                .map(|u| hints(&[("urgency", OwnedValue::from(u))]))
+                .unwrap_or_default();
+            let id = futures_executor::block_on(iface.notify(
+                "client",
+                replaces_id,
+                "",
+                "summary",
+                "",
+                Vec::new(),
+                hint_map,
+                expire_timeout,
+            ));
+            let list = iface.active.lock_ref();
+            let n = list.iter().find(|n| n.id == id).expect("published");
+            (id, n.urgency, n.timeout)
+        };
+
+        let (critical, urgency, timeout) = post(0, Some(2), -1);
+        assert_eq!(urgency, Urgency::Critical);
+        assert_eq!(timeout, None, "a critical with the default timeout stays");
+
+        let (_, _, timeout) = post(0, Some(2), 3000);
+        assert_eq!(timeout, Some(Duration::from_secs(3)));
+
+        let (_, urgency, timeout) = post(0, None, -1);
+        assert_eq!(urgency, Urgency::Normal, "no hint is normal urgency");
+        assert_eq!(timeout, Some(Duration::from_secs(5)));
+
+        let (_, _, timeout) = post(0, Some(0), 0);
+        assert_eq!(timeout, None);
+
+        // The client replaces the sticky critical with a normal one: the
+        // replacement re-resolves, so it expires on the default again.
+        let (id, urgency, timeout) = post(critical, Some(1), -1);
+        assert_eq!(id, critical, "a replace of a live id keeps the id");
+        assert_eq!(urgency, Urgency::Normal);
+        assert_eq!(timeout, Some(Duration::from_secs(5)));
     }
 
     // ── Local action registry: insert / dispatch / cleanup ──────────────────

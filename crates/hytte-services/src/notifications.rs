@@ -2155,20 +2155,23 @@ mod tests {
 
     #[test]
     fn shared_atomic_ids_never_collide_across_allocators() {
-        // post_local (through the live set the shared registry holds) and the
-        // D-Bus Notify handler (through the bus's clone of it) both fetch_add
-        // on the SAME Arc<AtomicU32>, so their id streams interleave without
-        // ever overlapping — the collision-safety invariant this feature
-        // depends on.
-        let counter = Arc::new(AtomicU32::new(1));
-        let iface_side = counter.clone(); // the bus's NotificationsIface::next_id
-        let shared_side = counter.clone(); // NotificationsShared::iface.next_id
-
-        let a = iface_side.fetch_add(1, Ordering::Relaxed); // a Notify
-        let b = shared_side.fetch_add(1, Ordering::Relaxed); // a post_local
-        let c = iface_side.fetch_add(1, Ordering::Relaxed); // another Notify
+        // `post_local`, on the half the shared registry holds, and the D-Bus
+        // `Notify` handler, on the bus's half, draw from one counter, so
+        // their ids interleave without ever colliding. Two toasts sharing an
+        // id would let a close, replace, hover or click on one land on the
+        // other. Both posts go through the real allocators, on the two halves
+        // `Service::start` builds (`live_set`, below).
+        let (kept, served) = live_set();
+        let a = post_notify(&served, 0, None, -1); // a Notify
+        let b = kept.post_local(
+            "Wi-Fi",
+            "Connection failed",
+            "",
+            Urgency::Normal,
+            Vec::new(),
+        );
+        let c = post_notify(&served, 0, None, -1); // another Notify
         assert_eq!((a, b, c), (1, 2, 3));
-        assert!(a != b && b != c && a != c);
     }
 
     // ── Notify id resolution: `replaces_id` is honoured only when live ──────
@@ -2604,6 +2607,33 @@ mod tests {
 
     fn has_timer(iface: &NotificationsIface, id: u32) -> bool {
         iface.timers.lock().expect("not poisoned").contains_key(&id)
+    }
+
+    /// The two halves share every handle, not only the two the crossing
+    /// tests below happen to read (#1609 review, LOW-1): a fresh `next_id` or
+    /// `local_actions` on the bus's half leaves those green. The destructure
+    /// names every field with no `..`, so a field added later is a compile
+    /// error here until it is checked too. That matters because a plain-value
+    /// field would be deep-copied by `#[derive(Clone)]`, leaving the bus a
+    /// copy of its own.
+    #[test]
+    fn the_two_halves_share_every_handle() {
+        let (kept, served) = live_set();
+        let NotificationsIface {
+            active,
+            next_id,
+            local_actions,
+            timers,
+        } = &served;
+        assert!(Arc::ptr_eq(next_id, &kept.next_id), "next_id");
+        assert!(
+            Arc::ptr_eq(local_actions, &kept.local_actions),
+            "local_actions"
+        );
+        assert!(Arc::ptr_eq(timers, &kept.timers), "timers");
+        // `Mutable` has no `ptr_eq`: write through one half, read the other.
+        active.lock_mut().push(live(7));
+        assert!(kept.active.lock_ref().iter().any(|n| n.id == 7), "active");
     }
 
     /// Arm through the bus's `Notify`, then hold, release, expire and close

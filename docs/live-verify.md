@@ -176,9 +176,11 @@ range above is a floor, not a ceiling.
       **Allow once** authorizes exactly one `get` then the next is denied. Let
       a prompt sit **60 s** unanswered → the card closes, and about 5 s later
       the CLI gets a retryable "timed out" refusal with a denied toast; nothing
-      is written to `grants.toml`, and the next `auth` prompts again (#1542
-      item 5: only a **Deny** click persists a no). Restart the shell first if
-      it predates #1542, or its timeout still sends a persisted Deny.
+      is written to `grants.toml` (#1542 item 5: only a **Deny** click persists
+      a no). For 5 min after that the same `auth` is refused at once with
+      "went unanswered recently … retry in N s" and no card; after that it
+      prompts again, and so does a restarted infobroker. Restart the shell
+      first if it predates #1542, or its timeout still sends a persisted Deny.
       Multi-monitor: the prompt lands on the focused output; hot-plug re-keys
       cleanly.
 - [ ] **(#996)** Two shells racing for the socket. With the deployed unit up,

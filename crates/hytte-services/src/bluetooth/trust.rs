@@ -59,9 +59,12 @@
 //! the agent checks the set only after its caller check's round trip to the
 //! bus: a request bluetoothd sent before it applied the `Set` can reach the
 //! check after the entry is gone. So when the set misses, the agent reads
-//! the device's `Trusted` from bluetoothd before it prompts
+//! the device's `Trusted` before it prompts, from the bluetoothd that sent
+//! the request, by the unique name the caller check verified
 //! ([`DeviceBus::trusted`]), and a device that is trusted by then is let
-//! through. A set miss means the entry ended before the check, so the `Set`
+//! through. The bus never activates a unique name, so the read cannot start
+//! a bluetoothd that was stopped in the meantime; it fails, and the user is
+//! asked. A set miss means the entry ended before the check, so the `Set`
 //! was answered before the read is sent: a device whose pairing succeeded,
 //! and whose `Set Trusted` bluetoothd took, is found in one or the other
 //! whatever the timing.
@@ -88,7 +91,7 @@
 
 use super::{PairOutcome, pair_outcome};
 use futures_util::future::BoxFuture;
-use hytte_bus::{BusError, BusKind, RetryPolicy};
+use hytte_bus::{BusError, BusKind, CallBuilder, RetryPolicy};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -245,10 +248,18 @@ pub(super) trait DeviceBus: Send + Sync {
     /// bluetoothd's own `Trusted` for `device`, read from bluetoothd now
     /// rather than from the snapshot, which can lag it.
     ///
-    /// The read goes to `org.bluez`, and a call to a name nobody owns
-    /// D-Bus-activates its service, so call it only while bluetoothd is
-    /// known to be running.
-    fn trusted<'a>(&'a self, device: &'a str) -> BoxFuture<'a, Result<bool, BusError>>;
+    /// `bluetoothd` is the **unique name** of the bluetoothd to ask: the one
+    /// whose request is being answered, as the caller check verified it.
+    /// Never `org.bluez`: a call to a well-known name nobody owns makes the
+    /// bus start its service, which would undo a `systemctl stop bluetooth`
+    /// issued since the request arrived. The bus never activates a unique
+    /// name; if that bluetoothd is gone, the read fails instead
+    /// (`org.freedesktop.DBus.Error.ServiceUnknown`, #1614 review LOW-1).
+    fn trusted<'a>(
+        &'a self,
+        bluetoothd: &'a str,
+        device: &'a str,
+    ) -> BoxFuture<'a, Result<bool, BusError>>;
     /// The watcher's snapshot of `device`, `None` if it lists no such device.
     fn shown(&self, device: &str) -> Option<Shown>;
 }
@@ -269,8 +280,16 @@ impl DeviceBus for SystemBluez {
         Box::pin(super::do_device_call(device, "Connect"))
     }
 
-    fn trusted<'a>(&'a self, device: &'a str) -> BoxFuture<'a, Result<bool, BusError>> {
-        Box::pin(read_trusted(device))
+    fn trusted<'a>(
+        &'a self,
+        bluetoothd: &'a str,
+        device: &'a str,
+    ) -> BoxFuture<'a, Result<bool, BusError>> {
+        Box::pin(read_trusted(
+            |to| hytte_bus::call(BusKind::System, to),
+            bluetoothd,
+            device,
+        ))
     }
 
     fn shown(&self, device: &str) -> Option<Shown> {
@@ -283,11 +302,20 @@ impl DeviceBus for SystemBluez {
     }
 }
 
-/// `Properties.Get(org.bluez.Device1, Trusted)` on the pooled system
-/// connection, bounded by [`TRUSTED_READ_TIMEOUT`] and never retried: a read
-/// that fails or is slow costs the caller a prompt, which is the safe answer.
-async fn read_trusted(device: &str) -> Result<bool, BusError> {
-    let value: zbus::zvariant::OwnedValue = hytte_bus::call(BusKind::System, "org.bluez")
+/// `Properties.Get(org.bluez.Device1, Trusted)` sent to the unique name
+/// `bluetoothd` ([`DeviceBus::trusted`] says why never `org.bluez`), bounded
+/// by [`TRUSTED_READ_TIMEOUT`] and never retried: a read that fails or is slow
+/// costs the caller a prompt, which is the safe answer.
+///
+/// `bus` builds the call to a destination: the pooled system connection in
+/// production, a test bus's connection in the system tests, which is how
+/// they run this function's own choice of destination.
+pub(super) async fn read_trusted(
+    bus: impl FnOnce(&str) -> CallBuilder<()>,
+    bluetoothd: &str,
+    device: &str,
+) -> Result<bool, BusError> {
+    let value: zbus::zvariant::OwnedValue = bus(bluetoothd)
         .at_path(device.to_owned())
         .iface("org.freedesktop.DBus.Properties")
         .method("Get")
@@ -443,8 +471,8 @@ pub(super) mod fake {
         /// the read fail. A `SetTrusted` changes it, as bluetoothd's setter
         /// does before it replies.
         pub(in super::super) live_trusted: Mutex<Option<bool>>,
-        /// How many live reads of `Trusted` were made.
-        pub(in super::super) trusted_reads: Mutex<usize>,
+        /// The destination of each live read of `Trusted`, in order.
+        pub(in super::super) trusted_reads: Mutex<Vec<String>>,
         /// When set, each `SetTrusted` records in [`Self::in_set_at_trust`]
         /// whether the device was in this set at that moment.
         pub(in super::super) watched: Mutex<Option<Pairings>>,
@@ -461,7 +489,7 @@ pub(super) mod fake {
                 pair_gate: Mutex::new(None),
                 calls: Mutex::new(Vec::new()),
                 live_trusted: Mutex::new(Some(false)),
-                trusted_reads: Mutex::new(0),
+                trusted_reads: Mutex::new(Vec::new()),
                 watched: Mutex::new(None),
                 in_set_at_trust: Mutex::new(Vec::new()),
             }
@@ -493,8 +521,9 @@ pub(super) mod fake {
             *self.live_trusted.lock().expect("live_trusted") = trusted;
         }
 
-        pub(in super::super) fn trusted_reads(&self) -> usize {
-            *self.trusted_reads.lock().expect("trusted_reads")
+        /// Where each live read of `Trusted` was sent.
+        pub(in super::super) fn trusted_reads(&self) -> Vec<String> {
+            self.trusted_reads.lock().expect("trusted_reads").clone()
         }
 
         fn record(&self, call: Call) {
@@ -519,8 +548,15 @@ pub(super) mod fake {
             Box::pin(async { Ok(()) })
         }
 
-        fn trusted<'a>(&'a self, _device: &'a str) -> BoxFuture<'a, Result<bool, BusError>> {
-            *self.trusted_reads.lock().expect("trusted_reads") += 1;
+        fn trusted<'a>(
+            &'a self,
+            bluetoothd: &'a str,
+            _device: &'a str,
+        ) -> BoxFuture<'a, Result<bool, BusError>> {
+            self.trusted_reads
+                .lock()
+                .expect("trusted_reads")
+                .push(bluetoothd.to_owned());
             let answer = self
                 .live_trusted
                 .lock()

@@ -218,7 +218,8 @@ impl PairAgent {
     /// bluetoothd decided to ask when it queued the request, and a pairing
     /// that has just succeeded can have trusted the device and left the set
     /// since: this check runs only after the caller check's round trip to
-    /// the bus. A read that fails asks, as before.
+    /// the bus. A read that fails, or takes longer than a couple of seconds,
+    /// asks.
     async fn authorize_service_for(
         &self,
         device: &OwnedObjectPath,
@@ -238,9 +239,9 @@ impl PairAgent {
         // comes from the current owner of `org.bluez`, and that bluetoothd is
         // waiting on our answer, so it is running: the bus delivers the read
         // to it and activates nothing. Only a bluetoothd that exits in the
-        // moment between that check and this read would be started again,
-        // the same window every call this module makes after a bluetoothd
-        // reply has.
+        // moment between that check and this read would be started again:
+        // the same narrow window as every follow-up call this module sends
+        // bluetoothd right after hearing from it.
         match self.devices.trusted(device.as_str()).await {
             Ok(true) => {
                 tracing::info!(

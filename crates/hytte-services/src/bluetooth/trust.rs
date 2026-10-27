@@ -61,8 +61,10 @@
 //! check after the entry is gone. So when the set misses, the agent reads
 //! the device's `Trusted` from bluetoothd before it prompts
 //! ([`DeviceBus::trusted`]), and a device that is trusted by then is let
-//! through. Between the set and that read, a device whose pairing succeeded
-//! is covered whatever the timing.
+//! through. A set miss means the entry ended before the check, so the `Set`
+//! was answered before the read is sent: a device whose pairing succeeded,
+//! and whose `Set Trusted` bluetoothd took, is found in one or the other
+//! whatever the timing.
 //!
 //! **A new pairing is a new decision.** If the user set a device to Untrust
 //! in its menu and later pairs it again (accepting the device's pairing
@@ -74,13 +76,13 @@
 //! A re-pairing the user accepts on a device that is **already paired** is
 //! trusted at the watcher's first look at the device list, since the list
 //! already shows the device `Paired` from its old bond, even if the new
-//! pairing then fails (#1603 review, NIT-2). That is harmless today: a failed
+//! pairing then fails (#1611, NIT-2). That is harmless today: a failed
 //! re-pairing keeps the old bond, so bluetoothd does not return the device to
 //! the temporary state, a spoofer whose re-pairing fails gets no link key and
 //! so nothing the trust would let it use, and `BlueZ`'s default
 //! `JustWorksRepairing=never` refuses a Just Works re-pairing before any
-//! prompt (`main.conf`). It does mean that a device set to Untrust becomes
-//! trusted again after an accepted re-pairing that failed.
+//! prompt (`src/main.c`, `src/device.c`). It does mean that a device set to
+//! Untrust becomes trusted again after an accepted re-pairing that failed.
 //!
 //! `AuthorizeService` itself still saves nothing: Allow answers one request.
 

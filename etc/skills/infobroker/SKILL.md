@@ -93,7 +93,11 @@ stderr. **Do not** keep re-running it — a denial is a standing "not yet".
 (An `invalid agent name` refusal is the exception: pick a name that follows
 the rule above and ask once with that.) `auth` can wait up to about a minute
 for the human to answer; the CLI gives up after 80 s if the broker never
-answers at all.
+answers at all. If nobody answers the prompt, `auth` fails as timed out and
+nothing is saved: the human hasn't refused you, they just weren't there. For
+the next 5 minutes, asking again for that datasource is refused at once with
+no prompt, and the message says when to retry. Don't loop on it; tell the
+human you're waiting, or ask later.
 
 ### `get <datasource> [--limit N]`
 

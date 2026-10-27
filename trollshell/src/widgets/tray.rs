@@ -2,7 +2,7 @@ use hytte::bus::OwnState;
 use hytte::futures_signals::signal::Signal;
 use hytte::gtk::{self, gdk, glib, prelude::*};
 use hytte::prelude::*;
-use hytte::services::tray::{self, MenuEntry, MenuItem, TrayItem};
+use hytte::services::tray::{self, ItemStatus, MenuEntry, MenuItem, TrayItem};
 
 use crate::components::cast;
 use crate::components::diff::{DiffOp, plan_diff};
@@ -107,6 +107,9 @@ fn bind_tray_items<S>(
 /// They capture an `Rc<RefCell<TrayItem>>` and read it at activation time, so
 /// they act on current data without stale captures.  Handlers are never
 /// reconnected on reuse — the double-connect bug cannot occur here.
+///
+/// A `NewStatus` arrives as a reuse like any other change, so a `Passive`
+/// item ([`shown`]) keeps its button, hidden, rather than losing it.
 fn update_tray(
     container: &gtk::Box,
     button_map: &Rc<RefCell<ButtonMap>>,
@@ -247,7 +250,22 @@ fn create_item_button(item_cell: &ItemCell, monitor: &Monitor) -> gtk::Button {
     btn
 }
 
-/// Apply (or re-apply) the icon and tooltip from `item` to `btn`.
+/// Whether `item` gets a visible button: every status but `Passive`.
+///
+/// The SNI spec calls `Passive` an idle status that a visualization is likely
+/// to hide, and this tray now does (#1542, from #1494's owner questions). The
+/// rule lives here and nowhere else: the service publishes every registered
+/// item with its status, and a status change re-applies the visuals of the
+/// item's existing button (see [`update_tray`]), so a flip between `Passive`
+/// and `Active`/`NeedsAttention` shows or hides that same button instead of
+/// destroying and rebuilding it — which is what filtering `Passive` out of the
+/// service's list would do on every flip. An item whose `Status` did not
+/// answer reads as `Active` in the service, so it stays visible.
+fn shown(item: &TrayItem) -> bool {
+    item.status != ItemStatus::Passive
+}
+
+/// Apply (or re-apply) the icon, tooltip and visibility from `item` to `btn`.
 ///
 /// Safe to call on both freshly-created and reused buttons.  When reusing,
 /// the old child widget is replaced and any previous tooltip is cleared if
@@ -260,6 +278,8 @@ fn create_item_button(item_cell: &ItemCell, monitor: &Monitor) -> gtk::Button {
 /// 3. Named icon best-effort (theme may resolve it later).
 /// 4. Generic symbolic fallback.
 fn apply_item_button_visuals(btn: &gtk::Button, item: &TrayItem) {
+    btn.set_visible(shown(item));
+
     let icon = gtk::Image::new();
 
     // Robust fallback chain:
@@ -493,19 +513,25 @@ mod tests {
     /// uses.
     type SharedMap = Rc<RefCell<ButtonMap>>;
 
-    /// A `TrayItem` distinguished only by `key` — the diff keys on it, and no
-    /// other field matters to either test below. Every field is `pub` (see
+    /// A visible (`Active`) `TrayItem` distinguished only by `key` — the diff
+    /// keys on it, and no other field matters to the reentrancy and binding
+    /// tests below. Every field is `pub` (see
     /// `hytte_services::tray::TrayItem`), so a struct literal needs no
     /// constructor of its own, exactly like `workspaces.rs`'s local `ws()`
     /// builds a `niri::Workspace` directly.
     fn item(key: &str) -> TrayItem {
+        item_in(key, ItemStatus::Active)
+    }
+
+    /// `item` with a given status, for the `Passive` test.
+    fn item_in(key: &str, status: ItemStatus) -> TrayItem {
         TrayItem {
             key: key.to_owned(),
             bus_name: String::new(),
             object_path: String::new(),
             title: String::new(),
             icon_name: String::new(),
-            status: ItemStatus::Passive,
+            status,
             icon_pixmap: None,
             tooltip_title: String::new(),
             tooltip_description: String::new(),
@@ -773,5 +799,96 @@ mod tests {
         // a dead weak ref: `bind` upgrades, gets `None`, and breaks its loop.
         items.set(vec![item("b")]);
         pump();
+    }
+
+    // ── #1542: `Passive` items are hidden ───────────────────────────────────
+
+    /// A `Passive` item's button is hidden, and a status flip shows or hides
+    /// that same button, live, with no new button per flip. The neighbour
+    /// stays visible throughout, so the rule is per item.
+    ///
+    /// Falsified by deleting `apply_item_button_visuals`' `set_visible` line:
+    /// the `Passive` button is then visible from the first pass.
+    #[gtk::test]
+    fn a_passive_item_is_hidden_and_a_status_flip_toggles_the_same_button() {
+        let monitor = test_monitor();
+        let (container, map) = strip(
+            &monitor,
+            &[item_in("a", ItemStatus::Passive), item("b")],
+        );
+        let button = map.borrow()["a"].0.clone();
+        assert!(!button.is_visible(), "a Passive item's button is hidden");
+        assert_eq!(
+            button.parent(),
+            Some(container.clone().upcast::<gtk::Widget>()),
+            "hidden, not removed"
+        );
+
+        for (status, visible) in [
+            (ItemStatus::Active, true),
+            (ItemStatus::NeedsAttention, true),
+            (ItemStatus::Passive, false),
+            (ItemStatus::Active, true),
+        ] {
+            update_tray(
+                &container,
+                &map,
+                &[item_in("a", status), item("b")],
+                &monitor,
+            );
+            let now = map.borrow()["a"].0.clone();
+            assert_eq!(
+                now, button,
+                "{status:?}: a status flip must reuse the item's button"
+            );
+            assert_eq!(now.is_visible(), visible, "{status:?}");
+            assert!(map.borrow()["b"].0.is_visible(), "{status:?}: neighbour");
+        }
+    }
+}
+
+/// The hiding rule on its own, in the default (hermetic) bucket. The test that
+/// it reaches a real button is the `Passive` one in the display-gated module
+/// above.
+#[cfg(test)]
+mod passive_tests {
+    use super::shown;
+    use hytte::services::tray::{ItemStatus, TrayItem};
+
+    fn item(status: ItemStatus) -> TrayItem {
+        TrayItem {
+            key: ":1.5/StatusNotifierItem".to_owned(),
+            bus_name: ":1.5".to_owned(),
+            object_path: "/StatusNotifierItem".to_owned(),
+            title: String::new(),
+            icon_name: String::new(),
+            status,
+            icon_pixmap: None,
+            tooltip_title: String::new(),
+            tooltip_description: String::new(),
+            menu_path: None,
+            item_is_menu: false,
+        }
+    }
+
+    /// One item moving Passive → Active → NeedsAttention → Passive → Active,
+    /// as successive `NewStatus` re-reads deliver it: hidden exactly while
+    /// it is `Passive`.
+    ///
+    /// Falsifiable: make `shown` answer `true` and the first and fourth steps
+    /// go red.
+    #[test]
+    fn an_item_is_hidden_exactly_while_it_is_passive() {
+        let seen: Vec<bool> = [
+            ItemStatus::Passive,
+            ItemStatus::Active,
+            ItemStatus::NeedsAttention,
+            ItemStatus::Passive,
+            ItemStatus::Active,
+        ]
+        .into_iter()
+        .map(|status| shown(&item(status)))
+        .collect();
+        assert_eq!(seen, [false, true, true, false, true]);
     }
 }

@@ -35,9 +35,10 @@ use futures_util::StreamExt;
 use hytte_bus::{BusKind, OwnNameSignal, OwnState, ProxyState, SignalItem, call, proxy, signals};
 use hytte_reactive::{Service, registry, runtime, spawn_supervised, spawn_supervised_bounded};
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::watch;
 use zbus::message::Header;
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{OwnedValue, Structure, Value};
@@ -47,23 +48,39 @@ use crate::retry;
 // ── Public data shapes ────────────────────────────────────────────────────────
 
 /// Active/passive/attention status of a [`TrayItem`].
+///
+/// Published for every item, `Passive` included: whether a `Passive` item is
+/// drawn is the visualization's call (the SNI spec calls it an idle status
+/// that a visualization is likely to hide), and the bar's tray widget makes
+/// it by hiding that item's button while it stays `Passive` (#1542).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ItemStatus {
     /// The item is not relevant to the user at the moment.
-    #[default]
     Passive,
-    /// The item is active and relevant.
+    /// The item is active and relevant. Also what an item is when its
+    /// `Status` did not answer, or answered a value the spec does not name.
+    #[default]
     Active,
     /// The item needs the user's attention.
     NeedsAttention,
 }
 
 impl ItemStatus {
+    /// Map the `Status` property's string. Only the exact spec spellings of
+    /// `Passive` and `NeedsAttention` count; anything else — `Active`, an
+    /// empty string, a value the spec does not name, or no answer at all
+    /// (which [`read_item_props`] reads as `""`) — is `Active`.
+    ///
+    /// The fallback used to be `Passive`. That was invisible while nothing
+    /// acted on the status, but with `Passive` items hidden (#1542) it would
+    /// hide every item that is merely sloppy about `Status`, which is the
+    /// kind of item [`Identity`] goes out of its way to keep. waybar's SNI
+    /// host draws the same line: only an exact `"Passive"` hides.
     fn from_str(s: &str) -> Self {
         match s {
-            "Active" => Self::Active,
+            "Passive" => Self::Passive,
             "NeedsAttention" => Self::NeedsAttention,
-            _ => Self::Passive,
+            _ => Self::Active,
         }
     }
 }
@@ -133,6 +150,7 @@ impl Service for TrayService {
         let state = State {
             items: items.clone(),
             registered: Arc::new(AsyncMutex::new(HashMap::new())),
+            watchers: Arc::new(StdMutex::new(Watchers::default())),
             ownership: ownership_slot.clone(),
         };
 
@@ -366,14 +384,197 @@ async fn do_menu_event(bus_name: &str, menu_path: &str, item_id: i32) -> Result<
 /// `OnceLock` is always populated before any `watch_item` task can call
 /// `emit_unregistered`, because item registrations only arrive after the
 /// watcher interface is fully mounted on the bus.
+///
+/// `watchers` is a plain `std` mutex, only ever locked **while `registered`
+/// is held** and never across an `await`. That one lock order is what makes
+/// "which watcher owns this key" and "is there a row for this key" a single
+/// observation for [`State::admit`], [`State::retire`] and
+/// [`State::store_if_current`].
 #[derive(Clone)]
 struct State {
     items: Mutable<Vec<TrayItem>>,
     registered: Arc<AsyncMutex<HashMap<String, TrayItem>>>,
+    watchers: Arc<StdMutex<Watchers>>,
     ownership: Arc<OnceLock<OwnNameSignal>>,
 }
 
+/// The running [`watch_item`] for each key (#1542 item 6, #1494 owner
+/// question 1).
+///
+/// Before this, every `RegisterStatusNotifierItem` that read successfully
+/// spawned a `watch_item`, so a repeat registration for a key — an app calling
+/// it twice at startup, or re-registering every item after the watcher name
+/// changed hands — left one row with two sets of signal forwarders and two
+/// liveness tasks: every `NewIcon` re-read the item twice, and its departure
+/// was handled twice. A slot here is what lets a repeat registration find the
+/// watcher that already serves the key.
+///
+/// A slot is present exactly while its watcher runs. Every way a watcher
+/// stops — its peer gone, its object gone, its proxy never built — removes
+/// its own slot, and removing a slot stops its watcher (see [`Slot::_stop`]).
+/// So "the existing watcher is dead" needs no flag: it is "there is no slot".
+#[derive(Default)]
+struct Watchers {
+    slots: HashMap<String, Slot>,
+    /// The last generation handed out; each started watcher gets the next.
+    last_generation: u64,
+}
+
+/// One running watcher's claim on its key.
+struct Slot {
+    generation: u64,
+    /// Unique bus name of the connection whose registration started this
+    /// watcher — the `RegisterStatusNotifierItem` sender, not the item's bus
+    /// name.
+    registrant: String,
+    /// Never sent on. The watcher's tasks wait on the paired receiver, whose
+    /// `changed()` errors once this sender is dropped — so dropping the slot,
+    /// whether [`Watchers::release`] removes it or [`Watchers::claim`] replaces
+    /// it, is what stops the watcher.
+    _stop: watch::Sender<()>,
+}
+
+/// What [`Watchers::claim`] hands a registration that must start a watcher:
+/// that watcher's generation and its stop signal. There is no other way to
+/// get one, so a registration cannot start a watcher `claim` did not ask for.
+#[derive(Clone)]
+struct Watch {
+    generation: u64,
+    stop: watch::Receiver<()>,
+}
+
+impl Watchers {
+    /// Decide whether a registration of `key` by the connection `registrant`
+    /// needs a watcher started.
+    ///
+    /// - **No slot** — the key is new, or its watcher has stopped (its peer
+    ///   went away, its object went away, or its proxy could not be built):
+    ///   start one.
+    /// - **A slot from the same connection** — the watcher serving the key is
+    ///   alive and is already watching this peer: `None`, start nothing. The
+    ///   caller refreshes the row.
+    /// - **A slot from another connection** — the key is a well-known bus name
+    ///   that has changed hands (a unique name never does: when the key is
+    ///   built from the sender, the sender is part of it). The old peer is
+    ///   gone even if that watcher has not seen it yet — its `PeerGone` races
+    ///   this call — so replace it: dropping its slot stops it, and its later
+    ///   [`Self::release`] finds a different generation and touches nothing.
+    fn claim(&mut self, key: &str, registrant: &str) -> Option<Watch> {
+        if self
+            .slots
+            .get(key)
+            .is_some_and(|slot| slot.registrant == registrant)
+        {
+            return None;
+        }
+        self.last_generation += 1;
+        let generation = self.last_generation;
+        let (stop_tx, stop) = watch::channel(());
+        // `insert` drops a replaced slot, and with it that watcher's stop.
+        self.slots.insert(
+            key.to_owned(),
+            Slot {
+                generation,
+                registrant: registrant.to_owned(),
+                _stop: stop_tx,
+            },
+        );
+        Some(Watch { generation, stop })
+    }
+
+    /// End watcher `generation`'s claim on `key`, stopping it. `false` when
+    /// the key is no longer that watcher's — a later registration replaced it,
+    /// and the row now belongs to the replacement.
+    fn release(&mut self, key: &str, generation: u64) -> bool {
+        if self.is_current(key, generation) {
+            self.slots.remove(key);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Whether watcher `generation` still owns `key`.
+    fn is_current(&self, key: &str, generation: u64) -> bool {
+        self.slots
+            .get(key)
+            .is_some_and(|slot| slot.generation == generation)
+    }
+}
+
+/// What [`State::admit`] did with one registration.
+struct Admitted {
+    /// The key had no row: the registration added it to
+    /// `RegisteredStatusNotifierItems`, so it is announced with
+    /// `StatusNotifierItemRegistered`. A repeat registration is not.
+    new_row: bool,
+    /// The watcher to start, or `None` when a live one already serves the key.
+    watch: Option<Watch>,
+}
+
 impl State {
+    /// Lock the watcher table. Poisoning is ignored: every critical section
+    /// is a single `HashMap` operation, so a panic cannot leave it half-done.
+    fn watchers(&self) -> MutexGuard<'_, Watchers> {
+        self.watchers.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Record a registration from `registrant` whose properties read as
+    /// `item`: insert its row, or refresh the row a repeat registration
+    /// already has, and [`claim`](Watchers::claim) a watcher for it.
+    async fn admit(&self, item: TrayItem, registrant: &str) -> Admitted {
+        let key = item.key.clone();
+        let mut map = self.registered.lock().await;
+        let watch = self.watchers().claim(&key, registrant);
+        let new_row = map.insert(key, item).is_none();
+        drop(map);
+        self.rebuild_published_list().await;
+        Admitted { new_row, watch }
+    }
+
+    /// Store watcher `generation`'s re-read of its item, unless the key is no
+    /// longer that watcher's. A read in flight when the watcher stopped would
+    /// otherwise put back a row its peer's departure just removed.
+    async fn store_if_current(&self, item: TrayItem, generation: u64) -> bool {
+        let mut map = self.registered.lock().await;
+        if !self.watchers().is_current(&item.key, generation) {
+            return false;
+        }
+        map.insert(item.key.clone(), item);
+        true
+    }
+
+    /// Watcher `generation` found its item gone: end its claim and drop the
+    /// row. `false` — and nothing touched — when a later registration owns the
+    /// key; the caller then publishes and announces nothing.
+    async fn retire(&self, key: &str, generation: u64) -> bool {
+        let mut map = self.registered.lock().await;
+        if !self.watchers().release(key, generation) {
+            return false;
+        }
+        map.remove(key);
+        true
+    }
+
+    /// [`Self::retire`], then — only when the key was still this watcher's —
+    /// publish the list without the row and announce
+    /// `StatusNotifierItemUnregistered`. A replaced watcher announces nothing:
+    /// the key is still registered, by its replacement.
+    async fn unregister_if_current(&self, key: String, generation: u64) {
+        if self.retire(&key, generation).await {
+            self.rebuild_published_list().await;
+            self.emit_unregistered(key).await;
+        }
+    }
+
+    /// Watcher `generation` could not start: end its claim but keep the row,
+    /// so a later registration of the key starts a fresh watcher instead of
+    /// finding this one's slot and starting nothing.
+    async fn abandon(&self, key: &str, generation: u64) {
+        let _map = self.registered.lock().await;
+        self.watchers().release(key, generation);
+    }
+
     /// Re-read one item's properties and update the map.  Returns `false`
     /// when the item should be removed: it answered none of its identifying
     /// properties (see [`read_item_props`]'s `# Errors`).
@@ -469,40 +670,52 @@ impl Watcher {
         tracing::debug!(bus_name, object_path, "RegisterStatusNotifierItem");
 
         // Initial property read, retried once after a grace delay (#1559).
-        match read_item_props_with_retry(&bus_name, &object_path).await {
-            Ok(item) => {
-                let key = item.key.clone();
-                self.state.registered.lock().await.insert(key.clone(), item);
-                self.state.rebuild_published_list().await;
-
-                let _ = Self::status_notifier_item_registered(
-                    &emitter,
-                    format!("{bus_name}{object_path}"),
-                )
-                .await;
-
-                // Spawn a per-item watcher using bus::proxy for PeerGone detection
-                // and bus::signals for property-update signals. Supervised:
-                // `watch_item` re-reads + parses this item's (untrusted) tooltip
-                // / icon-pixmap / menu properties, so it's the real panic
-                // surface. Bounded (#1174): a clean completion means the item
-                // disconnected, which is this task finishing its job — no
-                // restart, and none of the `warn!`-plus-kept-row that
-                // `spawn_supervised` gives an unexpected return.
-                let state = self.state.clone();
-                spawn_supervised_bounded("tray-item", move || {
-                    let state = state.clone();
-                    let bus_name = bus_name.clone();
-                    let object_path = object_path.clone();
-                    async move {
-                        watch_item(state, bus_name, object_path).await;
-                    }
-                });
-            }
+        // A repeat registration reads too: refreshing its row is what the
+        // repeat is for (#1542 item 6).
+        let item = match read_item_props_with_retry(&bus_name, &object_path).await {
+            Ok(item) => item,
             Err(e) => {
                 tracing::warn!(error = %e, bus_name, object_path, "initial property read failed");
+                return;
             }
+        };
+        let Admitted { new_row, watch } = self.state.admit(item, &sender).await;
+
+        if new_row {
+            let _ = Self::status_notifier_item_registered(
+                &emitter,
+                format!("{bus_name}{object_path}"),
+            )
+            .await;
         }
+
+        let Some(watch) = watch else {
+            tracing::debug!(
+                bus_name,
+                object_path,
+                "repeat registration: row refreshed, its watcher kept"
+            );
+            return;
+        };
+
+        // Spawn a per-item watcher using bus::proxy for PeerGone detection
+        // and bus::signals for property-update signals. Supervised:
+        // `watch_item` re-reads + parses this item's (untrusted) tooltip
+        // / icon-pixmap / menu properties, so it's the real panic
+        // surface. Bounded (#1174): a clean completion means the item
+        // disconnected, which is this task finishing its job — no
+        // restart, and none of the `warn!`-plus-kept-row that
+        // `spawn_supervised` gives an unexpected return.
+        let state = self.state.clone();
+        spawn_supervised_bounded("tray-item", move || {
+            let state = state.clone();
+            let bus_name = bus_name.clone();
+            let object_path = object_path.clone();
+            let watch = watch.clone();
+            async move {
+                watch_item(state, bus_name, object_path, watch).await;
+            }
+        });
     }
 
     /// No-op: we are the host.
@@ -553,7 +766,31 @@ impl Watcher {
 
 // ── Per-item watcher task ─────────────────────────────────────────────────────
 
-async fn watch_item(state: State, bus_name: String, object_path: String) {
+/// Watch one registered item for as long as `watch` owns its key: forward its
+/// four update signals into re-reads of the row, and retire the row when the
+/// item goes away.
+///
+/// # Lifetime
+///
+/// The watcher is this task plus five children: four signal forwarders and a
+/// liveness task. It stops when `watch`'s stop fires — its slot was released
+/// (it retired its own row, or could not start) or replaced by a registration
+/// from another connection (see [`Watchers::claim`]) — or when it retires the
+/// row itself. The children are tied to this task's channel, not to the slot:
+/// each one runs under [`while_open`], which ends it as soon as this task's
+/// receiver is dropped. So when this task returns, for any reason
+/// including a panic that the supervisor restarts it after, every child of
+/// that run stops with it, and a restarted run starts its own. Before #1542
+/// nothing stopped them: a forwarder only noticed a dropped receiver on its
+/// next send, so the forwarders of an item whose peer had left waited for a
+/// signal that could never come, for the rest of the session.
+async fn watch_item(state: State, bus_name: String, object_path: String, watch: Watch) {
+    let key = format!("{bus_name}{object_path}");
+    let Watch {
+        generation,
+        mut stop,
+    } = watch;
+
     // Build a long-lived proxy for this item. The proxy monitors
     // NameOwnerChanged for this exact bus name, giving us PeerGone when the
     // item app exits.
@@ -566,6 +803,9 @@ async fn watch_item(state: State, bus_name: String, object_path: String) {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(error = %e, bus_name, object_path, "failed to build item proxy");
+            // Keep the row, as before, but give up the key: a later
+            // registration must start a watcher, not find this one's slot.
+            state.abandon(&key, generation).await;
             return;
         }
     };
@@ -578,11 +818,11 @@ async fn watch_item(state: State, bus_name: String, object_path: String) {
     // in one silently killed just that forwarder while `watch_item` stayed
     // healthy in the supervisor's eyes, freezing that one property (icon,
     // title, status or tooltip) for the item's whole session with nothing
-    // surfacing it. `Bounded`, mirroring `tray-item` itself: the stream
-    // ending (item disconnected) is this forwarder's normal, expected
-    // completion, not a return worth a `warn!`. The subscription is
-    // (re-)established *inside* the factory so a restart after a panic gets
-    // a fresh one rather than reusing whatever the first, now-dead run built.
+    // surfacing it. `Bounded`, mirroring `tray-item` itself: stopping with
+    // this task is this forwarder's normal, expected completion, not a return
+    // worth a `warn!`. The subscription is (re-)established *inside* the
+    // factory so a restart after a panic gets a fresh one rather than reusing
+    // whatever the first, now-dead run built.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(4);
 
     for (sig_name, task_name) in [
@@ -607,38 +847,18 @@ async fn watch_item(state: State, bus_name: String, object_path: String) {
                     .signal(sig.clone())
                     .start();
                 let mut events = sub.events();
-                while events.next().await.is_some() {
-                    if tx2.send(()).await.is_err() {
-                        break;
+                while_open(&tx2, async {
+                    while events.next().await.is_some() {
+                        if tx2.send(()).await.is_err() {
+                            break;
+                        }
                     }
-                }
-                tracing::debug!(signal = sig, bus_name = bus2, "signal stream ended");
+                })
+                .await;
+                tracing::debug!(signal = sig, bus_name = bus2, "signal forwarder stopped");
             }
         });
     }
-    // Drop this function's own `Sender`, so only the forwarders' clones keep
-    // the channel open.
-    //
-    // That used to be the whole story: each of the four clones lived in the
-    // body of a bare `tokio::spawn`, so a forwarder dying dropped its sender,
-    // and once all four were gone `rx.recv()` below returned `None` and fell
-    // through to the stream-ended cleanup that unregisters the item. Since
-    // #1172 the clones live in the **factories** above, which the supervisor
-    // holds for the life of the supervised task — so a run that returns (or
-    // panics) releases only its own per-run clone, and a permanently-panicking
-    // forwarder holds its sender across every backoff. A forwarder dying no
-    // longer unregisters the item. That is the better behaviour and is why the
-    // code is unchanged: a crashed forwarder now shows up as a `health` row
-    // and is restarted with backoff, instead of an item silently vanishing
-    // from the tray.
-    //
-    // So the only route to `None` here is the designed one: all four signal
-    // streams *ending* because the item disconnected. A `Bounded` return ends
-    // the supervisor itself, which drops the factory and with it that clone —
-    // so the last of the four to return closes the channel. (The liveness
-    // watcher observes the same disconnect as `PeerGone` and unregisters
-    // directly, without going through this channel at all.)
-    drop(tx);
 
     // Liveness watcher for PeerGone — same rationale as the signal
     // forwarders above: a panic here used to silently stop PeerGone
@@ -653,47 +873,106 @@ async fn watch_item(state: State, bus_name: String, object_path: String) {
     // either to see. `watch_liveness` closes it by asking the bus whether the
     // name still has an owner each time the proxy reports `Live`, which
     // `hytte_bus` only does once that subscription is active.
+    //
+    // It holds a `Sender` only to wait on `closed()`; it never sends.
     {
         let state2 = state.clone();
         let bus2 = bus_name.clone();
-        let path2 = object_path.clone();
+        let key2 = key.clone();
         let proxy2 = item_proxy.clone();
+        let tx2 = tx.clone();
         spawn_supervised_bounded("tray-item-liveness", move || {
             let state2 = state2.clone();
             let bus2 = bus2.clone();
-            let path2 = path2.clone();
+            let key2 = key2.clone();
             let proxy2 = proxy2.clone();
+            let tx2 = tx2.clone();
             async move {
-                let end =
-                    watch_liveness(proxy2.liveness().to_stream(), || name_has_owner(&bus2)).await;
-                if end == LivenessEnd::Gone {
-                    tracing::debug!(bus_name = bus2, object_path = path2, "item peer gone");
-                    let key = format!("{bus2}{path2}");
-                    state2.registered.lock().await.remove(&key);
-                    state2.rebuild_published_list().await;
-                    state2.emit_unregistered(key).await;
+                let liveness =
+                    watch_liveness(proxy2.liveness().to_stream(), || name_has_owner(&bus2));
+                if while_open(&tx2, liveness).await == Some(LivenessEnd::Gone) {
+                    tracing::debug!(key = key2, "item peer gone");
+                    state2.unregister_if_current(key2, generation).await;
                 }
             }
         });
     }
+    // Only the children's clones keep the channel open now. `rx.recv()` sees
+    // `None` only once every child's supervisor has ended, and each of them
+    // ends only when this task's receiver is dropped (or, for the liveness
+    // task, after it has retired the row itself) — so the `None` arm below is
+    // a backstop, not a path a running item takes.
+    drop(tx);
 
-    // Process update notifications.
-    while rx.recv().await.is_some() {
-        let still_alive = state.refresh_item(&bus_name, &object_path).await;
-        state.rebuild_published_list().await;
-        if !still_alive {
-            let key = format!("{bus_name}{object_path}");
-            tracing::debug!(key, "item disappeared, unregistering");
-            state.emit_unregistered(key).await;
-            return;
+    // Process update notifications until the key stops being this watcher's.
+    loop {
+        match next_wake(&mut rx, &mut stop).await {
+            // Released or replaced: whoever did it owns the row now.
+            Wake::Stopped => return,
+            Wake::Closed => break,
+            Wake::Changed => match read_item_props(&bus_name, &object_path).await {
+                Ok(item) => {
+                    if !state.store_if_current(item, generation).await {
+                        return;
+                    }
+                    state.rebuild_published_list().await;
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, key, "item disappeared, unregistering");
+                    state.unregister_if_current(key, generation).await;
+                    return;
+                }
+            },
         }
     }
 
-    // All signal streams ended (item disconnected).
-    let key = format!("{bus_name}{object_path}");
-    state.registered.lock().await.remove(&key);
-    state.rebuild_published_list().await;
-    state.emit_unregistered(key).await;
+    state.unregister_if_current(key, generation).await;
+}
+
+/// Run a watcher child's `work` only while the run that spawned it is alive:
+/// `None` as soon as that run's receiver is dropped, whatever `work` is
+/// waiting on.
+///
+/// The children's `work` waits on something only the item can end — the next
+/// signal, the next `NameOwnerChanged` — and an item whose peer has left never
+/// ends it. So without this a child outlives its watcher for the rest of the
+/// session, and a key whose watcher was replaced gets two sets of forwarders
+/// again, which is what [`Watchers`] exists to prevent.
+async fn while_open<T>(
+    tx: &tokio::sync::mpsc::Sender<()>,
+    work: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        out = work => Some(out),
+        () = tx.closed() => None,
+    }
+}
+
+/// What woke [`watch_item`]'s loop.
+#[derive(Debug, PartialEq, Eq)]
+enum Wake {
+    /// A forwarder saw one of the item's update signals: re-read the row.
+    Changed,
+    /// The watcher's slot was released or replaced (see [`Watchers::claim`]):
+    /// the key is not this watcher's any more, so stop and touch nothing.
+    Stopped,
+    /// Every child has ended. A backstop: see the comment above its `drop(tx)`.
+    Closed,
+}
+
+/// Wait for the next thing [`watch_item`]'s loop has to act on.
+async fn next_wake(
+    rx: &mut tokio::sync::mpsc::Receiver<()>,
+    stop: &mut watch::Receiver<()>,
+) -> Wake {
+    tokio::select! {
+        // Nothing is ever sent on `stop`, so this resolves only with the error
+        // its sender's drop produces.
+        _ = stop.changed() => Wake::Stopped,
+        changed = rx.recv() => {
+            if changed.is_some() { Wake::Changed } else { Wake::Closed }
+        }
+    }
 }
 
 /// Why [`watch_liveness`] returned.
@@ -1290,7 +1569,7 @@ mod tests {
 
     // ── #1201: NameOwnerChanged re-syncs on Resubscribed/Lagged ─────────────
 
-    use super::{Mutable, SignalItem, State, run_owner_change_loop};
+    use super::{Mutable, SignalItem, State, StdMutex, Watchers, run_owner_change_loop};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, OnceLock};
@@ -1300,6 +1579,7 @@ mod tests {
         State {
             items: Mutable::new(Vec::new()),
             registered: Arc::new(AsyncMutex::new(HashMap::new())),
+            watchers: Arc::new(StdMutex::new(Watchers::default())),
             ownership: Arc::new(OnceLock::new()),
         }
     }
@@ -1699,5 +1979,302 @@ mod tests {
         let after = state.items.get_cloned();
         assert_eq!(before.len(), after.len());
         assert_eq!(after[0].key, ":1.7/StatusNotifierItem");
+    }
+
+    // ── #1542 item 6: one watcher per key ───────────────────────────────────
+
+    use super::{Admitted, Wake, Watch, next_wake, while_open};
+    use std::time::Duration;
+
+    /// A row for `bus_name`'s default item path, told apart by `title`.
+    fn row(bus_name: &str, title: &str, status: ItemStatus) -> TrayItem {
+        let object_path = "/StatusNotifierItem";
+        TrayItem {
+            key: format!("{bus_name}{object_path}"),
+            bus_name: bus_name.to_string(),
+            object_path: object_path.to_string(),
+            title: title.to_string(),
+            icon_name: String::new(),
+            status,
+            icon_pixmap: None,
+            tooltip_title: String::new(),
+            tooltip_description: String::new(),
+            menu_path: None,
+            item_is_menu: false,
+        }
+    }
+
+    /// Whether the watcher holding `watch` has been told to stop: its slot,
+    /// which holds the only sender, is gone.
+    fn stopped(watch: &Watch) -> bool {
+        watch.stop.has_changed().is_err()
+    }
+
+    async fn row_title(state: &State, key: &str) -> Option<String> {
+        state
+            .registered
+            .lock()
+            .await
+            .get(key)
+            .map(|item| item.title.clone())
+    }
+
+    /// The bug: a second `RegisterStatusNotifierItem` for the same key, from
+    /// the same connection, spawned a second `watch_item`. That is one row
+    /// with two sets of forwarders and two liveness tasks, so each property
+    /// signal re-read the item twice. A repeat must refresh the row and start
+    /// nothing; the one watcher keeps running.
+    ///
+    /// Falsifiable: make `Watchers::claim` start a watcher whatever the slot
+    /// says (the old unconditional spawn) and the repeat hands out a second
+    /// `Watch`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_repeat_registration_refreshes_the_row_and_starts_no_second_watcher() {
+        let state = empty_state();
+        let Admitted { new_row, watch } = state
+            .admit(row(":1.5", "before", ItemStatus::Active), ":1.5")
+            .await;
+        assert!(new_row);
+        let first = watch.expect("the first registration starts the watcher");
+
+        let again = state
+            .admit(row(":1.5", "after", ItemStatus::Active), ":1.5")
+            .await;
+        assert!(
+            again.watch.is_none(),
+            "a repeat registration must not start a second watcher for the same key"
+        );
+        assert!(
+            !again.new_row,
+            "and it is no new row, so it is not announced again"
+        );
+        assert!(!stopped(&first), "the first watcher keeps running");
+        assert_eq!(state.watchers().slots.len(), 1, "exactly one live watcher");
+
+        let published = state.items.get_cloned();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].title, "after", "the repeat's read refreshed the row");
+    }
+
+    /// The other case: the watcher is dead. The item went away — here its
+    /// object, as when an app turns its tray icon off — so the watcher
+    /// retired the row and its slot; then the app turned it back on and
+    /// registered the same key again, from the same connection. That is a new
+    /// row with a new watcher, not a refresh of nothing.
+    ///
+    /// Falsifiable: leave the slot in place on `retire` and the
+    /// re-registration finds it and starts nothing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_registration_after_its_watcher_stopped_starts_a_new_one() {
+        const KEY: &str = ":1.5/StatusNotifierItem";
+        let state = empty_state();
+        let first = state
+            .admit(row(":1.5", "first", ItemStatus::Active), ":1.5")
+            .await
+            .watch
+            .expect("first watcher");
+
+        assert!(state.retire(KEY, first.generation).await, "its object left");
+        assert!(stopped(&first));
+        assert!(state.watchers().slots.is_empty());
+
+        let again = state
+            .admit(row(":1.5", "second", ItemStatus::Active), ":1.5")
+            .await;
+        assert!(again.new_row);
+        let second = again.watch.expect("a stopped watcher is replaced");
+        assert_ne!(second.generation, first.generation);
+        assert!(!stopped(&second));
+    }
+
+    /// A well-known name that changed hands, with the old watcher not yet
+    /// aware of it: the new owner's registration can reach us before the old
+    /// proxy's `PeerGone` does. A different registering connection is the
+    /// sign. The old watcher is replaced and told to stop, and when its late
+    /// `PeerGone` or an in-flight re-read lands, it touches neither the row
+    /// nor the watcher that replaced it.
+    ///
+    /// Falsifiable: drop the generation check from `retire` and the late
+    /// `PeerGone` removes the new owner's row; drop it from
+    /// `store_if_current` and the stale re-read overwrites it; drop the
+    /// registrant check from `claim` and the new owner gets no watcher.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_registration_from_another_connection_replaces_the_watcher() {
+        const KEY: &str = "org.example.Tray/StatusNotifierItem";
+        let state = empty_state();
+        let old = state
+            .admit(row("org.example.Tray", "old", ItemStatus::Active), ":1.5")
+            .await
+            .watch
+            .expect("old watcher");
+
+        let new = state
+            .admit(row("org.example.Tray", "new", ItemStatus::Active), ":1.9")
+            .await
+            .watch
+            .expect("another connection behind the same key gets its own watcher");
+        assert!(stopped(&old), "the replaced watcher is told to stop");
+        assert!(!stopped(&new));
+        assert_eq!(state.watchers().slots.len(), 1);
+
+        assert!(
+            !state
+                .store_if_current(
+                    row("org.example.Tray", "stale", ItemStatus::Active),
+                    old.generation
+                )
+                .await,
+            "a re-read by the replaced watcher is not stored"
+        );
+        assert!(
+            !state.retire(KEY, old.generation).await,
+            "the replaced watcher's late PeerGone retires nothing"
+        );
+        assert_eq!(row_title(&state, KEY).await.as_deref(), Some("new"));
+        assert!(!stopped(&new));
+    }
+
+    /// A re-read that was in flight when its watcher retired the row must not
+    /// put the row back: that would be the ghost row #1494 removed, by
+    /// another door.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_reread_after_the_watcher_retired_does_not_bring_the_row_back() {
+        const KEY: &str = ":1.5/StatusNotifierItem";
+        let state = empty_state();
+        let watch = state
+            .admit(row(":1.5", "t", ItemStatus::Active), ":1.5")
+            .await
+            .watch
+            .expect("watcher");
+        assert!(state.retire(KEY, watch.generation).await);
+        assert!(
+            !state
+                .store_if_current(row(":1.5", "t", ItemStatus::Active), watch.generation)
+                .await
+        );
+        assert_eq!(row_title(&state, KEY).await, None);
+    }
+
+    /// A watcher whose proxy could not be built keeps the row (as before) but
+    /// gives up the key, so the item's next registration starts a watcher.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_watcher_that_could_not_start_leaves_the_key_free() {
+        const KEY: &str = ":1.5/StatusNotifierItem";
+        let state = empty_state();
+        let watch = state
+            .admit(row(":1.5", "t", ItemStatus::Active), ":1.5")
+            .await
+            .watch
+            .expect("watcher");
+        state.abandon(KEY, watch.generation).await;
+        assert!(stopped(&watch));
+        assert_eq!(row_title(&state, KEY).await.as_deref(), Some("t"));
+
+        let again = state.admit(row(":1.5", "t", ItemStatus::Active), ":1.5").await;
+        assert!(!again.new_row);
+        assert!(again.watch.is_some());
+    }
+
+    /// How a watcher learns it was replaced: its loop wakes `Stopped` once
+    /// its slot is gone, even while nothing is queued.
+    ///
+    /// Falsifiable: drop the `stop` arm from `next_wake` and the loop sleeps
+    /// on, with its forwarders, until the item next signals.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_replaced_watcher_wakes_stopped() {
+        let state = empty_state();
+        let Watch { mut stop, .. } = state
+            .admit(row("org.example.Tray", "old", ItemStatus::Active), ":1.5")
+            .await
+            .watch
+            .expect("old watcher");
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(4);
+
+        tx.send(()).await.expect("queue one change");
+        assert_eq!(next_wake(&mut rx, &mut stop).await, Wake::Changed);
+
+        state
+            .admit(row("org.example.Tray", "new", ItemStatus::Active), ":1.9")
+            .await;
+        let woke = tokio::time::timeout(Duration::from_secs(5), next_wake(&mut rx, &mut stop))
+            .await
+            .expect("a replaced watcher must wake without another signal");
+        assert_eq!(woke, Wake::Stopped);
+        drop(tx);
+    }
+
+    /// The children of a watcher stop with it. Their work waits on the next
+    /// signal from the item, which an item whose peer has left never sends.
+    ///
+    /// Falsifiable: make `while_open` just await `work` and this times out.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_child_stops_when_its_watcher_run_ends() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<()>(4);
+        let child = tokio::spawn(async move {
+            while_open(&tx, std::future::pending::<()>()).await
+        });
+        tokio::task::yield_now().await;
+        drop(rx);
+        let out = tokio::time::timeout(Duration::from_secs(5), child)
+            .await
+            .expect("the child must stop once its watcher's receiver is dropped")
+            .expect("the child must not panic");
+        assert_eq!(out, None);
+    }
+
+    // ── #1542 item 6: the service side of hiding `Passive` ──────────────────
+
+    /// Only an explicit `Passive` is passive. The fallback used to be
+    /// `Passive`, so with `Passive` hidden, an item that did not answer
+    /// `Status` (read as `""`) would have vanished from the tray.
+    ///
+    /// Falsifiable: put the `Passive` fallback back and `""` reads `Passive`.
+    #[test]
+    fn only_the_spec_spelling_of_passive_is_passive() {
+        assert_eq!(ItemStatus::from_str("Passive"), ItemStatus::Passive);
+        assert_eq!(
+            ItemStatus::from_str("NeedsAttention"),
+            ItemStatus::NeedsAttention
+        );
+        for other in ["Active", "", "passive", "Idle"] {
+            assert_eq!(ItemStatus::from_str(other), ItemStatus::Active, "{other:?}");
+        }
+    }
+
+    /// The tray widget hides a `Passive` item by its status and keeps its
+    /// button (#1542), which needs the service to keep publishing that item,
+    /// under the same key, through every status change. A `NewStatus` lands
+    /// through the watcher's re-read, i.e. `store_if_current`.
+    ///
+    /// Falsifiable: filter `Passive` out in `rebuild_published_list` and the
+    /// first and last steps publish nothing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_status_flip_keeps_publishing_the_row_with_its_status() {
+        let state = empty_state();
+        let watch = state
+            .admit(row(":1.5", "t", ItemStatus::Passive), ":1.5")
+            .await
+            .watch
+            .expect("watcher");
+        let published = state.items.get_cloned();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].status, ItemStatus::Passive);
+
+        for status in [
+            ItemStatus::Active,
+            ItemStatus::NeedsAttention,
+            ItemStatus::Passive,
+        ] {
+            assert!(
+                state
+                    .store_if_current(row(":1.5", "t", status), watch.generation)
+                    .await
+            );
+            state.rebuild_published_list().await;
+            let published = state.items.get_cloned();
+            assert_eq!(published.len(), 1, "{status:?}");
+            assert_eq!(published[0].key, ":1.5/StatusNotifierItem");
+            assert_eq!(published[0].status, status);
+        }
     }
 }

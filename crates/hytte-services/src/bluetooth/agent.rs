@@ -131,7 +131,8 @@ impl PairAgent {
     /// service requests it queued during the pairing as soon as the pairing's
     /// services resolve, and those must find the device in progress. Nothing
     /// is set in bluetoothd until the device has paired. A rejected prompt
-    /// never enters the set.
+    /// never enters the set. An accepted one while the shell's own `Pair` of
+    /// the device runs leaves that `Pair`'s entry as it is.
     fn in_progress_if_accepted<T>(
         &self,
         device: &OwnedObjectPath,
@@ -211,8 +212,17 @@ impl PairAgent {
     /// its 60 s `REQUEST_TIMEOUT`, `src/agent.c`) and a second request while
     /// one is waiting are all `org.bluez.Error.Rejected`. Nothing is saved:
     /// the device is not made `Trusted`, so it asks again next time.
+    ///
+    /// Before it asks, it reads the device's `Trusted` from `bluetoothd`, the
+    /// unique name of the bluetoothd that sent the request, and a device
+    /// trusted by then is allowed without a prompt (#1611, LOW-2). bluetoothd
+    /// decided to ask when it queued the request, and a pairing that has just
+    /// succeeded can have trusted the device and left the set since: this
+    /// check runs only after the caller check's round trip to the bus. A read
+    /// that fails, or takes longer than a couple of seconds, asks.
     async fn authorize_service_for(
         &self,
+        bluetoothd: &str,
         device: &OwnedObjectPath,
         uuid: &str,
     ) -> Result<(), AgentError> {
@@ -224,6 +234,30 @@ impl PairAgent {
                  since the user started or accepted its pairing"
             );
             return Ok(());
+        }
+        // Asked of the bluetoothd that sent this request, by the unique name
+        // the caller check verified, never `org.bluez`: the bus never
+        // activates a unique name, so a bluetoothd stopped since cannot be
+        // started again by this read (#1614 review, LOW-1). The read fails
+        // instead, and the user is asked.
+        match self.devices.trusted(bluetoothd, device.as_str()).await {
+            Ok(true) => {
+                tracing::info!(
+                    device = %device.as_str(),
+                    uuid,
+                    "bluetooth agent: a device trusted since bluetoothd asked wants to use a \
+                     service; allowed"
+                );
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::debug!(
+                    device = %device.as_str(),
+                    error = %e,
+                    "bluetooth agent: could not read the device's Trusted; asking the user"
+                );
+            }
         }
         let prompt = PairPrompt {
             service: Some(service_label(uuid)),
@@ -390,7 +424,13 @@ impl PairAgent {
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> Result<(), AgentError> {
         self.admit(conn, &header, "AuthorizeService").await?;
-        self.authorize_service_for(&device, &uuid).await
+        // The caller check refuses a call with no sender, so this is the
+        // unique name of the bluetoothd it has just verified.
+        let Some(bluetoothd) = header.sender() else {
+            return Err(AgentError::Rejected("a call with no sender".into()));
+        };
+        self.authorize_service_for(bluetoothd.as_str(), &device, &uuid)
+            .await
     }
 
     /// Reject whichever request is waiting. Its banner is taken down by that
@@ -1242,17 +1282,23 @@ mod authorize_service_tests {
         allow_or_reject, answer_in, cancel_in, service_label, service_name,
     };
     use crate::bluetooth::trust::fake::{Call, FakeBus};
-    use crate::bluetooth::trust::{PAIRING_WINDOW, Pairings, Shown};
+    use crate::bluetooth::trust::{PAIRING_WINDOW, Pairings, Shown, pair_then_trust};
+    use crate::bluetooth::{BluetoothShared, PairOutcome, pair_from_shell};
     use futures_signals::signal::Mutable;
     use futures_util::FutureExt;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::Mutex as AsyncMutex;
+    use tokio::sync::Notify;
     use zbus::zvariant::OwnedObjectPath;
 
     /// What bluetoothd sends for an incoming A2DP stream
     /// (`ADVANCED_AUDIO_UUID`).
     const A2DP: &str = "0000110d-0000-1000-8000-00805f9b34fb";
+
+    /// The unique name of the bluetoothd whose request is being answered, as
+    /// the caller check hands it on.
+    const BLUETOOTHD: &str = ":1.42";
 
     /// An agent with its own slots and a recording device bus. Its caller
     /// check is never run here.
@@ -1309,7 +1355,7 @@ mod authorize_service_tests {
     async fn it_asks_the_user_and_allow_admits_the_service() {
         let (agent, pending, banner) = agent();
         let device = device();
-        let mut asking = std::pin::pin!(agent.authorize_service_for(&device, A2DP));
+        let mut asking = std::pin::pin!(agent.authorize_service_for(BLUETOOTHD, &device, A2DP));
         assert!(
             asking.as_mut().now_or_never().is_none(),
             "AuthorizeService waits on the user"
@@ -1335,7 +1381,7 @@ mod authorize_service_tests {
     async fn deny_rejects_the_service() {
         let (agent, pending, banner) = agent();
         let device = device();
-        let mut asking = std::pin::pin!(agent.authorize_service_for(&device, A2DP));
+        let mut asking = std::pin::pin!(agent.authorize_service_for(BLUETOOTHD, &device, A2DP));
         assert!(asking.as_mut().now_or_never().is_none());
         let shown = banner.get_cloned().expect("a prompt is raised");
 
@@ -1353,7 +1399,7 @@ mod authorize_service_tests {
     async fn a_cancel_or_timeout_rejects_the_service() {
         let (agent, pending, _banner) = agent();
         let device = device();
-        let mut asking = std::pin::pin!(agent.authorize_service_for(&device, A2DP));
+        let mut asking = std::pin::pin!(agent.authorize_service_for(BLUETOOTHD, &device, A2DP));
         assert!(asking.as_mut().now_or_never().is_none());
 
         cancel_in(&pending).await;
@@ -1368,7 +1414,7 @@ mod authorize_service_tests {
     async fn allowing_a_service_does_not_trust_the_device() {
         let f = fixture();
         let device = device();
-        let mut asking = std::pin::pin!(f.agent.authorize_service_for(&device, A2DP));
+        let mut asking = std::pin::pin!(f.agent.authorize_service_for(BLUETOOTHD, &device, A2DP));
         assert!(asking.as_mut().now_or_never().is_none());
         let shown = f.banner.get_cloned().expect("a prompt is raised");
         answer_in(&f.pending, shown.id, AgentReply::Confirm).await;
@@ -1460,14 +1506,175 @@ mod authorize_service_tests {
     async fn a_service_request_during_a_pairing_is_allowed_without_a_prompt() {
         let f = fixture();
         let device = device();
-        f.pairings.begin(device.as_str());
-        let answered = f.agent.authorize_service_for(&device, A2DP).now_or_never();
+        f.pairings.begin_pair(device.as_str());
+        let answered = f
+            .agent
+            .authorize_service_for(BLUETOOTHD, &device, A2DP)
+            .now_or_never();
         assert!(
             matches!(answered, Some(Ok(()))),
             "allowed at once, got {answered:?}"
         );
         assert!(f.banner.get_cloned().is_none(), "no prompt");
         assert!(f.devices.calls().is_empty(), "nothing set");
+    }
+
+    /// LOW-2 (#1611): the set misses a device whose pairing has just
+    /// succeeded, and bluetoothd already has it trusted. No prompt.
+    ///
+    /// This is the review's sequence: bluetoothd sends `AuthorizeService`,
+    /// then applies the shell's `Set Trusted` and answers it, and the shell
+    /// takes the device out of the set, all while the request is still in
+    /// the caller check. So by the time it reaches the set, the device is out.
+    ///
+    /// **Falsification:** drop the read of bluetoothd's `Trusted` from
+    /// `authorize_service_for` (prompt on every set miss) and the request
+    /// raises a prompt and waits; address the read to `org.bluez` instead of
+    /// the caller's unique name (#1614 review, LOW-1) and the read's
+    /// destination is wrong.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_device_trusted_since_bluetoothd_asked_is_allowed_without_a_prompt() {
+        let f = fixture();
+        let device = device();
+        let outcome = pair_then_trust(&*f.devices, &f.pairings, device.as_str()).await;
+        assert!(matches!(outcome, PairOutcome::Paired));
+        assert!(
+            !f.pairings.contains(device.as_str()),
+            "the set misses: the pairing has ended"
+        );
+
+        let answered = f
+            .agent
+            .authorize_service_for(BLUETOOTHD, &device, A2DP)
+            .now_or_never();
+        assert!(
+            matches!(answered, Some(Ok(()))),
+            "allowed at once, got {answered:?}"
+        );
+        assert!(f.banner.get_cloned().is_none(), "no prompt");
+        assert_eq!(
+            f.devices.trusted_reads(),
+            vec![BLUETOOTHD],
+            "the bluetoothd that asked was asked once, by its unique name"
+        );
+        assert_eq!(
+            f.devices.calls(),
+            vec![Call::Pair, Call::SetTrusted(true), Call::Connect],
+            "the request itself set nothing"
+        );
+    }
+
+    /// A read of bluetoothd's `Trusted` that fails asks the user, as a miss
+    /// did before the read existed: an unreadable device is not a trusted
+    /// one.
+    ///
+    /// **Falsification:** take a failed read for "trusted" and the request
+    /// is allowed without asking.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_trust_read_still_asks() {
+        let f = fixture();
+        f.devices.set_live_trusted(None);
+        let device = device();
+        let mut asking = std::pin::pin!(f.agent.authorize_service_for(BLUETOOTHD, &device, A2DP));
+        assert!(
+            asking.as_mut().now_or_never().is_none(),
+            "the request asks the user"
+        );
+        let shown = f.banner.get_cloned().expect("a prompt is raised");
+        assert_eq!(shown.kind, PromptKind::AuthorizeService);
+        assert_eq!(f.devices.trusted_reads(), vec![BLUETOOTHD]);
+        answer_in(&f.pending, shown.id, AgentReply::Reject).await;
+        assert!(asking.await.is_err());
+    }
+
+    /// LOW-1 (#1611): a device the shell's `Pair` puts in the set is one the
+    /// agent built beside that state finds there. While the shell pairs it,
+    /// bluetoothd's service request for it is allowed with no prompt.
+    ///
+    /// **Falsification:** give either side its own set, the review's two
+    /// mutations, and the request misses the set and raises a prompt:
+    /// - Q2: `pair_from_shell` pairs in `Pairings::default()` instead of
+    ///   `shared.pairings`;
+    /// - Q3: `BluetoothShared::with_agent` builds the agent with
+    ///   `Pairings::default()` instead of `shared.pairings.clone()`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_shells_pair_and_the_agent_share_one_pairing_set() {
+        let bus = FakeBus::new();
+        let gate = Arc::new(Notify::new());
+        *bus.pair_gate.lock().unwrap() = Some(gate.clone());
+        let bus = Arc::new(bus);
+        let (shared, agent) = BluetoothShared::with_agent(bus.clone());
+        let shared = Arc::new(shared);
+        let device = device();
+
+        let pairing = tokio::spawn({
+            let shared = shared.clone();
+            let bus = bus.clone();
+            let path = device.as_str().to_owned();
+            async move { pair_from_shell(&shared, &*bus, &path).await }
+        });
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(bus.calls(), vec![Call::Pair], "the shell's Pair is running");
+
+        let answered = agent
+            .authorize_service_for(BLUETOOTHD, &device, A2DP)
+            .now_or_never();
+        assert!(
+            matches!(answered, Some(Ok(()))),
+            "a request during the shell's Pair is allowed at once, got {answered:?}"
+        );
+        assert!(shared.pair_prompt.get_cloned().is_none(), "no prompt");
+
+        gate.notify_one();
+        pairing.await.expect("pairing task");
+        assert_eq!(
+            bus.calls(),
+            vec![Call::Pair, Call::SetTrusted(true), Call::Connect]
+        );
+        assert!(shared.action_error.get_cloned().is_none(), "no toast");
+    }
+
+    /// The agent built beside the shared state raises its prompts on that
+    /// state's banner, the one the UI shows, and is answered through its reply
+    /// slot, the one the UI answers through.
+    ///
+    /// **Falsification:** build the agent in `with_agent` with a banner or a
+    /// reply slot of its own and the prompt never reaches the shared state.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_agent_prompts_on_the_shared_banner_and_reply_slot() {
+        let (shared, agent) = BluetoothShared::with_agent(Arc::new(FakeBus::new()));
+        let device = device();
+        let mut asking = std::pin::pin!(agent.authorize_service_for(BLUETOOTHD, &device, A2DP));
+        assert!(asking.as_mut().now_or_never().is_none());
+        let shown = shared
+            .pair_prompt
+            .get_cloned()
+            .expect("the prompt is on the shared banner");
+        answer_in(&shared.pending_response, shown.id, AgentReply::Confirm).await;
+        let answered = asking.now_or_never();
+        assert!(
+            matches!(answered, Some(Ok(()))),
+            "answered through the shared slot, got {answered:?}"
+        );
+    }
+
+    /// A pairing the shell starts that fails reaches the toast through the
+    /// state it paired in.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_shell_pairing_reaches_the_toast() {
+        let bus = FakeBus::new();
+        *bus.pair_reply.lock().unwrap() = Some(Err(hytte_bus::BusError::Permanent {
+            reason: "AuthenticationFailed".to_owned(),
+            dbus_name: Some("org.bluez.Error.AuthenticationFailed".to_owned()),
+        }));
+        let bus = Arc::new(bus);
+        let (shared, _agent) = BluetoothShared::with_agent(bus.clone());
+        pair_from_shell(&shared, &*bus, device().as_str()).await;
+        let toast = shared.action_error.get_cloned().expect("a toast");
+        assert!(toast.message.starts_with("Couldn't pair: "), "{toast:?}");
+        assert!(!shared.pairings.contains(device().as_str()));
     }
 
     /// Once an accepted pairing's window has passed without it completing,
@@ -1493,7 +1700,7 @@ mod authorize_service_tests {
         }
         assert!(!f.pairings.contains(device.as_str()), "the window passed");
 
-        let mut asking = std::pin::pin!(f.agent.authorize_service_for(&device, A2DP));
+        let mut asking = std::pin::pin!(f.agent.authorize_service_for(BLUETOOTHD, &device, A2DP));
         assert!(
             asking.as_mut().now_or_never().is_none(),
             "the request asks the user again"
@@ -1833,7 +2040,10 @@ mod system_tests {
     use super::{
         AGENT_PATH, AgentReply, BLUEZ_BUS_NAME, PairAgent, PairPrompt, ReplySlot, answer_in,
     };
+    use crate::bluetooth::trust::fake::FakeBus;
+    use crate::bluetooth::trust::read_trusted;
     use futures_signals::signal::Mutable;
+    use hytte_bus::test_support::SharedConnection;
     use std::path::PathBuf;
     use std::process::Stdio;
     use std::sync::Arc;
@@ -1941,6 +2151,9 @@ mod system_tests {
         dest: String,
         pending: Arc<ReplySlot>,
         banner: Mutable<Option<PairPrompt>>,
+        /// The agent's device bus, which records where each `Trusted` read
+        /// was sent.
+        devices: Arc<FakeBus>,
     }
 
     /// Mount a `PairAgent`, built exactly as production builds it: its caller
@@ -1951,10 +2164,11 @@ mod system_tests {
     async fn mount(guard: &BusGuard) -> Mounted {
         let pending: Arc<ReplySlot> = Arc::new(AsyncMutex::new(None));
         let banner: Mutable<Option<PairPrompt>> = Mutable::new(None);
+        let devices = Arc::new(FakeBus::new());
         let agent = PairAgent::new(
             pending.clone(),
             banner.clone(),
-            Arc::new(crate::bluetooth::trust::fake::FakeBus::new()),
+            devices.clone(),
             crate::bluetooth::trust::Pairings::default(),
         );
         let server = Builder::address(guard.address.as_str())
@@ -1973,6 +2187,7 @@ mod system_tests {
             dest,
             pending,
             banner,
+            devices,
         }
     }
 
@@ -2139,7 +2354,13 @@ mod system_tests {
 
     /// `AuthorizeService` over the wire: bluetoothd's request raises the
     /// prompt with the service's name and gets `Ok` on Allow and `Rejected`
-    /// on Deny; anyone else's is rejected without a prompt.
+    /// on Deny; anyone else's is rejected without a prompt. Before each
+    /// prompt, the device's `Trusted` is read from the unique name of the
+    /// bluetoothd that sent the request, the sender the caller check
+    /// verified, and never from `org.bluez` (#1614 review, LOW-1).
+    ///
+    /// **Falsification:** hand `authorize_service_for` `"org.bluez"` instead
+    /// of the header's sender and the recorded destinations are wrong.
     #[tokio::test(flavor = "multi_thread")]
     async fn authorize_service_asks_for_bluez_and_refuses_anyone_else() {
         const A2DP: &str = "0000110d-0000-1000-8000-00805f9b34fb";
@@ -2148,6 +2369,11 @@ mod system_tests {
         let mounted = mount(&guard).await;
         let intruder = proxy(&guard, &mounted, None).await;
         let bluez = proxy(&guard, &mounted, Some(BLUEZ_BUS_NAME)).await;
+        let bluez_name = bluez
+            .connection()
+            .unique_name()
+            .expect("bluetoothd's connection has a unique name")
+            .to_string();
 
         let refused: Result<(), zbus::Error> = tokio::time::timeout(
             DBUS_REPLY_BUDGET,
@@ -2187,6 +2413,112 @@ mod system_tests {
                 "the prompt comes down with the reply"
             );
         }
+        assert_eq!(
+            mounted.devices.trusted_reads(),
+            vec![bluez_name.clone(), bluez_name],
+            "each request's Trusted read goes to the bluetoothd that sent it, by its \
+             unique name; the intruder's refused request reads nothing"
+        );
+    }
+
+    /// A stand-in for a bluetoothd's `org.bluez.Device1` object: the one
+    /// property the trust read asks for. zbus serves its
+    /// `org.freedesktop.DBus.Properties` for it.
+    struct FakeDevice {
+        trusted: bool,
+    }
+
+    #[zbus::interface(name = "org.bluez.Device1")]
+    impl FakeDevice {
+        #[zbus(property)]
+        fn trusted(&self) -> bool {
+            self.trusted
+        }
+    }
+
+    /// Whether `name` has an owner on the bus `shared` is connected to.
+    async fn has_owner(shared: &SharedConnection, name: &str) -> bool {
+        hytte_bus::call_with(shared, "org.freedesktop.DBus")
+            .at_path("/org/freedesktop/DBus")
+            .iface("org.freedesktop.DBus")
+            .method("NameHasOwner")
+            .args((name.to_owned(),))
+            .send::<bool>()
+            .await
+            .expect("NameHasOwner")
+    }
+
+    /// The real `Trusted` read (`trust::read_trusted`, what `SystemBluez`
+    /// runs on the system bus) on a real bus: it asks the bluetoothd it is
+    /// handed, by unique name, and answers what that one says, even while
+    /// something else owns `org.bluez` and says otherwise. Once that
+    /// bluetoothd is gone, the read fails instead of reaching anyone, which is
+    /// what keeps it from D-Bus-activating a stopped one (#1614 review,
+    /// LOW-1).
+    ///
+    /// **Falsification:** address the read to `org.bluez` in `read_trusted`
+    /// and the decoy that owns that name answers `false`, and keeps answering
+    /// once the asking bluetoothd is gone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_trust_read_asks_the_calling_bluetoothd_by_its_unique_name() {
+        let guard = ephemeral_bus().await;
+        // The bluetoothd whose request is being answered: owns no name.
+        let asking = Builder::address(guard.address.as_str())
+            .expect("parse ephemeral bus address")
+            .serve_at(DEVICE, FakeDevice { trusted: true })
+            .expect("stage the asking bluetoothd's device")
+            .build()
+            .await
+            .expect("connect the asking bluetoothd");
+        let asking_name = asking
+            .unique_name()
+            .expect("the asking bluetoothd has a unique name")
+            .to_string();
+        // Whoever owns `org.bluez` here, with the opposite answer.
+        let _decoy = Builder::address(guard.address.as_str())
+            .expect("parse ephemeral bus address")
+            .name(BLUEZ_BUS_NAME)
+            .expect("a valid well-known name")
+            .serve_at(DEVICE, FakeDevice { trusted: false })
+            .expect("stage the decoy's device")
+            .build()
+            .await
+            .expect("connect the decoy");
+        let shared = SharedConnection::for_test_system(
+            hytte_bus::test_support::connect(guard.address.as_str())
+                .await
+                .expect("connect the reader"),
+        );
+        let read = |to: &str| hytte_bus::call_with(&shared, to);
+
+        let trusted =
+            tokio::time::timeout(DBUS_REPLY_BUDGET, read_trusted(read, &asking_name, DEVICE))
+                .await
+                .expect("the read did not return in time");
+        assert_eq!(
+            trusted.ok(),
+            Some(true),
+            "the read asks the bluetoothd that called, not org.bluez's owner"
+        );
+
+        // That bluetoothd goes away; its unique name is never handed out again.
+        asking.close().await.expect("close the asking bluetoothd");
+        let end = tokio::time::Instant::now() + DBUS_REPLY_BUDGET;
+        while has_owner(&shared, &asking_name).await {
+            assert!(
+                tokio::time::Instant::now() < end,
+                "the bus never dropped {asking_name}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let gone =
+            tokio::time::timeout(DBUS_REPLY_BUDGET, read_trusted(read, &asking_name, DEVICE))
+                .await
+                .expect("the read did not return in time");
+        assert!(
+            gone.is_err(),
+            "a read for a bluetoothd that is gone fails, got {gone:?}"
+        );
     }
 
     /// The methods that raise no prompt are checked too: bluetoothd gets its

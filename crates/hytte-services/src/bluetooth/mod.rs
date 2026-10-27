@@ -101,6 +101,12 @@ pub(super) struct BluetoothShared {
     pub(super) devices: Mutable<Vec<Device>>,
     pub(super) device_actions: Mutable<HashSet<String>>,
     pub(super) pair_prompt: Mutable<Option<PairPrompt>>,
+    /// Sender half of the oneshot the agent method is awaiting, keyed by the
+    /// [`PairPrompt::id`] of the prompt it raised. Held under an async mutex
+    /// so `respond_to_prompt` / `submit_pin` / `submit_passkey` / `Cancel`
+    /// can race-lessly take it; the three answers take it only for their own
+    /// prompt's id. `None` when no prompt is in-flight. Only this bag holds
+    /// it: nothing reads it through the registry.
     pub(super) pending_response: Arc<ReplySlot>,
     /// Most recent connect/pair/disconnect failure (#1171), or `None` before
     /// the first one. `Mutable::set` always notifies subscribers, even on an
@@ -117,6 +123,36 @@ pub(super) struct BluetoothShared {
     /// The devices being paired, the same set the agent holds: `pair_device`
     /// puts a device in for the length of its `Pair` call.
     pub(super) pairings: trust::Pairings,
+}
+
+impl BluetoothShared {
+    /// The service's shared state and the pairing agent that answers on it,
+    /// built together: the agent raises its prompts on this state's banner,
+    /// waits for answers in its reply slot, and reads its pairing set. So a
+    /// device the shell's `Pair` puts in the set is one the agent's
+    /// `AuthorizeService` finds there (#1611, LOW-1). Built apart, a private
+    /// set on either side brings back the "Allow …?" prompt for every service
+    /// a device opens while the shell pairs it, and no test would notice.
+    ///
+    /// The agent marks an accepted pairing's device `Trusted` through
+    /// `devices`.
+    fn with_agent(devices: Arc<dyn trust::DeviceBus>) -> (Self, PairAgent) {
+        let shared = Self {
+            devices: Mutable::new(Vec::new()),
+            device_actions: Mutable::new(HashSet::new()),
+            pair_prompt: Mutable::new(None),
+            pending_response: Arc::new(AsyncMutex::new(None)),
+            action_error: Mutable::new(None),
+            pairings: trust::Pairings::default(),
+        };
+        let agent = PairAgent::new(
+            shared.pending_response.clone(),
+            shared.pair_prompt.clone(),
+            devices,
+            shared.pairings.clone(),
+        );
+        (shared, agent)
+    }
 }
 
 /// A user-facing message describing why a connect/pair/disconnect action
@@ -202,12 +238,6 @@ pub struct BluetoothHandles {
     /// or `None` when no prompt is pending. The UI renders a banner when
     /// `Some` and calls `respond_to_prompt(...)` on user action.
     pub(crate) pair_prompt: Mutable<Option<PairPrompt>>,
-    /// Sender half of the oneshot the agent method is awaiting, keyed by the
-    /// [`PairPrompt::id`] of the prompt it raised. Held under an async mutex
-    /// so `respond_to_prompt` / `submit_pin` / `submit_passkey` / `Cancel`
-    /// can race-lessly take it; the three answers take it only for their own
-    /// prompt's id. `None` when no prompt is in-flight.
-    pub(crate) pending_response: Arc<ReplySlot>,
     /// Most recent connect/pair/disconnect failure, or `None` before the
     /// first one (#1171). The UI binds [`action_error`] and forwards each
     /// emission **newer than the binding itself** to a toast — see
@@ -230,21 +260,12 @@ impl Service for BluetoothService {
     type Handles = BluetoothHandles;
 
     fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
-        // The agent raises its prompts on these two handles, and the UI
-        // answers through them, so they exist before the agent does.
-        let pair_prompt = Mutable::new(None);
-        let pending_response: Arc<ReplySlot> = Arc::new(AsyncMutex::new(None));
-        // The devices being paired: `pair_device` and the agent's accepted
-        // prompts put them in, and the agent's `AuthorizeService` reads it.
-        let pairings = trust::Pairings::default();
-        // It answers only bluetoothd, whose unique name it looks up per
-        // call: the object is reachable by any peer on the system bus.
-        let agent = PairAgent::new(
-            pending_response.clone(),
-            pair_prompt.clone(),
-            Arc::new(trust::SystemBluez),
-            pairings.clone(),
-        );
+        // The agent raises its prompts on the shared state's banner and reply
+        // slot, which the UI answers through, and reads the same pairing set
+        // `pair_device` writes: one constructor builds both. It answers only
+        // bluetoothd, whose unique name it looks up per call: the object is
+        // reachable by any peer on the system bus.
+        let (shared, agent) = BluetoothShared::with_agent(Arc::new(trust::SystemBluez));
 
         // Build the own_name handle first so it can be stored in Handles for
         // parity with other services (polkit, screensaver, etc.) and passed
@@ -255,21 +276,13 @@ impl Service for BluetoothService {
 
         let handles = BluetoothHandles {
             adapter: Mutable::new(None),
-            devices: Mutable::new(Vec::new()),
-            device_actions: Mutable::new(HashSet::new()),
-            pair_prompt,
-            pending_response,
-            action_error: Mutable::new(None),
+            devices: shared.devices.clone(),
+            device_actions: shared.device_actions.clone(),
+            pair_prompt: shared.pair_prompt.clone(),
+            action_error: shared.action_error.clone(),
             _ownership: ownership.clone(),
         };
-        hytte_reactive::shared::insert(BluetoothShared {
-            devices: handles.devices.clone(),
-            device_actions: handles.device_actions.clone(),
-            pair_prompt: handles.pair_prompt.clone(),
-            pending_response: handles.pending_response.clone(),
-            action_error: handles.action_error.clone(),
-            pairings,
-        });
+        hytte_reactive::shared::insert(shared);
 
         let adapter_mutable = handles.adapter.clone();
         let devices_mutable = handles.devices.clone();
@@ -618,30 +631,44 @@ pub fn disconnect_device(device_path: &str) {
 /// users expect from a "tap to pair my headphones" interaction. For devices
 /// that require a PIN/passkey `BlueZ` delegates to a registered `Agent1`;
 /// without one such pairings will silently fail.
+///
+/// Nothing happens until the service has started: the pairing must go into
+/// the set the agent reads, and a set of its own would leave the agent asking
+/// "Allow …?" for each service the device opens while it pairs (#1611,
+/// LOW-1).
 pub fn pair_device(device_path: &str) {
+    let Some(shared) = shared_state() else {
+        tracing::warn!(
+            path = device_path,
+            "bluetooth pair_device: the bluetooth service has not started; not pairing"
+        );
+        return;
+    };
     let path = device_path.to_string();
     mark_busy(&path);
-    // Shared with the agent, so its `AuthorizeService` sees this pairing.
-    let pairings = shared_state()
-        .map(|s| s.pairings.clone())
-        .unwrap_or_default();
     runtime::handle().spawn(async move {
-        match trust::pair_then_trust(&trust::SystemBluez, &pairings, &path).await {
-            PairOutcome::Paired => {}
-            PairOutcome::PairedDespite(e) => {
-                tracing::info!(
-                    error = %e,
-                    path,
-                    "Pair answered an error but the device is paired; trusted and connecting"
-                );
-            }
-            PairOutcome::Failed(e) => {
-                tracing::warn!(error = %e, path, "bluetooth pair_device failed");
-                report_action_error(format!("Couldn't pair: {e}"));
-            }
-        }
+        pair_from_shell(&shared, &trust::SystemBluez, &path).await;
         mark_idle(&path);
     });
+}
+
+/// [`pair_device`]'s work: pair `path` through `bus`, in `shared`'s pairing
+/// set (the one its agent reads), and record a failure for the toast.
+async fn pair_from_shell(shared: &BluetoothShared, bus: &impl trust::DeviceBus, path: &str) {
+    match trust::pair_then_trust(bus, &shared.pairings, path).await {
+        PairOutcome::Paired => {}
+        PairOutcome::PairedDespite(e) => {
+            tracing::info!(
+                error = %e,
+                path,
+                "Pair answered an error but the device is paired; trusted and connecting"
+            );
+        }
+        PairOutcome::Failed(e) => {
+            tracing::warn!(error = %e, path, "bluetooth pair_device failed");
+            set_action_error(&shared.action_error, format!("Couldn't pair: {e}"));
+        }
+    }
 }
 
 /// What [`pair_device`] does once its `Pair` call has answered.

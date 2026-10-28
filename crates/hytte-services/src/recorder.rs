@@ -557,6 +557,18 @@ fn interrupt(child: &Child) {
 
 /// The unit's version of [`stop_child`]: SIGINT through the user manager
 /// (`KillUnit`), [`STOP_GRACE`] to finalize, then SIGKILL.
+///
+/// A normal stop reads as success, so no `SuccessExitStatus=` is needed
+/// (checked against wf-recorder 0.6.0, the nixpkgs pin, `src/main.cpp`).
+/// `handle_graceful_termination` (`:736`, installed at `:1383`) only sets
+/// `exit_main_loop`. The capture loop (`:1386`) breaks out and joins the
+/// writer thread (`:1422`), whose `write_loop` ends by destroying the
+/// `FrameWriter` (`:733`), which flushes and writes the trailer. `main` then
+/// ends with `return EXIT_SUCCESS` (`:1437`). The process neither dies by the
+/// signal nor returns non-zero, so systemd records `Result=success` and the
+/// unit goes `inactive` and is collected. A write failure doesn't change
+/// that: it only sets the same flag (`frame-writer.cpp:1009`). Only a SIGINT
+/// before the handler is installed (startup, before `:1383`) kills it.
 async fn stop_unit() -> Exit {
     if let Err(e) = bounded(systemd::kill_user_unit(
         RECORDER_UNIT,

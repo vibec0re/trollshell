@@ -5018,6 +5018,36 @@ sudo mount -o loop /tmp/lv.img /mnt`. With the Stats drawer open on the
      (`RUST_LOG=hytte_services=debug`).
   4. Make `hytte-bus` reconnect to the system bus (suspend and resume, for
      example), then crash a unit as in step 1. It still shows up.
+- [ ] **(#1553 bullet 4)** The `NFailedUnits` tracking works against the
+      **system** manager, which is the one the bar chip reads
+      (`BusKind::System`, `systemd.rs`). The automated test
+      (`the_failed_unit_count_moves_for_a_failure_with_no_job`) runs against the
+      user manager only. Needs root and a session where the services chip is
+      on the bar. Note the baseline first: the chip hides at zero, and
+      otherwise shows `<n> failed unit(s)` in its tooltip.
+
+  ```sh
+  busctl get-property org.freedesktop.systemd1 /org/freedesktop/systemd1 \
+    org.freedesktop.systemd1.Manager NFailedUnits   # baseline, e.g. u 0
+  ```
+
+  1. A unit that fails **with no job** (the #1501 case: the start job is long
+     done when it exits):
+     `sudo systemd-run --unit=ts-fail-probe sh -c 'sleep 2; exit 1'`.
+     Two seconds later `NFailedUnits` is baseline + 1, the chip count goes up
+     by one within about a second (well under the 60 s poll), and its tooltip
+     / the Stats Services card lists `ts-fail-probe.service`.
+  2. `sudo systemctl reset-failed ts-fail-probe.service`. `NFailedUnits` is
+     back at baseline and the chip count goes down by one within about a
+     second, and hides if the baseline was zero.
+  3. A unit that fails **through a job** still works:
+     `sudo systemd-run --unit=ts-fail-job -p Type=oneshot false`. The count
+     goes up by one (the start job itself fails, so `JobRemoved` fires), and
+     `sudo systemctl reset-failed ts-fail-job.service` takes it down again.
+  4. Debug view of what drove each refresh:
+     `RUST_LOG=hytte_services=debug cargo run -p trollshell` (or the
+     journal of the shell unit), repeating steps 1 and 2: one refresh per
+     change, no refresh storm.
 
 ## Weather & location
 

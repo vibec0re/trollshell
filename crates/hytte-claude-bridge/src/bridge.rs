@@ -1252,7 +1252,10 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"answered"}
         let (captured, _scope) = hytte_config::test_support::capture();
         for _ in 0..20 {
             let (mut client, server) = UnixStream::pair().expect("a socket pair");
-            client.write_all(&request("pet", "gone")).await.expect("send");
+            client
+                .write_all(&request("pet", "gone"))
+                .await
+                .expect("send");
             hang_up(client);
             assert_eq!(
                 super::serve(&bridge, server).await,
@@ -1296,7 +1299,10 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"answered"}
             let [pid] = stand_in::wait_for(dir.path(), 1).await[..] else {
                 panic!("one child");
             };
-            follow.write_all(&request("pet", "same")).await.expect("send");
+            follow
+                .write_all(&request("pet", "same"))
+                .await
+                .expect("send");
             tokio::time::sleep(Duration::from_millis(300)).await;
             assert_eq!(
                 stand_in::started(dir.path()),
@@ -1358,7 +1364,10 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"answered"}
             let [pid] = stand_in::wait_for(dir.path(), 1).await[..] else {
                 panic!("one child");
             };
-            follow.write_all(&request("pet", "same")).await.expect("send");
+            follow
+                .write_all(&request("pet", "same"))
+                .await
+                .expect("send");
             tokio::time::sleep(Duration::from_millis(300)).await;
             hang_up(lead);
             tokio::time::sleep(Duration::from_millis(400)).await;
@@ -1377,7 +1386,11 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"answered"}
 
         assert_eq!(lead_ending, Some((super::HUNG_UP, false)));
         assert_eq!(follow_ending, Some((super::HUNG_UP, false)));
-        assert_eq!(abandoned(&captured), 1, "the shared turn's kill went unreported");
+        assert_eq!(
+            abandoned(&captured),
+            1,
+            "the shared turn's kill went unreported"
+        );
         assert!(bridge.inflight.lock().expect("unpoisoned").is_empty());
         assert_eq!(bridge.permits.available_permits(), super::PERMITS);
     }
@@ -1509,7 +1522,10 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"answered"}
             "clients that sent and hung up put {started} paid calls in flight against {} permits",
             super::PERMITS,
         );
-        assert_eq!(free, 0, "a hung-up request gave its permit back while its call ran");
+        assert_eq!(
+            free, 0,
+            "a hung-up request gave its permit back while its call ran"
+        );
         assert_eq!(shed.len(), 2, "{shed:?}");
         for reply in &shed {
             assert!(reply.starts_with("HTTP/1.1 503 "), "{reply:?}");

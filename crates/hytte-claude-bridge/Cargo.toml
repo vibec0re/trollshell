@@ -82,3 +82,14 @@ tempfile.workspace = true
 # `time`); this dev-only edge adds one feature flag and no `Cargo.lock` entry,
 # and never reaches the shipped daemon.
 tokio = { workspace = true, features = ["test-util"] }
+# `test-support` for `hytte_config::test_support::capture`: `backend.rs`'s
+# tests count the `warn!` lines a turn's kill emits (#1550). That harness's
+# process-wide `ensure_global_default` is what keeps a callsite that a
+# subscriber-less test thread (bridge.rs's hung turns) registers first from
+# being cached `Interest::never()` and blanking the capture — the #1022 trap,
+# which a hand-rolled `set_default` capture here hit in 21 of 40 runs (#1623
+# review). A **dev**-dependency only, so no shipped rlib carries its
+# `set_global_default`, and no new resolved package: `hytte-config` is a
+# workspace member, and the feature's two extra crates (`tempfile`,
+# `temp-env`) are already in `Cargo.lock` through it.
+hytte-config = { path = "../hytte-config", features = ["test-support"] }

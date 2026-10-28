@@ -1240,6 +1240,7 @@ dependencies = [
  "hive-claude",
  "httparse",
  "hytte-ai-providers",
+ "hytte-config",
  "hytte-plugin",
  "serde",
  "serde_json",

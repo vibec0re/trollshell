@@ -153,7 +153,7 @@ pub struct Client {
     /// Always [`ENDPOINT`] outside the tests. A field rather than the constant
     /// at the call site only so a test can point the real client — its
     /// `spawn_blocking`, its `ureq` agent — at a loopback listener instead
-    /// ([`Client::with_endpoint`]).
+    /// (`Client::with_endpoint`, which exists only in the test build).
     endpoint: String,
 }
 

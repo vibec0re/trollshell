@@ -536,7 +536,10 @@ async fn capabilities_and_server_information_answer_over_the_bus_inner() {
             .deserialize()
             .expect("GetServerInformation returns (ssss)");
     assert_eq!(name, "trollshell");
-    assert_eq!(spec_version, "1.2", "the spec version the daemon implements");
+    assert_eq!(
+        spec_version, "1.2",
+        "the spec version the daemon implements"
+    );
     assert!(!vendor.is_empty(), "a vendor");
     assert!(!version.is_empty(), "a version");
 
@@ -640,8 +643,12 @@ async fn a_client_replace_of_a_shell_toast_turns_its_clicks_into_broadcasts_inne
         "",
         Urgency::Normal,
         vec![
-            LocalAction::new("open", "Open", move || on_open.store(true, Ordering::SeqCst)),
-            LocalAction::new("copy", "Copy", move || on_copy.store(true, Ordering::SeqCst)),
+            LocalAction::new("open", "Open", move || {
+                on_open.store(true, Ordering::SeqCst);
+            }),
+            LocalAction::new("copy", "Copy", move || {
+                on_copy.store(true, Ordering::SeqCst);
+            }),
         ],
     );
     let toast = live_id("the shell's own toast").await;
@@ -653,8 +660,18 @@ async fn a_client_replace_of_a_shell_toast_turns_its_clicks_into_broadcasts_inne
         "a click on the shell's own toast runs its callback"
     );
 
-    let replaced = notify(&client, toast, "a client's replacement", &["copy", "Copy"], STICKY).await;
-    assert_eq!(replaced, toast, "the client's Notify replaces the live toast");
+    let replaced = notify(
+        &client,
+        toast,
+        "a client's replacement",
+        &["copy", "Copy"],
+        STICKY,
+    )
+    .await;
+    assert_eq!(
+        replaced, toast,
+        "the client's Notify replaces the live toast"
+    );
 
     notifications::invoke_action(toast, "copy");
     assert!(
@@ -708,12 +725,12 @@ async fn close_notification_on_a_non_live_id_replies_success_and_emits_nothing_i
         .expect("the first close replies success");
     assert_eq!(next_closed(&mut closed).await, (id, 3));
 
-    close_notification(&client, id).await.expect(
-        "a second CloseNotification for a closed id replies success, not an error (#1542)",
-    );
-    close_notification(&client, u32::MAX).await.expect(
-        "CloseNotification for an id never issued replies success, not an error (#1542)",
-    );
+    close_notification(&client, id)
+        .await
+        .expect("a second CloseNotification for a closed id replies success, not an error (#1542)");
+    close_notification(&client, u32::MAX)
+        .await
+        .expect("CloseNotification for an id never issued replies success, not an error (#1542)");
 
     let barrier = notify(&client, 0, "barrier", &[], STICKY).await;
     close_notification(&client, barrier)

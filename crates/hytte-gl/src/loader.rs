@@ -116,30 +116,33 @@
 //! observed here, and opening `libGL.so.1` to look would load a library GTK
 //! may never have mapped.
 //!
-//! # A recycled address — the generation (#1562)
+//! # A recycled address — the identity (#1562)
 //!
 //! An `EGLContext` is an opaque pointer, and once `eglDestroyContext` has run
-//! the driver may hand the same pointer to the next `eglCreateContext` (Mesa's
-//! is a heap allocation, so nothing stops it). The address alone would then
-//! let a handle that outlived its context match the context that took its
-//! address, and delete *that* context's object of the same name — the hazard
-//! the owner check exists to close, one context later. So a [`ContextId`] is
-//! the address **and a generation**: a process-wide count per address that
-//! only ever goes up, raised by [`retire`] when the context's owner declares
-//! it finished (`Gl::retire_current_context`, which `hytte-ui`'s two surfaces
-//! call as the last thing their `unrealize` does before GTK lets go of the
-//! context). Every handle made before the retire carries the old generation,
-//! and every context EGL can put at that address afterwards reads as the new
-//! one, so the two never compare equal.
+//! the driver may hand the same pointer to the next `eglCreateContext` —
+//! measured under llvmpipe, a re-realized `GtkGLArea` routinely gets its
+//! predecessor's address back. The address alone would then let a handle that
+//! outlived its context match the context that took its address, and delete
+//! *that* context's object of the same name — the hazard the owner check
+//! exists to close, one context later. So a [`ContextId`] is the address
+//! **and an id**: a number from a process-wide counter that never repeats,
+//! given to an address the first time a handle is created under it
+//! ([`identify_for_handle`]) and kept in a table until the context's owner
+//! declares that context finished ([`retire`], through
+//! `Gl::retire_current_context`, which `hytte-ui`'s two surfaces call as the
+//! last thing their `unrealize` does before GTK lets go of the context). A
+//! drop only looks the address up ([`identify`]); an address with no entry
+//! matches no handle at all.
 //!
 //! **Why it is sound.** Say a handle was made under context `C` at address
-//! `X` while `X`'s generation was `g`: it records `(X, g)`. `C`'s owner
-//! retires `C` while `C` is still alive, which leaves `X`'s generation at
-//! `g + 1` or more for the rest of the process, since nothing lowers it. EGL
-//! can only reuse `X` once `C` is destroyed, which is after the retire, so any
-//! later context at `X` reads as `(X, g')` with `g' > g`. The only moment
-//! `(X, g)` is current is while `C` itself is current and not yet retired —
-//! which is exactly when deleting the handle's object is right.
+//! `X`: it records `(X, a)`, where `a` is `X`'s entry at that moment. `C`'s
+//! owner retires `C` while `C` is still alive, which removes that entry. EGL
+//! can only reuse `X` once `C` is destroyed, which is after the retire, so from
+//! then on `X` either has no entry — and a drop there matches nothing — or a
+//! fresh id that a later handle took from the counter, which is larger than
+//! `a` and so never equal to it. The only moment `(X, a)` is current is while
+//! `C` itself is current and not yet retired, which is exactly when deleting
+//! the handle's object is right.
 //!
 //! **Why the old context's owner, not a bump when a context is created.** The
 //! context that takes over the address need not be one this tree made: GSK's
@@ -151,26 +154,34 @@
 //! **Why per address, not one process-wide epoch.** A single counter raised by
 //! every retire would put every live handle of every *other* context out of
 //! date too, and each would leak on its next drop: a GPU leak per unrealize of
-//! any surface anywhere. (And not a generation carried on the `Gl` token: a
-//! `Drop` takes no token, so it would need a thread-local "generation current
-//! now", which GDK's own `make_current` calls never update — stale precisely
-//! when the address has been reused.)
+//! any surface anywhere. (And not an id carried on the `Gl` token: a `Drop`
+//! takes no token, so it would need a thread-local "context current now",
+//! which GDK's own `make_current` calls never update — stale precisely when
+//! the address has been reused.)
 //!
 //! **What it does not cover.** A context nobody retires — a GLX context, a
 //! process where the probe sees nothing, or a context whose owner is not one
-//! of this tree's surfaces — keeps address-only identity, which is #1543's
-//! behaviour and no worse. A handle made in a context *after* its retire
-//! carries the new generation like any later context at that address would,
-//! so the retire has to be the owner's last act in that context. And a retire
-//! of the wrong context (say, after a `make_current` that failed and left
-//! another context bound) can only make that context's live handles leak on
-//! their next drop, never delete under the wrong context; `hytte-ui` retires
-//! only once GDK confirms the area's own context is the current one.
+//! of this tree's surfaces — keeps its entry, so a later context at its
+//! address matches its handles: address-only identity, which is #1543's
+//! behaviour and no worse. A handle made in a context *after* its retire gets
+//! a fresh id like any later context at that address would, so the retire has
+//! to be the owner's last act in that context. And a retire of the wrong
+//! context (say, after a `make_current` that failed and left another context
+//! bound) can only make that context's live handles leak on their next drop,
+//! never delete under the wrong context; `hytte-ui` retires only once GDK
+//! confirms the area's own context is the current one.
 //!
-//! The table holds one entry per address ever retired and is never pruned: an
-//! entry's generation is the very thing that keeps an outlived handle from
-//! matching. Addresses are reused, which is the point, so it stays as small as
-//! the number of contexts alive at once.
+//! **Its size.** The table holds one entry per address that has had a handle
+//! created under it and has not been retired since — a few dozen bytes each.
+//! Both of `hytte-ui`'s surfaces retire at every `unrealize`, so for them it
+//! holds at most one entry per surface realized right now. An address whose
+//! context is never retired keeps its entry, so in principle the table grows
+//! with the number of such addresses; nothing in this tree outside its tests
+//! makes a handle in a context it does not retire. (The first version of this
+//! kept a generation per address ever retired and never shed one: the #1562
+//! review measured 24 to 43 distinct addresses over 90 realizations with at
+//! most three contexts alive. Entries are now created by handles and removed
+//! by the retire instead.)
 
 use std::collections::BTreeMap;
 use std::ffi::{CString, c_char, c_void};
@@ -200,8 +211,9 @@ type GetProcAddress = unsafe extern "C" fn(*const c_char) -> *const c_void;
 type GetCurrentContext = unsafe extern "C" fn() -> *mut c_void;
 
 /// The identity of one GL context: the `EGLContext` handle glvnd reports as
-/// current on this thread, **paired with that address's generation** — see
-/// the module header's section on a recycled address (#1562).
+/// current on this thread, **paired with the id that address holds in the
+/// identity table** — see the module header's section on a recycled address
+/// (#1562).
 ///
 /// Opaque and compared only for equality — never dereferenced, never handed
 /// back to EGL. The address is non-zero by construction, because
@@ -211,107 +223,165 @@ type GetCurrentContext = unsafe extern "C" fn() -> *mut c_void;
 pub(crate) struct ContextId {
     /// The `EGLContext` pointer, as an address.
     address: NonZeroUsize,
-    /// How many times a context at `address` had been [`retire`]d when this
-    /// identity was read. Two contexts that share an address never share
-    /// this, provided the first was retired before it was destroyed.
-    generation: u64,
+    /// The id `address` held when this identity was read, or [`UNIDENTIFIED`]
+    /// when it held none. A handle's owner is never `UNIDENTIFIED`: owners
+    /// come from [`identify_for_handle`], which always gives an id.
+    id: u64,
 }
+
+/// The id of an address with no entry in the table: no handle has been made
+/// under the context there since that address was last retired, so no handle
+/// can match it. The counter starts above it, so no real id is ever this.
+const UNIDENTIFIED: u64 = 0;
 
 impl ContextId {
     /// A context identity made up from a number, for tests that need an owner
-    /// no live context can ever match. Generation `0`, without consulting
-    /// the table — [`identify`] is the constructor that does.
+    /// no live context can ever match. Its id is `u64::MAX`, which the counter
+    /// never reaches and which is not [`UNIDENTIFIED`], and it never touches
+    /// the table — [`identify_for_handle`] is the constructor that does.
     #[cfg(test)]
     pub(crate) fn fake(value: usize) -> Self {
         Self {
             address: NonZeroUsize::new(value).expect("a fake context id is non-zero"),
-            generation: 0,
+            id: u64::MAX,
         }
     }
 }
 
-/// Every address that has been [`retire`]d, with its current generation; an
-/// address absent here is at generation `0`.
-///
+/// The identity table: every address that has had a handle created under it
+/// and has not been retired since, with the id it was given, plus the counter
+/// the next id comes from.
+struct Identities {
+    /// The id the next newly identified address gets. Starts above
+    /// [`UNIDENTIFIED`] and only goes up, so an id is never handed out twice.
+    next: u64,
+    /// Address → id, for the addresses described above.
+    by_address: BTreeMap<usize, u64>,
+}
+
 /// Process-wide rather than thread-local because an `EGLContext` is: a context
 /// can be current on one thread today and another tomorrow, and a retire seen
 /// only by the thread that made it would leave the other thread's handles
 /// matching a recycled address. A `BTreeMap` because its `new` is `const`, so
 /// the static needs no lazy initialisation. Locked once per handle creation,
-/// drop and retire — never per frame.
-static GENERATIONS: Mutex<BTreeMap<usize, u64>> = Mutex::new(BTreeMap::new());
+/// drop and retire — never per frame, and never nested.
+static IDENTITIES: Mutex<Identities> = Mutex::new(Identities {
+    next: UNIDENTIFIED + 1,
+    by_address: BTreeMap::new(),
+});
 
-/// The identity a context at `address` has **now**: the address paired with
-/// its current generation.
+/// The table, locked. A poisoned lock still holds a consistent table: nothing
+/// between a lock and its unlock in this module can panic halfway through a
+/// write, so the data is as good as before the panic that poisoned it.
+fn identities() -> std::sync::MutexGuard<'static, Identities> {
+    IDENTITIES.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The identity a context at `address` has **now**, without changing the
+/// table: the address paired with its id, or with [`UNIDENTIFIED`] when it has
+/// none. What a drop compares its owner against.
 ///
 /// What [`current_context`] answers with once the probe has read an address,
 /// and the seam the hermetic tests drive with made-up addresses, since no
 /// context is ever current in them.
 pub(crate) fn identify(address: NonZeroUsize) -> ContextId {
-    // A poisoned lock still holds a consistent map: nothing between the lock
-    // and the unlock below (or in `retire`) can panic halfway through a
-    // write, so the data is as good as before the panic that poisoned it.
-    let generations = GENERATIONS.lock().unwrap_or_else(PoisonError::into_inner);
+    let table = identities();
     ContextId {
         address,
-        generation: generations.get(&address.get()).copied().unwrap_or(0),
+        id: table
+            .by_address
+            .get(&address.get())
+            .copied()
+            .unwrap_or(UNIDENTIFIED),
     }
 }
 
-/// Declare `context` finished: its address moves to a later generation, so no
-/// identity read before this call — and so no handle created before it — can
-/// ever equal one read after it, whichever context is at that address then.
-///
-/// Takes the whole [`ContextId`] rather than the address so that retiring a
-/// context **once** is what it says: a second retire of the same identity is
-/// a no-op (the address is already past that generation), and retiring a
-/// stale identity cannot push the address further than its own successor.
-pub(crate) fn retire(context: ContextId) {
-    let mut generations = GENERATIONS.lock().unwrap_or_else(PoisonError::into_inner);
-    let generation = generations.entry(context.address.get()).or_insert(0);
-    *generation = (*generation).max(context.generation.saturating_add(1));
+/// The identity a handle being created under a context at `address` records
+/// as its owner: the address's id, giving it a fresh one from the counter if
+/// it has none. So every handle made under one context, between two retires
+/// of its address, records the same identity.
+pub(crate) fn identify_for_handle(address: NonZeroUsize) -> ContextId {
+    let mut table = identities();
+    let next = table.next;
+    let id = *table.by_address.entry(address.get()).or_insert(next);
+    if id == next {
+        // `saturating_add` rather than `+`: 2^64 identified contexts cannot
+        // happen, and a lock holder must not be able to panic.
+        table.next = next.saturating_add(1);
+    }
+    ContextId { address, id }
 }
 
-/// The context current on this thread, as glvnd's EGL sees it — or `None`
-/// when no EGL context is current, or when there is no glvnd `libEGL.so.1` to
-/// ask (see the module header's last section for what that does and does not
-/// cover).
+/// Declare `context` finished: its address's entry is removed, so no handle
+/// created before this call can ever match that address again — whichever
+/// context is there next either has no entry or a fresh id.
+///
+/// Takes the whole [`ContextId`] rather than the address so that retiring a
+/// context **once** is what it says: the entry goes only if it still holds
+/// this identity's id. A second retire of the same identity, or a retire of a
+/// stale one, finds a missing or newer entry and leaves it alone, so it cannot
+/// take a later context's identity with it.
+pub(crate) fn retire(context: ContextId) {
+    let mut table = identities();
+    if table.by_address.get(&context.address.get()) == Some(&context.id) {
+        table.by_address.remove(&context.address.get());
+    }
+}
+
+/// The address glvnd's EGL reports as current on this thread, or `None` when
+/// no EGL context is current or there is no glvnd `libEGL.so.1` to ask (see
+/// the module header's section on which context is current for what that does
+/// and does not cover).
 ///
 /// The library and symbol are resolved **once** for the process and the call
 /// itself is a thread-local read inside glvnd, so this is cheap enough to ask
 /// on every object creation and every drop — which are the only callers, and
-/// neither is per frame. The generation lookup ([`identify`]) is one
-/// uncontended lock and one map read on top.
+/// neither is per frame.
 ///
 /// **Only reached after [`load`]**, in production: a handle records its owner
 /// in its constructor, which takes a `Gl` token, which is what runs `load` —
 /// and `load` always tries route 1's `dlopen` of this same soname first. So the
 /// `open` below never maps anything route 1 had not already mapped (or failed
 /// to): it is the same refcount bump `open`'s own SAFETY note relies on.
-pub(crate) fn current_context() -> Option<ContextId> {
+fn current_address() -> Option<NonZeroUsize> {
     let get_current_context = context_probe()?;
     // SAFETY: calling `eglGetCurrentContext` through the signature EGL defines
     // for it. It takes no arguments, needs no initialised display and no
     // current context — with none it returns `EGL_NO_CONTEXT` — and only reads
     // glvnd's per-thread state. The result is compared, never dereferenced.
     let context = unsafe { get_current_context() };
-    NonZeroUsize::new(context.addr()).map(identify)
+    NonZeroUsize::new(context.addr())
 }
 
-/// The raw address [`current_context`] would identify, with no generation —
-/// for the `system-tests` seam that lets a live-driver test see whether the
-/// driver actually reused an address across a context recreate.
-#[cfg(feature = "system-tests")]
-pub(crate) fn current_address() -> Option<usize> {
-    current_context().map(|context| context.address.get())
+/// The context current on this thread, identified without changing the table
+/// ([`identify`]) — what a drop compares its owner against, and what a retire
+/// retires. `None` when the probe sees no context.
+pub(crate) fn current_context() -> Option<ContextId> {
+    current_address().map(identify)
 }
 
-/// The generation [`identify`] would pair with `address` now — for the
-/// `system-tests` seam that lets a live-driver test see a retire happen
-/// without needing the driver to reuse the address.
+/// The context current on this thread, identified for a handle being created
+/// under it ([`identify_for_handle`]) — what a constructor records as the
+/// handle's owner. `None` when the probe sees no context, which leaves the
+/// handle with no owner.
+pub(crate) fn current_context_for_handle() -> Option<ContextId> {
+    current_address().map(identify_for_handle)
+}
+
+/// The raw address current on this thread, with no id — for the
+/// `system-tests` seam that lets a live-driver test see whether the driver
+/// actually reused an address across a context recreate.
 #[cfg(feature = "system-tests")]
-pub(crate) fn generation_of(address: NonZeroUsize) -> u64 {
-    identify(address).generation
+pub(crate) fn current_raw_address() -> Option<usize> {
+    current_address().map(NonZeroUsize::get)
+}
+
+/// The id `address` holds in the table now, or `None` when it holds none —
+/// for the `system-tests` seam that lets a live-driver test see a retire
+/// happen without needing the driver to reuse the address.
+#[cfg(feature = "system-tests")]
+pub(crate) fn id_of(address: NonZeroUsize) -> Option<u64> {
+    identities().by_address.get(&address.get()).copied()
 }
 
 /// glvnd's `eglGetCurrentContext`, resolved once for the process, or `None`
@@ -623,8 +693,9 @@ fn open(soname: Option<&str>) -> Result<&'static libloading::Library, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        EPOXY_SONAMES, GLVND_EGL_SONAME, GetProcAddress, Source, context_probe, current_context,
-        identify, install, load_once, loader_for, open, retire,
+        EPOXY_SONAMES, GLVND_EGL_SONAME, GetProcAddress, Source, UNIDENTIFIED, context_probe,
+        current_context, identities,
+        identify, identify_for_handle, install, load_once, loader_for, open, retire,
     };
     use std::num::NonZeroUsize;
 
@@ -867,54 +938,83 @@ mod tests {
         );
     }
 
-    /// **#1562.** Once a context is retired, no identity read before the
-    /// retire matches its address again — the property that stops a handle
-    /// which outlived its context from deleting under the next context EGL
-    /// puts at the same address. Driven through [`identify`] and [`retire`]
-    /// with made-up addresses, since no context is ever current on a test
-    /// thread; the `Drop` decision that consumes it is `lib.rs`'s
+
+    /// **#1562.** Once a context is retired, no handle made under it matches
+    /// its address again, and the retire takes its entry out of the table —
+    /// the property that stops a handle which outlived its context from
+    /// deleting under the next context EGL puts at the same address, and the
+    /// one that keeps the table as small as the set of live, identified
+    /// contexts. Driven through [`identify_for_handle`], [`identify`] and
+    /// [`retire`] with made-up addresses, since no context is ever current on
+    /// a test thread; the `Drop` decision that consumes it is `lib.rs`'s
     /// `a_handle_made_before_its_context_was_retired_is_never_deleted`, and
     /// the real driver's half is `hytte-ui`'s gated `gl_surface` test
     /// `a_handle_that_outlives_its_context_never_matches_the_next_one`.
     ///
     /// Its own addresses (nothing else in this binary identifies these two),
-    /// because the generation table is process-wide and `cargo test` runs
-    /// tests on parallel threads.
+    /// because the table is process-wide and `cargo test` runs tests on
+    /// parallel threads.
     ///
-    /// **Falsified** four ways, each reddening a different assertion:
-    /// `identify` ignoring the table, i.e. address-only identity, which is
-    /// #1543's shipped behaviour (the first `assert_ne!`); `retire` raising
-    /// every address at once instead of its own (the neighbour assertion);
-    /// `retire` incrementing instead of moving to `generation + 1`, so a
-    /// stale identity pushes its own successor out of date (the double-retire
-    /// assertion); and `retire` writing nothing (the first `assert_ne!`).
+    /// **Falsified** four ways, each reddening a different assertion: `retire`
+    /// leaving the entry in place (the "entry is gone" assertion, and the
+    /// first `assert_ne!` after the retire); `retire` removing the entry
+    /// whatever id it holds, so a stale retire takes its successor's identity
+    /// (the stale-retire assertion); ids handed out twice, e.g. the counter
+    /// not advancing (the `second != first` assertion); and `identify`
+    /// creating an entry instead of only reading (the "a drop does not
+    /// identify" assertion).
     #[test]
-    fn a_retired_address_never_matches_an_identity_read_before_the_retire() {
+    fn a_retired_address_never_matches_a_handle_made_before_the_retire() {
         let here = NonZeroUsize::new(0x1562_0000).expect("non-zero");
         let next_door = NonZeroUsize::new(0x1562_1000).expect("non-zero");
+        let entry = |address: NonZeroUsize| {
+            identities()
+                .by_address
+                .get(&address.get())
+                .copied()
+        };
 
-        let first = identify(here);
-        let neighbour = identify(next_door);
+        let unseen = identify(here);
+        assert_eq!(unseen.id, UNIDENTIFIED, "no handle has been made here yet");
+        assert_eq!(
+            entry(here),
+            None,
+            "a drop does not identify: looking an address up must not add it to the table",
+        );
+
+        let first = identify_for_handle(here);
+        assert_ne!(first.id, UNIDENTIFIED, "a handle's owner always has an id");
         assert_eq!(
             identify(here),
             first,
-            "an address nobody has retired must keep reading as itself, or every handle's drop \
-             would leak",
+            "a drop under the context that made the handle must match it, or every drop leaks",
         );
+        assert_eq!(
+            identify_for_handle(here),
+            first,
+            "every handle made under one context records the same identity",
+        );
+        let neighbour = identify_for_handle(next_door);
+        assert_ne!(neighbour.id, first.id, "two contexts never share an id");
 
         retire(first);
-        let second = identify(here);
+        assert_eq!(
+            entry(here),
+            None,
+            "a retire must take the entry out, which is what bounds the table",
+        );
         assert_ne!(
-            second, first,
+            identify(here),
+            first,
             "after a retire the same address is a different context: a handle made before it must \
              not match whatever EGL puts at that address next",
         );
-        assert_eq!(
-            identify(here),
-            second,
-            "…and the context that takes the address over matches itself, so its own handles \
-             keep deleting",
+        let second = identify_for_handle(here);
+        assert_ne!(
+            second, first,
+            "the next context at the address gets a fresh id, never the retired one",
         );
+        assert_eq!(identify(here), second, "…and matches its own handles");
         assert_eq!(
             identify(next_door),
             neighbour,
@@ -925,16 +1025,16 @@ mod tests {
         assert_eq!(
             identify(here),
             second,
-            "retiring a context twice is one retire, and a stale identity must not push the \
-             context now at its address out of date",
+            "retiring a context twice is one retire, and a stale identity must not take the \
+             context now at its address with it",
         );
 
         retire(second);
-        let third = identify(here);
-        assert!(
-            third != second && third != first,
-            "generations only go up, so no earlier identity ever comes back: {first:?} \
-             {second:?} {third:?}",
+        retire(neighbour);
+        assert_eq!(
+            (entry(here), entry(next_door)),
+            (None, None),
+            "both entries gone once both contexts are retired",
         );
     }
 }

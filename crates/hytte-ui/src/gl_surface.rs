@@ -138,9 +138,9 @@
 //!   `GdkGLTexture` holds the context too (`gdk/gdkgltexture.c:270`) — and
 //!   from then on the driver may hand that `EGLContext` address to the next
 //!   context anyone creates. So the override's last act before
-//!   `parent_unrealize` is `retire_context`, which moves the address to a
-//!   new generation in `hytte-gl` so that a handle which outlived this
-//!   realization cannot match the newcomer.
+//!   `parent_unrealize` is `retire_context`, which drops the address's
+//!   identity in `hytte-gl` so that a handle which outlived this realization
+//!   cannot match the newcomer.
 //! * **Until #1562 these contexts never died at all — not GTK's doing but
 //!   gtk4-rs's.** A Rust `GtkGLArea` subclass that inherits
 //!   `GLAreaImpl::create_context` gets gtk4-rs 0.11.2's
@@ -662,8 +662,8 @@ pub fn abandon_gl(reason: &str) {
 /// `unrealize` drops the area's reference to it (`gtk/gtkglarea.c:681`), and
 /// the `EGLContext` is destroyed when the last reference goes
 /// (`gdk/gdkglcontext.c:222`), after which the driver may give its address to
-/// the next context anyone creates. Retiring first moves that address to a
-/// new generation, so a handle that outlived this realization can never match
+/// the next context anyone creates. Retiring first drops that address's
+/// identity, so a handle that outlived this realization can never match
 /// whatever is at that address later — see `hytte_gl::Gl::retire_current_context`.
 ///
 /// **Only when GDK says the area's own context is current.** The
@@ -742,7 +742,7 @@ pub(crate) fn create_area_context(area: &gtk::GLArea) -> Option<gdk::GLContext> 
 /// unrealize — measured under llvmpipe, still alive a second later — which
 /// would keep the old address from coming back.
 ///
-/// The retire is asserted on the generation table itself, every round, so
+/// The retire is asserted on the identity table itself, every round, so
 /// it holds whether or not the driver reuses an address; so is the context
 /// being finalized by the unrealize, which is what [`create_area_context`]
 /// restores and what lets the address come back at all. The handle is a
@@ -803,7 +803,17 @@ pub(crate) fn assert_an_outlived_handle_never_deletes_under_a_reused_address(
         // Out of the window and back in: GTK unrealizes an unparented widget
         // (`gtk/gtkwidget.c:2702`), which runs the override under test, and
         // `GtkGLArea` makes a fresh context on the way back.
-        let generation = hgl::context_generation_for_test(current);
+        // A handle made and dropped under this round's context gives its
+        // address an entry (the first round's already has the outlived
+        // texture's), so the retire below has something to take away.
+        drop(
+            hgl::Texture::new(&gl, hgl::Format::R8, 1, 1)
+                .unwrap_or_else(|error| panic!("a 1x1 R8 texture: {error}")),
+        );
+        assert!(
+            hgl::context_id_for_test(current).is_some(),
+            "the premise: a handle made under the context at {current:#x} gave it an identity",
+        );
         let context = area.context().map(|context| context.downgrade());
         window.set_child(None::<&gtk::Widget>);
         assert!(
@@ -817,7 +827,7 @@ pub(crate) fn assert_an_outlived_handle_never_deletes_under_a_reused_address(
              can never come back (gtk4-rs's default create_context; see create_area_context)",
         );
         assert!(
-            hgl::context_generation_for_test(current) > generation,
+            hgl::context_id_for_test(current).is_none(),
             "unrealize must retire the context it is about to lose (at {current:#x}), or a \
              handle that outlives it can match whatever the driver puts at that address next",
         );
@@ -2395,8 +2405,8 @@ mod imp {
         /// every resize would leak.
         ///
         /// Asked of the real probe and a real `Drop`, so it pins what the
-        /// hermetic tests cannot reach: that `current_context` reads the
-        /// generation at all, on both the creating and the dropping side.
+        /// hermetic tests cannot reach: that the live probe goes through the
+        /// identity table at all, on both the creating and the dropping side.
         ///
         /// **Falsified** by `loader::current_context` building its identity
         /// from the address alone (bypassing `identify`), or by
@@ -2421,7 +2431,7 @@ mod imp {
             assert_eq!(
                 hgl::current_context_address_for_test(&gl),
                 address,
-                "the premise: same context, same address — only the generation moved",
+                "the premise: same context, same address — only its identity was retired",
             );
             drop(outlived);
             assert!(
@@ -2435,7 +2445,7 @@ mod imp {
             drop(fresh);
             assert!(
                 !hgl::is_texture_for_test(&gl, fresh_name),
-                "a handle made after the retire belongs to the new generation and must still \
+                "a handle made after the retire gets a fresh identity and must still \
                  delete texture {fresh_name}",
             );
 

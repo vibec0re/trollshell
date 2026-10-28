@@ -63,13 +63,13 @@
 //!    destroyed, and in this tree that is the next thing that happens to it.
 //!
 //!    "The context that created it" is an `EGLContext` address **paired with
-//!    a generation** (#1562): an address can be handed to a new context once
-//!    the old one is destroyed, and a handle that outlived its context would
-//!    otherwise match the newcomer. A context's owner calls
+//!    an id** that never repeats (#1562): an address can be handed to a new
+//!    context once the old one is destroyed, and a handle that outlived its
+//!    context would otherwise match the newcomer. A context's owner calls
 //!    [`Gl::retire_current_context`] as its last act in that context, which
-//!    moves the address to a new generation, so no handle made before it can
-//!    match whatever is at that address afterwards. `loader`'s module docs
-//!    carry the argument that this is sound and what it does not cover.
+//!    drops the address's id, so no handle made before it can match whatever
+//!    is at that address afterwards. `loader`'s module docs carry the argument
+//!    that this is sound, what it does not cover, and how big its table gets.
 //!
 //!    The check reaches EGL contexts only. A handle created where the probe
 //!    sees none (a GLX context, or a process with no glvnd `libEGL.so.1`)
@@ -374,8 +374,11 @@ impl Gl {
 /// The token is the claim that *a* context is current; the probe is what says
 /// *which* one. `None` when the probe can see no context at all — see
 /// [`release`] for what a handle with no recorded owner does.
+///
+/// The one caller that *identifies* the context — gives its address an id if
+/// it has none (#1562); a drop and a retire only look it up.
 fn owner_now(_gl: &Gl) -> Option<ContextId> {
-    loader::current_context()
+    loader::current_context_for_handle()
 }
 
 /// The line a handle writes when it leaks its object instead of deleting it.
@@ -1591,21 +1594,22 @@ pub fn is_texture_for_test(_gl: &Gl, name: u32) -> bool {
 }
 
 /// **Test-only.** The `EGLContext` address current on this thread, with no
-/// generation, or `None` where the probe sees no context.
+/// id, or `None` where the probe sees no context.
 ///
 /// For a live-driver test to report whether the driver actually **reused** an
 /// address across a context recreate — the precondition of #1562's hazard,
 /// which a test cannot arrange, only observe. Never compared against a
 /// handle's owner by anything shipped: the owner check compares the address
-/// *and* its generation.
+/// *and* its id.
 #[cfg(feature = "system-tests")]
 #[must_use]
 pub fn current_context_address_for_test(_gl: &Gl) -> Option<usize> {
-    loader::current_address()
+    loader::current_raw_address()
 }
 
-/// **Test-only.** The generation an `EGLContext` address is at now — how many
-/// times a context there has been retired (#1562).
+/// **Test-only.** The id an `EGLContext` address holds in this crate's
+/// identity table now, or `None` when it holds none — no handle made under it
+/// since it was last retired (#1562).
 ///
 /// So a live-driver test can assert that a widget's `unrealize` retired the
 /// context it was about to lose, which no drop can show unless the driver
@@ -1614,8 +1618,8 @@ pub fn current_context_address_for_test(_gl: &Gl) -> Option<usize> {
 /// gone.
 #[cfg(feature = "system-tests")]
 #[must_use]
-pub fn context_generation_for_test(address: usize) -> u64 {
-    std::num::NonZeroUsize::new(address).map_or(0, loader::generation_of)
+pub fn context_id_for_test(address: usize) -> Option<u64> {
+    std::num::NonZeroUsize::new(address).and_then(loader::id_of)
 }
 
 /// **Test-only.** Whether `name` is a vertex array object in the **current**
@@ -1837,18 +1841,18 @@ mod tests {
     ///
     /// Through [`release`] itself, with the probe answering what
     /// `loader::current_context` would for that address now
-    /// ([`loader::identify`]), so the generation is checked where the delete
-    /// is decided rather than only in the loader's own table test.
+    /// ([`loader::identify`]), so the id is checked where the delete is
+    /// decided rather than only in the loader's own table test.
     ///
-    /// **Falsified** by `loader::identify` ignoring its table, i.e. #1543's
-    /// address-only identity: the first `release` deletes.
+    /// **Falsified** by `loader::retire` leaving the entry in place, which is
+    /// #1543's address-only identity: the first `release` deletes.
     #[test]
     fn a_handle_made_before_its_context_was_retired_is_never_deleted() {
         let address = std::num::NonZeroUsize::new(0x1562_8000).expect("non-zero");
         let deletes = Cell::new(0_u32);
         let delete = || deletes.set(deletes.get() + 1);
 
-        let outlived = loader::identify(address);
+        let outlived = loader::identify_for_handle(address);
         loader::retire(outlived);
         let newcomer = || Some(loader::identify(address));
 
@@ -1866,13 +1870,14 @@ mod tests {
              same address: VAO 1 there is the newcomer's own",
         );
 
-        let fresh = loader::identify(address);
+        let fresh = loader::identify_for_handle(address);
         assert!(release("vertex array", 1, Some(fresh), newcomer, delete));
         assert_eq!(
             deletes.get(),
             1,
             "…while a handle the newcomer made itself still deletes, or every resize would leak",
         );
+        loader::retire(fresh);
     }
 
     /// The same table, through a **real** `Drop`: handles whose owner no live

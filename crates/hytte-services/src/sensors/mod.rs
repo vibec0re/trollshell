@@ -246,6 +246,18 @@ fn spawn_per_core_history<T, F>(
     });
 }
 
+/// One clock frame for the per-core history: each core's frequency over the
+/// shared ceiling, and the CPU number of each (the rings' restart key).
+fn clock_frame(f: &CpuFreq) -> (Vec<f64>, Vec<u32>) {
+    let ceiling = f.max_ceiling_hz;
+    let frame = f
+        .per_core
+        .iter()
+        .map(|&hz| normalized_clock(hz, ceiling))
+        .collect();
+    (frame, f.core_ids.clone())
+}
+
 /// Fold one per-core frame into `series`, one sample per ring.
 ///
 /// **The rings restart on a CPU hot-plug**: when the frame's width changes, or
@@ -368,20 +380,12 @@ impl Service for SensorsService {
             handles.cpu_per_core_hist.clone(),
             |c| (c.per_core.clone(), c.core_ids.clone()),
         );
-        // `CpuFreq` carries no CPU numbers, so this one restarts on a width
-        // change alone, as it always has.
+        // The clock rings restart on a change of CPUs too, by
+        // `CpuFreq::core_ids` (#1561), exactly as the load rings do.
         spawn_per_core_history(
             handles.cpu_freq.clone(),
             handles.cpu_freq_per_core_hist.clone(),
-            |f| {
-                let ceiling = f.max_ceiling_hz;
-                let frame = f
-                    .per_core
-                    .iter()
-                    .map(|&hz| normalized_clock(hz, ceiling))
-                    .collect();
-                (frame, Vec::new())
-            },
+            clock_frame,
         );
 
         handles
@@ -1240,7 +1244,7 @@ mod tests {
         GpuVendor, HISTORY_CAP, NetConnections, NetIo, PollState, PollWriters, TickData,
         TickInputs, WARN_COOLDOWN, apply_conn_counts, apply_cpu_freq, apply_cpu_load,
         apply_cpu_temp, apply_disk, apply_disk_io, apply_gpu, apply_memory, apply_network,
-        poll_loop_with, poll_tick, push_per_core_frame, read_gpu_with_cache,
+        clock_frame, poll_loop_with, poll_tick, push_per_core_frame, read_gpu_with_cache,
     };
     use futures_signals::signal::Mutable;
     use std::collections::HashMap;
@@ -1624,8 +1628,41 @@ mod tests {
         );
     }
 
-    /// A source with no CPU numbers (`CpuFreq`) passes an empty `ids`, so the
-    /// width alone decides, as before #1561, and the rings stay capped.
+    /// **#1561, the clock rings**: `clock_frame` hands the history the
+    /// `CpuFreq`'s CPU numbers, so an equal-count swap (cpu2 out, cpu4 in)
+    /// restarts every clock ring, and the frame's values are each core over the
+    /// shared ceiling.
+    ///
+    /// **Falsified** by returning an empty id list from `clock_frame`.
+    #[allow(clippy::float_cmp)]
+    #[test]
+    fn clock_history_restarts_on_a_relabel_at_the_same_count() {
+        let freq = |ids: &[u32]| CpuFreq {
+            max_hz: 2.0e9,
+            per_core: vec![1.0e9, 2.0e9, 1.0e9, 0.5e9],
+            core_ids: ids.to_vec(),
+            max_ceiling_hz: 4.0e9,
+        };
+        let mut series = Vec::new();
+        let mut cores = Vec::new();
+        for _ in 0..3 {
+            let (frame, ids) = clock_frame(&freq(&[0, 1, 2, 3]));
+            assert_eq!(frame, vec![0.25, 0.5, 0.25, 0.125]);
+            push_per_core_frame(&mut series, &mut cores, &frame, &ids);
+        }
+        assert_eq!(ring_lens(&series), vec![3; 4], "same CPUs: rings grow");
+
+        let (frame, ids) = clock_frame(&freq(&[0, 1, 3, 4]));
+        push_per_core_frame(&mut series, &mut cores, &frame, &ids);
+        assert_eq!(
+            ring_lens(&series),
+            vec![1; 4],
+            "a relabel at the same count restarts every clock ring"
+        );
+    }
+
+    /// A source that passes no CPU numbers gives an empty `ids`, so the width
+    /// alone decides, as before #1561, and the rings stay capped.
     #[test]
     fn per_core_history_without_ids_restarts_on_width_alone() {
         let mut series = Vec::new();
@@ -1647,6 +1684,7 @@ mod tests {
         let sample = CpuFreq {
             max_hz: 3_200_000_000.0,
             per_core: vec![3_200_000_000.0, 1_800_000_000.0],
+            core_ids: vec![0, 1],
             max_ceiling_hz: 4_000_000_000.0,
         };
         apply_cpu_freq(sample.clone(), &writer);

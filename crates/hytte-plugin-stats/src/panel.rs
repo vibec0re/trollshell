@@ -269,6 +269,12 @@ pub struct History {
     /// exposes `cpufreq` — the expanded Clock row's series, native
     /// `cpu_freq_per_core_history`.
     per_core_clock: Vec<VecDeque<f32>>,
+    /// The CPU number of each [`per_core_clock`](Self::per_core_clock) window:
+    /// the `Snapshot::clock_core_ids` they were started for. Separate from
+    /// [`core_ids`](Self::core_ids) because a core without a `cpufreq` node has
+    /// a load window and no clock window. A snapshot naming different CPUs
+    /// starts them over, as a count change does (#1561).
+    clock_core_ids: Vec<u32>,
 }
 
 /// Append one sample to a ring, dropping the oldest past [`HISTORY_LEN`].
@@ -367,6 +373,13 @@ impl History {
         if !snapshot.per_core.is_empty() && self.core_ids != snapshot.core_ids {
             self.per_core.clear();
             self.core_ids.clone_from(&snapshot.core_ids);
+        }
+        // The clock windows follow the same rule on their own ids: a core
+        // whose `scaling_cur_freq` is unreadable for a tick drops out of the
+        // frame by name, so the windows start over rather than slide.
+        if !snapshot.per_core_clock.is_empty() && self.clock_core_ids != snapshot.clock_core_ids {
+            self.per_core_clock.clear();
+            self.clock_core_ids.clone_from(&snapshot.clock_core_ids);
         }
         push_frame(&mut self.per_core, &snapshot.per_core);
         push_frame(&mut self.per_core_clock, &snapshot.per_core_clock);
@@ -1220,6 +1233,7 @@ mod tests {
             cpu_clock_ceiling_hz: Some(5_000_000_000.0),
             // Four cores, the fastest at 3.8 GHz of the 5 GHz ceiling.
             per_core_clock: vec![0.24, 0.76, 0.5, 0.3],
+            clock_core_ids: vec![0, 1, 2, 3],
             disk_io: Some(DiskIo {
                 read_bps: 2_097_152.0,
                 write_bps: 1_048_576.0,
@@ -2549,6 +2563,59 @@ mod tests {
 
         h.push(&frame(&[0, 1, 3, 4]));
         assert_eq!(lens(&h.per_core), vec![2; 4], "…then the new set grows");
+    }
+
+    /// **#1561, the clock windows**: they start over when the snapshot's clock
+    /// frame names different CPUs at the same count (cpu2 out, cpu4 in), and
+    /// when one core drops out of the frame for a tick (its `scaling_cur_freq`
+    /// was unreadable) — never sliding a core's past onto a neighbour's line.
+    /// The load windows, whose ids did not change, keep theirs, and a frame
+    /// with no clock (no governor) restarts nothing.
+    ///
+    /// **Falsified** by dropping the `clock_core_ids` comparison in
+    /// [`History::push`].
+    #[test]
+    fn the_clock_windows_restart_when_the_cpus_change_at_the_same_count() {
+        let frame = |ids: &[u32]| Snapshot {
+            per_core: vec![0.1, 0.2, 0.3, 0.4],
+            core_ids: vec![0, 1, 2, 3],
+            per_core_clock: vec![0.5; ids.len()],
+            clock_core_ids: ids.to_vec(),
+            ..Snapshot::default()
+        };
+        let lens = |windows: &[std::collections::VecDeque<f32>]| {
+            windows
+                .iter()
+                .map(std::collections::VecDeque::len)
+                .collect::<Vec<_>>()
+        };
+
+        let mut h = History::default();
+        for _ in 0..5 {
+            h.push(&frame(&[0, 1, 2, 3]));
+        }
+        assert_eq!(lens(&h.per_core_clock), vec![5; 4], "same CPUs: grow");
+
+        h.push(&Snapshot::default());
+        assert_eq!(lens(&h.per_core_clock), vec![5; 4], "a cold tick: nothing");
+
+        h.push(&frame(&[0, 1, 3, 4]));
+        assert_eq!(
+            lens(&h.per_core_clock),
+            vec![1; 4],
+            "a relabel at the same count starts every clock window over"
+        );
+        assert_eq!(lens(&h.per_core), vec![7; 4], "the load keeps its");
+
+        h.push(&frame(&[0, 1, 3, 4]));
+        assert_eq!(lens(&h.per_core_clock), vec![2; 4], "…then the set grows");
+
+        h.push(&frame(&[0, 3, 4]));
+        assert_eq!(
+            lens(&h.per_core_clock),
+            vec![1; 3],
+            "cpu1 missing for a tick: the survivors are named, and start over"
+        );
     }
 
     /// **The header's words**, as literals (#1026): native's

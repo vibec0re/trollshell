@@ -122,6 +122,15 @@ pub struct Snapshot {
     /// when [`cpu_clock_hz`](Self::cpu_clock_hz) is `None`: no governor, or an
     /// instance that does not draw the CPU half.
     pub per_core_clock: Vec<f32>,
+    /// The kernel's number (`N` of `cpuN`) of each [`per_core_clock`](Self::per_core_clock)
+    /// entry: same length, same order, ascending, and empty exactly when
+    /// `per_core_clock` is. It is **not** [`core_ids`](Self::core_ids): a core
+    /// without a `cpufreq` node (or whose `scaling_cur_freq` is unreadable for
+    /// one tick) has a load entry and no clock entry.
+    ///
+    /// The page's per-core clock history restarts when this changes, not only
+    /// when its length does (#1561), as the load history does on `core_ids`.
+    pub clock_core_ids: Vec<u32>,
     /// Aggregate disk-throughput history — the native Disks card's I/O row
     /// (`stats.rs:610` → `:1293`) — or `None` when this instance does not draw
     /// disks (see [`Needs`]). Unlike [`cpu`](Self::cpu) this is never withheld
@@ -440,12 +449,14 @@ impl Sampler {
         };
         // One `cpufreq` walk feeds the aggregate and the per-core series alike,
         // so the page's collapsed and expanded Clock rows are one observation.
-        let (cpu_clock_hz, cpu_clock_ceiling_hz, per_core_clock) = if self.needs.cpu {
+        let (cpu_clock_hz, cpu_clock_ceiling_hz, per_core_clock, clock_core_ids) = if self.needs.cpu
+        {
             let freq = hytte_sensors::read_cpu_freq();
             let (hz, ceiling) = clock_of(&freq);
-            (hz, ceiling, per_core_clock_of(&freq))
+            let (per_core_clock, clock_core_ids) = per_core_clock_of(&freq);
+            (hz, ceiling, per_core_clock, clock_core_ids)
         } else {
-            (None, None, Vec::new())
+            (None, None, Vec::new(), Vec::new())
         };
 
         let memory = if self.needs.memory {
@@ -512,6 +523,7 @@ impl Sampler {
             cpu_clock_hz,
             cpu_clock_ceiling_hz,
             per_core_clock,
+            clock_core_ids,
             disk_io,
         }
     }
@@ -633,14 +645,20 @@ fn clock_of(freq: &hytte_sensors::CpuFreq) -> (Option<f64>, Option<f64>) {
 /// boost above `cpuinfo_max_freq` sits on the top rail, as the aggregate line
 /// does — `panel::History::push` clamps that one) and a `NaN` reads as `0.0`
 /// rather than defeating the render dedup (#896/#898).
-fn per_core_clock_of(freq: &hytte_sensors::CpuFreq) -> Vec<f32> {
+///
+/// Returns the fractions **and** the CPU number of each (`CpuFreq::core_ids`),
+/// the page history's restart key (#1561); both are empty together.
+fn per_core_clock_of(freq: &hytte_sensors::CpuFreq) -> (Vec<f32>, Vec<u32>) {
     if freq.max_ceiling_hz > 0.0 {
-        freq.per_core
-            .iter()
-            .map(|&hz| as_unit(hz / freq.max_ceiling_hz))
-            .collect()
+        (
+            freq.per_core
+                .iter()
+                .map(|&hz| as_unit(hz / freq.max_ceiling_hz))
+                .collect(),
+            freq.core_ids.clone(),
+        )
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     }
 }
 
@@ -1055,6 +1073,7 @@ mod tests {
         let freq = hytte_sensors::CpuFreq {
             max_hz: 3_800_000_000.0,
             per_core: vec![1_200_000_000.0, 3_800_000_000.0],
+            core_ids: vec![0, 1],
             max_ceiling_hz: 5_000_000_000.0,
         };
         assert_eq!(
@@ -1087,15 +1106,20 @@ mod tests {
         let freq = hytte_sensors::CpuFreq {
             max_hz: 4_000_000_000.0,
             per_core: vec![1_250_000_000.0, 4_000_000_000.0, 5_500_000_000.0, f64::NAN],
+            core_ids: vec![0, 1, 3, 4],
             max_ceiling_hz: 5_000_000_000.0,
         };
-        assert_eq!(per_core_clock_of(&freq), vec![0.25, 0.8, 1.0, 0.0]);
+        assert_eq!(
+            per_core_clock_of(&freq),
+            (vec![0.25, 0.8, 1.0, 0.0], vec![0, 1, 3, 4]),
+            "each fraction travels with its CPU number"
+        );
         assert_eq!(
             per_core_clock_of(&hytte_sensors::CpuFreq {
                 max_ceiling_hz: 0.0,
                 ..freq
             }),
-            Vec::<f32>::new(),
+            (Vec::<f32>::new(), Vec::<u32>::new()),
             "no governor, no per-core clock",
         );
     }

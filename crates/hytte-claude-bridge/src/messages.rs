@@ -150,6 +150,11 @@ pub struct Client {
     model: String,
     thinking: Thinking,
     budget: Duration,
+    /// Always [`ENDPOINT`] outside the tests. A field rather than the constant
+    /// at the call site only so a test can point the real client — its
+    /// `spawn_blocking`, its `ureq` agent — at a loopback listener instead
+    /// (`Client::with_endpoint`, which exists only in the test build).
+    endpoint: String,
 }
 
 // Hand-written so the key cannot reach a log line: `Backend` and `Reprompt`
@@ -160,6 +165,7 @@ impl std::fmt::Debug for Client {
             .field("model", &self.model)
             .field("thinking", &self.thinking)
             .field("budget", &self.budget)
+            .field("endpoint", &self.endpoint)
             .field("key", &"<redacted>")
             .finish()
     }
@@ -180,7 +186,20 @@ impl Client {
             model,
             thinking,
             budget,
+            endpoint: ENDPOINT.to_owned(),
         }
+    }
+
+    /// The same client, posting to `endpoint` instead of the Anthropic API —
+    /// for the tests that need a real paid-call-shaped request (blocking,
+    /// uncancellable, bounded by `budget`) without the network: `bridge.rs`'s
+    /// API-mode hang-up test points it at a loopback listener that never
+    /// answers.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_endpoint(mut self, endpoint: String) -> Self {
+        self.endpoint = endpoint;
+        self
     }
 
     /// Answer one composed transcript.
@@ -191,8 +210,9 @@ impl Client {
     ) -> Result<String, Failure> {
         let body = build_request(&self.model, self.thinking, messages, max_tokens)?;
         let key = self.key.clone();
+        let endpoint = self.endpoint.clone();
         let budget = self.budget;
-        match tokio::task::spawn_blocking(move || post(&key, budget, &body)).await {
+        match tokio::task::spawn_blocking(move || post(&endpoint, &key, budget, &body)).await {
             Ok(Ok((status, text))) => interpret(status, &text),
             Ok(Err(failure)) => Err(failure),
             Err(e) => Err(Failure::new(
@@ -203,12 +223,17 @@ impl Client {
     }
 }
 
-/// POST `body` and return the status plus the raw response text.
+/// POST `body` to `endpoint` and return the status plus the raw response text.
 ///
 /// Errors here are transport-level only; a non-2xx is a perfectly good
 /// `(status, text)` that [`map_status`] turns into a [`Failure`] with the
 /// endpoint's own explanation in it.
-fn post(key: &str, budget: Duration, body: &Value) -> Result<(u16, String), Failure> {
+fn post(
+    endpoint: &str,
+    key: &str,
+    budget: Duration,
+    body: &Value,
+) -> Result<(u16, String), Failure> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_connect(Some(CONNECT_TIMEOUT))
         .timeout_global(Some(budget))
@@ -219,7 +244,7 @@ fn post(key: &str, budget: Duration, body: &Value) -> Result<(u16, String), Fail
         .build()
         .into();
     let mut resp = agent
-        .post(ENDPOINT)
+        .post(endpoint)
         .header("x-api-key", key)
         .header("anthropic-version", API_VERSION)
         .send_json(body)

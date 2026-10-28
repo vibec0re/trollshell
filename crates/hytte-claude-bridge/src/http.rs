@@ -19,7 +19,8 @@
 
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, Interest};
+use tokio::net::UnixStream;
 
 /// Anything one request can be read off and one response written back to.
 ///
@@ -57,6 +58,13 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// life of the process — the request permit is already released by then, but
 /// the task, the fd and the response buffer are not.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often [`hung_up`] looks at a connection whose request is being
+/// answered — and so the longest a turn runs on after its client has gone: a
+/// tenth of a second, against a request budget of about eight. Also the tick
+/// on which a single-flight leader whose client has left re-counts the
+/// followers still waiting on its turn (`bridge::Bridge::complete`).
+pub const HANG_UP_POLL: Duration = Duration::from_millis(100);
 
 /// A request that cannot be answered, as the status and body text the client
 /// will see.
@@ -252,6 +260,51 @@ pub async fn write_response(stream: &mut impl Stream, status: u16, body: &[u8]) 
         })
 }
 
+/// Resolves once the client at the far end of `stream` has **gone**, and never
+/// before (#1550).
+///
+/// "Gone" is the kernel's answer, not a guess from a read. When the peer of a
+/// Unix stream socket closes its end (or shuts down both directions), Linux
+/// marks *this* end shut for reading **and** writing, and `poll(2)` reports
+/// `POLLHUP` — which tokio surfaces as
+/// [`Ready::is_write_closed`](tokio::io::Ready::is_write_closed). A client that
+/// shuts down only its **write** half after sending the request, and keeps
+/// reading for the answer, marks this end shut for reading alone: `POLLRDHUP`,
+/// and a read that returns 0, but no `POLLHUP`. That half-closed client keeps
+/// its turn. A zero-length read looks the same in both cases, which is why this
+/// never reads. It would have nothing to read anyway: [`read_request`] has
+/// taken exactly the request's `Content-Length`, and the protocol is one
+/// request per connection.
+///
+/// It **polls** the connection's readiness every [`HANG_UP_POLL`] rather than
+/// awaiting the hang-up as an event, because no readiness a connected socket
+/// can wait on fits. Waiting for `READABLE` returns on a half-close too, and
+/// at once every time after it, because the read-closed state it matches is
+/// one tokio never clears. `WRITABLE` is set the whole time, and clearing it
+/// to wait for the next event would also park [`write_response`] on an edge
+/// that never comes. The flags themselves are kept current by the runtime
+/// whether or not anything waits on them, so reading them costs a timer tick,
+/// and that tick bounds how long a turn nobody will read runs on after its
+/// client has left.
+///
+/// Never resolves if the readiness cannot be read at all (the runtime is
+/// shutting down): a turn is dropped for a hang-up and for nothing else.
+pub async fn hung_up(stream: &UnixStream) {
+    loop {
+        match stream.ready(Interest::WRITABLE).await {
+            Ok(ready) if ready.is_write_closed() => return,
+            Ok(_) => tokio::time::sleep(HANG_UP_POLL).await,
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    "cannot watch the connection for a hang-up; answering it unwatched",
+                );
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+}
+
 /// Reason phrase for the statuses this bridge emits.
 fn reason(status: u16) -> &'static str {
     match status {
@@ -319,6 +372,49 @@ mod tests {
             started.elapsed() < WRITE_TIMEOUT,
             "no timeout on the happy path"
         );
+    }
+
+    /// **What the watch counts as gone** (#1550, #1632 review P1), on real
+    /// Unix stream sockets: a peer that closes, and one that shuts down both
+    /// directions with its descriptor still open, are gone; a peer that only
+    /// shut its write half — a client that sent its request and is reading
+    /// for the answer — is not, however long the watch looks.
+    #[tokio::test]
+    async fn the_watch_hears_a_hang_up_and_not_a_half_close() {
+        use super::{HANG_UP_POLL, hung_up};
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt as _;
+        use tokio::net::UnixStream;
+
+        /// Generous for a loaded runner: the watch looks every tenth of a
+        /// second.
+        const HEARD_WITHIN: Duration = Duration::from_secs(1);
+
+        let (ours, theirs) = UnixStream::pair().expect("a socket pair");
+        drop(theirs);
+        tokio::time::timeout(HEARD_WITHIN, hung_up(&ours))
+            .await
+            .expect("a peer that closed is gone");
+
+        let (ours, theirs) = UnixStream::pair().expect("a socket pair");
+        let theirs = theirs.into_std().expect("off the runtime");
+        theirs
+            .shutdown(std::net::Shutdown::Both)
+            .expect("shut down both directions");
+        tokio::time::timeout(HEARD_WITHIN, hung_up(&ours))
+            .await
+            .expect("a peer that shut down both directions is gone, open or not");
+        drop(theirs);
+
+        let (ours, mut theirs) = UnixStream::pair().expect("a socket pair");
+        theirs.shutdown().await.expect("shut down the write half");
+        assert!(
+            tokio::time::timeout(HANG_UP_POLL * 5, hung_up(&ours))
+                .await
+                .is_err(),
+            "a half-closed peer, still reading, was taken for gone",
+        );
+        drop(theirs);
     }
 
     /// A peer that hangs up before sending anything made no request: `None`,

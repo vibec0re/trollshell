@@ -960,9 +960,10 @@ mod tests {
     /// first `assert_ne!` after the retire); `retire` removing the entry
     /// whatever id it holds, so a stale retire takes its successor's identity
     /// (the stale-retire assertion); ids handed out twice, e.g. the counter
-    /// not advancing (the `second != first` assertion); and `identify`
-    /// creating an entry instead of only reading (the "a drop does not
-    /// identify" assertion).
+    /// not advancing (the "two contexts never share an id" assertion, and
+    /// `second != first` behind it); and `identify` creating an entry
+    /// instead of only reading (the opening "no handle has been made here
+    /// yet" assertion).
     #[test]
     fn a_retired_address_never_matches_a_handle_made_before_the_retire() {
         let here = NonZeroUsize::new(0x1562_0000).expect("non-zero");

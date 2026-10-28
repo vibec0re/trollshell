@@ -98,11 +98,11 @@
 //! be dropped *without* going through `unrealize` — so its handles are never
 //! dropped from `finalize`, under whatever context happens to be current
 //! there — but checked that against no GTK source. Read since against
-//! **GTK 4.22.4**, the `gtk4` this flake pins (with GLib 2.88.3, glib-rs
+//! **GTK 4.22.4**, the `gtk4` this flake pins (with `GLib` 2.88.3, glib-rs
 //! 0.22.5 and gtk4-rs 0.11.2), the argument holds:
 //!
-//! * **A realized `GtkGLArea` is never finalized.** On the last unref GObject
-//!   runs `dispose` and only then `finalize` (GLib `gobject/gobject.c:4839`,
+//! * **A realized `GtkGLArea` is never finalized.** On the last unref `GObject`
+//!   runs `dispose` and only then `finalize` (`GLib`'s `gobject/gobject.c:4839`,
 //!   `:4910`). `gtk_widget_dispose` unrealizes a widget that is still realized
 //!   (`gtk/gtkwidget.c:7670`), and taking a widget out of its parent
 //!   unrealizes it before unrooting it (`gtk/gtkwidget.c:2702`). Unrealizing
@@ -766,12 +766,11 @@ pub(crate) fn assert_an_outlived_handle_never_deletes_under_a_reused_address(
     window.set_child(Some(area));
     gtk::prelude::WidgetExt::realize(&window);
     area.realize();
-    let gl = match area.error() {
-        Some(error) => Err(format!("the surface could not create a context: {error}")),
-        None => {
-            area.make_current();
-            hgl::Gl::current().map_err(|error| format!("GDK made a context current, but {error}"))
-        }
+    let gl = if let Some(error) = area.error() {
+        Err(format!("the surface could not create a context: {error}"))
+    } else {
+        area.make_current();
+        hgl::Gl::current().map_err(|error| format!("GDK made a context current, but {error}"))
     };
     let gl = match gl {
         Ok(gl) => gl,

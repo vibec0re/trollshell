@@ -108,7 +108,8 @@ where
     where
         R: DeserializeOwned + Type,
     {
-        self.shared
+        let answered = self
+            .shared
             .with_conn(|conn| {
                 let dest = self.destination.clone();
                 let path = self.path.clone();
@@ -121,12 +122,20 @@ where
                         zbus::Proxy::new(&conn, dest.as_str(), path.as_str(), iface.as_str())
                             .await?;
                     let fut = proxy.call::<_, _, R>(method.as_str(), &args);
-                    tokio::time::timeout(timeout, fut)
-                        .await
-                        .map_err(|_| zbus::Error::Failure("call timeout".into()))?
+                    // The deadline is not a zbus error, so it does not travel
+                    // as one: it passes `with_conn` as `Ok(Err(elapsed))` and
+                    // becomes `BusError::Timeout` below. Until #1551 it was a
+                    // `zbus::Error::Failure("call timeout")`, which callers
+                    // could only recognise by that string. It never counted as
+                    // a lost connection either way.
+                    match tokio::time::timeout(timeout, fut).await {
+                        Ok(reply) => reply.map(Ok),
+                        Err(elapsed) => Ok(Err(elapsed)),
+                    }
                 }
             })
-            .await
+            .await?;
+        answered.map_err(|_elapsed| BusError::call_timeout())
     }
 
     async fn execute<R>(self) -> Result<R, BusError>
@@ -206,7 +215,9 @@ impl<A> CallBuilder<A> {
         self
     }
 
-    /// Override the call timeout (default: 25 s).
+    /// Override the call timeout (default: 25 s). A call that gets no reply
+    /// within it returns [`BusError::Timeout`], which no [`RetryPolicy`]
+    /// retries.
     #[must_use]
     pub fn timeout(mut self, d: Duration) -> Self {
         self.timeout = d;
@@ -501,6 +512,29 @@ mod tests {
             count.load(Ordering::Relaxed),
             2,
             "the first permanent answer must be the last call"
+        );
+    }
+
+    /// A call that ran out of its own deadline ends the run as a permanent
+    /// answer does. It was a `Permanent` until it got its own variant
+    /// (#1551), and the variant must not make it retryable: the peer may still
+    /// carry the call out, so issuing it again could do it twice.
+    ///
+    /// **Falsification:** make `is_transient` count `Timeout` too and the
+    /// count reads 10.
+    #[tokio::test(start_paused = true)]
+    async fn a_timeout_ends_the_run() {
+        let count = AtomicU32::new(1);
+        let outcome: Result<(), BusError> = retry_with_backoff(transient(), 10, || {
+            count.fetch_add(1, Ordering::Relaxed);
+            std::future::ready(Err(BusError::call_timeout()))
+        })
+        .await;
+        assert!(outcome.is_err_and(|e| e.is_timeout()));
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            2,
+            "the first deadline must be the last call"
         );
     }
 }

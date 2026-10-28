@@ -259,3 +259,66 @@ async fn calls_in_flight_across_a_broker_restart_answer_promptly() {
         "the slowest of {IN_FLIGHT} calls in flight across a broker restart took {slowest:?}"
     );
 }
+
+/// A call whose peer never answers returns `BusError::Timeout` once its own
+/// deadline runs out: a variant a caller can match, where until #1551 it was a
+/// `Permanent` recognisable only by its `reason` string. Three things it must
+/// keep from that: the call is not retried (the peer may still carry it out,
+/// so the default `RetryPolicy::Once` must not issue it twice), it is not a
+/// lost connection (the epoch stays put), and it reads as it always did.
+///
+/// **Falsification:** put `do_call`'s elapsed timer back on
+/// `zbus::Error::Failure("call timeout")` and the first assertion fails with
+/// the `Permanent` it gets instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_past_its_deadline_is_a_timeout() {
+    let (conn, guard) = ephemeral_bus().await;
+    let arrived = Arc::new(AtomicUsize::new(0));
+    let _peer = serve_stall(&guard.address, Some(arrived.clone())).await;
+
+    let shared = SharedConnection::for_test_session(conn);
+    shared.spawn_supervisor_for_test();
+    let epoch = shared.epoch();
+
+    let call = call_with(&shared, STALL)
+        .at_path(STALL_PATH)
+        .iface(STALL)
+        .method("Ping")
+        .timeout(Duration::from_millis(150))
+        .send::<u32>();
+    let err = tokio::time::timeout(Duration::from_secs(5), call)
+        .await
+        .expect("the call must give up at its own deadline, not hang")
+        .expect_err("a peer that never answers cannot have answered");
+
+    assert!(
+        matches!(err, BusError::Timeout { .. }) && err.is_timeout(),
+        "a call past its deadline is BusError::Timeout, got {err:?}"
+    );
+    assert!(
+        !err.is_transient(),
+        "a deadline is not a lost connection, got {err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "bus operation permanently failed: call timeout"
+    );
+    // The peer counts a call when its handler runs, which a loaded runner can
+    // delay past the client's 150 ms. A retry, had there been one, would have
+    // been issued and waited out before `send` returned.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while arrived.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline, "the call never reached the peer");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        arrived.load(Ordering::SeqCst),
+        1,
+        "RetryPolicy::Once must not re-issue a call that ran out of time"
+    );
+    assert_eq!(
+        shared.epoch(),
+        epoch,
+        "a deadline must not force a reconnect"
+    );
+}

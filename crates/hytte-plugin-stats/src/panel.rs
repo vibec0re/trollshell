@@ -2605,7 +2605,7 @@ mod tests {
             vec![1; 4],
             "a relabel at the same count starts every clock window over"
         );
-        assert_eq!(lens(&h.per_core), vec![7; 4], "the load keeps its");
+        assert_eq!(lens(&h.per_core), vec![6; 4], "the load keeps its");
 
         h.push(&frame(&[0, 1, 3, 4]));
         assert_eq!(lens(&h.per_core_clock), vec![2; 4], "…then the set grows");

@@ -135,6 +135,12 @@ impl Bridge {
     /// paying twice for the same answer is pure waste — of a subscription that
     /// is rate-limited, and, on the API backend, of real money.
     ///
+    /// The turn belongs to the **leader**, the first of the identical requests
+    /// to arrive. If the leader's request is dropped mid-turn — its client hung
+    /// up, say — the turn goes with it, and every follower gets a 503 rather
+    /// than wait for an answer that is no longer coming, even a follower whose
+    /// own client is still connected.
+    ///
     /// The key is the transcript **and the caller's identity**, deliberately:
     /// `max_tokens` is a cap on the answer, not part of the question, and keying
     /// on it would split two otherwise-identical in-flight requests into two
@@ -162,8 +168,12 @@ impl Bridge {
         match leader {
             Err(rx) => follow(rx).await,
             Ok(tx) => {
-                // Removes the map entry even if this task is cancelled
-                // mid-turn, so a disconnected client can't wedge the key.
+                // Removes the map entry however this turn ends — answered, or
+                // dropped mid-turn by a client that hangs up
+                // (`serve_connection` watches for it, #1550), the request
+                // backstop, a panic, or shutdown — so no ending can wedge the
+                // key. A drop takes `tx` with it, which is what tells the
+                // followers (see above).
                 let _guard = FlightGuard {
                     inflight: &self.inflight,
                     key,
@@ -439,18 +449,29 @@ fn error_response(status: u16, message: &str) -> (u16, Vec<u8>) {
     (status, body)
 }
 
+/// What the status board is told about a request whose client hung up before
+/// its answer: nginx's "client closed request". It never goes on the wire, and
+/// only the `delivered: false` beside it decides the board's classification —
+/// an error, as a hang-up has always counted (it used to surface as the failed
+/// write of an answer nobody read).
+const HUNG_UP: u16 = 499;
+
 /// Read one request off `stream`, answer it, close.
 ///
 /// This is also where the answer is counted for the plugin face's status chip
 /// (#866) — at the connection boundary rather than inside [`Bridge::handle`], so
-/// a malformed request the parser rejects is counted too, and so the unit tests
-/// below (which call `handle` directly) never touch the process-global board.
+/// a malformed request the parser rejects is counted too. The tally is the one
+/// thing done here rather than in [`serve`], so the unit tests below, which
+/// drive whole connections through `serve`, never touch the process-global
+/// board.
 ///
-/// Generic over the stream since #993: the socket underneath is a
-/// [`UnixStream`](tokio::net::UnixStream) now rather than a `TcpStream`, and
-/// nothing above it changed — same protocol, same bytes, same statuses.
+/// A [`UnixStream`](tokio::net::UnixStream) rather than any [`http::Stream`]
+/// since #1550, because [`http::hung_up`] reads the socket's own readiness,
+/// which only a socket has. The request and the response still go through the
+/// generic [`http::read_request`] and [`http::write_response`], so the bytes on
+/// the wire are the ones #993 settled.
 ///
-/// Two things are deliberately **not** counted as served:
+/// Three things are deliberately **not** counted as served:
 ///
 /// - a connection that closed before sending a byte — no request was made, so
 ///   it gets no response and no tally. That is a second bridge's startup probe
@@ -458,15 +479,54 @@ fn error_response(status: u16, message: &str) -> (u16, Vec<u8>) {
 ///   incumbent's chip every time a duplicate start was refused;
 /// - a 2xx whose response never reached the client. The tally is taken *after*
 ///   the bounded write (#1481) rather than before it, and an answer the client
-///   did not get is, from where the client sits, a failure — it fell back.
-pub async fn serve_connection(bridge: &Bridge, mut stream: impl http::Stream) {
+///   did not get is, from where the client sits, a failure — it fell back;
+/// - a request whose client hung up before its answer (see [`serve`]), counted
+///   as an undelivered [`HUNG_UP`] for the same reason.
+pub async fn serve_connection(bridge: &Bridge, stream: tokio::net::UnixStream) {
+    if let Some((status, delivered)) = serve(bridge, stream).await {
+        crate::status::record(status, delivered);
+    }
+}
+
+/// Everything [`serve_connection`] does except the tally: `None` for a peer
+/// that sent no request, otherwise the status the board should hear and
+/// whether the response reached the client.
+///
+/// **A client that hangs up stops its turn** (#1550). While [`Bridge::handle`]
+/// runs, [`http::hung_up`] watches the connection, and if the client goes away
+/// first the handler is dropped and nothing is written. Dropping the handler
+/// drops the turn, through the same path as any other dropped turn:
+/// `backend::run_until`'s guard sends the `claude` child `SIGKILL` at once,
+/// then the title lock and the request permit are released as the futures
+/// holding them drop, and the reap is left to tokio — kill first, release
+/// second, the order #1623's review found safe for the next `--resume`. A
+/// request still queued, for its title or behind its single-flight leader, has
+/// spawned nothing and only leaves the queue. Before this nothing watched the
+/// socket, so a turn whose client had left ran on — spending the owner's
+/// subscription — until its deadline killed it.
+///
+/// A client that only **half-closed** (shut its write side after the request)
+/// is still reading, keeps its turn and gets its answer: `hung_up` waits for
+/// the peer to be gone, which a half-close is not.
+///
+/// `biased` towards the watch, so a client that has already gone when the
+/// request is parsed is noticed before the handler's first poll can spawn
+/// anything.
+async fn serve(bridge: &Bridge, mut stream: tokio::net::UnixStream) -> Option<(u16, bool)> {
     let (status, body) = match http::read_request(&mut stream).await {
-        Ok(Some((head, body))) => bridge.handle(&head, &body).await,
-        Ok(None) => return,
+        Ok(Some((head, body))) => tokio::select! {
+            biased;
+            () = http::hung_up(&stream) => {
+                tracing::info!("the client hung up before its answer; dropped its request");
+                return Some((HUNG_UP, false));
+            }
+            answer = bridge.handle(&head, &body) => answer,
+        },
+        Ok(None) => return None,
         Err(f) => error_response(f.status, &f.message),
     };
     let delivered = http::write_response(&mut stream, status, &body).await;
-    crate::status::record(status, delivered);
+    Some((status, delivered))
 }
 
 #[cfg(test)]
@@ -783,6 +843,284 @@ mod tests {
             super::PERMITS,
         );
         assert_eq!(bridge.permits.available_permits(), super::PERMITS);
+    }
+
+    // ---- a client that hangs up stops its turn (#1550) ----------------------
+
+    /// A budget nobody reaches in these tests, so that only a hang-up can end
+    /// a hung turn early — and long enough that [`REAP_SLACK`] is "well before
+    /// the deadline" even on a loaded runner.
+    const HANG_UP_BUDGET: Duration = Duration::from_secs(20);
+
+    /// How long a child may take to leave `/proc` — killed **and** reaped —
+    /// after its client hung up: generous for a loaded runner, and still a
+    /// quarter of [`HANG_UP_BUDGET`].
+    const REAP_SLACK: Duration = Duration::from_secs(5);
+
+    /// What `backend::KillOnDrop` says when it fires: the same fragment as
+    /// `backend.rs`'s own `ABANDONED`, so a reworded line turns the positive
+    /// counts below red rather than the zeroes silently vacuous.
+    const ABANDONED: &str = "claude's turn was dropped before it finished";
+
+    /// A stand-in `claude` that reads its prompt, leaves the `<pid>.pid`
+    /// marker [`stand_in::started`](crate::backend::stand_in::started) looks
+    /// for, and then answers only once a `go` file appears beside it — so a
+    /// test can hold the turn open across whatever it does to the client, and
+    /// see the turn survive it.
+    const GATED: &str = r#"#!/bin/sh
+dir="${0%/*}"
+cat > /dev/null
+: > "$dir/$$.pid"
+while [ ! -e "$dir/go" ]; do sleep 0.05; done
+echo '{"type":"result","subtype":"success","is_error":false,"result":"answered"}'
+"#;
+
+    /// A subscription bridge running `program` as its `claude`.
+    fn bridge_running(program: std::path::PathBuf) -> Bridge {
+        let config = hive_claude::Config {
+            program: Some(program),
+            ..hive_claude::Config::default()
+        };
+        Bridge::new(
+            Backend::Subscription(Subscription::new(config)),
+            HANG_UP_BUDGET,
+            None,
+        )
+    }
+
+    /// The bytes one `chat()` call by `user` puts on the socket — the
+    /// `ureq`-shaped head `http.rs`'s parser tests pin.
+    fn request(user: &str, text: &str) -> Vec<u8> {
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": text}],
+            "user": user,
+        })
+        .to_string();
+        format!(
+            "POST {} HTTP/1.1\r\nhost: localhost\r\ncontent-type: application/json\r\n\
+             content-length: {}\r\n\r\n{body}",
+            crate::http::ROUTE,
+            body.len(),
+        )
+        .into_bytes()
+    }
+
+    /// How many times `captured` heard the abandoned-turn guard.
+    fn abandoned(captured: &hytte_config::test_support::Captured) -> usize {
+        captured
+            .warnings()
+            .iter()
+            .filter(|message| message.contains(ABANDONED))
+            .count()
+    }
+
+    /// Wait, bounded by [`REAP_SLACK`] from `since`, until `pid` is out of
+    /// `/proc`: killed **and** reaped. A poll, because the reap of a dropped
+    /// turn's child falls to tokio's orphan reaper on a later `SIGCHLD`.
+    async fn gone_within_slack(pid: u32, since: tokio::time::Instant, after: &str) {
+        while crate::backend::stand_in::present(pid) {
+            assert!(
+                since.elapsed() < REAP_SLACK,
+                "the child ({pid}) is still in /proc {REAP_SLACK:?} after {after} — running on \
+                 until its deadline, or killed but never reaped",
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// **A client that hangs up takes its turn with it (#1550).** The client
+    /// sends a request over a real Unix socket, then closes it outright while
+    /// `claude` is still working: the child is killed and reaped well before
+    /// the deadline, and the turn's title lock and request permit come back.
+    ///
+    /// Before the fix `serve_connection` awaited the answer without watching
+    /// the socket, so the stand-in here slept on — on the owner's
+    /// subscription — until the 20 s deadline killed it (#1623's review
+    /// measured the same thing at a 3 s budget).
+    ///
+    /// The title lock is proved by a second turn of the same conversation (same
+    /// `user`, so the same title, but a different transcript, so single-flight
+    /// does not merge them): sent while the first runs, it cannot start a child
+    /// until the first lets go, and it must start one once the first client
+    /// hangs up. It is then hung up in turn, so both dropped turns are counted.
+    #[tokio::test]
+    async fn a_client_that_hangs_up_mid_turn_stops_its_turn() {
+        use crate::backend::stand_in;
+        use std::cell::Cell;
+        use tokio::io::AsyncWriteExt as _;
+        use tokio::net::UnixStream;
+        use tokio::time::Instant;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bridge = hung_bridge(dir.path(), HANG_UP_BUDGET);
+        let (captured, _scope) = hytte_config::test_support::capture();
+        let (mut first, first_end) = UnixStream::pair().expect("a socket pair");
+        let (mut second, second_end) = UnixStream::pair().expect("a socket pair");
+        let hung_up_at = Cell::new(None);
+        let first_served_at = Cell::new(None);
+
+        let served_first = async {
+            let ending = super::serve(&bridge, first_end).await;
+            first_served_at.set(Some(Instant::now()));
+            ending
+        };
+        let clients = async {
+            first.write_all(&request("pet", "one")).await.expect("send");
+            let [first_pid] = stand_in::wait_for(dir.path(), 1).await[..] else {
+                panic!("one child before the second turn is sent");
+            };
+            second.write_all(&request("pet", "two")).await.expect("send");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(
+                stand_in::started(dir.path()),
+                [first_pid],
+                "the second turn started beside the first: their title is not locked",
+            );
+
+            drop(first);
+            let hung_up = Instant::now();
+            hung_up_at.set(Some(hung_up));
+            gone_within_slack(first_pid, hung_up, "its client hung up").await;
+
+            let pids = stand_in::wait_for(dir.path(), 2).await;
+            let [second_pid] = pids[..]
+                .iter()
+                .copied()
+                .filter(|&p| p != first_pid)
+                .collect::<Vec<_>>()[..]
+            else {
+                panic!("the second turn never got the title: {pids:?}");
+            };
+            drop(second);
+            gone_within_slack(second_pid, Instant::now(), "its client hung up").await;
+        };
+        let (first_ending, second_ending, ()) =
+            tokio::join!(served_first, super::serve(&bridge, second_end), clients);
+
+        assert_eq!(first_ending, Some((super::HUNG_UP, false)));
+        assert_eq!(second_ending, Some((super::HUNG_UP, false)));
+        let (Some(hung_up), Some(served)) = (hung_up_at.get(), first_served_at.get()) else {
+            panic!("both instants are set once the join is done");
+        };
+        assert!(
+            served.duration_since(hung_up) < REAP_SLACK,
+            "the first request was served {:?} after its client hung up, not at once",
+            served.duration_since(hung_up),
+        );
+        assert_eq!(bridge.permits.available_permits(), super::PERMITS);
+        assert!(
+            bridge.inflight.lock().expect("unpoisoned").is_empty(),
+            "a dropped turn left its single-flight entry behind",
+        );
+        assert_eq!(
+            abandoned(&captured),
+            2,
+            "each dropped turn's kill was not reported exactly once",
+        );
+    }
+
+    /// **A half-closed client keeps its turn.** A client may shut down its
+    /// write side once the request is out and still read the answer — and a
+    /// read on the bridge's end then returns 0 exactly as it would for a
+    /// client that has gone. The watch must not take that for a hang-up.
+    ///
+    /// The gated stand-in holds the turn open for a second after the
+    /// half-close — ten of the watch's polls — and must still be running at
+    /// the end of it; then it answers, and the client reads the whole 200.
+    #[tokio::test]
+    async fn a_half_closed_client_keeps_its_turn_and_gets_the_answer() {
+        use crate::backend::stand_in;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::UnixStream;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let program = dir.path().join("gated-claude");
+        stand_in::install(&program, GATED);
+        let bridge = bridge_running(program);
+        let (captured, _scope) = hytte_config::test_support::capture();
+        let (mut client, server) = UnixStream::pair().expect("a socket pair");
+
+        let client_side = async {
+            client.write_all(&request("pet", "hi")).await.expect("send");
+            let [pid] = stand_in::wait_for(dir.path(), 1).await[..] else {
+                panic!("one child");
+            };
+            client.shutdown().await.expect("shut down the write half");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert!(
+                stand_in::present(pid),
+                "the half-closed client's turn was dropped: its child ({pid}) is gone",
+            );
+            std::fs::write(dir.path().join("go"), b"").expect("release the stand-in");
+            let mut reply = Vec::new();
+            client
+                .read_to_end(&mut reply)
+                .await
+                .expect("read the answer to EOF");
+            String::from_utf8(reply).expect("an ASCII head and a JSON body")
+        };
+        let (ending, reply) = tokio::join!(super::serve(&bridge, server), client_side);
+
+        assert!(reply.starts_with("HTTP/1.1 200 OK\r\n"), "{reply:?}");
+        assert!(reply.contains("answered"), "{reply:?}");
+        assert_eq!(ending, Some((200, true)));
+        assert_eq!(
+            abandoned(&captured),
+            0,
+            "the half-closed client's turn was reported as abandoned",
+        );
+    }
+
+    /// The positive control: a client that stays connected gets its answer,
+    /// and nothing is dropped or killed on the way.
+    ///
+    /// The zero is only worth something if this capture would have heard the
+    /// guard, so the same capture then watches a client that does hang up and
+    /// must count exactly one.
+    #[tokio::test]
+    async fn a_client_that_stays_connected_gets_its_answer_and_trips_no_guard() {
+        use crate::backend::stand_in;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::UnixStream;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (captured, _scope) = hytte_config::test_support::capture();
+
+        let answering = bridge_running(stand_in::answering_claude(dir.path()));
+        let (mut client, server) = UnixStream::pair().expect("a socket pair");
+        let client_side = async {
+            client.write_all(&request("pet", "hi")).await.expect("send");
+            let mut reply = Vec::new();
+            client
+                .read_to_end(&mut reply)
+                .await
+                .expect("read the answer to EOF");
+            String::from_utf8(reply).expect("an ASCII head and a JSON body")
+        };
+        let (ending, reply) = tokio::join!(super::serve(&answering, server), client_side);
+        assert!(reply.starts_with("HTTP/1.1 200 OK\r\n"), "{reply:?}");
+        assert!(reply.contains("answered"), "{reply:?}");
+        assert_eq!(ending, Some((200, true)));
+        assert_eq!(
+            abandoned(&captured),
+            0,
+            "a connected client's answered turn was reported as abandoned",
+        );
+
+        let hung = hung_bridge(dir.path(), HANG_UP_BUDGET);
+        let (mut client, server) = UnixStream::pair().expect("a socket pair");
+        let client_side = async {
+            client.write_all(&request("pet", "hi")).await.expect("send");
+            stand_in::wait_for(dir.path(), 1).await;
+            drop(client);
+        };
+        let (ending, ()) = tokio::join!(super::serve(&hung, server), client_side);
+        assert_eq!(ending, Some((super::HUNG_UP, false)));
+        assert_eq!(
+            abandoned(&captured),
+            1,
+            "this capture does not hear the guard, so the zero above proves nothing",
+        );
     }
 
     /// Error bodies are the `OpenAI` error shape, so a client that parses errors

@@ -97,14 +97,13 @@ pub struct Turn<'a> {
     /// this instead, and the one that owns a child ([`run_until`]) kills and
     /// reaps it before giving the deadline back as a 504.
     ///
-    /// A turn dropped anyway — by `bridge.rs`'s backstop, a panic, or a runtime
-    /// shutdown — no longer orphans the child: [`run_until`]'s drop guard
-    /// `SIGKILL`s it before the lock and the permit go (#1550). What a drop
-    /// still gives up is the *reap*, which falls to tokio's orphan reaper — so
-    /// a deadline remains the one way a turn ends with its child provably
-    /// gone. (A client hanging up mid-turn drops nothing: `serve_connection`
-    /// awaits the answer without watching the socket, so that turn runs on to
-    /// its deadline.)
+    /// A turn dropped anyway — by a client that hangs up mid-turn (which
+    /// `bridge::serve_connection` watches for), `bridge.rs`'s backstop, a
+    /// panic, or a runtime shutdown — no longer orphans the child:
+    /// [`run_until`]'s drop guard `SIGKILL`s it before the lock and the permit
+    /// go (#1550). What a drop still gives up is the *reap*, which falls to
+    /// tokio's orphan reaper — so a deadline remains the one way a turn ends
+    /// with its child provably gone.
     pub deadline: Instant,
 }
 
@@ -274,15 +273,14 @@ where
 /// # The edges, stated plainly
 ///
 /// - **A dropped turn.** This future is dropped before the turn ends — today
-///   by `bridge.rs`'s backstop, a panic, or the runtime shutting down, or
-///   tomorrow by a timeout someone wraps around a backend again. (Not by a
-///   client hanging up mid-turn: `serve_connection` awaits the answer without
-///   watching the socket, so that turn runs on to its deadline and the path
-///   above kills it.) The guard then sends the child `SIGKILL` and logs one
-///   warning.
+///   by a client that hangs up mid-turn (`bridge::serve_connection` watches
+///   the socket and drops the handler when the peer is gone, #1550),
+///   `bridge.rs`'s backstop, a panic, or the runtime shutting down, or
+///   tomorrow by a timeout someone wraps around a backend again. The guard
+///   then sends the child `SIGKILL` and logs one warning.
 ///
-///   When this future is dropped while *suspended* — the backstop, a
-///   shutdown, a panic somewhere above it — the guard drops before the
+///   When this future is dropped while *suspended* — a hang-up, the backstop,
+///   a shutdown, a panic somewhere above it — the guard drops before the
 ///   driver's `Child`: it is declared *after* the pinned `turn` future, and
 ///   locals drop in reverse order of declaration, so the signal goes out while
 ///   `turn` still owns the `Child`. The other order would hand that `Child` to
@@ -416,8 +414,8 @@ impl Drop for KillOnDrop {
         if let Some(cancel) = self.cancel.take() {
             cancel.cancel(true);
             tracing::warn!(
-                "claude's turn was dropped before it finished (the request backstop, a panic, or \
-                 shutdown); killed it and left the reap to tokio",
+                "claude's turn was dropped before it finished (a client that hung up, the request \
+                 backstop, a panic, or shutdown); killed it and left the reap to tokio",
             );
         }
     }
@@ -450,10 +448,10 @@ impl TitleLocks {
     /// Wait for exclusive use of `title`.
     ///
     /// Dropping the returned future while it still waits — the request's
-    /// deadline, or whatever drops the turn around it (the backstop, a panic,
-    /// a shutdown) — gives up the place in the queue
-    /// (and any lock already handed to it) and retires the title's entry if
-    /// no other turn holds or waits on it.
+    /// deadline, or whatever drops the turn around it (a client that hangs
+    /// up, the backstop, a panic, a shutdown) — gives up the place in the
+    /// queue (and any lock already handed to it) and retires the title's entry
+    /// if no other turn holds or waits on it.
     async fn acquire(&self, title: &str) -> TitleGuard<'_> {
         let mutex = {
             let mut by_title = self.by_title.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1421,12 +1419,12 @@ mod tests {
 
     /// **The leak, closed.** A turn queued behind another on its title is
     /// dropped *after* the holder let go but *before* it was polled to take the
-    /// lock — a runtime shutdown dropping the task, say (not a client hanging
-    /// up, which drops nothing: the turn runs on). The holder's release
-    /// rightly kept the entry, because the waiter still held a clone of its
-    /// mutex; before #1550 nothing ran the cleanup after that, so the entry
-    /// stayed until the title's next turn. One per cancelled title, without
-    /// bound over a session with many distinct titles.
+    /// lock — its client hanging up, say, or a runtime shutdown dropping the
+    /// task. The holder's release rightly kept the entry, because the waiter
+    /// still held a clone of its mutex; before #1550 nothing ran the cleanup
+    /// after that, so the entry stayed until the title's next turn. One per
+    /// cancelled title, without bound over a session with many distinct
+    /// titles.
     #[tokio::test]
     async fn a_waiter_dropped_after_the_release_retires_the_entry() {
         let locks = TitleLocks::default();
@@ -1702,9 +1700,10 @@ mod tests {
     }
 
     /// **The orphan, closed for a dropped turn too (#1550).** A turn whose
-    /// future is dropped mid-flight — `bridge.rs`'s backstop, a panic unwinding
-    /// through it, the runtime shutting down — takes its `claude` with it,
-    /// rather than leaving the child running on the owner's subscription.
+    /// future is dropped mid-flight — a client that hangs up, `bridge.rs`'s
+    /// backstop, a panic unwinding through it, the runtime shutting down —
+    /// takes its `claude` with it, rather than leaving the child running on
+    /// the owner's subscription.
     ///
     /// Before the guard the stand-in here slept on for its full 30 s, unreaped:
     /// `hive-claude` sets no `kill_on_drop`, so dropping the driver's `Child`

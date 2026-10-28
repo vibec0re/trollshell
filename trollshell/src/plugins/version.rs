@@ -80,36 +80,11 @@ pub(super) fn single_line(raw: &str) -> String {
         .collect()
 }
 
-/// Whether [`sanitize`] drops `c`: anything that is invisible, moves text
-/// between lines, or reorders how the rest displays.
-///
-/// `std` has no general-category API, so the non-`Cc` classes are listed by
-/// code point — the `Cf` characters a display string plausibly meets, plus
-/// `Zl`/`Zp`:
-///
-/// - `Cc` — [`char::is_control`]: C0/C1 controls, incl. `\n`, `\r`, `ESC` and
-///   `U+0085` NEL.
-/// - `Zl`/`Zp` — `U+2028` LINE SEPARATOR, `U+2029` PARAGRAPH SEPARATOR.
-/// - bidi — `U+061C` ALM, `U+200E`/`U+200F` LRM/RLM, `U+202A`–`U+202E`
-///   embeddings/overrides, `U+2066`–`U+2069` isolates.
-/// - zero-width / invisible — `U+00AD` soft hyphen, `U+180E`, `U+200B`–`U+200D`
-///   (ZWSP/ZWNJ/ZWJ), `U+2060`–`U+2064` (word joiner, invisible operators),
-///   `U+206A`–`U+206F` (deprecated format controls), `U+FEFF` (BOM/ZWNBSP),
-///   `U+FFF9`–`U+FFFB` (interlinear annotation).
+/// Whether [`sanitize`] drops `c`: the shared host rule,
+/// [`is_invisible_or_control`](hytte_plugin_proto::text::is_invisible_or_control),
+/// whose doc lists what each range is.
 fn is_dropped(c: char) -> bool {
-    c.is_control()
-        || matches!(
-            c,
-            '\u{00AD}'
-                | '\u{061C}'
-                | '\u{180E}'
-                | '\u{200B}'..='\u{200F}'
-                | '\u{2028}'..='\u{202E}'
-                | '\u{2060}'..='\u{2064}'
-                | '\u{2066}'..='\u{206F}'
-                | '\u{FEFF}'
-                | '\u{FFF9}'..='\u{FFFB}'
-        )
+    hytte_plugin_proto::text::is_invisible_or_control(c)
 }
 
 #[cfg(test)]

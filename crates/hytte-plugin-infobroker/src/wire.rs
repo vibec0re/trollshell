@@ -267,22 +267,10 @@ pub fn check_agent_name(agent: &str) -> Result<(), String> {
 
 /// Whether [`check_agent_name`] refuses a name containing `c`: anything that
 /// is invisible, moves text between lines, or reorders how the rest displays.
-/// A transcription of `trollshell`'s `plugins::version::is_dropped` (#1397
-/// review M1), whose doc lists what each range is.
+/// The rule is [`hytte_plugin::proto::text::is_invisible_or_control`], the one
+/// definition `trollshell`'s display-text sanitiser shares (#1556).
 fn is_unprintable(c: char) -> bool {
-    c.is_control()
-        || matches!(
-            c,
-            '\u{00AD}'
-                | '\u{061C}'
-                | '\u{180E}'
-                | '\u{200B}'..='\u{200F}'
-                | '\u{2028}'..='\u{202E}'
-                | '\u{2060}'..='\u{2064}'
-                | '\u{2066}'..='\u{206F}'
-                | '\u{FEFF}'
-                | '\u{FFF9}'..='\u{FFFB}'
-        )
+    hytte_plugin::proto::text::is_invisible_or_control(c)
 }
 
 /// Parse one request line. Returns a human-readable error (used verbatim in the

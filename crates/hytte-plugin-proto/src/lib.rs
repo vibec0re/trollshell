@@ -177,6 +177,7 @@ pub mod manifest;
 pub mod msg;
 pub mod preem;
 pub mod state;
+pub mod text;
 pub mod topology;
 pub mod wire;
 

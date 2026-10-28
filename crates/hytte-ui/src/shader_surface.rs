@@ -1422,6 +1422,58 @@ mod imp {
             );
         }
 
+        /// **#1562 review, finding 1**, for this widget's own `unrealize`:
+        /// it must delete the surface's GL objects **before** it retires the
+        /// context, or every handle in `resources` would carry an identity
+        /// that no longer matches, and leak. The twin of `gl_surface`'s
+        /// `unrealize_deletes_its_own_objects_before_the_retire`, since this
+        /// `unrealize` is a separate body. Observed from a plain `GtkGLArea`'s
+        /// context, which shares textures with the surface's.
+        ///
+        /// **Falsified** by moving `retire_context` above
+        /// `self.resources.replace(ResourceSlot::Unbuilt)` in `unrealize`:
+        /// the deletion assertion fails.
+        #[gtk::test]
+        fn unrealize_deletes_its_own_objects_before_the_retire() {
+            const BODY: &str = "void main() { fragColor = texture(u_data, v_uv).rrrr; }";
+            let Some((window, surface, gl)) =
+                realised_surface_or_skip("unrealize_deletes_its_own_objects_before_the_retire")
+            else {
+                return;
+            };
+            surface.set_state(8, 4, &state_with(BODY));
+            surface.make_current();
+            surface.imp().draw();
+            let name = match &*surface.imp().resources.borrow() {
+                ResourceSlot::Built(resources) => resources.data.name_for_test(),
+                _ => panic!("the premise: a realised surface builds its GL objects"),
+            };
+
+            let observer_window = gtk::Window::new();
+            let observer = gtk::GLArea::new();
+            observer.set_allowed_apis(gtk::gdk::GLAPI::GLES);
+            observer_window.set_child(Some(&observer));
+            gtk::prelude::WidgetExt::realize(&observer_window);
+            observer.realize();
+            assert!(observer.error().is_none(), "an observer context");
+            observer.make_current();
+            assert!(
+                hgl::is_texture_for_test(&gl, name),
+                "the premise: the surface's data texture {name} is shared, so visible here",
+            );
+
+            window.set_child(None::<&gtk::Widget>);
+            assert!(!surface.is_realized(), "unparenting must unrealize");
+            observer.make_current();
+            assert!(
+                !hgl::is_texture_for_test(&gl, name),
+                "unrealize leaked the surface's own data texture {name}, which is \
+                 share-group-wide and so outlives the context: the retire ran before the deletes",
+            );
+            window.destroy();
+            observer_window.destroy();
+        }
+
         /// **#1180 item 9.** The widget that runs untrusted GLSL compiles it,
         /// uploads the plugin's buffer and draws — on a real driver, through
         /// the real `draw`.

@@ -643,7 +643,7 @@ fn register_in(host: &'static Host, runtime: &PluginRuntimeStore, id: &str, decl
 /// connected. Blocking (the first call reads the cache file, and a prune
 /// writes it), so the D-Bus handler runs it off its own task.
 ///
-/// This is [`snapshot_in`] on [`PRODUCTION`].
+/// This is `snapshot_in` on the production host (`PRODUCTION`).
 #[must_use]
 pub fn snapshot(declared: Option<&BTreeSet<String>>) -> Schemas {
     snapshot_in(&PRODUCTION, declared)

@@ -26,7 +26,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use hive_claude::{Attach, Claude, Config, Error as ClaudeError, Sink};
+use hive_claude::{Attach, Cancel, Claude, Config, Error as ClaudeError, Sink};
 use serde_json::Value;
 use tokio::time::Instant;
 
@@ -96,6 +96,15 @@ pub struct Turn<'a> {
     /// were meant to bound live children. Every wait in a backend is bounded by
     /// this instead, and the one that owns a child ([`run_until`]) kills and
     /// reaps it before giving the deadline back as a 504.
+    ///
+    /// A turn dropped anyway — by `bridge.rs`'s backstop, a panic, or a runtime
+    /// shutdown — no longer orphans the child: [`run_until`]'s drop guard
+    /// `SIGKILL`s it before the lock and the permit go (#1550). What a drop
+    /// still gives up is the *reap*, which falls to tokio's orphan reaper — so
+    /// a deadline remains the one way a turn ends with its child provably
+    /// gone. (A client hanging up mid-turn drops nothing: `serve_connection`
+    /// awaits the answer without watching the socket, so that turn runs on to
+    /// its deadline.)
     pub deadline: Instant,
 }
 
@@ -256,8 +265,46 @@ where
 /// pipes. Only once it returns does this function, and with it the title lock
 /// and the request permit above it, let go.
 ///
+/// The deadline is not the only way a turn can end early, though: this future
+/// can itself be dropped before the child is dealt with. So a [`KillOnDrop`]
+/// guard is armed the moment the spawn succeeds and disarmed on both paths
+/// above — the turn's own outcome, and the deadline's kill — which leaves an
+/// *abandoned* turn as the one thing that fires it (#1550).
+///
 /// # The edges, stated plainly
 ///
+/// - **A dropped turn.** This future is dropped before the turn ends — today
+///   by `bridge.rs`'s backstop, a panic, or the runtime shutting down, or
+///   tomorrow by a timeout someone wraps around a backend again. (Not by a
+///   client hanging up mid-turn: `serve_connection` awaits the answer without
+///   watching the socket, so that turn runs on to its deadline and the path
+///   above kills it.) The guard then sends the child `SIGKILL` and logs one
+///   warning.
+///
+///   When this future is dropped while *suspended* — the backstop, a
+///   shutdown, a panic somewhere above it — the guard drops before the
+///   driver's `Child`: it is declared *after* the pinned `turn` future, and
+///   locals drop in reverse order of declaration, so the signal goes out while
+///   `turn` still owns the `Child`. The other order would hand that `Child` to
+///   tokio's orphan reaper first, which could reap a child that had just
+///   exited on its own, freeing its pid, before the guard's signal went out.
+///   Dropping `turn` after the signal hands over a `Child` that is dying or
+///   already a zombie, and the orphan reaper collects it — the same hand-off
+///   as the grandchild case.
+///
+///   A panic raised *inside* `turn`'s own poll (the sink, the driver's pumps)
+///   is the exception. Its unwind leaves `RunningClaude::wait` first, which
+///   drops the `Child` — and tokio's drop reaps it if it has already exited —
+///   before the unwind reaches this frame and the guard, so the signal can
+///   find a freed pid (measured under `strace`: `wait4`, then `kill` =
+///   `ESRCH`; #1623 review). The bridge cannot reorder that, because the
+///   `Child` lives inside `hive-claude`'s `wait`; it is one of the raw-pid
+///   exceptions below.
+///
+///   What a drop cannot do is *wait* for the reap: the title lock and the
+///   request permit above belong to outer futures, which drop after this one,
+///   so they let go with the `SIGKILL` sent but the child not yet reaped —
+///   where the deadline path holds them until it is.
 /// - **A pipe-holding grandchild.** `wait` also needs both output pipes at EOF,
 ///   which a grandchild that inherited them can withhold after the child is
 ///   dead. That wait is bounded by [`REAP_GRACE`] and then abandoned with a
@@ -270,10 +317,18 @@ where
 ///   the driver's stdin write, which returns *before* it reaps; the child is
 ///   dead either way and tokio's orphan reaper collects it.
 /// - **The raw pid.** `Cancel` signals a pid with no generation check
-///   (hive-claude#15). It is only ever sent while `wait` is still pending, so
-///   the child is unreaped and its pid cannot have been recycled — except in
-///   the grandchild case above, where it can only have been recycled if the
-///   pid space wrapped within the turn.
+///   (hive-claude#15). It is only ever sent while `wait` is still pending — by
+///   the deadline path, or by the guard, which is disarmed the moment `turn`
+///   returns because a turn that ended on its own may have reaped its child —
+///   so the child is normally unreaped and its pid cannot have been recycled.
+///   Three exceptions, all of one class, where the child was reaped first: the
+///   grandchild case above; a `wait` whose `join!` has reaped the child but is
+///   still pending while its pumps drain buffered output; and a panic raised
+///   inside `turn` (see "A dropped turn"). In each, the signal can only reach
+///   another process if the pid space wrapped in between. The bridge cannot
+///   close them, since the `Child` lives inside `hive-claude`'s `wait`; what
+///   would is upstream — `kill_on_drop(true)` on the child (tokio then kills
+///   before it reaps) or a pidfd-based `Cancel` (hive-claude#15).
 ///
 /// A deadline that has already passed spawns nothing: a turn that spent its
 /// budget queued behind another one must not start a child just to kill it.
@@ -293,12 +348,24 @@ async fn run_until(
     };
     let cancel = running.cancel_handle();
     let mut turn = std::pin::pin!(running.wait(prompt, sink));
+    // Declared after `turn` on purpose, so that dropping this future while it
+    // is suspended drops the guard first and signals the child while `turn`
+    // still owns it. (A panic inside `turn`'s own poll unwinds through `turn`
+    // first and cannot be reordered from here; see "A dropped turn" above.)
+    // Nothing awaits between the spawn and here, so there is no earlier point
+    // at which this future could be abandoned with a child and no guard.
+    let abandoned = KillOnDrop::arm(cancel.clone());
     // `timeout_at` polls the turn before it checks the clock, so a turn that
     // finished on the same tick the deadline fell is still taken as an answer.
     if let Ok(ended) = tokio::time::timeout_at(deadline, &mut turn).await {
+        abandoned.disarm();
         return Ok(ended);
     }
     cancel.cancel(true);
+    // Killed here and reaped below, by this path's own wait: a drop during
+    // that wait has nothing left to kill, and must not report the deadline's
+    // kill as an abandoned turn.
+    abandoned.disarm();
     if tokio::time::timeout(REAP_GRACE, &mut turn).await.is_ok() {
         tracing::warn!("claude did not finish within the request budget; killed and reaped it");
     } else {
@@ -309,6 +376,51 @@ async fn run_until(
         );
     }
     Err(expired())
+}
+
+/// `SIGKILL`s a turn's `claude` child if the turn is **abandoned**: its
+/// [`run_until`] future dropped before the child was dealt with (#1550).
+///
+/// `hive-claude` sets no `kill_on_drop` on the child it spawns, so before this
+/// a dropped turn left `claude` running — still spending the owner's
+/// subscription — and nothing said so unless the drop was `bridge.rs`'s own
+/// backstop. [`run_until`] arms one right after a successful spawn and
+/// disarms it on each path that deals with the child itself, so [`Drop`] fires
+/// for a dropped or panicking turn and for nothing else.
+///
+/// Signalling only, never waiting: a `Drop` cannot await the reap, which is
+/// left to tokio's orphan reaper once the driver's `Child` is dropped after it.
+#[derive(Debug)]
+struct KillOnDrop {
+    /// `None` once disarmed.
+    cancel: Option<Cancel>,
+}
+
+impl KillOnDrop {
+    /// Kill the child behind `cancel` on drop, unless disarmed first.
+    fn arm(cancel: Cancel) -> Self {
+        Self {
+            cancel: Some(cancel),
+        }
+    }
+
+    /// The child is already dealt with — it ended its own turn, or the
+    /// deadline killed it and is reaping it — so dropping this sends nothing.
+    fn disarm(mut self) {
+        self.cancel = None;
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            cancel.cancel(true);
+            tracing::warn!(
+                "claude's turn was dropped before it finished (the request backstop, a panic, or \
+                 shutdown); killed it and left the reap to tokio",
+            );
+        }
+    }
 }
 
 /// The status a request gets when its budget ran out while it was still
@@ -338,7 +450,8 @@ impl TitleLocks {
     /// Wait for exclusive use of `title`.
     ///
     /// Dropping the returned future while it still waits — the request's
-    /// deadline, a client that hung up — gives up the place in the queue
+    /// deadline, or whatever drops the turn around it (the backstop, a panic,
+    /// a shutdown) — gives up the place in the queue
     /// (and any lock already handed to it) and retires the title's entry if
     /// no other turn holds or waits on it.
     async fn acquire(&self, title: &str) -> TitleGuard<'_> {
@@ -766,6 +879,20 @@ exec sleep 30
     pub(crate) fn hung_claude(dir: &Path) -> PathBuf {
         let program = dir.join("hung-claude");
         install(&program, SCRIPT);
+        program
+    }
+
+    /// The opposite stand-in: reads its prompt, answers with one successful
+    /// `result` event and exits 0 — a turn that ends on its own, for the tests
+    /// that need [`super::run_until`]'s ordinary path. It leaves no `.pid`
+    /// marker, so it is invisible to [`started`] and can share a directory
+    /// with [`hung_claude`] runs.
+    pub(crate) fn answering_claude(dir: &Path) -> PathBuf {
+        let program = dir.join("answering-claude");
+        install(
+            &program,
+            "#!/bin/sh\ncat > /dev/null\necho '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"answered\"}'\n",
+        );
         program
     }
 
@@ -1294,11 +1421,12 @@ mod tests {
 
     /// **The leak, closed.** A turn queued behind another on its title is
     /// dropped *after* the holder let go but *before* it was polled to take the
-    /// lock — the HTTP client hung up, say. The holder's release rightly kept
-    /// the entry, because the waiter still held a clone of its mutex; before
-    /// #1550 nothing ran the cleanup after that, so the entry stayed until the
-    /// title's next turn. One per cancelled title, without bound over a
-    /// session with many distinct titles.
+    /// lock — a runtime shutdown dropping the task, say (not a client hanging
+    /// up, which drops nothing: the turn runs on). The holder's release
+    /// rightly kept the entry, because the waiter still held a clone of its
+    /// mutex; before #1550 nothing ran the cleanup after that, so the entry
+    /// stayed until the title's next turn. One per cancelled title, without
+    /// bound over a session with many distinct titles.
     #[tokio::test]
     async fn a_waiter_dropped_after_the_release_retires_the_entry() {
         let locks = TitleLocks::default();
@@ -1445,6 +1573,52 @@ mod tests {
 
     // ---- the request deadline kills and reaps the child --------------------
 
+    /// What [`super::KillOnDrop`] says when it fires — a fragment of its
+    /// `warn!`, so a reworded line turns the positive assertions below red
+    /// rather than leaving the zero-counts silently vacuous.
+    const ABANDONED: &str = "claude's turn was dropped before it finished";
+
+    /// The `WARN` lines this thread logs while it lives — the workspace's one
+    /// capture harness, `hytte_config::test_support::capture`, plus a count.
+    ///
+    /// A *scoped* default, so a sibling test on another thread cannot write
+    /// into it; `#[tokio::test]`'s current-thread runtime is what keeps every
+    /// poll — and every drop — of the turn under test on this thread.
+    ///
+    /// Not a hand-rolled `set_default`, which is what this was first and what
+    /// failed 21 of 40 runs beside bridge.rs's hung-turn tests (#1623 review).
+    /// A fresh `Dispatch` re-derives the interest of every callsite registered
+    /// *before* it, but while it is the only live dispatcher, a callsite first
+    /// registered *after* it by a thread with no subscriber is cached
+    /// `Interest::never()` for the whole process (`tracing-core`'s
+    /// `Rebuilder::JustOne`, #1022) — and bridge.rs's tests reach the deadline
+    /// path's `warn!` from exactly such threads. `capture` installs the
+    /// process-wide `AlwaysInterested` global default first, which makes that
+    /// thread impossible; its module doc has the measurements.
+    struct Warnings {
+        captured: hytte_config::test_support::Captured,
+        _scope: tracing::dispatcher::DefaultGuard,
+    }
+
+    impl Warnings {
+        fn capture() -> Self {
+            let (captured, scope) = hytte_config::test_support::capture();
+            Self {
+                captured,
+                _scope: scope,
+            }
+        }
+
+        /// How many captured `WARN` messages contain `needle`.
+        fn count(&self, needle: &str) -> usize {
+            self.captured
+                .warnings()
+                .iter()
+                .filter(|message| message.contains(needle))
+                .count()
+        }
+    }
+
     /// **The orphan, closed.** A `claude` that stalls without a byte of output
     /// is killed with `SIGKILL` at the deadline and reaped before `run_until`
     /// hands the 504 back — so before the title lock and the request permit
@@ -1464,6 +1638,11 @@ mod tests {
     /// a bound tight enough to tell a reap from a grace expiry would fail on a
     /// slow machine rather than on a regression. What it still catches is the
     /// deadline not being enforced at all — the stand-in sleeps for 30 s.
+    ///
+    /// It also pins that the deadline's kill is the deadline's own, reported
+    /// in its own words: the abandoned-turn guard (#1550) is disarmed on this
+    /// path, so it neither signals a pid the deadline has just reaped nor
+    /// reports this turn as dropped.
     #[tokio::test]
     async fn a_silently_hung_child_is_killed_and_reaped_at_the_deadline() {
         use super::{run_until, stand_in};
@@ -1480,6 +1659,7 @@ mod tests {
             program: Some(stand_in::hung_claude(dir.path())),
             ..Config::default()
         };
+        let warnings = Warnings::capture();
         // Long enough that a loaded machine still gets the stand-in to its
         // marker before the kill; the claim is about what happens after it.
         let budget = Duration::from_secs(2);
@@ -1509,6 +1689,226 @@ mod tests {
             !stand_in::present(pid),
             "the child ({pid}) is still in /proc after its 504 — running, or dead but unreaped",
         );
+        assert_eq!(
+            warnings.count("did not finish within the request budget"),
+            1,
+            "the deadline's kill went unreported (or this capture hears nothing)",
+        );
+        assert_eq!(
+            warnings.count(ABANDONED),
+            0,
+            "the deadline's own kill was also reported as an abandoned turn",
+        );
+    }
+
+    /// **The orphan, closed for a dropped turn too (#1550).** A turn whose
+    /// future is dropped mid-flight — `bridge.rs`'s backstop, a panic unwinding
+    /// through it, the runtime shutting down — takes its `claude` with it,
+    /// rather than leaving the child running on the owner's subscription.
+    ///
+    /// Before the guard the stand-in here slept on for its full 30 s, unreaped:
+    /// `hive-claude` sets no `kill_on_drop`, so dropping the driver's `Child`
+    /// only handed tokio a process that was still running. Now the guard's
+    /// `SIGKILL` lands first, and that same hand-off becomes a zombie for
+    /// tokio's orphan reaper — so "out of `/proc`" (killed **and** reaped) is
+    /// what this waits for, bounded well under those 30 s. The wait is a poll
+    /// rather than a single check because nothing in a drop can await the
+    /// reap: it happens on the next `SIGCHLD` the runtime sees.
+    #[tokio::test]
+    async fn a_turn_dropped_mid_flight_kills_its_child() {
+        use super::{run_until, stand_in};
+        use hive_claude::Config;
+        use std::time::Duration;
+        use tokio::time::Instant;
+
+        /// How long the kill and the orphan reap together may take before
+        /// this test calls the child orphaned — generous for a loaded runner,
+        /// and still far under the stand-in's 30 s sleep.
+        const REAP_SLACK: Duration = Duration::from_secs(5);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = Config {
+            program: Some(stand_in::hung_claude(dir.path())),
+            ..Config::default()
+        };
+        let sink = TextSink::default();
+        let warnings = Warnings::capture();
+
+        // A deadline nobody reaches: the only way this turn ends is a drop.
+        let far = Instant::now() + Duration::from_hours(1);
+        let mut turn = Box::pin(run_until(&config, &Attach::OneOff, "hi", &sink, far));
+        let pid = tokio::select! {
+            outcome = &mut turn => panic!("the hung turn ended on its own: {outcome:?}"),
+            pids = stand_in::wait_for(dir.path(), 1) => pids[0],
+        };
+        assert!(stand_in::present(pid), "the child ({pid}) is not up yet");
+        drop(turn);
+
+        let reaped_by = Instant::now() + REAP_SLACK;
+        while stand_in::present(pid) {
+            assert!(
+                Instant::now() < reaped_by,
+                "the child ({pid}) is still in /proc {REAP_SLACK:?} after its turn was dropped \
+                 — orphaned and running, or killed but never reaped",
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            warnings.count(ABANDONED),
+            1,
+            "the abandoned turn's kill was not reported exactly once",
+        );
+    }
+
+    /// The guard's positive control: a turn that ends on its own was never
+    /// abandoned, so the guard is disarmed and sends nothing — a `SIGKILL`
+    /// there would go to a pid the driver may already have reaped, i.e. to
+    /// whatever the kernel hands that number next, and the warning would cry
+    /// wolf on every answered turn.
+    ///
+    /// The zero is only worth something if this capture would have heard the
+    /// line, so the same capture then watches a turn that really is abandoned
+    /// and must count exactly one.
+    #[tokio::test]
+    async fn a_turn_that_ends_on_its_own_trips_no_guard() {
+        use super::{run_until, stand_in};
+        use hive_claude::Config;
+        use std::time::Duration;
+        use tokio::time::Instant;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let far = Instant::now() + Duration::from_hours(1);
+        let warnings = Warnings::capture();
+
+        let answering = Config {
+            program: Some(stand_in::answering_claude(dir.path())),
+            ..Config::default()
+        };
+        let sink = TextSink::default();
+        let outcome = run_until(&answering, &Attach::OneOff, "hi", &sink, far).await;
+        assert!(matches!(outcome, Ok(Ok(()))), "{outcome:?}");
+        assert_eq!(sink.into_text().expect("the stand-in's answer"), "answered");
+        assert_eq!(
+            warnings.count(ABANDONED),
+            0,
+            "a turn that answered was reported as abandoned",
+        );
+
+        let hung = Config {
+            program: Some(stand_in::hung_claude(dir.path())),
+            ..Config::default()
+        };
+        let sink = TextSink::default();
+        let mut turn = Box::pin(run_until(&hung, &Attach::OneOff, "hi", &sink, far));
+        tokio::select! {
+            outcome = &mut turn => panic!("the hung turn ended on its own: {outcome:?}"),
+            _ = stand_in::wait_for(dir.path(), 1) => {}
+        }
+        drop(turn);
+        assert_eq!(
+            warnings.count(ABANDONED),
+            1,
+            "this capture does not hear the guard, so the zero above proves nothing",
+        );
+    }
+
+    /// The deadline path disarms the guard **at its kill**, not once the reap
+    /// grace is over — so a turn dropped *during* that grace sends nothing more.
+    ///
+    /// That window is real: with a grandchild holding the pipes, the driver's
+    /// `child.wait()` reaps the killed child within milliseconds while `turn`
+    /// stays pending for up to [`super::REAP_GRACE`], and a guard still armed
+    /// there would `SIGKILL` a freed pid. "Disarm once, at the end" is a
+    /// natural refactor that the suite did not see (#1623 review, M1).
+    ///
+    /// Deterministic rather than timed: the turn is not polled while its
+    /// deadline passes, then polled exactly once — which takes the deadline
+    /// branch (kill, disarm) and parks in the reap grace, held open by the
+    /// stand-in's 3 s grandchild — and then dropped.
+    #[tokio::test]
+    async fn a_drop_during_the_deadlines_reap_grace_sends_nothing() {
+        use super::{run_until, stand_in};
+        use hive_claude::Config;
+        use std::time::Duration;
+        use tokio::time::Instant;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let program = dir.path().join("forking-claude");
+        // `sleep 3 &` inherits stdout/stderr, so the driver's `wait` is still
+        // pending after the deadline's kill, whatever the load.
+        stand_in::install(
+            &program,
+            "#!/bin/sh\ndir=\"${0%/*}\"\ncat > /dev/null\nsleep 3 &\n: > \"$dir/$$.pid\"\nexec sleep 30\n",
+        );
+        let config = Config {
+            program: Some(program),
+            ..Config::default()
+        };
+        let sink = TextSink::default();
+        let warnings = Warnings::capture();
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        let mut turn = Box::pin(run_until(&config, &Attach::OneOff, "hi", &sink, deadline));
+        tokio::select! {
+            biased;
+            outcome = &mut turn => panic!("the turn ended before its deadline: {outcome:?}"),
+            _ = stand_in::wait_for(dir.path(), 1) => {}
+        }
+        tokio::time::sleep_until(deadline).await;
+        let polled = std::future::poll_fn(|cx| Poll::Ready(turn.as_mut().poll(cx))).await;
+        assert!(
+            polled.is_pending(),
+            "the grandchild holds the pipes, so the reap grace is still running: {polled:?}",
+        );
+        drop(turn);
+        assert_eq!(
+            warnings.count(ABANDONED),
+            0,
+            "a drop inside the deadline's reap grace was reported as abandoned",
+        );
+    }
+
+    /// The guard's kill is `SIGKILL`, which a child cannot ignore. The hung
+    /// stand-in dies of `SIGINT` too, so the drop test above cannot tell; real
+    /// `claude` may well install a `SIGINT` handler (#1623 review, M2). This
+    /// stand-in ignores `SIGINT` and `SIGTERM` — `SIG_IGN` survives the
+    /// `exec` — so only an uncatchable signal takes it out of `/proc`.
+    #[tokio::test]
+    async fn the_guards_kill_cannot_be_ignored() {
+        use super::{run_until, stand_in};
+        use hive_claude::Config;
+        use std::time::Duration;
+        use tokio::time::Instant;
+
+        /// As in `a_turn_dropped_mid_flight_kills_its_child`.
+        const REAP_SLACK: Duration = Duration::from_secs(5);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let program = dir.path().join("stubborn-claude");
+        stand_in::install(
+            &program,
+            "#!/bin/sh\ndir=\"${0%/*}\"\ncat > /dev/null\ntrap '' INT TERM\n: > \"$dir/$$.pid\"\nexec sleep 30\n",
+        );
+        let config = Config {
+            program: Some(program),
+            ..Config::default()
+        };
+        let sink = TextSink::default();
+        let far = Instant::now() + Duration::from_hours(1);
+        let mut turn = Box::pin(run_until(&config, &Attach::OneOff, "hi", &sink, far));
+        let pid = tokio::select! {
+            outcome = &mut turn => panic!("the stubborn turn ended on its own: {outcome:?}"),
+            pids = stand_in::wait_for(dir.path(), 1) => pids[0],
+        };
+        drop(turn);
+
+        let reaped_by = Instant::now() + REAP_SLACK;
+        while stand_in::present(pid) {
+            assert!(
+                Instant::now() < reaped_by,
+                "the SIGINT-ignoring child ({pid}) survived the guard for {REAP_SLACK:?}",
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// A turn whose deadline has already passed — it spent the budget queued

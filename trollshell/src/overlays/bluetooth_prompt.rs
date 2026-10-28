@@ -9,9 +9,13 @@
 //!
 //! So while a prompt is pending and no output's drawer shows the Bluetooth
 //! page, this module posts one shell toast with an **Open Bluetooth** action.
-//! The action opens the drawer on that page on the focused output, by the
+//! The action, and a click anywhere on the toast's body (the spec's `default`
+//! action), opens the drawer on that page on the focused output, by the
 //! route the `open-page` keybind takes (`modal::open_on_focused` with
-//! `focused_output::current`). The toast is [`Urgency::Critical`], so
+//! `focused_output::current`). The toast names the device by its alias, with
+//! what the shell drops from any text a stranger chooses taken out, and its
+//! address beside it, as the page's own banner does: the alias is a name the
+//! device picks for itself. The toast is [`Urgency::Critical`], so
 //! Do-Not-Disturb and a per-app mute let it through, and it goes through
 //! [`notifications::post_local_until_closed`], so nothing closes it on a
 //! timer: this module does, with reason 3 (closed by a call),
@@ -60,9 +64,16 @@ use crate::modal::{self, Page};
 /// so the two read as one source in the history.
 const APP_NAME: &str = "Bluetooth";
 
-/// The one action's key and label.
+/// The one button's key and label.
 const OPEN_KEY: &str = "open";
 const OPEN_LABEL: &str = "Open Bluetooth";
+
+/// The freedesktop notification spec's reserved action key for a click on the
+/// notification itself. The toast overlay runs it on a body click and draws
+/// no button for it (`components::notif_actions`). Without it a body click
+/// only dismisses the toast, and with it the prompt's one toast, leaving the
+/// prompt on no screen (#1629 review, F1).
+const DEFAULT_KEY: &str = "default";
 
 /// The toast's body: one line, the same for every kind of prompt. The summary
 /// says what is being asked.
@@ -76,9 +87,10 @@ const CLOSED_BY_CALL: u32 = 3;
 
 /// How many characters of the device's alias the summary shows. The alias is
 /// a name the device picks for itself, up to 248 bytes, and the toast's
-/// summary has two lines: a long one would push what the device is asking for
-/// out of view.
-const ALIAS_CAP: usize = 40;
+/// summary has two lines of about 40 characters, which also carry the
+/// 17-character address and what the device asks for: a long alias would push
+/// those out of view.
+const ALIAS_CAP: usize = 24;
 
 thread_local! {
     /// Per monitor key ([`monitor_key`]): whether that output's drawer shows
@@ -112,13 +124,23 @@ pub fn install(monitor: &Monitor) {
         old.abort();
     }
 
-    if !WIRED.with(Cell::get) {
-        WIRED.with(|wired| wired.set(true));
+    wire_once(|| {
         glib::MainContext::default().spawn_local(reconcile(
             bluetooth::pair_prompts(),
             post_toast,
             |toast| notifications::dismiss(toast, CLOSED_BY_CALL),
         ));
+    });
+}
+
+/// Run `spawn` on the first call only, for the process: there is one
+/// reconciler, however many monitors [`install`] runs for and however many
+/// hot-plugs re-install them. Without the latch, every `install` would start
+/// another reconciler, each posting its own toast for the same prompt.
+fn wire_once(spawn: impl FnOnce()) {
+    if !WIRED.with(Cell::get) {
+        WIRED.with(|wired| wired.set(true));
+        spawn();
     }
 }
 
@@ -190,15 +212,57 @@ where
 }
 
 /// Post the toast for `prompt`, returning its notification id (`None` with no
-/// notification service registered).
+/// notification service registered). Everything it posts comes from
+/// [`toast_args`]; this only hands it [`open_bluetooth_page`] and the post.
 fn post_toast(prompt: &PairPrompt) -> Option<u32> {
+    let ToastArgs {
+        app_name,
+        summary,
+        body,
+        urgency,
+        actions,
+    } = toast_args(prompt, open_bluetooth_page);
     notifications::post_local_until_closed(
-        APP_NAME,
-        &summary(prompt),
-        BODY,
-        Urgency::Critical,
-        vec![LocalAction::new(OPEN_KEY, OPEN_LABEL, open_bluetooth_page)],
+        app_name,
+        &summary,
+        body,
+        urgency,
+        actions
+            .into_iter()
+            .map(|(key, label, open)| LocalAction::new(key, label, open))
+            .collect(),
     )
+}
+
+/// What [`post_toast`] posts for one prompt.
+struct ToastArgs<F> {
+    app_name: &'static str,
+    summary: String,
+    body: &'static str,
+    urgency: Urgency,
+    /// Each action as its key, its label and the callback it runs.
+    actions: Vec<(&'static str, &'static str, F)>,
+}
+
+/// The toast for `prompt`, short of posting it: what it says, its urgency,
+/// and its actions, each running `open`. Pure, so a test can read the urgency
+/// and run each action's callback with a recorder for `open`, where
+/// [`post_toast`] passes [`open_bluetooth_page`].
+///
+/// `Critical`, so Do-Not-Disturb and a per-app mute let it through. Two
+/// actions, both opening the page: the **Open Bluetooth** button, and
+/// [`DEFAULT_KEY`], the body click, which draws no button.
+fn toast_args<F: Clone>(prompt: &PairPrompt, open: F) -> ToastArgs<F> {
+    ToastArgs {
+        app_name: APP_NAME,
+        summary: summary(prompt),
+        body: BODY,
+        urgency: Urgency::Critical,
+        actions: vec![
+            (OPEN_KEY, OPEN_LABEL, open.clone()),
+            (DEFAULT_KEY, OPEN_LABEL, open),
+        ],
+    }
 }
 
 /// The toast action: open the drawer on the Bluetooth page on the focused
@@ -299,12 +363,18 @@ fn step(
 /// The toast's summary: the device, and what it asks for. Plain text — the
 /// toast's summary label renders no markup.
 fn summary(prompt: &PairPrompt) -> String {
-    let who = device_name(&prompt.alias);
+    let who = device_label(prompt);
     match prompt.kind {
-        PromptKind::AuthorizeService => format!(
-            "{who} wants to use {}",
-            prompt.service.as_deref().unwrap_or("a service")
-        ),
+        PromptKind::AuthorizeService => {
+            let service = prompt.service.as_deref().map(one_line);
+            format!(
+                "{who} wants to use {}",
+                service
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("a service")
+            )
+        }
         PromptKind::ConfirmPasskey => format!("{who} wants to pair with a code to confirm"),
         PromptKind::Authorize => format!("{who} wants to pair"),
         PromptKind::EnterPinCode => format!("{who} wants to pair with a PIN"),
@@ -312,32 +382,75 @@ fn summary(prompt: &PairPrompt) -> String {
     }
 }
 
-/// The device's alias on one line, capped at [`ALIAS_CAP`] characters. A
-/// newline in it would take one of the summary's two lines, and a long one
-/// would push the rest out of view.
+/// The device as the toast names it: [`device_name`] with the address beside
+/// it, as `panels::bluetooth`'s banner names it. The alias is a name the
+/// device picks for itself, so two devices can share one, and one can take
+/// the name of a device the user knows; the address tells them apart. The
+/// alias alone when there is no address, or when the alias already is it.
+fn device_label(prompt: &PairPrompt) -> String {
+    let name = device_name(&prompt.alias);
+    let address = one_line(&prompt.address);
+    if address.is_empty() || name == address {
+        name
+    } else {
+        format!("{name} ({address})")
+    }
+}
+
+/// The device's alias as [`one_line`] leaves it, capped at [`ALIAS_CAP`]
+/// characters, or "A Bluetooth device" when nothing is left: an alias of
+/// only invisible characters names nothing the user can read.
 fn device_name(alias: &str) -> String {
-    let one_line = alias.split_whitespace().collect::<Vec<_>>().join(" ");
-    if one_line.is_empty() {
+    let name = one_line(alias);
+    if name.is_empty() {
         return "A Bluetooth device".to_owned();
     }
-    if one_line.chars().count() <= ALIAS_CAP {
-        return one_line;
+    if name.chars().count() <= ALIAS_CAP {
+        return name;
     }
-    let mut capped: String = one_line.chars().take(ALIAS_CAP - 1).collect();
+    let mut capped: String = name.chars().take(ALIAS_CAP - 1).collect();
     capped.push('\u{2026}');
     capped
+}
+
+/// `text` as one plain line: a character the shell drops from text someone
+/// else chose (the shared rule, [`is_invisible_or_control`]: controls, line
+/// and paragraph separators, bidi overrides and isolates, zero-width
+/// characters) is dropped, or becomes a space if it is whitespace, and runs of
+/// whitespace become one space. `plugins::version`'s sanitiser applies the
+/// same rule to a plugin's version string. A bidi override would otherwise
+/// reverse the rest of the summary, and a newline would take one of its two
+/// lines (#1629 review, F4).
+///
+/// [`is_invisible_or_control`]: hytte_plugin_proto::text::is_invisible_or_control
+fn one_line(text: &str) -> String {
+    let kept: String = text
+        .chars()
+        .filter_map(|c| {
+            if !hytte_plugin_proto::text::is_invisible_or_control(c) {
+                Some(c)
+            } else if c.is_whitespace() {
+                Some(' ')
+            } else {
+                None
+            }
+        })
+        .collect();
+    kept.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Action, PAGE_VISIBLE, Toasted, apply, close_all, decide, device_name, reconcile, step,
-        summary, track,
+        Action, PAGE_VISIBLE, Toasted, WIRED, apply, close_all, decide, device_name, reconcile,
+        step, summary, toast_args, track, wire_once,
     };
+    use crate::components::notif_actions;
     use crate::modal::Page;
     use hytte::futures_signals::signal::Mutable;
     use hytte::services::bluetooth::{PairPrompt, PromptKind};
-    use std::cell::RefCell;
+    use hytte::services::notifications::{Action as NotificationAction, Urgency};
+    use std::cell::{Cell, RefCell};
     use std::future::Future;
     use std::pin::Pin;
     use std::rc::Rc;
@@ -708,24 +821,143 @@ mod tests {
         assert!(!PAGE_VISIBLE.with(|visible| visible.get()));
     }
 
-    /// The summary names the device and what it asks for: the service for a
-    /// service request, the kind of pairing otherwise.
+    /// Unplugging the output whose drawer showed the page must not leave the
+    /// page "on screen" for good (#1629 review, F3): its stale entry would be
+    /// counted back in by the next drawer to report, and no prompt would ever be
+    /// toasted again. The reviewer's test, on this module's helpers.
+    ///
+    /// **Falsification:** delete `close_all`'s `SHOWS` clear and this fails
+    /// at its first assertion: the page reads as on screen once the next
+    /// drawer reports. Past it, the later prompt would get no toast, which
+    /// the second assertion holds.
+    #[test]
+    fn an_unplugged_outputs_page_does_not_outlive_close_all() {
+        close_all();
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let (post, dismiss) = recorders(&calls);
+        let slot = Mutable::new(None::<PairPrompt>);
+        let mut reconciler: Pin<Box<dyn Future<Output = ()>>> =
+            Box::pin(reconcile(slot.signal_cloned(), post, dismiss));
+
+        let hdmi = Mutable::new(Some(Page::Bluetooth));
+        let mut old: Pin<Box<dyn Future<Output = ()>>> =
+            Box::pin(track("HDMI-A-1".to_owned(), hdmi.signal()));
+        poll(&mut old);
+        poll(&mut reconciler);
+
+        // HDMI-A-1 unplugged: its subscription goes, then the teardown.
+        drop(old);
+        close_all();
+        let dp1 = Mutable::new(None::<Page>);
+        let mut new: Pin<Box<dyn Future<Output = ()>>> =
+            Box::pin(track("DP-1".to_owned(), dp1.signal()));
+        poll(&mut new);
+        poll(&mut reconciler);
+        assert!(
+            !PAGE_VISIBLE.with(|visible| visible.get()),
+            "the unplugged output's page is on screen nowhere"
+        );
+
+        slot.set(Some(prompt(9, PromptKind::Authorize)));
+        poll(&mut reconciler);
+        assert_eq!(
+            *calls.borrow(),
+            [Call::Post(9)],
+            "a later prompt gets its toast"
+        );
+    }
+
+    /// However many times `install` runs (once per monitor, again on every
+    /// hot-plug), the reconciler is spawned once (#1629 review, F3).
+    ///
+    /// **Falsification:** delete `wire_once`'s `WIRED` set and this fails:
+    /// two spawns, i.e. two reconcilers, each posting a toast for the same
+    /// prompt.
+    #[test]
+    fn the_reconciler_is_spawned_once_however_many_installs() {
+        WIRED.with(|wired| wired.set(false));
+        let spawned = Cell::new(0);
+        wire_once(|| spawned.set(spawned.get() + 1));
+        wire_once(|| spawned.set(spawned.get() + 1));
+        assert_eq!(spawned.get(), 1);
+    }
+
+    /// The toast's arguments: Critical, so it gets past Do-Not-Disturb and a
+    /// per-app mute (M12), and two actions that both open the page, the
+    /// button and the spec's `default` key that a body click runs (#1629
+    /// review, F1). Each action's callback is run, with a recorder standing in
+    /// for `open_bluetooth_page`. The keys are checked against the toast
+    /// overlay's own reading of them (`components::notif_actions`), so the
+    /// body click finds `default` and no button is drawn for it.
+    ///
+    /// **Falsification:** `Urgency::Normal` in `toast_args`, drop the
+    /// `default` action, or give it a callback that does nothing, and this
+    /// fails.
+    #[test]
+    fn the_toast_is_critical_and_a_body_click_opens_the_page() {
+        let opened = Rc::new(Cell::new(0));
+        let open = {
+            let opened = Rc::clone(&opened);
+            move || opened.set(opened.get() + 1)
+        };
+        let pending = prompt(1, PromptKind::ConfirmPasskey);
+        let args = toast_args(&pending, open);
+
+        assert_eq!(args.app_name, "Bluetooth");
+        assert_eq!(args.urgency, Urgency::Critical);
+        assert_eq!(args.summary, summary(&pending));
+        assert_eq!(args.body, super::BODY);
+
+        let shown: Vec<NotificationAction> = args
+            .actions
+            .iter()
+            .map(|(key, label, _)| NotificationAction {
+                key: (*key).to_owned(),
+                label: (*label).to_owned(),
+            })
+            .collect();
+        assert_eq!(
+            notif_actions::default_action(&shown).map(|a| a.key.as_str()),
+            Some("default"),
+            "a body click finds an action to run"
+        );
+        let buttons: Vec<&str> = notif_actions::visible_actions(&shown)
+            .map(|a| a.label.as_str())
+            .collect();
+        assert_eq!(buttons, ["Open Bluetooth"], "one button");
+
+        for (key, _, open) in &args.actions {
+            let before = opened.get();
+            open();
+            assert_eq!(opened.get(), before + 1, "{key:?} opens the page");
+        }
+    }
+
+    /// The summary names the device, with its address beside the alias, and
+    /// what it asks for: the service for a service request, the kind of
+    /// pairing otherwise.
     #[test]
     fn the_summary_names_the_device_and_the_ask() {
         let cases = [
             (
                 PromptKind::AuthorizeService,
-                "Pixel 7 wants to use audio streaming (A2DP)",
+                "Pixel 7 (AA:BB:CC:DD:EE:FF) wants to use audio streaming (A2DP)",
             ),
             (
                 PromptKind::ConfirmPasskey,
-                "Pixel 7 wants to pair with a code to confirm",
+                "Pixel 7 (AA:BB:CC:DD:EE:FF) wants to pair with a code to confirm",
             ),
-            (PromptKind::Authorize, "Pixel 7 wants to pair"),
-            (PromptKind::EnterPinCode, "Pixel 7 wants to pair with a PIN"),
+            (
+                PromptKind::Authorize,
+                "Pixel 7 (AA:BB:CC:DD:EE:FF) wants to pair",
+            ),
+            (
+                PromptKind::EnterPinCode,
+                "Pixel 7 (AA:BB:CC:DD:EE:FF) wants to pair with a PIN",
+            ),
             (
                 PromptKind::EnterPasskey,
-                "Pixel 7 wants to pair with a passkey",
+                "Pixel 7 (AA:BB:CC:DD:EE:FF) wants to pair with a passkey",
             ),
         ];
         for (kind, want) in cases {
@@ -733,7 +965,47 @@ mod tests {
         }
         let mut unnamed = prompt(1, PromptKind::AuthorizeService);
         unnamed.service = None;
-        assert_eq!(summary(&unnamed), "Pixel 7 wants to use a service");
+        assert_eq!(
+            summary(&unnamed),
+            "Pixel 7 (AA:BB:CC:DD:EE:FF) wants to use a service"
+        );
+    }
+
+    /// The address is shown once: not at all when there is none, and alone
+    /// when the alias already is the address.
+    #[test]
+    fn the_address_is_not_shown_twice_or_empty() {
+        let mut p = prompt(1, PromptKind::Authorize);
+        p.address = String::new();
+        assert_eq!(summary(&p), "Pixel 7 wants to pair");
+        p.alias = "AA:BB:CC:DD:EE:FF".to_owned();
+        p.address = "AA:BB:CC:DD:EE:FF".to_owned();
+        assert_eq!(summary(&p), "AA:BB:CC:DD:EE:FF wants to pair");
+    }
+
+    /// A name a stranger chose cannot reorder the toast or hide in invisible
+    /// characters (#1629 review, F4): a right-to-left override is taken out,
+    /// and an alias of only zero-width characters names "A Bluetooth device",
+    /// with the address beside it either way.
+    ///
+    /// **Falsification:** drop the shared predicate from `one_line` and the
+    /// override survives; check emptiness before filtering and the zero-width
+    /// alias shows as an empty name.
+    #[test]
+    fn a_spoofing_alias_is_cleaned_and_the_address_still_shows() {
+        let mut p = prompt(1, PromptKind::Authorize);
+        p.alias = "\u{202E}sdohpdaeH s'aknnA".to_owned();
+        let shown = summary(&p);
+        assert!(!shown.contains('\u{202E}'), "{shown:?}");
+        assert_eq!(shown, "sdohpdaeH s'aknnA (AA:BB:CC:DD:EE:FF) wants to pair");
+
+        p.alias = "\u{200B}\u{200D}\u{2060}".to_owned();
+        assert_eq!(
+            summary(&p),
+            "A Bluetooth device (AA:BB:CC:DD:EE:FF) wants to pair"
+        );
+        assert_eq!(device_name("\u{200B}"), "A Bluetooth device");
+        assert_eq!(device_name("\u{202E}x"), "x");
     }
 
     /// The alias is put on one line and capped, and an empty one still names
@@ -741,6 +1013,7 @@ mod tests {
     #[test]
     fn the_alias_is_one_capped_line() {
         assert_eq!(device_name("Pixel\n7\tPro "), "Pixel 7 Pro");
+        assert_eq!(device_name("Pixel\u{2028}7"), "Pixel 7");
         assert_eq!(device_name("  "), "A Bluetooth device");
         let long = "x".repeat(100);
         let capped = device_name(&long);

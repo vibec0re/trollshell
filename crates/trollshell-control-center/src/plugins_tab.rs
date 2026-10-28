@@ -3872,33 +3872,21 @@ fn unanswered_or(
     }
 }
 
-/// The reason `hytte-bus` gives when a call's own client timeout runs out:
-/// `call.rs` maps the elapsed `tokio::time::timeout` to
-/// `zbus::Error::Failure("call timeout")`, zbus 5 displays a `Failure` as its
-/// bare string, and `BusError::from_zbus` carries that into
-/// `BusError::Permanent` with no D-Bus error name. The
-/// `a_call_timeout_is_recognised_as_hytte_bus_spells_it` test reads
-/// `hytte-bus`'s own source, so a change there reddens here.
-const HYTTE_BUS_CALL_TIMEOUT: &str = "call timeout";
-
 /// Whether `err` means the call got **no answer**, rather than an answer
 /// that was an error (#1421 review, M2). Pure.
 ///
-/// Two spellings: `hytte-bus`'s own client timeout
-/// ([`HYTTE_BUS_CALL_TIMEOUT`], with no D-Bus error name — an error the shell
-/// sends always carries one, which is what tells the two apart), and the bus
-/// daemon's `org.freedesktop.DBus.Error.NoReply`, which it sends in place of
-/// a reply that never came.
+/// Two spellings: `hytte-bus`'s own client timeout, its
+/// `BusError::Timeout` variant, and the bus daemon's
+/// `org.freedesktop.DBus.Error.NoReply`, which it sends in place of a reply
+/// that never came. Until #1551 the first was a nameless `Permanent` this
+/// recognised by its `reason` string, "call timeout", kept in step with
+/// `hytte-bus` by a test that read its source.
 fn timed_out(err: &hytte_bus::BusError) -> bool {
     match err {
-        hytte_bus::BusError::Permanent {
-            reason,
-            dbus_name: None,
-        } => reason == HYTTE_BUS_CALL_TIMEOUT,
-        hytte_bus::BusError::Permanent {
-            dbus_name: Some(name),
-            ..
-        } => name == "org.freedesktop.DBus.Error.NoReply",
+        hytte_bus::BusError::Timeout { .. } => true,
+        hytte_bus::BusError::Permanent { dbus_name, .. } => {
+            dbus_name.as_deref() == Some("org.freedesktop.DBus.Error.NoReply")
+        }
         hytte_bus::BusError::Transient { .. } => false,
     }
 }
@@ -3929,7 +3917,7 @@ where
 
 /// What is left of the round trip's budget at `now`: one call's own client
 /// timeout. Zero once `deadline` has passed, which makes that call answer
-/// [`HYTTE_BUS_CALL_TIMEOUT`] at once — i.e. [`ToggleError::Unanswered`].
+/// `BusError::Timeout` at once — i.e. [`ToggleError::Unanswered`].
 /// Pure.
 fn call_budget(deadline: tokio::time::Instant, now: tokio::time::Instant) -> Duration {
     deadline.saturating_duration_since(now)
@@ -4067,16 +4055,16 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime};
 
     use super::{
-        DeclaredFile, DeclaredPlugins, HYTTE_BUS_CALL_TIMEOUT, LastToggle, PendingToggle,
-        PluginRuntime, PluginsJson, PollGenerations, PollStates, SwitchPolicy, TOGGLE_TIMEOUT,
-        ToggleAnswer, ToggleCall, ToggleError, ToggleNote, ToggleOrder, ToggleTurn,
-        VersionsOutcome, already_stopped, answer_intent, answered_by, call_budget,
-        classify_versions, declared_from_json, declared_mounts_from_json, is_running,
-        manifest_id_of_exec, mount_display, mount_or_unknown, plugin_subtitle, probe_candidates,
-        probe_plugins_json, read_declared_at, resolve_pending, resolved_search_path,
-        runtime_overlay, runtime_states, same_plugin_set, seen_suffix, status_cell, switch_policy,
-        switch_row_subtitle, switch_subtitle, timed_out, toggle_note_for, toggle_round_trip,
-        version_label, versions_log, versions_or_empty, violations_suffix,
+        DeclaredFile, DeclaredPlugins, LastToggle, PendingToggle, PluginRuntime, PluginsJson,
+        PollGenerations, PollStates, SwitchPolicy, TOGGLE_TIMEOUT, ToggleAnswer, ToggleCall,
+        ToggleError, ToggleNote, ToggleOrder, ToggleTurn, VersionsOutcome, already_stopped,
+        answer_intent, answered_by, call_budget, classify_versions, declared_from_json,
+        declared_mounts_from_json, is_running, manifest_id_of_exec, mount_display,
+        mount_or_unknown, plugin_subtitle, probe_candidates, probe_plugins_json, read_declared_at,
+        resolve_pending, resolved_search_path, runtime_overlay, runtime_states, same_plugin_set,
+        seen_suffix, status_cell, switch_policy, switch_row_subtitle, switch_subtitle, timed_out,
+        toggle_note_for, toggle_round_trip, version_label, versions_log, versions_or_empty,
+        violations_suffix,
     };
 
     // ── The switch holds until the shell answers (#1417 item 2) ─────────────
@@ -4241,12 +4229,13 @@ mod tests {
             .block_on(fut)
     }
 
-    /// `hytte-bus`'s own client timeout, exactly as `call.rs` produces it
-    /// and `BusError::from_zbus` carries it — see [`HYTTE_BUS_CALL_TIMEOUT`].
+    /// `hytte-bus`'s own client timeout. That a call past its deadline
+    /// answers this variant is pinned in `hytte-bus` itself, by
+    /// `a_call_past_its_deadline_is_a_timeout` against a real peer that never
+    /// replies.
     fn call_timed_out() -> hytte_bus::BusError {
-        hytte_bus::BusError::Permanent {
+        hytte_bus::BusError::Timeout {
             reason: "call timeout".to_owned(),
-            dbus_name: None,
         }
     }
 
@@ -4365,46 +4354,39 @@ mod tests {
         assert!(res.is_ok() && applied, "{res:?}");
     }
 
-    /// What counts as no answer, pinned to `hytte-bus`'s own source rather
-    /// than to a copy of its string: `call.rs` gives up with
-    /// `zbus::Error::Failure("call timeout")`, and `error.rs` carries a
-    /// `Failure` into `BusError::Permanent` with no D-Bus error name. An
-    /// error *from the shell* always has a name, so one that happens to say
-    /// "call timeout" is still an answer. The bus daemon's `NoReply` is no
-    /// answer whatever it says.
+    /// What counts as no answer: `hytte-bus`'s own client timeout, by its
+    /// variant whatever it says (#1551), and the bus daemon's `NoReply`
+    /// whatever *it* says. Any other error is an answer, including one that
+    /// reads "call timeout" — the string this matched, and kept in step with
+    /// `hytte-bus`'s source by scanning it, until the variant existed.
+    ///
+    /// **Falsification:** make `timed_out` count a `Permanent` reading
+    /// "call timeout" again and the lookalike rows fail.
     #[test]
-    fn a_call_timeout_is_recognised_as_hytte_bus_spells_it() {
-        let squash = |s: &str| s.split_whitespace().collect::<String>();
-        let call_rs = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../hytte-bus/src/call.rs"
-        ));
-        // Not squashed: the literal's own space is part of what is pinned.
-        assert!(
-            call_rs.contains(&format!(
-                "zbus::Error::Failure({HYTTE_BUS_CALL_TIMEOUT:?}.into())"
-            )),
-            "hytte-bus no longer spells its client timeout {HYTTE_BUS_CALL_TIMEOUT:?}"
-        );
-        let error_rs = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../hytte-bus/src/error.rs"
-        ));
-        assert!(
-            squash(error_rs).contains("_=>Self::Permanent{reason:err.to_string(),dbus_name:None,}"),
-            "hytte-bus no longer carries a zbus Failure as a nameless Permanent"
-        );
-
+    fn a_call_timeout_is_recognised_by_its_variant() {
         assert!(timed_out(&call_timed_out()));
-        assert!(!timed_out(&refused(HYTTE_BUS_CALL_TIMEOUT)));
+        assert!(
+            timed_out(&hytte_bus::BusError::Timeout {
+                reason: "reworded".to_owned(),
+            }),
+            "the variant decides, not the text"
+        );
+        assert!(timed_out(&hytte_bus::BusError::Permanent {
+            reason: "Did not receive a reply".to_owned(),
+            dbus_name: Some("org.freedesktop.DBus.Error.NoReply".to_owned()),
+        }));
+
+        assert!(!timed_out(&refused("call timeout")));
         assert!(!timed_out(&refused("disk full")));
         assert!(!timed_out(&hytte_bus::BusError::Permanent {
             reason: "disk full".to_owned(),
             dbus_name: None,
         }));
-        assert!(timed_out(&hytte_bus::BusError::Permanent {
-            reason: "Did not receive a reply".to_owned(),
-            dbus_name: Some("org.freedesktop.DBus.Error.NoReply".to_owned()),
+        // What the client timeout looked like before it had a variant: now
+        // an answer like any other.
+        assert!(!timed_out(&hytte_bus::BusError::Permanent {
+            reason: "call timeout".to_owned(),
+            dbus_name: None,
         }));
     }
 

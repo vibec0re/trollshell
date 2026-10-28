@@ -14,8 +14,8 @@ use tokio::sync::RwLock;
 use zbus::zvariant::Type;
 
 /// Default per-call timeout, matching `call()`'s default and D-Bus
-/// conventions. A call that receives no reply within this window surfaces a
-/// (permanent) timeout error instead of hanging the caller's task forever.
+/// conventions. A call that receives no reply within this window surfaces
+/// [`BusError::Timeout`] instead of hanging the caller's task forever.
 const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(25);
 
 // ── Public state enum ─────────────────────────────────────────────────────────
@@ -124,8 +124,8 @@ impl BusProxy {
     /// Returns `BusError::Transient` when the proxy is mid-reconnect.
     ///
     /// The call is bounded by the proxy's timeout (default 25 s, overridable
-    /// with [`ProxyBuilder::timeout`]): a peer that never replies surfaces a
-    /// (permanent) timeout error rather than hanging the caller's task forever.
+    /// with [`ProxyBuilder::timeout`]): a peer that never replies surfaces
+    /// [`BusError::Timeout`] rather than hanging the caller's task forever.
     /// A transient (connection-level) failure additionally kicks the shared
     /// connection's reconnect path, so it is handled just like a `call()`
     /// failure instead of being swallowed on the cached proxy.
@@ -152,9 +152,12 @@ impl BusProxy {
         };
 
         let fut = proxy.call::<_, _, R>(method, &args);
-        let outcome = match tokio::time::timeout(self.inner.timeout, fut).await {
-            Ok(inner) => inner,
-            Err(_elapsed) => Err(zbus::Error::Failure("proxy call timeout".into())),
+        // The deadline is not a lost connection, so it returns before the
+        // reconnect kick below, which only a transient error reaches. Until
+        // #1551 it was a `zbus::Error::Failure("proxy call timeout")` mapped to
+        // `Permanent`, which skipped that kick the same way.
+        let Ok(outcome) = tokio::time::timeout(self.inner.timeout, fut).await else {
+            return Err(BusError::proxy_call_timeout());
         };
 
         match outcome.map_err(BusError::from_zbus) {
@@ -225,7 +228,7 @@ impl ProxyBuilder {
 
     /// Override the per-call timeout applied to every [`BusProxy::call`]
     /// (default 25 s). Bound this lower for calls to peers that must stay
-    /// responsive; a call exceeding it returns a timeout error.
+    /// responsive; a call exceeding it returns [`BusError::Timeout`].
     pub fn timeout(mut self, d: Duration) -> Self {
         self.timeout = d;
         self

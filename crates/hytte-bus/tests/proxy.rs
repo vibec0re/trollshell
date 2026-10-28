@@ -151,15 +151,25 @@ async fn call_times_out_on_slow_peer() {
     assert_eq!(fast.expect("fast call should succeed"), "quick");
 
     // The slow method (3 s) exceeds the timeout: the call must RETURN a
-    // permanent timeout error. Bound the whole thing so a regression (no
-    // timeout) fails the test rather than hanging it.
+    // timeout error. Bound the whole thing so a regression (no timeout) fails
+    // the test rather than hanging it.
     let slow: Result<String, hytte_bus::BusError> =
         tokio::time::timeout(Duration::from_secs(2), proxy.call("Slow", &()))
             .await
             .expect("BusProxy::call must return within its own timeout, not hang");
     let err = slow.expect_err("slow call should have timed out");
+    // Typed, so a caller tells "no answer" from an error answer without
+    // matching the text (#1551) — which still reads as it did before.
+    assert!(
+        matches!(err, hytte_bus::BusError::Timeout { .. }) && err.is_timeout(),
+        "a call timeout is BusError::Timeout, got {err:?}"
+    );
     assert!(
         !err.is_transient(),
-        "a call timeout is a permanent error, got {err:?}"
+        "a call timeout is not a lost connection, got {err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "bus operation permanently failed: proxy call timeout"
     );
 }

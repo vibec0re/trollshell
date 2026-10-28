@@ -3565,9 +3565,9 @@ mod tests {
 #[cfg(all(test, feature = "system-tests"))]
 mod system_tests {
     use super::{
-        LocalAction, NotificationsIface, NotificationsShared, Urgency, dismiss, dismiss_all,
-        invoke_action, pause_expiry, post_local, post_local_until_closed, post_local_with_actions,
-        resume_expiry, serve_live_set, start_on,
+        LocalAction, NotificationsHandles, NotificationsIface, NotificationsShared, Urgency,
+        dismiss, dismiss_all, invoke_action, pause_expiry, post_local, post_local_until_closed,
+        post_local_with_actions, resume_expiry, serve_live_set, start_on,
     };
     use futures_signals::signal::SignalExt as _;
     use futures_util::StreamExt as _;
@@ -3742,6 +3742,51 @@ mod system_tests {
         iface.active.lock_ref().iter().any(|n| n.id == id)
     }
 
+    /// `post_local_until_closed` (#1608) on the live set `start_on`
+    /// registered, which `kept` and `handles` are: it returns the id its toast
+    /// got in the list the handles hand the overlay, arms no expiry for it, and
+    /// is not rate-limited, so the same words posted twice are two toasts.
+    /// Part of [`the_free_functions_act_on_the_registered_live_set`], run
+    /// under its `TEST_LOCK` while the set is registered.
+    fn held_posts_act_on_the_registered_live_set(
+        kept: &NotificationsIface,
+        handles: &NotificationsHandles,
+    ) {
+        let held: Vec<u32> = (0..2)
+            .map(|_| {
+                post_local_until_closed(
+                    "review-1608",
+                    "held until closed",
+                    "",
+                    Urgency::Critical,
+                    Vec::new(),
+                )
+                .expect("the service is registered")
+            })
+            .collect();
+        assert_ne!(held[0], held[1], "a repeat is a second toast");
+        for &id in &held {
+            assert!(
+                handles
+                    .active
+                    .lock_ref()
+                    .iter()
+                    .any(|n| n.id == id && n.summary == "held until closed"),
+                "post_local_until_closed returns the id of the toast it posted"
+            );
+            assert!(
+                kept.timers
+                    .lock()
+                    .expect("not poisoned")
+                    .get(&id)
+                    .is_some_and(|entry| entry.state.timeout.is_none() && entry.abort.is_none()),
+                "and arms no expiry for it"
+            );
+            dismiss(id, 3);
+            assert!(!is_live(kept, id), "dismiss with the id closes it");
+        }
+    }
+
     /// `serve_live_set`'s mount closure: a client's `Notify` on the served
     /// object lands in the live set `serve_live_set` returns, which is what
     /// `start_on` registers, timer included.
@@ -3850,42 +3895,7 @@ mod system_tests {
                 "and files it in the history the handles hand the history page"
             );
 
-            // `post_local_until_closed` (#1608): it returns the id its toast
-            // got in the registered list, arms no expiry there, and is not
-            // rate-limited, so the same words posted twice are two toasts.
-            let held: Vec<u32> = (0..2)
-                .map(|_| {
-                    post_local_until_closed(
-                        "review-1608",
-                        "held until closed",
-                        "",
-                        Urgency::Critical,
-                        Vec::new(),
-                    )
-                    .expect("the service is registered")
-                })
-                .collect();
-            assert_ne!(held[0], held[1], "a repeat is a second toast");
-            for &id in &held {
-                assert!(
-                    handles
-                        .active
-                        .lock_ref()
-                        .iter()
-                        .any(|n| n.id == id && n.summary == "held until closed"),
-                    "post_local_until_closed returns the id of the toast it posted"
-                );
-                assert!(
-                    kept.timers
-                        .lock()
-                        .expect("not poisoned")
-                        .get(&id)
-                        .is_some_and(|entry| entry.state.timeout.is_none() && entry.abort.is_none()),
-                    "and arms no expiry for it"
-                );
-                dismiss(id, 3);
-                assert!(!is_live(&kept, id), "dismiss with the id closes it");
-            }
+            held_posts_act_on_the_registered_live_set(&kept, &handles);
 
             post_local(
                 "review-1609",

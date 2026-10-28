@@ -635,6 +635,7 @@ fn entry_page(
                 ),
             )),
             polls: false,
+            parent: Rc::downgrade(inner),
         },
     );
 
@@ -806,7 +807,7 @@ pub(super) fn remove_entry(inner: &Rc<FormInner>, path: &str) -> Result<(), Conf
     let locked = inner.raw.borrow().locked.clone();
     let result = (inner.ops.remove_entry)(overlay, path, &locked);
     if result.is_ok() {
-        inner.reload(true);
+        inner.reload_after_write();
     } else {
         tracing::warn!(
             family = inner.ops.family.name,
@@ -917,7 +918,7 @@ impl ListPage {
                     // rule — a list of blanks is not a thing this file can
                     // mean, and the alternative is a row nobody can get rid of.
                     let text = entry.text().trim().to_owned();
-                    page.write(|items| {
+                    page.write(Some(slot), |items| {
                         if slot >= items.len() {
                         } else if text.is_empty() {
                             items.remove(slot);
@@ -941,7 +942,7 @@ impl ListPage {
                     let Some(page) = page.upgrade() else {
                         return;
                     };
-                    page.write(|items| {
+                    page.write(Some(slot), |items| {
                         if slot < items.len() {
                             items.remove(slot);
                         }
@@ -969,7 +970,7 @@ impl ListPage {
                     return;
                 }
                 entry.set_text("");
-                page.write(|items| items.push(text.clone()));
+                page.write(None, |items| items.push(text.clone()));
             });
             self.group.add(&add);
             rows.push(add.upcast::<gtk::Widget>());
@@ -981,11 +982,23 @@ impl ListPage {
     }
 
     /// Apply `edit` to the items and write the **whole array** back.
-    fn write(self: &Rc<Self>, edit: impl FnOnce(&mut Vec<String>)) {
+    ///
+    /// The items are the file's as they are now, not the page's (#1558), and
+    /// `at` is the item the edit addresses — `None` for an append — which
+    /// must still be the one this page shows in that slot
+    /// ([`FormInner::array_for_edit`]).
+    fn write(self: &Rc<Self>, at: Option<usize>, edit: impl FnOnce(&mut Vec<String>)) {
         let Some(inner) = self.form.upgrade() else {
             return;
         };
-        let mut items = items_of(inner.raw.borrow().value(&self.key));
+        let mut items = match inner.array_for_edit(&self.key, at) {
+            Ok(value) => items_of(value.as_ref()),
+            Err(err) => {
+                reread_if_moved(&inner, &err);
+                self.say(&err.to_string());
+                return;
+            }
+        };
         edit(&mut items);
 
         let Some(overlay) = inner.overlay.as_ref() else {
@@ -1008,7 +1021,7 @@ impl ListPage {
         match result {
             Ok(()) => {
                 self.banner.set_revealed(false);
-                inner.reload(true);
+                inner.reload_after_write();
             }
             Err(err) => self.say(&err.to_string()),
         }
@@ -1195,7 +1208,7 @@ impl RecordsPage {
                     let Some(page) = page.upgrade() else {
                         return;
                     };
-                    page.write(|array| {
+                    page.write(index, |array| {
                         if index < array.len() {
                             array.remove(index);
                         }
@@ -1275,11 +1288,22 @@ impl RecordsPage {
     }
 
     /// Apply `edit` to the array and write it back whole. `true` if it stuck.
-    fn write(self: &Rc<Self>, edit: impl FnOnce(&mut toml_edit::Array)) -> bool {
+    ///
+    /// The array is the file's as it is now (#1558), and the record at `at`
+    /// — the one the edit addresses — must still be the one this page shows
+    /// there ([`FormInner::array_for_edit`]).
+    fn write(self: &Rc<Self>, at: usize, edit: impl FnOnce(&mut toml_edit::Array)) -> bool {
         let Some(inner) = self.form.upgrade() else {
             return false;
         };
-        let mut array = inner.array_at(&self.key);
+        let mut array = match inner.array_for_edit(&self.key, Some(at)) {
+            Ok(value) => super::edit_array(value.as_ref()),
+            Err(err) => {
+                reread_if_moved(&inner, &err);
+                self.say(&err.to_string());
+                return false;
+            }
+        };
         edit(&mut array);
         // Schema order, for [`in_field_order`]'s reason: the array came out of
         // the merged read, which is ordered by key rather than by any layer's
@@ -1300,7 +1324,7 @@ impl RecordsPage {
         match result {
             Ok(()) => {
                 self.banner.set_revealed(false);
-                inner.reload(true);
+                inner.reload_after_write();
                 true
             }
             Err(err) => {
@@ -1378,6 +1402,7 @@ fn record_page(
                 ),
             )),
             polls: false,
+            parent: Rc::downgrade(inner),
         },
     );
 
@@ -1473,7 +1498,18 @@ fn prune_empty_record(weak: &Weak<FormInner>, key: &str, index: usize) {
     let Some(overlay) = inner.overlay.as_ref() else {
         return;
     };
-    let mut array = inner.array_at(key);
+    let mut array = match inner.array_for_edit(key, Some(index)) {
+        Ok(value) => super::edit_array(value.as_ref()),
+        Err(err) => {
+            tracing::warn!(
+                family = inner.ops.family.name,
+                key,
+                %err,
+                "an empty record was not swept up"
+            );
+            return;
+        }
+    };
     if index >= array.len() {
         return;
     }
@@ -1489,7 +1525,17 @@ fn prune_empty_record(weak: &Weak<FormInner>, key: &str, index: usize) {
         );
         return;
     }
-    inner.reload(true);
+    inner.reload_after_write();
+}
+
+/// What a page does before showing a whole-array write's refusal: when the
+/// element it addressed moved on disk, re-read the drill-down, so the page
+/// the refusal goes up on shows what it is about. Called **before** the
+/// banner is raised, because a page that rebuilds lowers it.
+fn reread_if_moved(inner: &FormInner, err: &ConfigError) {
+    if super::moved_on_disk(err) {
+        inner.reload_drill_down();
+    }
 }
 
 // ── Furniture ────────────────────────────────────────────────────────────────

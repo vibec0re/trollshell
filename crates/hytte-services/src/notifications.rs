@@ -4136,16 +4136,9 @@ mod system_tests {
                     .history
                     .lock_ref()
                     .iter()
-                    .any(|h| h.id == id && h.reason == 2),
-                "and files it in the history the handles hand the history page"
-            );
-            assert!(
-                handles
-                    .history
-                    .lock_ref()
-                    .iter()
-                    .any(|h| h.id == id && h.actions.is_empty()),
-                "without the buttons its swept callbacks can no longer serve (#1630)"
+                    .any(|h| h.id == id && h.reason == 2 && h.actions.is_empty()),
+                "and files it, without the buttons its swept callbacks can no longer serve \
+                 (#1630), in the history the handles hand the history page"
             );
 
             held_posts_act_on_the_registered_live_set(&kept, &handles);

@@ -10808,14 +10808,6 @@ mod tests {
                 t0.elapsed(),
                 launched.get()
             );
-            assert!(
-                launched.get(),
-                "the start launched pet from the declaration"
-            );
-            assert!(
-                took < STOP_WAIT / 2,
-                "took {took:?}: a unit that came back ends the wait, it is not waited out"
-            );
             for _ in 0..60 {
                 let units = list_prefixed(&prefix).await.expect("listed");
                 if units
@@ -10856,6 +10848,7 @@ mod tests {
                 .filter(|l| !l.starts_with("Environment="))
                 .collect();
             eprintln!("the unit after the start: {state:?} {running_with:?}");
+            // The consequence first: what the user was promised.
             assert_eq!(
                 running_with,
                 ["PET_NAME=new"],
@@ -10864,6 +10857,14 @@ mod tests {
             assert!(
                 props.contains("ActiveState=active"),
                 "running, from the start's own launch: {props}"
+            );
+            assert!(
+                launched.get(),
+                "the start launched pet from the declaration"
+            );
+            assert!(
+                took < STOP_WAIT / 2,
+                "took {took:?}: a unit that came back ends the wait, it is not waited out"
             );
         }
     }

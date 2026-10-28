@@ -199,7 +199,10 @@ impl Service for NotificationsService {
 /// `the_free_functions_act_on_the_registered_live_set` hands it an ephemeral
 /// bus's, so everything `start` wires except that one builder expression is
 /// what the test drives: the served object, the shared registry and the
-/// handles (#1609 review, LOW-2).
+/// handles (#1609 review, LOW-2). The builder expression is driven by
+/// `tests/notifications_dbus.rs`, which runs `start` itself in a child
+/// process whose session bus is an ephemeral broker, and calls the daemon
+/// over that bus as a client would (#1552).
 fn start_on(own: OwnNameBuilder) -> NotificationsHandles {
     let history = Mutable::new(Vec::new());
 

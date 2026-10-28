@@ -77,30 +77,53 @@ impl Bridge {
         }
     }
 
-    /// Answer one parsed request. Returns the status and the JSON body.
+    /// Answer one parsed request with nobody watching its client: the status
+    /// and the JSON body. What the tests drive when the connection is not the
+    /// thing under test.
+    #[cfg(test)]
     pub async fn handle(&self, head: &Head, body: &[u8]) -> (u16, Vec<u8>) {
+        self.handle_watched(head, body, std::future::pending())
+            .await
+            .expect("a client that never leaves always gets an answer")
+    }
+
+    /// Answer one parsed request: the status and the JSON body, or `None` if
+    /// `gone` resolved first — its client hung up — and nobody is left to read
+    /// one (#1550).
+    ///
+    /// `gone` is [`http::hung_up`] on the request's own connection, or a
+    /// future that never resolves where dropping a turn would save nothing
+    /// (`Backend::stops_on_drop`). What the client leaving does to the turn is
+    /// [`Bridge::complete`]'s business, because it depends on who else is
+    /// waiting for the same answer.
+    pub async fn handle_watched(
+        &self,
+        head: &Head,
+        body: &[u8],
+        gone: impl Future<Output = ()>,
+    ) -> Option<(u16, Vec<u8>)> {
         if head.path != http::ROUTE {
-            return error_response(
+            return Some(error_response(
                 404,
                 &format!(
                     "no route {}; this bridge serves only POST {}",
                     head.path,
                     http::ROUTE
                 ),
-            );
+            ));
         }
         if head.method != "POST" {
-            return error_response(
+            return Some(error_response(
                 405,
                 &format!("{} is not allowed here; use POST", head.method),
-            );
+            ));
         }
         let req: ChatRequest = match serde_json::from_slice(body) {
             Ok(req) => req,
-            Err(e) => return error_response(400, &format!("bad request body: {e}")),
+            Err(e) => return Some(error_response(400, &format!("bad request body: {e}"))),
         };
         if req.messages.is_empty() {
-            return error_response(400, "`messages` must not be empty");
+            return Some(error_response(400, "`messages` must not be empty"));
         }
         // The sampling knobs, named in the journal rather than silently
         // dropped. `max_tokens` now rides down to the backend — the Messages
@@ -118,13 +141,13 @@ impl Bridge {
         );
 
         match self
-            .complete(&req.messages, req.user.as_deref(), req.max_tokens)
-            .await
+            .complete(&req.messages, req.user.as_deref(), req.max_tokens, gone)
+            .await?
         {
-            Ok(text) => ok_response(text, req.model, &req.messages),
+            Ok(text) => Some(ok_response(text, req.model, &req.messages)),
             Err(f) => {
                 tracing::warn!(status = f.status, message = %f.message, "request failed");
-                error_response(f.status, &f.message)
+                Some(error_response(f.status, &f.message))
             }
         }
     }
@@ -135,12 +158,6 @@ impl Bridge {
     /// paying twice for the same answer is pure waste — of a subscription that
     /// is rate-limited, and, on the API backend, of real money.
     ///
-    /// The turn belongs to the **leader**, the first of the identical requests
-    /// to arrive. If the leader's request is dropped mid-turn — its client hung
-    /// up, say — the turn goes with it, and every follower gets a 503 rather
-    /// than wait for an answer that is no longer coming, even a follower whose
-    /// own client is still connected.
-    ///
     /// The key is the transcript **and the caller's identity**, deliberately:
     /// `max_tokens` is a cap on the answer, not part of the question, and keying
     /// on it would split two otherwise-identical in-flight requests into two
@@ -148,12 +165,33 @@ impl Bridge {
     /// in two sessions, so sharing one answer between them would undo at the
     /// reply what the identity separated at the session. A request with no
     /// `user` keys exactly as it did before #704.
+    ///
+    /// **A turn runs while anyone still waits for it** (#1550). The first of
+    /// the identical requests to arrive leads: it runs the turn, and the rest
+    /// follow its outcome. `None` means this request's own client went away
+    /// (`gone` resolved) and it has no answer to give:
+    ///
+    /// - a follower whose client leaves just stops following; the turn is
+    ///   not its to stop;
+    /// - a leader whose client leaves keeps driving the turn for as long as
+    ///   a follower still waits on it — two pet instances share `user =
+    ///   "pet"`, so one of them restarting mid-turn must not cost the other
+    ///   its answer, or the subscription the turn has already spent — and
+    ///   drops it, which kills its `claude`, once nobody does.
+    ///
+    /// The followers are counted by `tx.receiver_count()`: the map holds one
+    /// receiver and each follower a clone of it, which it drops when it stops
+    /// following. Re-counted every [`http::HANG_UP_POLL`], the watch's own
+    /// tick. A follower that joins in the last tick before the leader gives up
+    /// gets the 503 a dropped leader has always meant (see [`follow`]).
     async fn complete(
         &self,
         messages: &[Message],
         user: Option<&str>,
         max_tokens: Option<u32>,
-    ) -> Result<String, Failure> {
+        gone: impl Future<Output = ()>,
+    ) -> Option<Result<String, Failure>> {
+        let mut gone = std::pin::pin!(gone);
         let key = session::flight_key(messages, user);
         let leader = {
             let mut inflight = self.inflight.lock().unwrap_or_else(PoisonError::into_inner);
@@ -166,21 +204,47 @@ impl Bridge {
             }
         };
         match leader {
-            Err(rx) => follow(rx).await,
+            // `biased` towards `gone` in both arms, so a client that has
+            // already left when its request is parsed is noticed before the
+            // turn's first poll can spawn anything.
+            Err(rx) => tokio::select! {
+                biased;
+                () = &mut gone => None,
+                outcome = follow(rx) => Some(outcome),
+            },
             Ok(tx) => {
                 // Removes the map entry however this turn ends — answered, or
-                // dropped mid-turn by a client that hangs up
-                // (`serve_connection` watches for it, #1550), the request
-                // backstop, a panic, or shutdown — so no ending can wedge the
-                // key. A drop takes `tx` with it, which is what tells the
-                // followers (see above).
+                // dropped mid-turn because every client waiting on it hung
+                // up (see above), by the request backstop, a panic, or
+                // shutdown — so no ending can wedge the key. Declared before
+                // `turn`, so on a drop the turn goes first (its `claude` is
+                // killed), then this entry, then `tx`, whose drop is what
+                // tells a follower that joined too late (`follow`'s 503).
                 let _guard = FlightGuard {
                     inflight: &self.inflight,
                     key,
                 };
-                let outcome = self.run_turn(messages, user, max_tokens).await;
+                let mut turn = std::pin::pin!(self.run_turn(messages, user, max_tokens));
+                let (outcome, client_left) = tokio::select! {
+                    biased;
+                    () = &mut gone => {
+                        let outcome = loop {
+                            // The map's own receiver is the one left: nobody
+                            // waits for this answer any more.
+                            if tx.receiver_count() <= 1 {
+                                return None;
+                            }
+                            tokio::select! {
+                                outcome = &mut turn => break outcome,
+                                () = tokio::time::sleep(http::HANG_UP_POLL) => {}
+                            }
+                        };
+                        (outcome, true)
+                    }
+                    outcome = &mut turn => (outcome, false),
+                };
                 let _ = tx.send(Some(Arc::new(outcome.clone())));
-                outcome
+                (!client_left).then_some(outcome)
             }
         }
     }
@@ -459,11 +523,11 @@ const HUNG_UP: u16 = 499;
 /// Read one request off `stream`, answer it, close.
 ///
 /// This is also where the answer is counted for the plugin face's status chip
-/// (#866) — at the connection boundary rather than inside [`Bridge::handle`], so
-/// a malformed request the parser rejects is counted too. The tally is the one
-/// thing done here rather than in [`serve`], so the unit tests below, which
-/// drive whole connections through `serve`, never touch the process-global
-/// board.
+/// (#866) — at the connection boundary rather than inside
+/// [`Bridge::handle_watched`], so a malformed request the parser rejects is
+/// counted too. Which call the board gets is [`serve_and_record`]'s, over any
+/// recorder, so the unit tests below can hear it without touching the
+/// process-global board; this is that function with the board plugged in.
 ///
 /// A [`UnixStream`](tokio::net::UnixStream) rather than any [`http::Stream`]
 /// since #1550, because [`http::hung_up`] reads the socket's own readiness,
@@ -483,8 +547,20 @@ const HUNG_UP: u16 = 499;
 /// - a request whose client hung up before its answer (see [`serve`]), counted
 ///   as an undelivered [`HUNG_UP`] for the same reason.
 pub async fn serve_connection(bridge: &Bridge, stream: tokio::net::UnixStream) {
+    serve_and_record(bridge, stream, crate::status::record).await;
+}
+
+/// [`serve`] one connection and hand `record` the status the board should
+/// hear and whether the response reached the client — once, for every
+/// request, a hung-up one included — and nothing for a peer that sent no
+/// request at all.
+async fn serve_and_record(
+    bridge: &Bridge,
+    stream: tokio::net::UnixStream,
+    record: impl FnOnce(u16, bool),
+) {
     if let Some((status, delivered)) = serve(bridge, stream).await {
-        crate::status::record(status, delivered);
+        record(status, delivered);
     }
 }
 
@@ -492,36 +568,48 @@ pub async fn serve_connection(bridge: &Bridge, stream: tokio::net::UnixStream) {
 /// that sent no request, otherwise the status the board should hear and
 /// whether the response reached the client.
 ///
-/// **A client that hangs up stops its turn** (#1550). While [`Bridge::handle`]
-/// runs, [`http::hung_up`] watches the connection, and if the client goes away
-/// first the handler is dropped and nothing is written. Dropping the handler
-/// drops the turn, through the same path as any other dropped turn:
-/// `backend::run_until`'s guard sends the `claude` child `SIGKILL` at once,
-/// then the title lock and the request permit are released as the futures
-/// holding them drop, and the reap is left to tokio — kill first, release
-/// second, the order #1623's review found safe for the next `--resume`. A
-/// request still queued, for its title or behind its single-flight leader, has
-/// spawned nothing and only leaves the queue. Before this nothing watched the
-/// socket, so a turn whose client had left ran on — spending the owner's
+/// **A client that hangs up stops its turn** (#1550), wherever that stops a
+/// spend. While the request is answered, [`http::hung_up`] watches the
+/// connection, and if the client goes away first nothing is written and
+/// [`Bridge::complete`] decides what becomes of the turn: dropped at once,
+/// unless another request with the same question still waits on it. A dropped
+/// turn goes through the same path as any other: `backend::run_until`'s guard
+/// sends the `claude` child `SIGKILL` at once, then the title lock and the
+/// request permit are released as the futures holding them drop, and the reap
+/// is left to tokio — kill first, release second, the order #1623's review
+/// found safe for the next `--resume`. A request still queued for its title
+/// has spawned nothing and only leaves the queue. Before this nothing watched
+/// the socket, so a turn whose client had left ran on — spending the owner's
 /// subscription — until its deadline killed it.
+///
+/// **Not in API mode** (`Backend::stops_on_drop` is false there). The Messages
+/// API request runs under `spawn_blocking`, which a drop cannot cancel, so
+/// dropping that turn would save nothing and only release its permit while the
+/// paid call ran on — a client that sends and hangs up could then keep more
+/// paid calls in flight than the permits allow (#1632 review). There the watch
+/// is a future that never resolves, and a hang-up costs what it always did:
+/// the answer is computed, and its write fails.
 ///
 /// A client that only **half-closed** (shut its write side after the request)
 /// is still reading, keeps its turn and gets its answer: `hung_up` waits for
 /// the peer to be gone, which a half-close is not.
-///
-/// `biased` towards the watch, so a client that has already gone when the
-/// request is parsed is noticed before the handler's first poll can spawn
-/// anything.
 async fn serve(bridge: &Bridge, mut stream: tokio::net::UnixStream) -> Option<(u16, bool)> {
     let (status, body) = match http::read_request(&mut stream).await {
-        Ok(Some((head, body))) => tokio::select! {
-            biased;
-            () = http::hung_up(&stream) => {
-                tracing::info!("the client hung up before its answer; dropped its request");
+        Ok(Some((head, body))) => {
+            let watch = bridge.backend.stops_on_drop();
+            let gone = async {
+                if watch {
+                    http::hung_up(&stream).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
+            let Some(answer) = bridge.handle_watched(&head, &body, gone).await else {
+                tracing::info!("the client hung up before its answer was ready");
                 return Some((HUNG_UP, false));
-            }
-            answer = bridge.handle(&head, &body) => answer,
-        },
+            };
+            answer
+        }
         Ok(None) => return None,
         Err(f) => error_response(f.status, &f.message),
     };
@@ -1005,9 +1093,14 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"answered"}
         let (Some(hung_up), Some(served)) = (hung_up_at.get(), first_served_at.get()) else {
             panic!("both instants are set once the join is done");
         };
+        // `serve` returns at the drop, not at the reap, so this measures the
+        // watch alone: a tenth of a second (`http::HANG_UP_POLL`), with ten
+        // times that for a loaded runner. A literal, so a slower poll cannot
+        // widen its own bound.
         assert!(
-            served.duration_since(hung_up) < REAP_SLACK,
-            "the first request was served {:?} after its client hung up, not at once",
+            served.duration_since(hung_up) < Duration::from_secs(1),
+            "the first request was served {:?} after its client hung up, not within the \
+             watch's tenth of a second",
             served.duration_since(hung_up),
         );
         assert_eq!(bridge.permits.available_permits(), super::PERMITS);
@@ -1123,6 +1216,349 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"answered"}
             abandoned(&captured),
             1,
             "this capture does not hear the guard, so the zero above proves nothing",
+        );
+    }
+
+    /// Hang `client` up with both directions shut down first, which marks the
+    /// bridge's end gone however many file descriptors share the socket.
+    ///
+    /// A plain `drop` is enough in production, where the client is a plugin
+    /// process that does not fork. Here, a sibling test that forks (every
+    /// stand-in spawn) can hold a copy of the client's descriptor between its
+    /// fork and its `exec`, which delays the close by that long — fine for a
+    /// test with seconds of slack, not for one about what happens *at once*
+    /// (#1632 review, P2 against P2s).
+    fn hang_up(client: tokio::net::UnixStream) {
+        client
+            .into_std()
+            .expect("take the client off the runtime")
+            .shutdown(std::net::Shutdown::Both)
+            .expect("shut down both directions");
+    }
+
+    /// **A client already gone when its request is parsed spawns nothing.**
+    /// The watch is polled before the turn (`biased`), so the turn's first
+    /// poll — which is where `claude` is spawned — never happens: twenty
+    /// clients that send and hang up, and the abandoned-turn guard must not
+    /// fire once. Without `biased` a select picks its first branch at random,
+    /// and about half of these would spawn a child only to kill it.
+    #[tokio::test]
+    async fn a_client_already_gone_when_its_request_is_parsed_spawns_nothing() {
+        use tokio::io::AsyncWriteExt as _;
+        use tokio::net::UnixStream;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bridge = hung_bridge(dir.path(), HANG_UP_BUDGET);
+        let (captured, _scope) = hytte_config::test_support::capture();
+        for _ in 0..20 {
+            let (mut client, server) = UnixStream::pair().expect("a socket pair");
+            client.write_all(&request("pet", "gone")).await.expect("send");
+            hang_up(client);
+            assert_eq!(
+                super::serve(&bridge, server).await,
+                Some((super::HUNG_UP, false))
+            );
+        }
+        assert_eq!(
+            abandoned(&captured),
+            0,
+            "a client already gone still got a claude spawned, and killed",
+        );
+    }
+
+    /// **A connected follower keeps the answer its leader hung up on.** Two
+    /// requests with the same question from the same `user` — two pet
+    /// instances on one clock tick — share one turn. The leader's client goes
+    /// away mid-turn; the follower's stays. The turn must run on for the
+    /// follower, which gets the 200.
+    ///
+    /// Before the refcount the leader's hang-up dropped the shared turn,
+    /// killed its child and handed the follower "the identical in-flight
+    /// request ended without a result" — a 503 for a client that was still
+    /// waiting, and a turn paid for twice when its next tick asked again
+    /// (#1632 review).
+    #[tokio::test]
+    async fn a_connected_follower_keeps_the_answer_its_leader_hung_up_on() {
+        use crate::backend::stand_in;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::UnixStream;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let program = dir.path().join("gated-claude");
+        stand_in::install(&program, GATED);
+        let bridge = bridge_running(program);
+        let (captured, _scope) = hytte_config::test_support::capture();
+        let (mut lead, lead_end) = UnixStream::pair().expect("a socket pair");
+        let (mut follow, follow_end) = UnixStream::pair().expect("a socket pair");
+
+        let clients = async {
+            lead.write_all(&request("pet", "same")).await.expect("send");
+            let [pid] = stand_in::wait_for(dir.path(), 1).await[..] else {
+                panic!("one child");
+            };
+            follow.write_all(&request("pet", "same")).await.expect("send");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(
+                stand_in::started(dir.path()),
+                [pid],
+                "single-flight did not merge the two requests",
+            );
+            hang_up(lead);
+            // Six of the leader's re-counts.
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            assert!(
+                stand_in::present(pid),
+                "the leader's hang-up killed the turn its follower still waits on",
+            );
+            std::fs::write(dir.path().join("go"), b"").expect("release the stand-in");
+            let mut reply = Vec::new();
+            follow
+                .read_to_end(&mut reply)
+                .await
+                .expect("read the answer to EOF");
+            String::from_utf8(reply).expect("an ASCII head and a JSON body")
+        };
+        let (lead_ending, follow_ending, reply) = tokio::join!(
+            super::serve(&bridge, lead_end),
+            super::serve(&bridge, follow_end),
+            clients
+        );
+
+        assert!(reply.starts_with("HTTP/1.1 200 OK\r\n"), "{reply:?}");
+        assert!(reply.contains("answered"), "{reply:?}");
+        assert_eq!(follow_ending, Some((200, true)));
+        assert_eq!(lead_ending, Some((super::HUNG_UP, false)));
+        assert_eq!(abandoned(&captured), 0, "the shared turn was dropped");
+        assert!(bridge.inflight.lock().expect("unpoisoned").is_empty());
+        assert_eq!(bridge.permits.available_permits(), super::PERMITS);
+    }
+
+    /// **…and the shared turn still dies once every waiter has gone.** The
+    /// leader hangs up first and the turn runs on for the follower; then the
+    /// follower hangs up too, and the child must be killed and reaped, the
+    /// single-flight entry retired and the permit returned — the refcount
+    /// keeps a turn for a waiter, never for nobody.
+    #[tokio::test]
+    async fn a_shared_turn_is_killed_once_every_waiter_has_hung_up() {
+        use crate::backend::stand_in;
+        use tokio::io::AsyncWriteExt as _;
+        use tokio::net::UnixStream;
+        use tokio::time::Instant;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let program = dir.path().join("gated-claude");
+        stand_in::install(&program, GATED);
+        let bridge = bridge_running(program);
+        let (captured, _scope) = hytte_config::test_support::capture();
+        let (mut lead, lead_end) = UnixStream::pair().expect("a socket pair");
+        let (mut follow, follow_end) = UnixStream::pair().expect("a socket pair");
+
+        let clients = async {
+            lead.write_all(&request("pet", "same")).await.expect("send");
+            let [pid] = stand_in::wait_for(dir.path(), 1).await[..] else {
+                panic!("one child");
+            };
+            follow.write_all(&request("pet", "same")).await.expect("send");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            hang_up(lead);
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            assert!(
+                stand_in::present(pid),
+                "the turn died while its follower still waited",
+            );
+            hang_up(follow);
+            gone_within_slack(pid, Instant::now(), "its last waiter hung up").await;
+        };
+        let (lead_ending, follow_ending, ()) = tokio::join!(
+            super::serve(&bridge, lead_end),
+            super::serve(&bridge, follow_end),
+            clients
+        );
+
+        assert_eq!(lead_ending, Some((super::HUNG_UP, false)));
+        assert_eq!(follow_ending, Some((super::HUNG_UP, false)));
+        assert_eq!(abandoned(&captured), 1, "the shared turn's kill went unreported");
+        assert!(bridge.inflight.lock().expect("unpoisoned").is_empty());
+        assert_eq!(bridge.permits.available_permits(), super::PERMITS);
+    }
+
+    /// Calls accepted by a [`blackhole`], and the connections it holds open.
+    type Held = std::sync::Arc<std::sync::Mutex<Vec<tokio::net::TcpStream>>>;
+
+    /// A loopback HTTP endpoint that accepts every call and never answers —
+    /// a slow paid API call, as far as the bridge can tell. Returns its URL,
+    /// a count of the calls it has accepted, and the calls themselves, which
+    /// end (the client sees the connection close) once dropped.
+    async fn blackhole() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>, Held) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback listener");
+        let endpoint = format!(
+            "http://{}/v1/messages",
+            listener.local_addr().expect("its address")
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let held = Held::default();
+        let (counted, kept) = (Arc::clone(&calls), Arc::clone(&held));
+        tokio::spawn(async move {
+            while let Ok((call, _)) = listener.accept().await {
+                kept.lock().expect("unpoisoned").push(call);
+                counted.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        (endpoint, calls, held)
+    }
+
+    /// **In API mode a hang-up keeps its permit while the paid call runs.**
+    /// The Messages API request runs under `spawn_blocking`, which no drop
+    /// can cancel. If a hang-up dropped that turn, the call would run on
+    /// (billed) while its permit came back at once, and a client that sends
+    /// and hangs up could keep any number of paid calls in flight. So API mode
+    /// is not watched: four such clients, and only two calls may ever start —
+    /// the third and fourth requests get "bridge busy".
+    ///
+    /// The real client and its real `ureq` agent, pointed at a loopback
+    /// listener that accepts and never answers, which is a slow paid call as
+    /// far as the bridge can tell; the calls end when the test drops the
+    /// listener's side of them.
+    #[tokio::test]
+    async fn in_api_mode_a_hang_up_keeps_its_permit_while_the_paid_call_runs() {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::UnixStream;
+
+        let (endpoint, calls, held) = blackhole().await;
+        let client = crate::messages::Client::new(
+            "sk-test-not-a-key".to_owned(),
+            "claude-test".to_owned(),
+            crate::messages::Thinking::default(),
+            Duration::from_secs(6),
+        )
+        .with_endpoint(endpoint);
+        let bridge = Bridge::new(
+            Backend::Reprompt(Reprompt::with_api(client)),
+            Duration::from_secs(8),
+            None,
+        );
+        let (c0, end0) = UnixStream::pair().expect("a socket pair");
+        let (c1, end1) = UnixStream::pair().expect("a socket pair");
+        let (c2, end2) = UnixStream::pair().expect("a socket pair");
+        let (c3, end3) = UnixStream::pair().expect("a socket pair");
+        let clients = [c0, c1, c2, c3];
+
+        let script = async {
+            let mut shed = Vec::new();
+            for (i, mut client) in clients.into_iter().enumerate() {
+                client
+                    .write_all(&request(&format!("caller{i}"), "hi"))
+                    .await
+                    .expect("send");
+                // Either this request's paid call reaches the endpoint — then
+                // its client hangs up — or the bridge answers it at once.
+                let started = async {
+                    while calls.load(Ordering::SeqCst) <= i {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                };
+                let mut reply = Vec::new();
+                let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+                    tokio::select! {
+                        () = started => None,
+                        read = client.read_to_end(&mut reply) => Some(read),
+                    }
+                })
+                .await
+                .expect(
+                    "neither a call nor an answer within 5s (an http proxy in the environment?)",
+                );
+                match outcome {
+                    None => hang_up(client),
+                    Some(read) => {
+                        read.expect("read the answer to EOF");
+                        shed.push(String::from_utf8(reply).expect("ASCII"));
+                    }
+                }
+                // Three ticks of a watch, had it been watching.
+                tokio::time::sleep(crate::http::HANG_UP_POLL * 3).await;
+            }
+            let started = calls.load(Ordering::SeqCst);
+            let free = bridge.permits.available_permits();
+            // End the calls still parked on the listener, so their blocking
+            // threads come back before the runtime is torn down.
+            held.lock().expect("unpoisoned").clear();
+            (started, free, shed)
+        };
+        let (e0, e1, e2, e3, (started, free, shed)) = tokio::join!(
+            super::serve(&bridge, end0),
+            super::serve(&bridge, end1),
+            super::serve(&bridge, end2),
+            super::serve(&bridge, end3),
+            script
+        );
+
+        assert_eq!(
+            started,
+            super::PERMITS,
+            "clients that sent and hung up put {started} paid calls in flight against {} permits",
+            super::PERMITS,
+        );
+        assert_eq!(free, 0, "a hung-up request gave its permit back while its call ran");
+        assert_eq!(shed.len(), 2, "{shed:?}");
+        for reply in &shed {
+            assert!(reply.starts_with("HTTP/1.1 503 "), "{reply:?}");
+            assert!(reply.contains("bridge busy"), "{reply:?}");
+        }
+        assert_eq!((e2, e3), (Some((503, true)), Some((503, true))));
+        for ending in [e0, e1] {
+            let (status, delivered) = ending.expect("a request was made");
+            assert_ne!(status, super::HUNG_UP, "API mode watched for the hang-up");
+            assert!(!delivered, "an answer reached a client that had hung up");
+        }
+    }
+
+    /// **Every request is tallied once, a hung-up one included** — as an
+    /// undelivered [`super::HUNG_UP`], the error a hang-up has always been on
+    /// the chip — and a peer that sent nothing (a second bridge's startup
+    /// probe) is not tallied at all. Through the recorder seam, so the
+    /// process-global board `crate::status`'s own tests read is not touched.
+    #[tokio::test]
+    async fn every_request_is_tallied_once_a_hung_up_one_included() {
+        use crate::backend::stand_in;
+        use std::cell::RefCell;
+        use tokio::io::AsyncWriteExt as _;
+        use tokio::net::UnixStream;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bridge = hung_bridge(dir.path(), HANG_UP_BUDGET);
+        let tallied = RefCell::new(Vec::new());
+
+        let (mut client, server) = UnixStream::pair().expect("a socket pair");
+        let client_side = async {
+            client.write_all(&request("pet", "hi")).await.expect("send");
+            stand_in::wait_for(dir.path(), 1).await;
+            hang_up(client);
+        };
+        tokio::join!(
+            super::serve_and_record(&bridge, server, |status, delivered| {
+                tallied.borrow_mut().push((status, delivered));
+            }),
+            client_side,
+        );
+        assert_eq!(*tallied.borrow(), [(super::HUNG_UP, false)]);
+
+        let (client, server) = UnixStream::pair().expect("a socket pair");
+        hang_up(client);
+        super::serve_and_record(&bridge, server, |status, delivered| {
+            tallied.borrow_mut().push((status, delivered));
+        })
+        .await;
+        assert_eq!(
+            *tallied.borrow(),
+            [(super::HUNG_UP, false)],
+            "a peer that sent no request was tallied",
         );
     }
 

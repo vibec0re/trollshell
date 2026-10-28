@@ -61,8 +61,10 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How often [`hung_up`] looks at a connection whose request is being
 /// answered — and so the longest a turn runs on after its client has gone: a
-/// tenth of a second, against a request budget of about eight.
-const HANG_UP_POLL: Duration = Duration::from_millis(100);
+/// tenth of a second, against a request budget of about eight. Also the tick
+/// on which a single-flight leader whose client has left re-counts the
+/// followers still waiting on its turn (`bridge::Bridge::complete`).
+pub const HANG_UP_POLL: Duration = Duration::from_millis(100);
 
 /// A request that cannot be answered, as the status and body text the client
 /// will see.
@@ -370,6 +372,49 @@ mod tests {
             started.elapsed() < WRITE_TIMEOUT,
             "no timeout on the happy path"
         );
+    }
+
+    /// **What the watch counts as gone** (#1550, #1632 review P1), on real
+    /// Unix stream sockets: a peer that closes, and one that shuts down both
+    /// directions with its descriptor still open, are gone; a peer that only
+    /// shut its write half — a client that sent its request and is reading
+    /// for the answer — is not, however long the watch looks.
+    #[tokio::test]
+    async fn the_watch_hears_a_hang_up_and_not_a_half_close() {
+        use super::{HANG_UP_POLL, hung_up};
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt as _;
+        use tokio::net::UnixStream;
+
+        /// Generous for a loaded runner: the watch looks every tenth of a
+        /// second.
+        const HEARD_WITHIN: Duration = Duration::from_secs(1);
+
+        let (ours, theirs) = UnixStream::pair().expect("a socket pair");
+        drop(theirs);
+        tokio::time::timeout(HEARD_WITHIN, hung_up(&ours))
+            .await
+            .expect("a peer that closed is gone");
+
+        let (ours, theirs) = UnixStream::pair().expect("a socket pair");
+        let theirs = theirs.into_std().expect("off the runtime");
+        theirs
+            .shutdown(std::net::Shutdown::Both)
+            .expect("shut down both directions");
+        tokio::time::timeout(HEARD_WITHIN, hung_up(&ours))
+            .await
+            .expect("a peer that shut down both directions is gone, open or not");
+        drop(theirs);
+
+        let (ours, mut theirs) = UnixStream::pair().expect("a socket pair");
+        theirs.shutdown().await.expect("shut down the write half");
+        assert!(
+            tokio::time::timeout(HANG_UP_POLL * 5, hung_up(&ours))
+                .await
+                .is_err(),
+            "a half-closed peer, still reading, was taken for gone",
+        );
+        drop(theirs);
     }
 
     /// A peer that hangs up before sending anything made no request: `None`,

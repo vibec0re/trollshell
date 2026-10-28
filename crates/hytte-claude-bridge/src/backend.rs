@@ -695,6 +695,24 @@ impl Backend {
     pub fn is_persisted(&self) -> bool {
         matches!(self, Self::Subscription(_))
     }
+
+    /// Whether dropping a turn stops what it is paying for — and so whether a
+    /// client that hangs up should take its turn with it (#1550).
+    ///
+    /// True wherever the turn is a `claude` child, which [`run_until`]'s guard
+    /// kills on the drop. False for the Messages API arm: its request runs
+    /// under `spawn_blocking`, which a drop cannot cancel, so dropping that
+    /// turn saves nothing — the request is still sent and billed — and only
+    /// hands back its request permit early, which would let a client that
+    /// sends and hangs up keep more paid calls in flight than the bridge's
+    /// permits allow (#1632 review).
+    #[must_use]
+    pub fn stops_on_drop(&self) -> bool {
+        match self {
+            Self::Subscription(_) => true,
+            Self::Reprompt(reprompt) => matches!(reprompt.engine, Engine::Cli(_)),
+        }
+    }
 }
 
 impl Conversation for Backend {

@@ -63,6 +63,13 @@
 //! pollute this process-wide map nor write the developer's real
 //! `$XDG_STATE_HOME`.
 //!
+//! Everything that path reads and writes is one value, a `Host` (#1555): the
+//! published-store cell, the reader, the store and the queue. `register` and
+//! `snapshot` run it on the production one, and a test runs the same path on
+//! a host of its own, so the gate, the queue, the drain and both readings are
+//! covered hermetically; a re-executed child pins the production wrappers
+//! over a scratch state directory.
+//!
 //! # Where the values go
 //!
 //! Not here. The values a person saves live in
@@ -77,7 +84,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use hytte_plugin_proto::manifest::{Setting, SettingKind};
 use serde::{Deserialize, Serialize};
@@ -397,16 +404,95 @@ impl Store {
     }
 }
 
-/// The production host's store, opened lazily over the real cache path on
-/// first use — by the first registration or the first `ListPluginSettings`,
-/// whichever comes first.
-static STORE: Mutex<Option<Store>> = Mutex::new(None);
+/// Everything the production path reads and writes, as one value (#1555):
+/// which runtime store is the production host's, and so where the connected
+/// ids are read; how `plugins.json` is read; the store; and the queue.
+///
+/// The production host is [`PRODUCTION`], and [`register`] and [`snapshot`]
+/// hand it to [`register_in`] and [`snapshot_in`]. A test builds a host of
+/// its own over a runtime store it owns, a reader it writes and a store over
+/// a scratch file, so it drives the same path — the gate, the queue, the
+/// drain, both readings and the store — without publishing the process-wide
+/// `PLUGIN_RUNTIME` or opening the real `$XDG_STATE_HOME`. Before, that path
+/// was gated on the published store alone, so no hermetic test reached it.
+struct Host {
+    /// The cell the production host publishes its runtime store into
+    /// (`PLUGIN_RUNTIME`, set by `PluginsService::start`). A registration
+    /// counts only from the store in it, and the connected ids are that
+    /// store's keys.
+    published: &'static OnceLock<PluginRuntimeStore>,
+    /// The cell `main` puts the `plugins.json` reader in
+    /// ([`read_declared_with`]).
+    reader: &'static OnceLock<DeclaredReader>,
+    /// Where the store's cache file is, asked once, when the store is first
+    /// used.
+    cache_path: fn() -> Option<PathBuf>,
+    /// The store, opened over `cache_path` on first use — by the first
+    /// registration or the first `ListPluginSettings`, whichever comes
+    /// first.
+    store: Mutex<Option<Store>>,
+    /// Registrations not applied yet.
+    queue: Mutex<Queue>,
+}
 
-fn with_store<R>(f: impl FnOnce(&mut Store) -> R) -> R {
-    let mut guard = STORE.lock().unwrap_or_else(PoisonError::into_inner);
-    let store =
-        guard.get_or_insert_with(|| Store::open(hytte_config::state::path(CACHE_SUBSYSTEM)));
-    f(store)
+/// The production host: `PLUGIN_RUNTIME`, `main`'s reader and the real
+/// `$XDG_STATE_HOME/trollshell/plugin-settings-schema.toml`.
+static PRODUCTION: Host = Host {
+    published: &super::PLUGIN_RUNTIME,
+    reader: &DECLARED_READER,
+    cache_path: production_cache_path,
+    store: Mutex::new(None),
+    queue: Mutex::new(Queue::new()),
+};
+
+/// [`PRODUCTION`]'s cache file.
+fn production_cache_path() -> Option<PathBuf> {
+    hytte_config::state::path(CACHE_SUBSYSTEM)
+}
+
+impl Host {
+    fn with_store<R>(&self, f: impl FnOnce(&mut Store) -> R) -> R {
+        let mut guard = self.store.lock().unwrap_or_else(PoisonError::into_inner);
+        let store = guard.get_or_insert_with(|| Store::open((self.cache_path)()));
+        f(store)
+    }
+
+    fn queue(&self) -> MutexGuard<'_, Queue> {
+        self.queue.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The ids connected to this host right now: its published store's.
+    fn live_ids(&self) -> BTreeSet<String> {
+        self.published
+            .get()
+            .map(|runtime| {
+                runtime
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .keys()
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Whether `runtime` is this host's published store — for
+    /// [`PRODUCTION`], the one `PluginsService::start` published, as opposed
+    /// to a test session's.
+    fn is_published(&self, runtime: &PluginRuntimeStore) -> bool {
+        self.published
+            .get()
+            .is_some_and(|published| Arc::ptr_eq(published, runtime))
+    }
+
+    /// A fresh reading of `plugins.json` through this host's reader; `None`
+    /// (could not tell) while no reader is set.
+    async fn read_declared(&self) -> Option<BTreeSet<String>> {
+        match self.reader.get() {
+            Some(read) => read().await,
+            None => None,
+        }
+    }
 }
 
 /// A reading of the ids `plugins.json` declares: `None` when that cannot be
@@ -429,13 +515,13 @@ pub fn read_declared_with(reader: DeclaredReader) {
     let _ = DECLARED_READER.set(reader);
 }
 
-/// Registrations the production store has not applied yet.
+/// Registrations a host's store has not applied yet.
 struct Queue {
     /// The latest declaration per id. A newer registration of an id replaces
     /// a queued older one, so the older can never be applied after it.
     pending: Schemas,
     /// Whether a [`drain`] task owns the queue. Read and written only under
-    /// [`QUEUE`]'s lock, which is what makes "start a drain iff none is
+    /// [`Host::queue`]'s lock, which is what makes "start a drain iff none is
     /// running" and "the drain stops when nothing is left" race-free against
     /// each other (`plugin_launcher`'s `WatchState::watching` shape).
     draining: bool,
@@ -469,15 +555,11 @@ impl Queue {
     }
 }
 
-static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
-
-fn queue() -> std::sync::MutexGuard<'static, Queue> {
-    QUEUE.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
 /// Hands the queue back when a [`drain`] ends however it ends, a panic
 /// included — or the next registration would never start another.
 struct Draining {
+    /// The host whose queue this drain owns.
+    host: &'static Host,
     /// Whether this drain still owns [`Queue::draining`]. The normal exit
     /// clears the flag under the lock and unsets this, so the guard cannot then
     /// clear a successor's flag.
@@ -487,14 +569,14 @@ struct Draining {
 impl Drop for Draining {
     fn drop(&mut self) {
         if self.owns_flag {
-            queue().draining = false;
+            self.host.queue().draining = false;
         }
     }
 }
 
-/// Apply queued registrations until the queue is empty, one batch at a time —
-/// the only thing that applies them, so they apply in the order they
-/// registered.
+/// Apply `host`'s queued registrations until its queue is empty, one batch at
+/// a time — the only thing that applies them, so they apply in the order
+/// they registered.
 ///
 /// Each batch takes a fresh reading of `plugins.json` (asynchronously, through
 /// the launcher) and of the connected ids, then applies under the store's lock
@@ -502,49 +584,26 @@ impl Drop for Draining {
 /// change writes it. A drain's reading and a `ListPluginSettings` one can
 /// still apply in either order; the older standing until the next application
 /// costs at most a form for an id that was neither connected nor in it.
-async fn drain() {
-    let mut guard = Draining { owns_flag: true };
+async fn drain(host: &'static Host) {
+    let mut guard = Draining {
+        host,
+        owns_flag: true,
+    };
     loop {
-        let Some(batch) = queue().next_batch() else {
+        let Some(batch) = host.queue().next_batch() else {
             guard.owns_flag = false;
             return;
         };
-        let declared = match DECLARED_READER.get() {
-            Some(read) => read().await,
-            None => None,
-        };
-        let live = live_ids();
+        let declared = host.read_declared().await;
+        let live = host.live_ids();
         let applied = tokio::task::spawn_blocking(move || {
-            with_store(|store| store.apply(batch, declared.as_ref(), &live));
+            host.with_store(|store| store.apply(batch, declared.as_ref(), &live));
         })
         .await;
         if let Err(e) = applied {
             tracing::warn!(error = %e, "applying plugin settings declarations failed");
         }
     }
-}
-
-/// The ids connected to the production host right now.
-fn live_ids() -> BTreeSet<String> {
-    super::PLUGIN_RUNTIME
-        .get()
-        .map(|runtime| {
-            runtime
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .keys()
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Whether `runtime` is the production host's store — the one
-/// `PluginsService::start` published, as opposed to a test's.
-fn is_production(runtime: &PluginRuntimeStore) -> bool {
-    super::PLUGIN_RUNTIME
-        .get()
-        .is_some_and(|published| Arc::ptr_eq(published, runtime))
 }
 
 /// Sanitise and queue what a newly-registered connection declared. Called
@@ -557,14 +616,24 @@ fn is_production(runtime: &PluginRuntimeStore) -> bool {
 /// Recording does not: the declaration joins the queue and the one [`drain`]
 /// applies it, so the connection's own task never waits on the disk or on
 /// `plugins.json`, and two registrations of one id cannot apply out of order.
+///
+/// This is [`register_in`] on [`PRODUCTION`], which a test drives on a host
+/// of its own.
 pub(super) fn register(runtime: &PluginRuntimeStore, id: &str, declared: &[Setting]) {
+    register_in(&PRODUCTION, runtime, id, declared);
+}
+
+/// [`register`] on `host`: records only when `runtime` is the store `host`
+/// published, so a test session's registration with the production host
+/// records nothing.
+fn register_in(host: &'static Host, runtime: &PluginRuntimeStore, id: &str, declared: &[Setting]) {
     let clean = sanitize(id, declared);
-    if !is_production(runtime) {
+    if !host.is_published(runtime) {
         return;
     }
-    let start = queue().push(id.to_owned(), clean);
+    let start = host.queue().push(id.to_owned(), clean);
     if start {
-        tokio::spawn(drain());
+        tokio::spawn(drain(host));
     }
 }
 
@@ -573,10 +642,17 @@ pub(super) fn register(runtime: &PluginRuntimeStore, id: &str, declared: &[Setti
 /// declares, `None` when it is unreadable or missing) does not cover and that are not
 /// connected. Blocking (the first call reads the cache file, and a prune
 /// writes it), so the D-Bus handler runs it off its own task.
+///
+/// This is `snapshot_in` on the production host (`PRODUCTION`).
 #[must_use]
 pub fn snapshot(declared: Option<&BTreeSet<String>>) -> Schemas {
-    let live = live_ids();
-    with_store(|store| store.snapshot(declared, &live))
+    snapshot_in(&PRODUCTION, declared)
+}
+
+/// [`snapshot`] on `host`, with `host`'s connected ids.
+fn snapshot_in(host: &Host, declared: Option<&BTreeSet<String>>) -> Schemas {
+    let live = host.live_ids();
+    host.with_store(|store| store.snapshot(declared, &live))
 }
 
 #[cfg(test)]
@@ -1049,15 +1125,292 @@ mod tests {
     /// guard leaves a successor's flag alone.
     #[test]
     fn a_drain_always_hands_the_queue_back() {
-        // Driven against the process-wide queue, which no test host ever
-        // reaches (`register`'s production gate), so this is its only user.
-        queue().draining = true;
-        drop(Draining { owns_flag: true });
-        assert!(!queue().draining, "a dead drain's guard released the queue");
-        queue().draining = true;
-        drop(Draining { owns_flag: false });
-        assert!(queue().draining, "a finished drain's guard touches nothing");
-        queue().draining = false;
+        // On a host of the test's own (#1555), so the production queue is
+        // never touched.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = test_host(&connected(&[]), declares_pet, dir.path().join("cache.toml"));
+        host.queue().draining = true;
+        drop(Draining {
+            host,
+            owns_flag: true,
+        });
+        assert!(
+            !host.queue().draining,
+            "a dead drain's guard released the queue"
+        );
+        host.queue().draining = true;
+        drop(Draining {
+            host,
+            owns_flag: false,
+        });
+        assert!(
+            host.queue().draining,
+            "a finished drain's guard touches nothing"
+        );
+    }
+
+    // ── the production path, on a host of the test's own (#1555) ────────
+
+    /// A runtime store with `ids` connected, as the session handshake's
+    /// `runtime_register` leaves it.
+    fn connected(ids: &[&str]) -> PluginRuntimeStore {
+        Arc::new(Mutex::new(
+            ids.iter()
+                .map(|&id| {
+                    let runtime = super::super::PluginRuntime {
+                        mount: "SidebarTop",
+                        rendering: false,
+                        last_seen: std::time::Instant::now(),
+                        violations: 0,
+                        version: None,
+                    };
+                    (id.to_owned(), runtime)
+                })
+                .collect(),
+        ))
+    }
+
+    /// A `plugins.json` reader that declares `pet` alone.
+    fn declares_pet() -> Pin<Box<dyn Future<Output = Option<BTreeSet<String>>> + Send>> {
+        Box::pin(async { Some(set(&["pet"])) })
+    }
+
+    /// A [`Host`] of the test's own: `runtime` published as its production
+    /// store, `reader` as its `plugins.json` reader, and its store already
+    /// open over `path`, so nothing resolves the real cache path. Leaked,
+    /// for the `'static` a drain's task needs.
+    fn test_host(
+        runtime: &PluginRuntimeStore,
+        reader: DeclaredReader,
+        path: PathBuf,
+    ) -> &'static Host {
+        Box::leak(Box::new(Host {
+            published: Box::leak(Box::new(OnceLock::from(runtime.clone()))),
+            reader: Box::leak(Box::new(OnceLock::from(reader))),
+            cache_path: || unreachable!("a test host's store is opened up front"),
+            store: Mutex::new(Some(Store::open(Some(path)))),
+            queue: Mutex::new(Queue::new()),
+        }))
+    }
+
+    /// Until `host`'s drain has applied everything queued and given the
+    /// queue up.
+    async fn drained(host: &Host) {
+        for _ in 0..10_000 {
+            {
+                let queue = host.queue();
+                if !queue.draining && queue.pending.is_empty() {
+                    return;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!("the drain never handed the queue back");
+    }
+
+    /// **The production path, end to end** (#1555): [`register_in`] and
+    /// [`snapshot_in`] on a host of the test's own, which is what
+    /// [`register`] and [`snapshot`] are on [`PRODUCTION`]. Two connected
+    /// plugins register through the published store, `pet` (declared) and
+    /// `static` (a hand-installed unit, never declared); a third
+    /// registration comes from a store the host never published, a test
+    /// session's.
+    ///
+    /// - The gate: the unpublished store's registration is not queued, so
+    ///   `pet`'s form is the one its own connection declared.
+    /// - The queue and the drain: both published registrations are applied,
+    ///   by the one drain the first one started, which hands the queue back.
+    /// - The `plugins.json` reading: only `pet` reaches the cache file. The
+    ///   store opened over a fresh file, so until a reading it declares
+    ///   nothing, and only the drain's reading through the host's reader
+    ///   makes `pet` declared.
+    /// - The connected ids: `static` is served while the published store has
+    ///   it, and forgotten once it is gone from there.
+    ///
+    /// Falsified by the drain not consulting the reader (nothing persisted),
+    /// by `live_ids` reading anything but the published store (`static` is
+    /// dropped at once, or kept after it left), by the gate letting another
+    /// store through (`pet` shows `FORGED`), and by `register_in` neither
+    /// queuing nor draining (nothing served).
+    #[test]
+    fn the_production_path_applies_registrations_end_to_end() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plugin-settings-schema.toml");
+        let runtime = connected(&["pet", "static"]);
+        let host = test_host(&runtime, declares_pet, path.clone());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            register_in(host, &runtime, "pet", &[Setting::text("PET_NAME", "Name")]);
+            register_in(host, &runtime, "static", &[Setting::text("STATIC", "S")]);
+            register_in(
+                host,
+                &connected(&["pet"]),
+                "pet",
+                &[Setting::text("FORGED", "Forged")],
+            );
+            drained(host).await;
+        });
+
+        let served = snapshot_in(host, None);
+        assert_eq!(
+            served.keys().collect::<Vec<_>>(),
+            ["pet", "static"],
+            "both published registrations were applied, and static is connected"
+        );
+        assert_eq!(
+            ids(&served["pet"]),
+            ["PET_NAME"],
+            "the unpublished store's registration was not"
+        );
+        assert_eq!(
+            Store::open(Some(path))
+                .snapshot(None, &set(&[]))
+                .keys()
+                .collect::<Vec<_>>(),
+            ["pet"],
+            "the drain read plugins.json through the host's reader, and persisted only pet"
+        );
+        runtime
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove("static");
+        assert_eq!(
+            snapshot_in(host, None).keys().collect::<Vec<_>>(),
+            ["pet"],
+            "static's form goes once it leaves the published store"
+        );
+    }
+
+    /// The variable that tells a re-executed test binary it is the child
+    /// [`register_and_snapshot_drive_the_published_store`] runs.
+    const PRODUCTION_CHILD_ENV: &str = "TROLLSHELL_PLUGIN_SETTINGS_PRODUCTION_CHILD";
+
+    /// **[`register`] and [`snapshot`] drive [`PRODUCTION`] over the real
+    /// store** (#1555): the wrappers the end-to-end test above stands in
+    /// for, which a host of the test's own cannot check. Publishing
+    /// `PLUGIN_RUNTIME` is once per process and would reach every other test
+    /// in this binary, so this re-executes the binary on
+    /// [`production_wrappers_child`] alone, with `$XDG_STATE_HOME` and
+    /// `$HOME` on a scratch directory. The child publishes a runtime store,
+    /// sets the reader the way `main` does, registers through [`register`]
+    /// and reads back through [`snapshot`]. It checks the cache file at the
+    /// path the scratch `$XDG_STATE_HOME` gives, then hands [`snapshot`] a
+    /// reading that declares nothing once `pet` has left the runtime store,
+    /// which must forget `pet` and delete the file (#1628 review, F3). The
+    /// parent then checks the file is gone from the scratch directory.
+    ///
+    /// Falsified by [`PRODUCTION`] reading any cell but `PLUGIN_RUNTIME` or
+    /// `DECLARED_READER`, by [`register`] or [`snapshot`] handing their seam
+    /// another host, by [`snapshot`] dropping its `declared` argument, and by
+    /// [`production_cache_path`] resolving anything but the state
+    /// directory's `plugin-settings-schema.toml`.
+    #[test]
+    fn register_and_snapshot_drive_the_published_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = std::process::Command::new(
+            std::env::current_exe().expect("this test binary's own path"),
+        )
+        .args([
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+            "plugins::settings::tests::production_wrappers_child",
+        ])
+        .env(PRODUCTION_CHILD_ENV, "1")
+        .env("XDG_STATE_HOME", dir.path())
+        .env("HOME", dir.path())
+        .output()
+        .expect("re-exec this test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() && stdout.contains("production wrappers child: ok"),
+            "the child failed or never reached its end ({:?})\n--- stdout ---\n{stdout}\n\
+             --- stderr ---\n{stderr}",
+            out.status
+        );
+        // The child persisted `pet` there and then, through `snapshot`'s
+        // own reading, forgot it (#1628 review, F3): the file is gone.
+        let file = dir
+            .path()
+            .join("trollshell")
+            .join(format!("{CACHE_SUBSYSTEM}.toml"));
+        assert!(
+            dir.path().join("trollshell").is_dir() && !file.exists(),
+            "the child wrote under the scratch state directory, and its last reading \
+             removed the cache file"
+        );
+    }
+
+    /// The child [`register_and_snapshot_drive_the_published_store`]
+    /// re-executes; a no-op in any other run.
+    #[test]
+    fn production_wrappers_child() {
+        if std::env::var_os(PRODUCTION_CHILD_ENV).is_none() {
+            return;
+        }
+        let runtime = connected(&["pet", "static"]);
+        assert!(
+            super::super::PLUGIN_RUNTIME.set(runtime.clone()).is_ok(),
+            "nothing in this child published a runtime store before"
+        );
+        read_declared_with(declares_pet);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            register(&runtime, "pet", &[Setting::text("PET_NAME", "Name")]);
+            register(&runtime, "static", &[Setting::text("STATIC", "S")]);
+            drained(&PRODUCTION).await;
+        });
+        assert_eq!(
+            snapshot(None).keys().collect::<Vec<_>>(),
+            ["pet", "static"],
+            "register recorded both through the published store"
+        );
+        runtime
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove("static");
+        assert_eq!(
+            snapshot(None).keys().collect::<Vec<_>>(),
+            ["pet"],
+            "snapshot reads the connected ids from the published store"
+        );
+        // #1628 review, F3: what `snapshot` does with the reading
+        // `ListPluginSettings` hands it. The path is derived from the
+        // scratch state directory, not from `production_cache_path`, so the
+        // resolver stays covered by the parent's check.
+        let expected =
+            PathBuf::from(std::env::var_os("XDG_STATE_HOME").expect("set by the parent"))
+                .join("trollshell")
+                .join(format!("{CACHE_SUBSYSTEM}.toml"));
+        assert_eq!(
+            Store::open(Some(expected.clone()))
+                .snapshot(None, &set(&[]))
+                .keys()
+                .collect::<Vec<_>>(),
+            ["pet"],
+            "persisted pet under the scratch state directory"
+        );
+        runtime
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove("pet");
+        assert!(
+            snapshot(Some(&BTreeSet::new())).is_empty(),
+            "snapshot hands its reading to the store: pet, neither declared nor connected, \
+             is forgotten"
+        );
+        assert!(
+            !expected.exists(),
+            "and that reading reached the cache file"
+        );
+        println!("production wrappers child: ok");
     }
 
     // ── the cache, under a tempdir ──────────────────────────────────────
@@ -1155,7 +1508,7 @@ mod tests {
         // which `PluginsService::start` never publishes — so `register` from
         // those sessions records nothing and writes nothing.
         let store: PluginRuntimeStore = Arc::new(Mutex::new(BTreeMap::new()));
-        assert!(!is_production(&store));
+        assert!(!PRODUCTION.is_published(&store));
     }
 
     /// `register` from a host that is not the production one leaves the
@@ -1178,11 +1531,12 @@ mod tests {
         });
         runtime.shutdown_timeout(std::time::Duration::from_secs(5));
         assert!(
-            queue().pending.is_empty(),
+            PRODUCTION.queue().pending.is_empty(),
             "a test host's registration was queued for the production store"
         );
         assert!(
-            STORE
+            PRODUCTION
+                .store
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .is_none(),

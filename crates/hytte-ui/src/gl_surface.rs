@@ -162,10 +162,11 @@
 //! What the reading settles about `unrealize` skipping `make_current` (#1562
 //! item 2): the guard `error().is_none() && context().is_some()` is false only
 //! when there is no context, so no GL object can be waiting to be dropped
-//! there. GTK sets the area's error itself only in `realize`, and only when it
-//! got no context (`gtk/gtkglarea.c:318-326`, `:358`, `:372`); otherwise only
-//! through the public `gtk_gl_area_set_error`, which nothing in this tree
-//! calls; and with no context there was no `render`, so no `resources`. The
+//! there. GTK sets the area's error itself only while realizing, and only when
+//! it got no context (`gtk/gtkglarea.c:318-326`, `:358`, `:372`); otherwise
+//! only through the public `gtk_gl_area_set_error`, which this tree calls in
+//! one place, `create_area_context`, on that same no-context failure; and
+//! with no context there was no `render`, so no `resources`. The
 //! live half of item 2 is the failed `make_current` above, and what to do
 //! about it — keep the objects until a matching context is current, or count
 //! the leak — is still a design question.

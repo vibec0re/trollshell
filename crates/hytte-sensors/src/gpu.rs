@@ -1466,9 +1466,10 @@ mod tests {
     fn the_reaper_loop_stops_tracking_past_the_cap() {
         // The test fills the real cap with live processes, so a cap raised
         // far past today's is a failure here, not a process flood.
+        let cap = std::hint::black_box(REAPER_MAX_PENDING);
         assert!(
-            REAPER_MAX_PENDING <= 256,
-            "REAPER_MAX_PENDING is {REAPER_MAX_PENDING}: the list is no longer bounded tightly"
+            cap <= 256,
+            "REAPER_MAX_PENDING is {cap}: the list is no longer bounded tightly"
         );
         let (tx, rx) = std::sync::mpsc::channel();
         let reaper = std::thread::spawn(move || reaper_loop(&rx));

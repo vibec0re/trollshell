@@ -61,6 +61,11 @@ xvfb-run cargo test --features system-tests -p hytte-ui   # display tests headle
 - `hytte-bus`'s system tests **spawn a real `dbus-daemon`** (one ephemeral
   broker per test; must be on `PATH`). They don't touch the host session bus.
 - The GTK-dependent system tests need a display server (`xvfb-run` works).
+- Concurrent local test runs need one X display each: bare `xvfb-run` always
+  takes `:99`, and several `xvfb-run -a` started at once can all be handed `:99`
+  too (#1631), so they click each other's windows. Give each run `xvfb-run -d`
+  or an explicit `-n N`. CI is unaffected (one process per sandbox). Display
+  tests register their GApplication under `test_support::app_id`.
 - `trollshell-agent-window`'s display tests construct a `webkit::WebView`, and
   WebKitGTK sandboxes its subprocesses with `bwrap`, which needs nested user
   namespaces. Without them, constructing the view **aborts the test binary**

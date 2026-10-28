@@ -318,8 +318,11 @@ impl SharedConnection {
     /// section that would clear it. Neither window can be held open by any
     /// test seam this crate has — `install_fresh_connection_for_test` performs
     /// the install and the bump back to back, as the supervisor does, and the
-    /// watcher is a task on the shared runtime — so the invariant is stated
-    /// here and on [`Inner::generation`] rather than pinned by a test.
+    /// watcher is a task on the shared runtime. What *is* pinned is the
+    /// comparison both windows reduce to: `tests/generation_guard.rs` (#1551)
+    /// checks that a stale generation keeps the installed connection and does
+    /// not wake the supervisor, that the current one clears it and wakes the
+    /// supervisor once, and that with no connection it is a no-op.
     pub(crate) async fn invalidate_if_generation(&self, issued_on: Generation) {
         let mut guard = self.inner.lock().await;
         if Generation(guard.generation) == issued_on && guard.conn.take().is_some() {
@@ -566,6 +569,43 @@ pub mod test_support {
             if let Some(notify) = SUPERVISOR_NOTIFY.lookup(self) {
                 notify.notify_one();
             }
+        }
+
+        /// Test-only: the generation of the connection currently installed,
+        /// as the `u64` [`Inner::generation`] holds it. `for_test_*` starts at
+        /// 1 and each [`Self::install_fresh_connection_for_test`] adds one.
+        #[doc(hidden)]
+        pub async fn generation_for_test(&self) -> u64 {
+            self.inner.lock().await.generation
+        }
+
+        /// Test-only: whether a connection is currently installed (`false`
+        /// is the "bus is mid-reconnect" state).
+        #[doc(hidden)]
+        pub async fn is_connected_for_test(&self) -> bool {
+            self.inner.lock().await.conn.is_some()
+        }
+
+        /// Test-only: run [`SharedConnection::invalidate_if_generation`] with
+        /// `issued_on` standing for the generation a failed call's cached
+        /// proxy was built on. This is what lets a test pin the comparison
+        /// itself, "an old generation keeps the fresh connection, the current
+        /// one clears it", without holding either race window open (#1551).
+        #[doc(hidden)]
+        pub async fn invalidate_if_generation_for_test(&self, issued_on: u64) {
+            self.invalidate_if_generation(super::Generation(issued_on))
+                .await;
+        }
+
+        /// Test-only: register a bare `Notify` as this connection's supervisor
+        /// wake-up, with **no** supervisor loop behind it, and return it. A
+        /// test then observes whether an invalidation woke the supervisor
+        /// (`notified()` completes) without a real reconnect running.
+        #[doc(hidden)]
+        pub fn supervisor_notify_for_test(&self) -> Arc<tokio::sync::Notify> {
+            let notify = Arc::new(tokio::sync::Notify::new());
+            SUPERVISOR_NOTIFY.register(self, notify.clone());
+            notify
         }
     }
 }

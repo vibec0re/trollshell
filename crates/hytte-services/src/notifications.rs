@@ -1589,7 +1589,8 @@ fn forget_replaced_local_actions(
 /// leaves the timeout to us (`expire_timeout < 0`, conventionally `-1`) for a
 /// `Low` or `Normal` urgency notification; a `Critical` one that does so gets
 /// no timeout at all (see [`resolve_timeout`]). The shell's own toasts
-/// ([`post_local`]) carry it at every urgency, `Critical` included.
+/// ([`post_local`]) carry it at every urgency, `Critical` included, except a
+/// [`post_local_until_closed`] one, which carries none.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Resolve a D-Bus `Notify` call's `expire_timeout` and urgency into a finite

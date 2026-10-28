@@ -639,7 +639,19 @@ mod tests {
             "the page opens: dismiss"
         );
 
+        hdmi.set(None);
+        tick();
+        assert_eq!(take(&calls), NONE, "its toast has been shown: not again");
+
+        // The page back on HDMI-A-1, then DP-1's drawer changing to another
+        // page: DP-1 is the last drawer heard from, and the page still shows
+        // on HDMI-A-1. Two ticks, so DP-1's change lands after HDMI-A-1's.
+        hdmi.set(Some(Page::Bluetooth));
+        tick();
         dp1.set(Some(Page::Media));
+        tick();
+        assert_eq!(take(&calls), NONE, "no toast is up to close");
+        slot.set(Some(prompt(2, PromptKind::ConfirmPasskey)));
         tick();
         assert_eq!(
             take(&calls),
@@ -649,11 +661,11 @@ mod tests {
 
         hdmi.set(None);
         tick();
-        assert_eq!(take(&calls), NONE, "its toast has been shown: not again");
-
-        slot.set(Some(prompt(2, PromptKind::ConfirmPasskey)));
-        tick();
-        assert_eq!(take(&calls), [Call::Post(2)], "a new prompt: post");
+        assert_eq!(
+            take(&calls),
+            [Call::Post(2)],
+            "the page closes on a prompt that was never toasted: post"
+        );
 
         slot.set(Some(prompt(3, PromptKind::EnterPinCode)));
         tick();
@@ -679,11 +691,7 @@ mod tests {
 
         dp1.set(None);
         tick();
-        assert_eq!(
-            take(&calls),
-            [Call::Post(4)],
-            "the page closes on a prompt that was never toasted: post"
-        );
+        assert_eq!(take(&calls), [Call::Post(4)], "the page closes on it: post");
     }
 
     /// [`close_all`] forgets every drawer, so the page reads as on screen

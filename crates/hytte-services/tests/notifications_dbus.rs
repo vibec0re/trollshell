@@ -398,8 +398,8 @@ async fn live_id(summary: &str) -> u32 {
         .await
         .iter()
         .find(|n| n.summary == summary)
-        .map(|n| n.id)
         .unwrap_or_else(|| panic!("no live notification titled {summary:?}"))
+        .id
 }
 
 // ── The tests ───────────────────────────────────────────────────────────────

@@ -117,6 +117,15 @@ pub struct CpuFreq {
     /// Per-logical-core current frequency, in Hz. Length matches the number of
     /// cores exposing a `cpufreq` node.
     pub per_core: Vec<f64>,
+    /// The kernel's number (`N` of `cpuN`) of each [`per_core`](Self::per_core)
+    /// entry: same length, same order, ascending. Not always `0..len` — a CPU
+    /// can be offline, and a core whose `scaling_cur_freq` is unreadable for a
+    /// tick is left out.
+    ///
+    /// This is what a per-core clock history restarts on, as
+    /// [`CpuLoad::core_ids`] is for the load history: windows built for one set
+    /// of CPUs start over when this changes, not only when its length does.
+    pub core_ids: Vec<u32>,
     /// Highest `cpuinfo_max_freq` across cores, in Hz — the fixed normalization
     /// ceiling for a 0→max axis.
     pub max_ceiling_hz: f64,

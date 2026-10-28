@@ -26,6 +26,8 @@ const CPU_BASE: &str = "/sys/devices/system/cpu";
 /// `cur_khz` comes from `scaling_cur_freq`; `max_khz` from `cpuinfo_max_freq`
 /// (absent on kernels/cores that don't expose it).
 pub(super) struct CoreFreqKhz {
+    /// The kernel's number of this core (`N` of `cpuN`).
+    pub core: u32,
     /// Current frequency (`scaling_cur_freq`), kHz.
     pub cur_khz: u64,
     /// Static hardware ceiling (`cpuinfo_max_freq`), kHz. `None` if unreadable.
@@ -37,14 +39,20 @@ pub(super) struct CoreFreqKhz {
 /// Enumerates `/sys/devices/system/cpu/cpu{N}` directories that carry a
 /// `cpufreq` subdir, orders them by core index for a stable `per_core` layout,
 /// and reads each core's current + ceiling frequency. A core whose
-/// `scaling_cur_freq` is missing or unparseable is skipped.
+/// `scaling_cur_freq` is missing or unparseable is skipped — and, because every
+/// reading keeps its CPU number ([`CpuFreq::core_ids`]), skipping one does not
+/// move the cores after it onto a neighbour's entry (#1561).
 ///
 /// Returns an empty [`CpuFreq`] (per-core empty, zeros) when the base cpufreq
 /// directory is absent (no governor — typical of VMs) or unreadable.
 #[must_use]
 pub fn read_cpu_freq() -> CpuFreq {
-    let base = Path::new(CPU_BASE);
+    read_cpu_freq_in(Path::new(CPU_BASE))
+}
 
+/// [`read_cpu_freq`] over a sysfs `cpu` directory of the caller's choosing, so
+/// a fixture tree can stand in for `/sys/devices/system/cpu`.
+fn read_cpu_freq_in(base: &Path) -> CpuFreq {
     // Graceful degrade: no cpufreq on cpu0 means no governor is driving the
     // CPU (VMs, some containers). Publish the default so a UI row self-hides.
     if !base.join("cpu0").join("cpufreq").is_dir() {
@@ -79,7 +87,7 @@ pub fn read_cpu_freq() -> CpuFreq {
 
     let samples: Vec<CoreFreqKhz> = cores
         .iter()
-        .filter_map(|(_, dir)| read_core_freq(dir))
+        .filter_map(|(idx, dir)| read_core_freq(*idx, dir))
         .collect();
 
     compute_cpu_freq(&samples)
@@ -88,10 +96,14 @@ pub fn read_cpu_freq() -> CpuFreq {
 /// Read one core's `scaling_cur_freq` + `cpuinfo_max_freq` from its `cpufreq`
 /// directory. Returns `None` (skip this core) when the current frequency is
 /// missing or unparseable; a missing ceiling is tolerated (`max_khz = None`).
-fn read_core_freq(cpufreq_dir: &Path) -> Option<CoreFreqKhz> {
+fn read_core_freq(core: u32, cpufreq_dir: &Path) -> Option<CoreFreqKhz> {
     let cur_khz = read_khz(&cpufreq_dir.join("scaling_cur_freq"))?;
     let max_khz = read_khz(&cpufreq_dir.join("cpuinfo_max_freq"));
-    Some(CoreFreqKhz { cur_khz, max_khz })
+    Some(CoreFreqKhz {
+        core,
+        cur_khz,
+        max_khz,
+    })
 }
 
 /// Read a single-integer kHz sysfs file. `None` if unreadable or non-numeric.
@@ -105,7 +117,8 @@ fn read_khz(path: &Path) -> Option<u64> {
 
 /// Fold per-core kHz samples into a [`CpuFreq`] (values in Hz).
 ///
-/// - `per_core` — each core's current frequency, in Hz.
+/// - `per_core` — each core's current frequency, in Hz, in ascending CPU number.
+/// - `core_ids` — the CPU number of each `per_core` entry.
 /// - `max_hz` — aggregate = the maximum current frequency across cores.
 /// - `max_ceiling_hz` — the highest `cpuinfo_max_freq` across cores.
 ///
@@ -116,6 +129,11 @@ pub(super) fn compute_cpu_freq(cores: &[CoreFreqKhz]) -> CpuFreq {
         return CpuFreq::default();
     }
 
+    // Ascending CPU number, whatever order the caller collected in: the ids
+    // are the history windows' restart key and must be canonical.
+    let mut cores: Vec<&CoreFreqKhz> = cores.iter().collect();
+    cores.sort_by_key(|c| c.core);
+    let core_ids: Vec<u32> = cores.iter().map(|c| c.core).collect();
     let per_core: Vec<f64> = cores.iter().map(|c| khz_to_hz(c.cur_khz)).collect();
     // Aggregate is the highest current core frequency (reporter chose max).
     let max_hz = per_core.iter().copied().fold(0.0_f64, f64::max);
@@ -126,6 +144,7 @@ pub(super) fn compute_cpu_freq(cores: &[CoreFreqKhz]) -> CpuFreq {
     CpuFreq {
         max_hz,
         per_core,
+        core_ids,
         max_ceiling_hz,
     }
 }
@@ -135,7 +154,11 @@ mod tests {
     use super::*;
 
     fn core(cur_khz: u64, max_khz: Option<u64>) -> CoreFreqKhz {
-        CoreFreqKhz { cur_khz, max_khz }
+        CoreFreqKhz {
+            core: 0,
+            cur_khz,
+            max_khz,
+        }
     }
 
     /// Per-core kHz values convert to Hz, and the aggregate `max_hz` is the
@@ -212,7 +235,7 @@ mod tests {
         std::fs::write(dir.path().join("scaling_cur_freq"), "2400000\n").unwrap();
         std::fs::write(dir.path().join("cpuinfo_max_freq"), "3600000\n").unwrap();
 
-        let sample = read_core_freq(dir.path()).expect("core parses");
+        let sample = read_core_freq(0, dir.path()).expect("core parses");
         assert_eq!(sample.cur_khz, 2_400_000);
         assert_eq!(sample.max_khz, Some(3_600_000));
 
@@ -228,12 +251,12 @@ mod tests {
     fn read_core_freq_handles_missing_files() {
         // No scaling_cur_freq at all → skip the core.
         let empty = tempfile::tempdir().expect("tempdir");
-        assert!(read_core_freq(empty.path()).is_none());
+        assert!(read_core_freq(0, empty.path()).is_none());
 
         // Current present, ceiling absent → parses with max_khz = None.
         let partial = tempfile::tempdir().expect("tempdir");
         std::fs::write(partial.path().join("scaling_cur_freq"), "1800000\n").unwrap();
-        let sample = read_core_freq(partial.path()).expect("core parses without ceiling");
+        let sample = read_core_freq(0, partial.path()).expect("core parses without ceiling");
         assert_eq!(sample.cur_khz, 1_800_000);
         assert_eq!(sample.max_khz, None);
     }
@@ -244,6 +267,98 @@ mod tests {
     fn read_core_freq_non_numeric_is_skipped() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("scaling_cur_freq"), "garbage\n").unwrap();
-        assert!(read_core_freq(dir.path()).is_none());
+        assert!(read_core_freq(0, dir.path()).is_none());
+    }
+
+    /// Write `cpu{n}/cpufreq/scaling_cur_freq` (and a ceiling) under `base`;
+    /// `cur` of `None` leaves the current-frequency file out.
+    fn write_cpu(base: &Path, n: u32, cur: Option<&str>) {
+        let dir = base.join(format!("cpu{n}")).join("cpufreq");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cpuinfo_max_freq"), "4000000\n").unwrap();
+        if let Some(cur) = cur {
+            std::fs::write(dir.join("scaling_cur_freq"), cur).unwrap();
+        }
+    }
+
+    /// **#1561, same CPUs**: a full tree reads one entry per core, ascending,
+    /// each with its own CPU number (and frequency).
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn read_cpu_freq_names_each_core() {
+        let base = tempfile::tempdir().expect("tempdir");
+        for n in 0..4u32 {
+            write_cpu(base.path(), n, Some(&format!("{}\n", (n + 1) * 1_000_000)));
+        }
+        // Sysfs noise that is not a `cpuN` core.
+        std::fs::create_dir_all(base.path().join("cpufreq")).unwrap();
+        std::fs::create_dir_all(base.path().join("cpuidle")).unwrap();
+
+        let freq = read_cpu_freq_in(base.path());
+        assert_eq!(freq.core_ids, vec![0, 1, 2, 3]);
+        assert_eq!(freq.per_core, vec![1.0e9, 2.0e9, 3.0e9, 4.0e9]);
+        assert_eq!(freq.max_hz, 4.0e9);
+    }
+
+    /// **#1561, equal-count swap**: cpu2 goes offline and cpu4 comes online, so
+    /// the count is four before and after. The ids name the new set, and each
+    /// frequency sits beside its own CPU rather than at its old position.
+    ///
+    /// **Falsified** by collecting positionally (`core: position`) or in
+    /// directory order instead of by the `cpuN` number.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn read_cpu_freq_ids_follow_a_hotplug_at_the_same_count() {
+        let base = tempfile::tempdir().expect("tempdir");
+        for n in 0..4u32 {
+            write_cpu(base.path(), n, Some(&format!("{}\n", (n + 1) * 1_000_000)));
+        }
+        let before = read_cpu_freq_in(base.path());
+        assert_eq!(before.core_ids, vec![0, 1, 2, 3]);
+
+        std::fs::remove_dir_all(base.path().join("cpu2")).unwrap();
+        write_cpu(base.path(), 4, Some("9000000\n"));
+
+        let after = read_cpu_freq_in(base.path());
+        assert_eq!(after.per_core.len(), before.per_core.len(), "same count");
+        assert_eq!(after.core_ids, vec![0, 1, 3, 4]);
+        assert_eq!(
+            after.per_core,
+            vec![1.0e9, 2.0e9, 4.0e9, 9.0e9],
+            "cpu3 keeps 4 GHz and cpu4 reads its own 9 GHz"
+        );
+    }
+
+    /// **#1561, a skipped core**: cpu1's `scaling_cur_freq` is missing for one
+    /// tick. It drops out of the frame by name; cpu2 and cpu3 keep their own
+    /// frequencies and ids instead of sliding onto cpu1's and cpu2's entries.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn read_cpu_freq_a_skipped_core_does_not_shift_the_rest() {
+        let base = tempfile::tempdir().expect("tempdir");
+        write_cpu(base.path(), 0, Some("1000000\n"));
+        write_cpu(base.path(), 1, None);
+        write_cpu(base.path(), 2, Some("3000000\n"));
+        write_cpu(base.path(), 3, Some("garbage\n"));
+        write_cpu(base.path(), 4, Some("5000000\n"));
+
+        let freq = read_cpu_freq_in(base.path());
+        assert_eq!(freq.core_ids, vec![0, 2, 4]);
+        assert_eq!(freq.per_core, vec![1.0e9, 3.0e9, 5.0e9]);
+    }
+
+    /// `compute_cpu_freq` canonicalises to ascending CPU number whatever order
+    /// it is handed, so `core_ids` is a stable key.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn compute_orders_by_cpu_number() {
+        let mk = |core, cur_khz| CoreFreqKhz {
+            core,
+            cur_khz,
+            max_khz: Some(4_000_000),
+        };
+        let freq = compute_cpu_freq(&[mk(3, 3_000_000), mk(0, 1_000_000), mk(1, 2_000_000)]);
+        assert_eq!(freq.core_ids, vec![0, 1, 3]);
+        assert_eq!(freq.per_core, vec![1.0e9, 2.0e9, 3.0e9]);
     }
 }

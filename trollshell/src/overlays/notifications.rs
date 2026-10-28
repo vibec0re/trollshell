@@ -2070,13 +2070,15 @@ mod reentrancy_tests {
         if let Some(monitor) = TEST_MONITOR.with(|cell| cell.borrow().clone()) {
             return monitor;
         }
-        App::new("mov.vibec0re.trollshell.test.notifications-reentrancy")
-            .run(|app| {
-                let first = app.monitors().first().cloned();
-                TEST_MONITOR.with(|cell| *cell.borrow_mut() = first);
-                app.quit();
-            })
-            .expect("App::run");
+        App::new(&crate::test_support::app_id(
+            "mov.vibec0re.trollshell.test.notifications-reentrancy",
+        ))
+        .run(|app| {
+            let first = app.monitors().first().cloned();
+            TEST_MONITOR.with(|cell| *cell.borrow_mut() = first);
+            app.quit();
+        })
+        .expect("App::run");
         TEST_MONITOR
             .with(|cell| cell.borrow().clone())
             .expect("the display server must report at least one output; `xvfb-run` provides one")

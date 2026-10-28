@@ -609,12 +609,14 @@ mod tests {
         }
         let captured: Rc<RefCell<Option<Monitor>>> = Rc::new(RefCell::new(None));
         let captured_for_body = Rc::clone(&captured);
-        App::new("mov.vibec0re.trollshell.test.tray-reentrancy")
-            .run(move |app| {
-                *captured_for_body.borrow_mut() = app.monitors().into_iter().next();
-                app.quit();
-            })
-            .expect("App::run");
+        App::new(&crate::test_support::app_id(
+            "mov.vibec0re.trollshell.test.tray-reentrancy",
+        ))
+        .run(move |app| {
+            *captured_for_body.borrow_mut() = app.monitors().into_iter().next();
+            app.quit();
+        })
+        .expect("App::run");
         let monitor = captured.borrow_mut().take().expect(
             "no output under this display server — not expected under xvfb-run \
              (modal_reentrancy.rs verified exactly one), but this helper is about \

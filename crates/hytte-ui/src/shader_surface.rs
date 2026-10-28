@@ -91,6 +91,19 @@
 //! A shader that hangs the GPU takes the whole shell with it, which is the same
 //! trust the plugin's own native code already has.
 //!
+//! # Teardown
+//!
+//! Exactly `GlSurface`'s: the same `GtkGLArea` parent and the same
+//! `unrealize` (make the context current, drop every GL object, retire the
+//! context in `hytte-gl`, then hand back to GTK), so the same reading of GTK
+//! 4.22.4's source applies — a realized area is never finalized, the context
+//! is current inside the override only because it calls `make_current`
+//! (which can fail), and once `parent_unrealize` runs the context may be
+//! destroyed and its address reused. The citations live in
+//! [`gl_surface`](crate::gl_surface)'s module docs, under "Teardown, as GTK's
+//! source has it" (#1562), and are not repeated here, so a GTK bump has one
+//! place to re-check.
+//!
 //! # Sizing
 //!
 //! Measured exactly like [`PixelSurface`](crate::PixelSurface) and
@@ -719,7 +732,7 @@ mod imp {
         ShaderState, WarnLatch, abandon_gl, first_line, fit_rect, gdk, glib, refuse_data_grid,
         source_key, would_upload, wrapped_seconds,
     };
-    use crate::gl_surface::{GLSL_HEADER, GlValue};
+    use crate::gl_surface::{GLSL_HEADER, GlValue, retire_context};
     use gtk::prelude::*;
     use gtk::subclass::prelude::*;
     use hytte_gl as hgl;
@@ -859,6 +872,9 @@ mod imp {
             self.resources.replace(ResourceSlot::Unbuilt);
             self.warned_compile.borrow_mut().said.clear();
             self.origin.set(None);
+            // Last, with every handle of ours already gone — `GlSurface`'s
+            // reason (#1562; its module docs' teardown section).
+            retire_context(obj.upcast_ref());
             self.parent_unrealize();
         }
     }
@@ -1370,6 +1386,37 @@ mod imp {
                     ("u_bg", GlValue::Vec4([0.0, 0.0, 0.0, 1.0])),
                 ],
             })
+        }
+
+        /// **#1562, through `ShaderSurface`'s own `unrealize`** — the twin of
+        /// `gl_surface`'s
+        /// `a_handle_that_outlives_its_context_never_matches_the_next_one`,
+        /// over the same shared check, since this widget's `unrealize` has to
+        /// retire its context on its own.
+        ///
+        /// **Falsified** by deleting the `retire_context` call from this
+        /// widget's `unrealize`: the retire assertion reds on the first
+        /// round, on any driver.
+        #[gtk::test]
+        fn an_outlived_handle_never_deletes_under_the_next_context() {
+            const NAME: &str = "an_outlived_handle_never_deletes_under_the_next_context";
+            let surface = ShaderSurface::new();
+            let Some(reused) =
+                crate::gl_surface::assert_an_outlived_handle_never_deletes_under_a_reused_address(
+                    surface.upcast_ref(),
+                    NAME,
+                )
+            else {
+                return;
+            };
+            eprintln!(
+                "{NAME}: the driver {} the first context's address",
+                if reused {
+                    "reused"
+                } else {
+                    "never reused"
+                },
+            );
         }
 
         /// **#1180 item 9.** The widget that runs untrusted GLSL compiles it,

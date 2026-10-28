@@ -969,7 +969,10 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"answered"}
             let [first_pid] = stand_in::wait_for(dir.path(), 1).await[..] else {
                 panic!("one child before the second turn is sent");
             };
-            second.write_all(&request("pet", "two")).await.expect("send");
+            second
+                .write_all(&request("pet", "two"))
+                .await
+                .expect("send");
             tokio::time::sleep(Duration::from_millis(300)).await;
             assert_eq!(
                 stand_in::started(dir.path()),

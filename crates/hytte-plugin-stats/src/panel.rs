@@ -261,6 +261,10 @@ pub struct History {
     /// `0.0..=1.0` and capped at [`HISTORY_LEN`] — the expanded CPU row's
     /// series (#1419 item 2), native `cpu_per_core_history`.
     per_core: Vec<VecDeque<f32>>,
+    /// The CPU number of each [`per_core`](Self::per_core) window: the
+    /// `Snapshot::core_ids` the windows were started for. A snapshot naming
+    /// different CPUs starts them over, as a count change does (#1561).
+    core_ids: Vec<u32>,
     /// Per-core clock over the shared ceiling, one window per core that
     /// exposes `cpufreq` — the expanded Clock row's series, native
     /// `cpu_freq_per_core_history`.
@@ -353,6 +357,17 @@ impl History {
         // page shows — native keeps them in its sensors service for the same
         // reason: an expanded row opens onto the last minute, not onto an
         // empty graph. Two small rings per core, no read of their own.
+        //
+        // The load windows restart on a change of *which* CPUs they hold, not
+        // only of how many (#1561): one CPU going offline while another comes
+        // online between two ticks keeps the count, and `push_frame`'s width
+        // check alone would carry each later core's past on as a different
+        // CPU's line. Starting from no windows makes `push_frame` start fresh
+        // ones; an empty frame (a withheld reading) restarts nothing.
+        if !snapshot.per_core.is_empty() && self.core_ids != snapshot.core_ids {
+            self.per_core.clear();
+            self.core_ids.clone_from(&snapshot.core_ids);
+        }
         push_frame(&mut self.per_core, &snapshot.per_core);
         push_frame(&mut self.per_core_clock, &snapshot.per_core_clock);
     }
@@ -1170,6 +1185,7 @@ mod tests {
         Snapshot {
             cpu: Some(0.42),
             per_core: vec![0.1, 0.5, 0.9, 0.3],
+            core_ids: vec![0, 1, 2, 3],
             cpu_temp_c: Some(61.0),
             gpu: Some(Gpu {
                 name: "Test Adapter".to_owned(),
@@ -2484,6 +2500,55 @@ mod tests {
         };
         assert_eq!(newest(&h.per_core), vec![Some(0.0), Some(1.0), Some(0.0)]);
         assert_eq!(newest(&h.per_core_clock), vec![Some(0.0)]);
+    }
+
+    /// **#1561**: the load windows start over when the snapshot names
+    /// different CPUs at the same count, as they do on a count change. cpu2
+    /// going offline while cpu4 comes online keeps four windows; without the
+    /// `core_ids` check the third would carry cpu2's history on as cpu3's
+    /// line. The clock windows, whose frame names no CPUs, keep theirs, and a
+    /// cold tick still restarts nothing.
+    ///
+    /// **Falsified** by dropping the `core_ids` comparison in
+    /// [`History::push`].
+    #[test]
+    fn the_per_core_windows_restart_when_the_cpus_change_at_the_same_count() {
+        let frame = |ids: &[u32]| Snapshot {
+            per_core: vec![0.1, 0.2, 0.3, 0.4],
+            core_ids: ids.to_vec(),
+            per_core_clock: vec![0.5, 0.6],
+            ..Snapshot::default()
+        };
+        let lens = |windows: &[std::collections::VecDeque<f32>]| {
+            windows
+                .iter()
+                .map(std::collections::VecDeque::len)
+                .collect::<Vec<_>>()
+        };
+
+        let mut h = History::default();
+        for _ in 0..5 {
+            h.push(&frame(&[0, 1, 2, 3]));
+        }
+        assert_eq!(lens(&h.per_core), vec![5; 4], "same CPUs: windows grow");
+
+        h.push(&Snapshot::default());
+        assert_eq!(
+            lens(&h.per_core),
+            vec![5; 4],
+            "a cold tick restarts nothing"
+        );
+
+        h.push(&frame(&[0, 1, 3, 4]));
+        assert_eq!(
+            lens(&h.per_core),
+            vec![1; 4],
+            "a relabel at the same count starts every load window over"
+        );
+        assert_eq!(lens(&h.per_core_clock), vec![6; 2], "the clock keeps its");
+
+        h.push(&frame(&[0, 1, 3, 4]));
+        assert_eq!(lens(&h.per_core), vec![2; 4], "…then the new set grows");
     }
 
     /// **The header's words**, as literals (#1026): native's

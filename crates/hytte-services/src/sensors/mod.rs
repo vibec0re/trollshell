@@ -56,8 +56,8 @@ pub use hytte_sensors::{
     NetConnections, NetInterface, NetIo,
 };
 use hytte_sensors::{
-    GpuCache, MountSpec, compute_cpu_load, compute_disk_io, read_cpu_freq, read_cpu_temp,
-    read_disk_for_specs, read_gpu_with_cache, read_mountlist, read_net_connections,
+    CpuJiffies, GpuCache, MountSpec, compute_cpu_load, compute_disk_io, read_cpu_freq,
+    read_cpu_temp, read_disk_for_specs, read_gpu_with_cache, read_mountlist, read_net_connections,
     read_proc_diskstats, read_proc_meminfo, read_proc_net_dev, read_proc_stat, read_process_count,
 };
 use warn_latch::{WARN_COOLDOWN, WarnLatch};
@@ -75,7 +75,7 @@ use warn_latch::{WARN_COOLDOWN, WarnLatch};
 #[derive(Default)]
 struct TickData {
     /// Parsed `/proc/stat` entries, or `None` on read error.
-    cpu_stat: Option<Vec<(u64, u64)>>,
+    cpu_stat: Option<Vec<CpuJiffies>>,
     /// Per-core CPU clock snapshot from `/sys/.../cpufreq`. Empty/default when
     /// no cpufreq governor is present (e.g. VMs).
     cpu_freq: CpuFreq,
@@ -217,17 +217,17 @@ where
 /// Spawn a task that accumulates a **per-core** history: one `HISTORY_CAP`-sample
 /// ring per series, mirroring `hytte_ui`'s `MultiSparkline::push_frame` width-reset
 /// semantics. For each `source` emit, `extract` yields one frame (one sample per
-/// core); when the frame width changes (a CPU hot-plug, or the first real frame
-/// after the empty default) the rings are cleared and re-sized to the new width
-/// so history restarts cleanly, then the whole 2-D window is republished into
-/// `sink`. Consumed by a lazily-built per-core `MultiSparkline` via `set_frames`.
+/// core) plus the CPU number of each sample, and [`push_per_core_frame`] folds
+/// it in, restarting every ring on a CPU hot-plug; then the whole 2-D window is
+/// republished into `sink`. Consumed by a lazily-built per-core
+/// `MultiSparkline` via `set_frames`.
 fn spawn_per_core_history<T, F>(
     source: Mutable<T>,
     sink: Mutable<Arc<Vec<VecDeque<f64>>>>,
     extract: F,
 ) where
     T: Clone + Send + Sync + 'static,
-    F: Fn(&T) -> Vec<f64> + Clone + Send + 'static,
+    F: Fn(&T) -> (Vec<f64>, Vec<u32>) + Clone + Send + 'static,
 {
     spawn_supervised("sensors", move || {
         let source = source.clone();
@@ -235,23 +235,46 @@ fn spawn_per_core_history<T, F>(
         let extract = extract.clone();
         async move {
             let mut series: Vec<VecDeque<f64>> = Vec::new();
+            let mut cores: Vec<u32> = Vec::new();
             let mut stream = source.signal_cloned().to_stream();
             while let Some(value) = stream.next().await {
-                let frame = extract(&value);
-                if series.len() != frame.len() {
-                    series.clear();
-                    series.resize_with(frame.len(), || VecDeque::with_capacity(HISTORY_CAP));
-                }
-                for (buf, &sample) in series.iter_mut().zip(frame.iter()) {
-                    if buf.len() == HISTORY_CAP {
-                        buf.pop_front();
-                    }
-                    buf.push_back(sample);
-                }
+                let (frame, ids) = extract(&value);
+                push_per_core_frame(&mut series, &mut cores, &frame, &ids);
                 sink.set(Arc::new(series.clone()));
             }
         }
     });
+}
+
+/// Fold one per-core frame into `series`, one sample per ring.
+///
+/// **The rings restart on a CPU hot-plug**: when the frame's width changes, or
+/// when `ids` (the CPU number of each sample) differs from the `cores` the
+/// rings were built for, every ring is cleared and re-sized to the new width,
+/// so history starts over instead of a core's past landing on its neighbour's
+/// line. The width check alone misses one CPU going offline while another
+/// comes online between two samples (#1561): the count is unchanged, but from
+/// the offline CPU on, every ring would be fed a different CPU. A source that
+/// carries no CPU numbers passes an empty `ids` every time, which leaves the
+/// width check alone deciding, as before.
+fn push_per_core_frame(
+    series: &mut Vec<VecDeque<f64>>,
+    cores: &mut Vec<u32>,
+    frame: &[f64],
+    ids: &[u32],
+) {
+    if series.len() != frame.len() || cores.as_slice() != ids {
+        series.clear();
+        series.resize_with(frame.len(), || VecDeque::with_capacity(HISTORY_CAP));
+        cores.clear();
+        cores.extend_from_slice(ids);
+    }
+    for (buf, &sample) in series.iter_mut().zip(frame.iter()) {
+        if buf.len() == HISTORY_CAP {
+            buf.pop_front();
+        }
+        buf.push_back(sample);
+    }
 }
 
 // ── Service marker ────────────────────────────────────────────────────────────
@@ -343,17 +366,21 @@ impl Service for SensorsService {
         spawn_per_core_history(
             handles.cpu.clone(),
             handles.cpu_per_core_hist.clone(),
-            |c| c.per_core.clone(),
+            |c| (c.per_core.clone(), c.core_ids.clone()),
         );
+        // `CpuFreq` carries no CPU numbers, so this one restarts on a width
+        // change alone, as it always has.
         spawn_per_core_history(
             handles.cpu_freq.clone(),
             handles.cpu_freq_per_core_hist.clone(),
             |f| {
                 let ceiling = f.max_ceiling_hz;
-                f.per_core
+                let frame = f
+                    .per_core
                     .iter()
                     .map(|&hz| normalized_clock(hz, ceiling))
-                    .collect()
+                    .collect();
+                (frame, Vec::new())
             },
         );
 
@@ -562,8 +589,9 @@ pub fn process_count() -> impl Signal<Item = u32> {
 // ── Polling loop ──────────────────────────────────────────────────────────────
 
 struct PollState {
-    /// `(active_prev, total_prev)` per cpu line — index 0 = overall, 1+ = core N-1.
-    cpu_prev: Vec<(u64, u64)>,
+    /// The previous `/proc/stat` sample: one labelled entry per cpu line, the
+    /// aggregate included (`core: None`). Paired by label, not index (#1561).
+    cpu_prev: Vec<CpuJiffies>,
     /// name → `(rx_bytes, tx_bytes, sample_instant)`
     net_prev: HashMap<String, (u64, u64, Instant)>,
     /// disk name → `(read_bytes, write_bytes, sample_instant)` for the disk-I/O
@@ -863,7 +891,7 @@ fn log_blocking_io_recovery(latch: &mut WarnLatch) {
 /// `clippy::too_many_lines`.
 fn apply_cpu_load(
     state: &mut PollState,
-    cpu_stat: Option<Vec<(u64, u64)>>,
+    cpu_stat: Option<Vec<CpuJiffies>>,
     writer: &Mutable<CpuLoad>,
     now: Instant,
 ) {
@@ -1208,11 +1236,11 @@ fn wait_for_change(fd: BorrowedFd<'_>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CpuFreq, CpuLoad, CpuTemp, DiskIo, DiskMount, DiskUsage, GpuCache, GpuState, GpuVendor,
-        NetConnections, NetIo, PollState, PollWriters, TickData, TickInputs, WARN_COOLDOWN,
-        apply_conn_counts, apply_cpu_freq, apply_cpu_load, apply_cpu_temp, apply_disk,
-        apply_disk_io, apply_gpu, apply_memory, apply_network, poll_loop_with, poll_tick,
-        read_gpu_with_cache,
+        CpuFreq, CpuJiffies, CpuLoad, CpuTemp, DiskIo, DiskMount, DiskUsage, GpuCache, GpuState,
+        GpuVendor, HISTORY_CAP, NetConnections, NetIo, PollState, PollWriters, TickData,
+        TickInputs, WARN_COOLDOWN, apply_conn_counts, apply_cpu_freq, apply_cpu_load,
+        apply_cpu_temp, apply_disk, apply_disk_io, apply_gpu, apply_memory, apply_network,
+        poll_loop_with, poll_tick, push_per_core_frame, read_gpu_with_cache,
     };
     use futures_signals::signal::Mutable;
     use std::collections::HashMap;
@@ -1463,31 +1491,40 @@ mod tests {
 
     // ── apply_cpu_load: table test (input sample → published value) ─────────
 
+    /// A `/proc/stat` sample holding only the aggregate `cpu` line.
+    fn agg(active: u64, total: u64) -> Vec<CpuJiffies> {
+        vec![CpuJiffies {
+            core: None,
+            active,
+            total,
+        }]
+    }
+
     #[allow(clippy::float_cmp)]
     #[test]
     fn apply_cpu_load_table() {
         struct Case {
             name: &'static str,
-            prev: Vec<(u64, u64)>,
-            sample: Option<Vec<(u64, u64)>>,
+            prev: Vec<CpuJiffies>,
+            sample: Option<Vec<CpuJiffies>>,
             want_overall: Option<f64>,
-            want_prev_after: Vec<(u64, u64)>,
+            want_prev_after: Vec<CpuJiffies>,
         }
         let cases = [
             Case {
                 name: "first sample: no prior, load reads 0",
                 prev: Vec::new(),
-                sample: Some(vec![(50, 200)]),
+                sample: Some(agg(50, 200)),
                 want_overall: Some(0.0),
-                want_prev_after: vec![(50, 200)],
+                want_prev_after: agg(50, 200),
             },
             Case {
                 name: "second sample: half the total delta was active",
-                prev: vec![(50, 200)],
-                sample: Some(vec![(150, 400)]),
+                prev: agg(50, 200),
+                sample: Some(agg(150, 400)),
                 // d_active=100, d_total=200 → 0.5
                 want_overall: Some(0.5),
-                want_prev_after: vec![(150, 400)],
+                want_prev_after: agg(150, 400),
             },
             Case {
                 // Two identical `/proc/stat` samples: the jiffy total did not
@@ -1496,17 +1533,17 @@ mod tests {
                 // the place that *says* a stalled counter reads 0 rather than
                 // NaN or a panic.
                 name: "identical samples: d_total == 0 reads 0, not NaN",
-                prev: vec![(50, 200)],
-                sample: Some(vec![(50, 200)]),
+                prev: agg(50, 200),
+                sample: Some(agg(50, 200)),
                 want_overall: Some(0.0),
-                want_prev_after: vec![(50, 200)],
+                want_prev_after: agg(50, 200),
             },
             Case {
                 name: "read failure: writer untouched, prev untouched",
-                prev: vec![(50, 200)],
+                prev: agg(50, 200),
                 sample: None,
                 want_overall: None,
-                want_prev_after: vec![(50, 200)],
+                want_prev_after: agg(50, 200),
             },
         ];
 
@@ -1515,7 +1552,7 @@ mod tests {
             state.cpu_prev = c.prev;
             let writer = Mutable::new(CpuLoad {
                 overall: -1.0,
-                per_core: Vec::new(),
+                ..CpuLoad::default()
             });
             apply_cpu_load(&mut state, c.sample, &writer, Instant::now());
 
@@ -1531,6 +1568,74 @@ mod tests {
             }
             assert_eq!(state.cpu_prev, c.want_prev_after, "{}", c.name);
         }
+    }
+
+    // ── push_per_core_frame: the per-core history's restart rule ────────────
+
+    fn ring_lens(series: &[std::collections::VecDeque<f64>]) -> Vec<usize> {
+        series.iter().map(std::collections::VecDeque::len).collect()
+    }
+
+    /// **#1561**: the per-core rings restart when the set of CPUs changes, not
+    /// only when the count does. cpu2 going offline while cpu4 comes online
+    /// keeps the width at four; without the CPU-number check the third ring
+    /// would carry cpu2's past on as cpu3's line, and the fourth cpu3's as
+    /// cpu4's.
+    #[test]
+    fn per_core_history_restarts_on_a_relabel_as_on_a_count_change() {
+        let mut series = Vec::new();
+        let mut cores = Vec::new();
+        for _ in 0..3 {
+            push_per_core_frame(
+                &mut series,
+                &mut cores,
+                &[0.1, 0.2, 0.3, 0.4],
+                &[0, 1, 2, 3],
+            );
+        }
+        assert_eq!(ring_lens(&series), vec![3; 4], "same CPUs: rings grow");
+
+        push_per_core_frame(
+            &mut series,
+            &mut cores,
+            &[0.1, 0.2, 0.9, 0.0],
+            &[0, 1, 3, 4],
+        );
+        assert_eq!(
+            ring_lens(&series),
+            vec![1; 4],
+            "a relabel at the same width restarts every ring"
+        );
+        assert_eq!(cores, vec![0, 1, 3, 4]);
+
+        push_per_core_frame(
+            &mut series,
+            &mut cores,
+            &[0.1, 0.2, 0.9, 0.0],
+            &[0, 1, 3, 4],
+        );
+        assert_eq!(ring_lens(&series), vec![2; 4], "…then they grow again");
+
+        push_per_core_frame(&mut series, &mut cores, &[0.1, 0.2, 0.9], &[0, 1, 3]);
+        assert_eq!(
+            ring_lens(&series),
+            vec![1; 3],
+            "a count change restarts them, as it always did"
+        );
+    }
+
+    /// A source with no CPU numbers (`CpuFreq`) passes an empty `ids`, so the
+    /// width alone decides, as before #1561, and the rings stay capped.
+    #[test]
+    fn per_core_history_without_ids_restarts_on_width_alone() {
+        let mut series = Vec::new();
+        let mut cores = Vec::new();
+        for _ in 0..(HISTORY_CAP + 5) {
+            push_per_core_frame(&mut series, &mut cores, &[0.5, 0.25], &[]);
+        }
+        assert_eq!(ring_lens(&series), vec![HISTORY_CAP; 2]);
+        push_per_core_frame(&mut series, &mut cores, &[0.5, 0.25, 1.0], &[]);
+        assert_eq!(ring_lens(&series), vec![1; 3]);
     }
 
     // ── apply_cpu_freq: unconditional passthrough ────────────────────────────

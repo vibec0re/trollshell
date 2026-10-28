@@ -1087,6 +1087,7 @@ mod tests {
         Snapshot {
             cpu: Some(0.42),
             per_core: vec![0.1, 0.9, 0.5, 0.0],
+            core_ids: vec![0, 1, 2, 3],
             cpu_temp_c: Some(57.0),
             gpu: Some(Gpu {
                 name: "AMD Radeon RX 6800".to_owned(),

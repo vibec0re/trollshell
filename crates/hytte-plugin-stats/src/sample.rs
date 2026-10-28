@@ -43,7 +43,7 @@ use std::time::{Duration, Instant};
 
 use hytte_plugin::poll::{Gate, Wake};
 use hytte_plugin::{CmdReceiver, CmdSender};
-use hytte_sensors::GpuCache;
+use hytte_sensors::{CpuJiffies, GpuCache};
 
 use crate::top_apps::{self, TopApps, Walker};
 
@@ -68,6 +68,15 @@ pub struct Snapshot {
     /// before the first delta is available (the first tick has no previous
     /// sample to subtract) — see [`cpu_half`].
     pub per_core: Vec<f32>,
+    /// The kernel's number (`N` of `cpuN`) of each [`per_core`](Self::per_core)
+    /// entry: same length, same order, ascending, and empty exactly when
+    /// `per_core` is. CPUs can be offline, so this is not always `0..len`.
+    ///
+    /// The page's per-core history restarts when this changes, not only when
+    /// its length does: one CPU going offline while another comes online
+    /// between two ticks keeps the count but moves every later core to a
+    /// different CPU (#1561).
+    pub core_ids: Vec<u32>,
     /// CPU package temperature in °C, or `None` when no hwmon chip answers.
     pub cpu_temp_c: Option<f32>,
     /// The GPU, or `None` when there is none to read — which is what makes the
@@ -343,8 +352,9 @@ impl Needs {
 pub struct Sampler {
     /// What this instance draws, and therefore what it reads.
     needs: Needs,
-    /// Previous `/proc/stat` (busy, total) per core.
-    prev_cpu: Vec<(u64, u64)>,
+    /// Previous `/proc/stat` sample: busy and total jiffies per cpu line, each
+    /// labelled with its CPU so a hotplug pairs by label (#1561).
+    prev_cpu: Vec<CpuJiffies>,
     /// The resolved `/sys/class/hwmon` chip directory, once found.
     hwmon: Option<PathBuf>,
     /// `nvidia-smi` availability, its last successful reading (#1297), and
@@ -382,7 +392,7 @@ impl Sampler {
     #[must_use]
     pub fn tick(&mut self) -> Snapshot {
         let now = hytte_sensors::read_proc_stat().unwrap_or_default();
-        let (cpu, per_core) = cpu_half(&self.prev_cpu, &now);
+        let (cpu, per_core, core_ids) = cpu_half(&self.prev_cpu, &now);
         // Only replace the baseline with a reading we actually got: an
         // `Err` from `/proc/stat` (which should not happen on Linux, but is a
         // plain `io::Error` away) would otherwise wipe the baseline and cost
@@ -493,6 +503,7 @@ impl Sampler {
         Snapshot {
             cpu,
             per_core,
+            core_ids,
             cpu_temp_c,
             gpu,
             memory,
@@ -536,8 +547,9 @@ impl Sampler {
     }
 }
 
-/// The CPU half of a tick: the overall load and the per-core loads, **or
-/// nothing at all** when `/proc/stat` has not been read twice yet.
+/// The CPU half of a tick: the overall load, the per-core loads and the CPU
+/// number of each, **or nothing at all** when `/proc/stat` has not been read
+/// twice yet.
 ///
 /// This is the branch that makes "the first tick draws dashes" true, and it is
 /// split out of [`Sampler::tick`] so it can be driven from a `/proc/stat`-shaped
@@ -549,14 +561,15 @@ impl Sampler {
 /// — so a cold card would draw one *idle* lamp per core and a `CPU 0%`
 /// headline, which is a measurement it never made (#1277 MEDIUM 3). `None` and
 /// an empty `per_core` are what [`crate::card`] renders as `—` and `----`.
-fn cpu_half(prev: &[(u64, u64)], now: &[(u64, u64)]) -> (Option<f32>, Vec<f32>) {
+fn cpu_half(prev: &[CpuJiffies], now: &[CpuJiffies]) -> (Option<f32>, Vec<f32>, Vec<u32>) {
     if prev.is_empty() || now.is_empty() {
-        return (None, Vec::new());
+        return (None, Vec::new(), Vec::new());
     }
     let load = hytte_sensors::compute_cpu_load(prev, now);
     (
         Some(as_unit(load.overall)),
         load.per_core.iter().copied().map(as_unit).collect(),
+        load.core_ids,
     )
 }
 
@@ -1028,6 +1041,7 @@ mod tests {
     use crate::config::Card;
     use crate::top_apps::{TopApps, Walker};
     use hytte_plugin::cmd_channel;
+    use hytte_sensors::CpuJiffies;
     use hytte_sensors::app_usage::ProcSample;
 
     /// The Clock row's two numbers are the **fastest core now** over the
@@ -1281,7 +1295,18 @@ mod tests {
     /// confidently as a real one.
     #[test]
     fn the_first_tick_withholds_its_reading_instead_of_publishing_an_idle_one() {
-        let first = [(400, 1_000), (100, 250), (100, 250), (100, 250), (100, 250)];
+        // `(active, total)` per line: the aggregate `cpu` line, then `cpu0`…
+        let stat = |lines: &[(u64, u64)]| -> Vec<CpuJiffies> {
+            (0u32..)
+                .zip(lines)
+                .map(|(i, &(active, total))| CpuJiffies {
+                    core: i.checked_sub(1),
+                    active,
+                    total,
+                })
+                .collect()
+        };
+        let first = stat(&[(400, 1_000), (100, 250), (100, 250), (100, 250), (100, 250)]);
 
         // The upstream behaviour this branch exists to correct, pinned so a
         // change to `hytte-sensors` that made the branch redundant shows up
@@ -1293,24 +1318,26 @@ mod tests {
             "compute_cpu_load answers a cold prev with one zero per core, not nothing",
         );
 
-        let (cpu, per_core) = cpu_half(&[], &first);
+        let (cpu, per_core, core_ids) = cpu_half(&[], &first);
         assert_eq!(cpu, None, "the headline has nothing to report yet");
         assert!(per_core.is_empty(), "…and neither has the lamp row");
+        assert!(core_ids.is_empty(), "…nor the history's restart key");
         assert_eq!(crate::card::percent_text(cpu), "—");
         assert_eq!(crate::card::lamp_rows(&per_core), vec!["----".to_owned()]);
 
         // The *second* tick has a delta, and it is a real one: core 1 spent the
         // whole window busy and core 2 none of it.
-        let second = [
+        let second = stat(&[
             (700, 2_000),
             (350, 1_250),
             (100, 250),
             (100, 250),
             (100, 250),
-        ];
-        let (cpu2, per_core2) = cpu_half(&first, &second);
+        ]);
+        let (cpu2, per_core2, core_ids2) = cpu_half(&first, &second);
         assert!(cpu2.is_some(), "the second tick reports");
         assert_eq!(per_core2.len(), 4);
+        assert_eq!(core_ids2, vec![0, 1, 2, 3], "each load names its CPU");
         assert!(
             (per_core2[0] - 0.25).abs() < 1e-6,
             "core 0 was busy a quarter of the window: {per_core2:?}",
@@ -1327,7 +1354,7 @@ mod tests {
 
         // An unreadable `/proc/stat` is the same "nothing measured" state, not
         // a zero: a `now` of nothing cannot be subtracted from either.
-        assert_eq!(cpu_half(&first, &[]), (None, Vec::new()));
+        assert_eq!(cpu_half(&first, &[]), (None, Vec::new(), Vec::new()));
     }
 
     /// A [`Sampler`] can be constructed with cold caches and costs nothing
@@ -1347,7 +1374,11 @@ mod tests {
         let mut s = Sampler::new(Needs::default());
         s.prev_diskio
             .insert("sda".to_string(), (1, 2, std::time::Instant::now()));
-        s.prev_cpu.push((1, 2));
+        s.prev_cpu.push(CpuJiffies {
+            core: None,
+            active: 1,
+            total: 2,
+        });
         s.reset();
         assert!(s.prev_diskio.is_empty(), "stale disk-I/O baseline kept");
         assert!(s.prev_cpu.is_empty());

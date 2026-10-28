@@ -3611,6 +3611,7 @@ mod pin_tests {
         CpuLoad {
             overall: 0.5,
             per_core: vec![0.1, 0.4, 0.8, 1.0],
+            core_ids: vec![0, 1, 2, 3],
         }
     }
 
@@ -3698,6 +3699,7 @@ mod pin_tests {
             cpu.set(dressed(CpuLoad {
                 overall: 0.9,
                 per_core: vec![0.9, 0.2, 0.3, 0.4],
+                core_ids: vec![0, 1, 2, 3],
             }));
             pump();
         });

@@ -16,7 +16,7 @@
 //! # Public API
 //!
 //! ```ignore
-//! hytte_sensors::read_proc_stat()       -> Result<Vec<(u64, u64)>, io::Error>
+//! hytte_sensors::read_proc_stat()       -> Result<Vec<CpuJiffies>, io::Error>
 //! hytte_sensors::compute_cpu_load(..)   -> CpuLoad
 //! hytte_sensors::read_cpu_freq()        -> CpuFreq
 //! hytte_sensors::read_proc_meminfo()    -> Result<Memory, io::Error>
@@ -69,13 +69,39 @@ pub use proc_stat::{compute_cpu_load, read_proc_stat};
 
 // ── Public data shapes ────────────────────────────────────────────────────────
 
+/// One `cpu*` line of `/proc/stat`: which CPU it counts, and its jiffies.
+///
+/// The kernel prints one line per **online** CPU, so a core's position in the
+/// file moves when a lower-numbered one goes offline or comes back. The label
+/// is what lets [`compute_cpu_load`] pair a core with its own previous counts
+/// rather than with whichever core used to sit at the same index (#1561).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CpuJiffies {
+    /// `Some(n)` for a `cpuN` line, `None` for the aggregate `cpu` line.
+    pub core: Option<u32>,
+    /// Non-idle jiffies (everything but `idle + iowait`).
+    pub active: u64,
+    /// All jiffies.
+    pub total: u64,
+}
+
 /// Per-CPU load snapshot.
 #[derive(Clone, Debug, Default)]
 pub struct CpuLoad {
     /// Overall load, `0.0..=1.0`.
     pub overall: f64,
-    /// Per-logical-core load. Length matches the kernel's CPU count.
+    /// Per-logical-core load, one entry per online CPU in ascending CPU
+    /// number. Length matches the kernel's online CPU count.
     pub per_core: Vec<f64>,
+    /// The kernel's number (`N` of `cpuN`) of each [`per_core`](Self::per_core)
+    /// entry: same length, same order. Not always `0..len` — CPUs can be
+    /// offline, at boot or later.
+    ///
+    /// This is what a per-core history restarts on: windows built for one set
+    /// of CPUs must start over when this changes, not only when its length
+    /// does, or one CPU going offline and another coming online between two
+    /// samples would carry a core's history on in its neighbour's window.
+    pub core_ids: Vec<u32>,
 }
 
 /// Per-core CPU clock (cpufreq) snapshot, all frequencies in **Hz**.

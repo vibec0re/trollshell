@@ -63,8 +63,8 @@ use hytte_config::subsystem::{ConfigError, Origin, Raw};
 use hytte_config::{toml, toml_edit};
 
 use super::{
-    Control, Form, FormInner, Spec, Subject, build_form, humanise, leaf_of, parse_scalar, plural,
-    provenance,
+    Control, Form, FormInner, Refusal, Spec, Subject, build_form, humanise, leaf_of, parse_scalar,
+    plural, provenance,
 };
 
 /// What the operator is told a collection page cannot be edited *for*.
@@ -230,8 +230,23 @@ fn push(inner: &Rc<FormInner>, nav: &adw::NavigationView, page: SubPage) {
             // `on_pop` can reach back into this same cell, and `truncate`
             // under a `borrow_mut` would be a `BorrowMutError` rather than a
             // missed sweep.
+            //
+            // And skipped when the cell is **busy** (#1558 review, finding
+            // 3). Two forms watch one navigation view in a two-level
+            // drill-down — `workspaces`' `workspace.<name>.apps`, whose
+            // record page the *entry* form pushes onto the view the *top*
+            // form pushed the entry page onto. The top form's re-read holds
+            // its `open` across every page's refresh (`refresh_open`); the
+            // entry form's refresh can find its record gone and pop it, and
+            // `pop_to_page` emits `popped` synchronously, into this handler,
+            // for the top form too. A `borrow_mut` there panicked inside the
+            // signal emission and aborted the app. Skipping is correct, not
+            // merely safe: a page a nested form pops sits above every page
+            // the outer form pushed, so the outer form has nothing to forget.
             let doomed: Vec<SubPage> = {
-                let mut open = inner.open.borrow_mut();
+                let Ok(mut open) = inner.open.try_borrow_mut() else {
+                    return;
+                };
                 match open.iter().position(|sub| sub.page == *popped) {
                     Some(index) => open.split_off(index),
                     None => return,
@@ -1259,19 +1274,24 @@ impl RecordsPage {
     /// the poison record in the file for good. A record comes into being with
     /// its name, which is the rule a map entry already followed one level up
     /// ([`MapPage`]'s Add writes nothing either).
+    ///
+    /// "One past the end" is the end of the list as the **file** has it, not
+    /// as this page last drew it (#1558 review, finding 5): the record page
+    /// reads the file, so an index taken from a read that predates a record
+    /// appended on disk opened onto that record, and naming "the new one"
+    /// renamed it. So the drill-down is re-read first — the poll's own body,
+    /// from the idle tick this runs on — and the end taken from that.
     fn add(self: &Rc<Self>) {
-        let at = self
-            .form
-            .upgrade()
-            .map(|inner| {
-                inner
-                    .raw
-                    .borrow()
-                    .value(&self.key)
-                    .and_then(toml::Value::as_array)
-                    .map_or(0, Vec::len)
-            })
-            .unwrap_or_default();
+        let Some(inner) = self.form.upgrade() else {
+            return;
+        };
+        inner.reload_drill_down();
+        let at = inner
+            .raw
+            .borrow()
+            .value(&self.key)
+            .and_then(toml::Value::as_array)
+            .map_or(0, Vec::len);
         self.open(at);
     }
 
@@ -1532,8 +1552,8 @@ fn prune_empty_record(weak: &Weak<FormInner>, key: &str, index: usize) {
 /// element it addressed moved on disk, re-read the drill-down, so the page
 /// the refusal goes up on shows what it is about. Called **before** the
 /// banner is raised, because a page that rebuilds lowers it.
-fn reread_if_moved(inner: &FormInner, err: &ConfigError) {
-    if super::moved_on_disk(err) {
+fn reread_if_moved(inner: &FormInner, err: &Refusal) {
+    if err.changed_on_disk() {
         inner.reload_drill_down();
     }
 }

@@ -764,7 +764,30 @@ impl FormInner {
     /// failed. The banner is not that signal: it is only taken down on the
     /// path where the view moved, so one raised by an earlier failure can
     /// still be up over a read that has since succeeded unchanged.
+    ///
+    /// # A record page with a save pending is not re-read by the poll
+    ///
+    /// A record page's save is judged against [`Self::raw`] — the read the
+    /// edit was made against ([`reread_array`]) — and it sits for
+    /// [`SAVE_DEBOUNCE`] first. A poll tick inside that window used to
+    /// replace [`Self::raw`] under it (#1558 review, finding 2): a tick that
+    /// carried an insertion before the record re-based the page onto the
+    /// shifted array, and 300 ms later the pending value went into whichever
+    /// record then sat at that index, with nothing refused. So an unforced
+    /// re-read of a [`Subject::Element`] form with a save pending reads
+    /// nothing; the save itself re-reads when it lands or is refused
+    /// ([`Self::reload_after_write`], [`Self::reload_drill_down`]), and so
+    /// does `write_on_drop`. A forced re-read — the one after this form's own
+    /// write — still runs, so a second pending row of one record is judged
+    /// against what the first left. Only element forms: a leaf save rebuilds
+    /// nothing from the read.
     fn try_reload(&self, force: bool) -> Option<bool> {
+        if !force
+            && matches!(self.subject, Subject::Element { .. })
+            && self.rows.iter().any(|row| row.pending.borrow().is_some())
+        {
+            return Some(false);
+        }
         let next = match (self.ops.load)(&self.layers) {
             Ok(raw) => raw,
             Err(err) => {
@@ -928,7 +951,7 @@ impl FormInner {
                 // it is now, which is what the refusal tells the operator to
                 // look at. Before the error goes up, because a re-render
                 // clears a refusal on a row whose own value moved.
-                if moved_on_disk(&err) {
+                if err.changed_on_disk() {
                     self.reload_drill_down();
                 }
                 row.show_error(&err.to_string());
@@ -958,10 +981,12 @@ impl FormInner {
         row: &Row,
         value: Option<toml_edit::Value>,
         locked: &BTreeSet<String>,
-    ) -> Option<Result<(), ConfigError>> {
+    ) -> Option<Result<(), Refusal>> {
         let overlay = self.overlay.as_ref()?;
         Some(match &self.subject {
-            Subject::Leaves { .. } => self.write_leaf(overlay, row, value, locked),
+            Subject::Leaves { .. } => self
+                .write_leaf(overlay, row, value, locked)
+                .map_err(Refusal::from),
             Subject::Element {
                 array,
                 index,
@@ -1132,12 +1157,13 @@ impl FormInner {
         row: &Row,
         value: Option<toml_edit::Value>,
         locked: &BTreeSet<String>,
-    ) -> Result<(), ConfigError> {
+    ) -> Result<(), Refusal> {
         let ElementAt {
             array: array_key,
             index,
             key_field,
         } = at;
+        let refuse = |reason: &str| Err(Refusal::from(self.not_a_leaf(&row.key, reason)));
         if let Some(value) = &value {
             self.check(&row.key, row.field.kind, value)?;
         }
@@ -1154,41 +1180,35 @@ impl FormInner {
                 return Ok(());
             }
             if index != array.len() {
-                return Err(self.not_a_leaf(
-                    &row.key,
+                return refuse(
                     "the array no longer has an entry there — it moved underneath this page",
-                ));
+                );
             }
             if !naming {
                 let name = key_field.map_or_else(
                     || "a name".to_owned(),
                     |field| format!("a {}", humanise(field).to_lowercase()),
                 );
-                return Err(self.not_a_leaf(
-                    &row.key,
-                    &format!(
-                        "give it {name} first — a record with no name is one the shell reads \
-                         as a broken list, so it is not written until it has one"
-                    ),
+                return refuse(&format!(
+                    "give it {name} first — a record with no name is one the shell reads as a \
+                     broken list, so it is not written until it has one"
                 ));
             }
             array.push(toml_edit::InlineTable::new());
         } else if naming && value.is_none() {
-            return Err(self.not_a_leaf(
-                &row.key,
-                "a record is named by this, and one without a name is a list the shell \
-                 refuses whole — remove the record from the list instead of clearing it",
-            ));
+            return refuse(
+                "a record is named by this, and one without a name is a list the shell refuses \
+                 whole — remove the record from the list instead of clearing it",
+            );
         }
 
         let Some(element) = array
             .get_mut(index)
             .and_then(toml_edit::Value::as_inline_table_mut)
         else {
-            return Err(self.not_a_leaf(
-                &row.key,
+            return refuse(
                 "the array no longer has an entry there — it moved underneath this page",
-            ));
+            );
         };
         match value {
             Some(value) => {
@@ -1206,7 +1226,7 @@ impl FormInner {
         // so it is the order to write back.
         let order: Vec<&str> = self.rows.iter().map(|row| row.field.path).collect();
         let array = collection::in_field_order(&array, &order);
-        self.write_array(overlay, array_key, Some(array), locked)
+        Ok(self.write_array(overlay, array_key, Some(array), locked)?)
     }
 
     /// Write a whole inline array at `key` — the write unit for **every**
@@ -1251,11 +1271,7 @@ impl FormInner {
     /// The one door every whole-array write goes through: a record field
     /// here, and a record's or a list item's removal, edit or append on the
     /// collection pages.
-    fn array_for_edit(
-        &self,
-        key: &str,
-        at: Option<usize>,
-    ) -> Result<Option<toml::Value>, ConfigError> {
+    fn array_for_edit(&self, key: &str, at: Option<usize>) -> Result<Option<toml::Value>, Refusal> {
         reread_array(self.ops, &self.layers, &self.raw.borrow(), key, at)
     }
 
@@ -1336,16 +1352,78 @@ fn element_of<'a>(raw: &'a Raw, array: &str, index: usize) -> Option<&'a toml::T
 
 // ── Whole-array writes: rebuilt from the file, judged against the page ──────
 
-/// Why a whole-array edit was refused when the element it addresses changed
-/// on disk since the page was drawn — [`reread_array`]'s refusal, and what
-/// [`moved_on_disk`] recognises.
-const MOVED_ON_DISK: &str = "it changed on disk since this page was drawn, so nothing was saved — the page now \
-     shows the file as it is; make the change again if you still want it";
+/// Why a save was refused: one of the writer's own refusals, or the one a
+/// whole-array edit adds — what it addresses is not what the page was drawn
+/// from any more (#1558).
+///
+/// A type of this form's own rather than a [`ConfigError`] variant, because
+/// the conflict is between a page and the file under it, which is this
+/// form's notion and not the writer's — and so that it reads as a conflict
+/// (*"changed on disk since this page was drawn"*) rather than under
+/// [`ConfigError::NotALeaf`]'s *"is not a leaf this editor may write"*.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Refusal {
+    /// The writer's, the layered reader's, or one of this form's own
+    /// [`ConfigError`]s.
+    Config(ConfigError),
+    /// [`reread_array`]: the element a whole-array edit addresses, or the
+    /// array's lock, changed on disk since the page was drawn.
+    ChangedOnDisk {
+        /// [`Family::name`].
+        subsystem: &'static str,
+        /// The array, or `array[index]` for the element the edit addresses.
+        key: String,
+        /// Whether the array is locked in the fresh read — what a
+        /// `nixos-rebuild` inside the poll window leaves.
+        pinned: bool,
+    },
+}
+
+impl Refusal {
+    /// Whether this is the refusal a page answers by re-reading — so what it
+    /// shows is what the refusal tells the operator to look at.
+    fn changed_on_disk(&self) -> bool {
+        matches!(self, Self::ChangedOnDisk { .. })
+    }
+}
+
+impl From<ConfigError> for Refusal {
+    fn from(err: ConfigError) -> Self {
+        Self::Config(err)
+    }
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Config(err) => err.fmt(f),
+            Self::ChangedOnDisk {
+                subsystem,
+                key,
+                pinned: false,
+            } => write!(
+                f,
+                "{subsystem}.{key} changed on disk since this page was drawn, so nothing was \
+                 saved — the page now shows the file as it is; make the change again if you \
+                 still want it"
+            ),
+            Self::ChangedOnDisk {
+                subsystem,
+                key,
+                pinned: true,
+            } => write!(
+                f,
+                "{subsystem}.{key} was pinned by a base layer since this page was drawn (set in \
+                 nix), so nothing was saved — your own file is unchanged"
+            ),
+        }
+    }
+}
 
 /// The value at `key` as the layers say it **now** — re-read just before a
 /// whole-array edit is applied to it — provided the element the edit
 /// addresses (`at`) says the same there as in `base`, the read the page was
-/// drawn from (#1558).
+/// drawn from, and the array is locked in both reads or in neither (#1558).
 ///
 /// `at` is `None` for an **append**, which addresses nothing already in the
 /// array and so cannot have been moved underneath. For every other edit — a
@@ -1353,15 +1431,24 @@ const MOVED_ON_DISK: &str = "it changed on disk since this page was drawn, so no
 /// index is only meaningful against the array the operator was looking at,
 /// and an element that moved in the meantime (renamed, replaced, shifted by
 /// an insertion or a removal before it) would take the edit to a record they
-/// never touched. That is refused, as a [`ConfigError::NotALeaf`] carrying
-/// [`MOVED_ON_DISK`], the sibling of `write_element`'s own *"moved underneath
-/// this page"*.
+/// never touched. That is refused as [`Refusal::ChangedOnDisk`], the sibling
+/// of `write_element`'s own *"moved underneath this page"*.
+///
+/// The **lock** is part of the same question (#1558 review, finding 1). A
+/// `nixos-rebuild` that pins the array after the page was drawn makes the
+/// merged read hand back the base layer's array, while the writers check the
+/// lock set the *page* was drawn with — so the edit would be applied to the
+/// nix array and written into the operator's own file, losing their entries.
+/// Before #1558 the array and the lock set came from the same stale read,
+/// which was harmless; now that the array is fresh, the lock is judged fresh
+/// too, and an append is not exempt from it.
 ///
 /// What this buys over rebuilding from `base`: nothing the file gained since
 /// `base` is written away. Another element changed by hand, an item appended
 /// by another save — the edit lands on the array that holds them. What it
 /// costs is a refusal when the edit's own target moved, which needs a write
-/// to that very element inside one poll window.
+/// to that very element (or a rebuild that pins the array) inside one poll
+/// window.
 ///
 /// A read that fails is the refusal, for `write_on_drop`'s reason: a write
 /// against a read this form cannot make is a guess.
@@ -1371,13 +1458,14 @@ fn reread_array(
     base: &Raw,
     key: &str,
     at: Option<usize>,
-) -> Result<Option<toml::Value>, ConfigError> {
+) -> Result<Option<toml::Value>, Refusal> {
     let fresh = (ops.load)(layers)?;
-    if !unmoved(base.value(key), fresh.value(key), at) {
-        return Err(ConfigError::NotALeaf {
-            subsystem: ops.family.name.to_owned(),
+    let pinned = fresh.is_locked(key);
+    if pinned != base.is_locked(key) || !unmoved(base.value(key), fresh.value(key), at) {
+        return Err(Refusal::ChangedOnDisk {
+            subsystem: ops.family.name,
             key: at.map_or_else(|| key.to_owned(), |index| format!("{key}[{index}]")),
-            reason: MOVED_ON_DISK.to_owned(),
+            pinned,
         });
     }
     Ok(fresh.value(key).cloned())
@@ -1401,8 +1489,7 @@ fn unmoved(base: Option<&toml::Value>, fresh: Option<&toml::Value>, at: Option<u
     }
 }
 
-/// `a == b`, except that a float NaN equals itself and a table's key order
-/// does not count.
+/// `a == b`, except that a float NaN equals itself, at any depth.
 ///
 /// Not `PartialEq` alone: a hand-written `nan` anywhere in a record would
 /// make that record compare unequal to itself on every read, and every edit
@@ -1423,12 +1510,6 @@ fn same_value(a: &toml::Value, b: &toml::Value) -> bool {
         }
         _ => a == b,
     }
-}
-
-/// Whether `err` is [`reread_array`]'s refusal — the one a page answers by
-/// re-reading, so what it shows is what the refusal says to look at.
-fn moved_on_disk(err: &ConfigError) -> bool {
-    matches!(err, ConfigError::NotALeaf { reason, .. } if reason == MOVED_ON_DISK)
 }
 
 /// `value` as the `toml_edit` array a whole-array edit patches, or an empty
@@ -2827,8 +2908,10 @@ mod tests {
 
     /// …and when the element the edit addresses is the one that moved, the
     /// index may name another record by now, so the edit is refused — as
-    /// [`MOVED_ON_DISK`], naming the element — while an edit of an element
-    /// that did not move, and an append, still go through onto the new file.
+    /// [`Refusal::ChangedOnDisk`], naming the element, and reading as a
+    /// conflict rather than as a leaf this editor may not write — while an
+    /// edit of an element that did not move, and an append, still go through
+    /// onto the new file.
     ///
     /// **Red without `reread_array`'s `unmoved` check**: the rename is
     /// silently built on, and an edit meant for `first` lands on `uno`.
@@ -2842,10 +2925,18 @@ mod tests {
         std::fs::write(&overlay, renamed).expect("the scratch overlay is writable");
         let err = reread_array(ops, &layers, &base, "items", Some(0))
             .expect_err("record 0 was renamed on disk");
-        assert!(moved_on_disk(&err), "the refusal is the moved one: {err}");
+        assert_eq!(
+            err,
+            Refusal::ChangedOnDisk {
+                subsystem: "form-fixture",
+                key: "items[0]".to_owned(),
+                pinned: false,
+            }
+        );
         assert!(
-            err.to_string().contains("form-fixture.items[0]"),
-            "it names the element: {err}"
+            err.to_string()
+                .starts_with("form-fixture.items[0] changed on disk since this page was drawn"),
+            "it names the element, as a conflict: {err}"
         );
 
         assert_eq!(
@@ -2890,9 +2981,8 @@ mod tests {
         let two = parse("[{ id = \"a\" }, { id = \"b\" }]");
         let appended = parse("[{ id = \"a\" }, { id = \"b\" }, { id = \"c\" }]");
         let inserted = parse("[{ id = \"z\" }, { id = \"a\" }, { id = \"b\" }]");
-        let reordered_keys = parse("[{ exec = \"x\", id = \"a\" }]");
-        let keys = parse("[{ id = \"a\", exec = \"x\" }]");
         let nan = parse("[{ id = \"a\", weight = nan }]");
+        let nested_nan = parse("[{ id = \"a\", weights = [1.0, nan] }]");
 
         assert!(unmoved(Some(&two), Some(&appended), Some(1)));
         assert!(!unmoved(Some(&two), Some(&inserted), Some(0)));
@@ -2902,8 +2992,59 @@ mod tests {
         assert!(unmoved(Some(&two), Some(&two), Some(5)), "absent from both");
         assert!(unmoved(Some(&two), None, None), "an append");
         assert!(!unmoved(Some(&two), None, Some(0)), "the array went");
-        assert!(unmoved(Some(&keys), Some(&reordered_keys), Some(0)));
         assert!(unmoved(Some(&nan), Some(&nan.clone()), Some(0)), "NaN");
+        assert!(
+            unmoved(Some(&nested_nan), Some(&nested_nan.clone()), Some(0)),
+            "a NaN inside an array inside a record"
+        );
+        assert!(
+            !unmoved(Some(&nan), Some(&nested_nan), Some(0)),
+            "NaN is not anything"
+        );
+    }
+
+    /// #1558 review, finding 1: a base layer that **pins** the array after
+    /// the page was drawn — a `nixos-rebuild` inside the poll window — makes
+    /// the merged read hand back the nix array. An edit applied to that would
+    /// write the nix array into the operator's own file, so it is refused,
+    /// marked `pinned`, for every kind of edit **including an append**, which
+    /// the element check alone would let through.
+    ///
+    /// **Red without the lock half of `reread_array`'s check**: every call
+    /// returns `Ok` with the nix array.
+    #[test]
+    fn a_whole_array_edit_after_a_base_layer_pinned_the_array_is_refused() {
+        let (tree, _overlay, layers) = scratch_layers(TWO_RECORDS);
+        let ops = fixture_ops();
+        let base = (ops.load)(&layers).expect("the scratch layers read");
+
+        let nix = tree
+            .path()
+            .join("etc")
+            .join("trollshell")
+            .join("form-fixture.toml");
+        std::fs::create_dir_all(nix.parent().expect("a base layer has a directory"))
+            .expect("the scratch base directory is writable");
+        std::fs::write(
+            &nix,
+            "_locked = [\"items\"]\nitems = [{ id = \"first\", exec = \"run\" }, { id = \"nix\" }]\n",
+        )
+        .expect("the scratch base layer is writable");
+        assert!(
+            layers.bases.iter().any(|layer| layer == &nix),
+            "the scratch base layer must be one the form reads: {:?}",
+            layers.bases
+        );
+
+        for at in [Some(0), Some(1), None] {
+            let err = reread_array(ops, &layers, &base, "items", at)
+                .expect_err("a base layer pinned the array since the page was drawn");
+            assert!(
+                matches!(err, Refusal::ChangedOnDisk { pinned: true, .. }),
+                "at {at:?}: {err:?}"
+            );
+            assert!(err.to_string().contains("pinned by a base layer"), "{err}");
+        }
     }
 
     #[test]
@@ -5736,5 +5877,386 @@ mod gtk_tests {
         assert!(refusal.contains("changed on disk"), "{refusal}");
         let slot: adw::EntryRow = page.find("Order 1").expect("the re-read page");
         assert_eq!(slot.text(), "zero", "the page shows the file as it is now");
+    }
+
+    // ── #1558 review round (PR #1627) ───────────────────────────────────────
+
+    /// Two records, the second the operator's own — what most of the review
+    /// round's tests draw their page from.
+    const RECORDS: &str =
+        "items = [{ id = \"first\", exec = \"run\" }, { id = \"second\", exec = \"mine\" }]\n";
+
+    /// [`RECORDS`] with `zero` inserted in front: every record's index moves
+    /// up by one, so index 1 now holds `first`.
+    const RECORDS_SHIFTED: &str = "items = [{ id = \"zero\" }, { id = \"first\", exec = \"run\" }, \
+                                   { id = \"second\", exec = \"mine\" }]\n";
+
+    /// The `Exec` row of the record page on top of `form`'s drill-down.
+    fn exec_row(record: &FormInner) -> &Row {
+        record
+            .rows
+            .iter()
+            .find(|row| row.field.path == "exec")
+            .expect("the record page has an Exec row")
+    }
+
+    /// Review finding 1 (R1): a base layer pins `order` — a `nixos-rebuild`
+    /// — after the list page was drawn and before the next poll. An append
+    /// used to be applied to the merged read, which by then is the nix list,
+    /// and written into the operator's own file under the page's stale lock
+    /// set: `order = ["nix", "three"]`, their own two items gone.
+    ///
+    /// **Red without the lock half of `reread_array`'s check.**
+    #[gtk::test]
+    fn a_list_append_after_a_base_layer_pinned_the_list_leaves_the_operators_file_alone() {
+        let scratch = Scratch::new();
+        let overlay = scratch.overlay("form-fixture");
+        Scratch::write(&overlay, "order = [\"one\", \"two\"]\n");
+        let page = mounted(&scratch, None);
+        stop_poll(&page.form);
+        page.open("order");
+
+        Scratch::write(
+            &scratch.base("form-fixture"),
+            "_locked = [\"order\"]\norder = [\"nix\"]\n",
+        );
+        page.type_into("Add an order", "three");
+        assert_eq!(
+            Scratch::read(&overlay),
+            "order = [\"one\", \"two\"]\n",
+            "the append rewrote the operator's own file under a lock"
+        );
+        let refusal = page.refusal().expect("the refusal is on the page");
+        assert!(refusal.contains("pinned by a base layer"), "{refusal}");
+    }
+
+    /// Review finding 1 (R2): the same for a record field saved through the
+    /// row's own debounce — `[first(walk), {id = "nix-only"}]` was written
+    /// into the operator's file, their `second` gone.
+    ///
+    /// **Red without the lock half of `reread_array`'s check.**
+    #[gtk::test]
+    fn a_record_edit_after_a_base_layer_pinned_the_records_leaves_the_operators_file_alone() {
+        let scratch = Scratch::new();
+        let overlay = scratch.overlay("form-fixture");
+        Scratch::write(&overlay, RECORDS);
+        let page = mounted(&scratch, None);
+        stop_poll(&page.form);
+        page.open("items");
+        page.activate_row("first");
+        let record = top_sub_form(&page.form);
+
+        Scratch::write(
+            &scratch.base("form-fixture"),
+            "_locked = [\"items\"]\nitems = [{ id = \"first\", exec = \"run\" }, { id = \"nix-only\" }]\n",
+        );
+        page.type_into("Exec", "walk");
+        let exec = exec_row(&record);
+        settle_until("the refusal to reach the Exec row", || exec.failed.get());
+        assert_eq!(
+            Scratch::read(&overlay),
+            RECORDS,
+            "the record edit rewrote the operator's own file under a lock"
+        );
+        assert!(
+            exec.note.get().contains("pinned by a base layer"),
+            "{}",
+            exec.note.get()
+        );
+    }
+
+    /// Review finding 2 (R3), the timer path: a poll tick lands inside the
+    /// row's 300 ms save delay and carries an insertion before the record
+    /// being edited. The tick used to re-base the record page onto the
+    /// shifted array, and the pending value then went into `first` — the
+    /// record that slid into index 1 — with nothing refused.
+    ///
+    /// **Red without `try_reload`'s hold** on a record page with a save
+    /// pending: the file ends `{ id = "first", exec = "walk" }`.
+    #[gtk::test]
+    fn a_poll_inside_the_save_delay_does_not_carry_a_pending_edit_to_another_record() {
+        let scratch = Scratch::new();
+        let overlay = scratch.overlay("form-fixture");
+        Scratch::write(&overlay, RECORDS);
+        let page = mounted(&scratch, None);
+        stop_poll(&page.form);
+        page.open("items");
+        page.activate_row("second");
+        let record = top_sub_form(&page.form);
+        page.type_into("Exec", "walk");
+        assert_eq!(Scratch::read(&overlay), RECORDS, "sanity: still debounced");
+
+        Scratch::write(&overlay, RECORDS_SHIFTED);
+        // The poll's own body, once — what the 2 s timer would have run.
+        page.form.refresh_from_disk();
+        let exec = exec_row(&record);
+        settle_until("the pending save to land or be refused", || {
+            Scratch::read(&overlay) != RECORDS_SHIFTED || exec.failed.get()
+        });
+        assert_eq!(
+            Scratch::read(&overlay),
+            RECORDS_SHIFTED,
+            "the edit typed on `second` was written somewhere"
+        );
+        assert!(
+            exec.note.get().contains("changed on disk"),
+            "the save was refused on its row: {}",
+            exec.note.get()
+        );
+    }
+
+    /// Review finding 2 (R3b), the drop path: the same tick, then Back
+    /// inside the save delay, so the pending edit is written as the record
+    /// page's form is dropped.
+    ///
+    /// **Red without `try_reload`'s hold.**
+    #[gtk::test]
+    fn back_inside_the_save_delay_after_a_poll_does_not_carry_the_edit_to_another_record() {
+        let scratch = Scratch::new();
+        let overlay = scratch.overlay("form-fixture");
+        Scratch::write(&overlay, RECORDS);
+        let page = mounted(&scratch, None);
+        stop_poll(&page.form);
+        page.open("items");
+        page.activate_row("second");
+        page.type_into("Exec", "walk");
+        Scratch::write(&overlay, RECORDS_SHIFTED);
+        page.form.refresh_from_disk();
+
+        // Synchronous: the parent's drop pops the record page and drops its
+        // form inside it, with no main-loop turn for the debounce to fire in.
+        let Mounted { form, nav } = page;
+        drop(form);
+        drop(nav);
+        assert_eq!(
+            Scratch::read(&overlay),
+            RECORDS_SHIFTED,
+            "the drop wrote the edit typed on `second` somewhere"
+        );
+    }
+
+    /// Review finding 4 (R4): the drop path's own element check — Back
+    /// inside the save delay with the record renamed on disk in between and
+    /// no poll at all. The drop's write is refused; the rename stays.
+    ///
+    /// **Red if `write_on_drop` adopts its pre-read as [`FormInner::raw`]**
+    /// (the #1519 behaviour), which makes the element check compare the file
+    /// with itself.
+    #[gtk::test]
+    fn back_inside_the_save_delay_refuses_a_record_that_changed_on_disk() {
+        let scratch = Scratch::new();
+        let overlay = scratch.overlay("form-fixture");
+        Scratch::write(&overlay, RECORDS);
+        let page = mounted(&scratch, None);
+        stop_poll(&page.form);
+        page.open("items");
+        page.activate_row("first");
+        page.type_into("Exec", "walk");
+        let renamed =
+            "items = [{ id = \"uno\", exec = \"run\" }, { id = \"second\", exec = \"mine\" }]\n";
+        Scratch::write(&overlay, renamed);
+
+        let Mounted { form, nav } = page;
+        drop(form);
+        drop(nav);
+        assert_eq!(
+            Scratch::read(&overlay),
+            renamed,
+            "the drop path wrote over a record that changed on disk"
+        );
+    }
+
+    /// Review finding 4 (R5): the records page's own Remove builds on the
+    /// file, so a record appended on disk since the page was drawn survives
+    /// removing another one.
+    ///
+    /// **Red if `RecordsPage::write` builds from its cache** while keeping
+    /// the check: `third` is written away.
+    #[gtk::test]
+    fn a_records_page_remove_keeps_a_record_appended_on_disk() {
+        let scratch = Scratch::new();
+        let overlay = scratch.overlay("form-fixture");
+        Scratch::write(&overlay, RECORDS);
+        let page = mounted(&scratch, None);
+        stop_poll(&page.form);
+        page.open("items");
+        Scratch::write(
+            &overlay,
+            "items = [{ id = \"first\", exec = \"run\" }, { id = \"second\", exec = \"mine\" }, \
+             { id = \"third\" }]\n",
+        );
+        page.remove("first");
+        assert_eq!(page.refusal(), None);
+        assert_eq!(
+            Scratch::read(&overlay),
+            "items = [{ id = \"second\", exec = \"mine\" }, { id = \"third\" }]\n",
+            "the record appended on disk was written away by a Remove"
+        );
+    }
+
+    /// Review finding 5 (R8): *Add* after a record was appended on disk
+    /// since the records page was drawn. The one-past-the-end index came
+    /// from the page's read while the record page read the file, so *Add*
+    /// opened onto `third`, and naming the new record renamed it.
+    ///
+    /// **Red without `RecordsPage::add`'s re-read**: the file ends with
+    /// `{ id = "fourth" }` where `third` was.
+    #[gtk::test]
+    fn add_after_a_record_was_appended_on_disk_adds_a_new_record() {
+        let scratch = Scratch::new();
+        let overlay = scratch.overlay("form-fixture");
+        Scratch::write(&overlay, RECORDS);
+        let page = mounted(&scratch, None);
+        stop_poll(&page.form);
+        page.open("items");
+        let appended = "items = [{ id = \"first\", exec = \"run\" }, { id = \"second\", exec = \
+                        \"mine\" }, { id = \"third\" }]\n";
+        Scratch::write(&overlay, appended);
+
+        page.activate_row("Add an item");
+        let id: adw::EntryRow = page.find("ID").expect("the new record's ID row");
+        assert_eq!(id.text(), "", "Add opened onto an existing record");
+        page.type_into("ID", "fourth");
+        settle_until("the name", || Scratch::read(&overlay).contains("fourth"));
+        assert_eq!(
+            Scratch::read(&overlay),
+            "items = [{ id = \"first\", exec = \"run\" }, { id = \"second\", exec = \"mine\" }, \
+             { id = \"third\" }, { id = \"fourth\" }]\n",
+            "Add must append, not rename the record appended on disk"
+        );
+    }
+
+    /// The marker a child process scenario is run under — set only by
+    /// [`a_record_vanishing_under_a_two_level_drill_down_aborts_nothing`].
+    const NESTED_CHILD: &str = "TROLLSHELL_CC_NESTED_VANISH_CHILD";
+
+    /// What a child scenario prints as its last act, so the parent can tell
+    /// "ran to the end" from "matched no test" — libtest exits 0 for both.
+    const NESTED_CHILD_OK: &str = "nested-vanish-child: survived";
+
+    /// Review finding 3 (R7, R7b): a two-level drill-down — `workspaces`'
+    /// `workspace.<name>.apps`, records inside a map entry — with an app
+    /// record's page open while that record is deleted on disk. The top
+    /// form's re-read holds its `open` cell across every page's refresh; the
+    /// entry form's refresh pops the record page; `popped` is emitted
+    /// synchronously into the top form's handler, which took the same cell
+    /// mutably — a `BorrowMutError` panic inside a GTK signal emission, which
+    /// cannot unwind and **aborts** the process. On `main` the 2 s poll
+    /// reached it; this PR's refusal re-read reached it from a field save.
+    ///
+    /// Each scenario runs in a **child process** — this test binary,
+    /// re-executed on one exact inner test — because an abort takes the
+    /// whole binary down with it: in-process it would kill every test after
+    /// it rather than fail this one. The parent turns the child's exit into
+    /// an ordinary failure carrying its stderr.
+    ///
+    /// **Red without `push`'s `try_borrow_mut`**: both children die on
+    /// `SIGABRT` with *"already borrowed"* on stderr.
+    #[test]
+    fn a_record_vanishing_under_a_two_level_drill_down_aborts_nothing() {
+        let exe = std::env::current_exe().expect("this test binary's own path");
+        for inner in [
+            "config_form::gtk_tests::nested_vanish_under_a_poll_inner",
+            "config_form::gtk_tests::nested_vanish_under_a_field_save_inner",
+        ] {
+            let out = std::process::Command::new(&exe)
+                .args(["--exact", "--nocapture", "--test-threads=1", inner])
+                .env(NESTED_CHILD, "1")
+                .output()
+                .expect("re-exec this test binary on one inner test");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                out.status.success(),
+                "{inner} did not survive ({:?})\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+                out.status,
+            );
+            assert!(
+                stdout.contains(NESTED_CHILD_OK),
+                "{inner} exited 0 without reaching its end — a stale filter matches no test and \
+                 libtest still reports success\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+            );
+        }
+    }
+
+    /// The two-level drill-down both inner scenarios start from: the
+    /// `workspaces` form, the `chat` workspace's page, its *Apps* list, and
+    /// the record page of its second app — over a scratch tree with no poll.
+    fn nested_record_page(scratch: &Scratch) -> Mounted {
+        Scratch::write(
+            &scratch.overlay("workspaces"),
+            "[workspace.chat]\napps = [{ id = \"a\" }, { id = \"b\" }]\n",
+        );
+        let ops = family("workspaces").expect("the workspaces family");
+        let form = build(ops, &scratch.env());
+        stop_poll(&form);
+        let page = adw::PreferencesPage::new();
+        for group in form.groups() {
+            page.add(group);
+        }
+        let nav = adw::NavigationView::new();
+        nav.add(&adw::NavigationPage::new(&page, "Workspaces"));
+        let page = Mounted { form, nav };
+        page.open("workspace");
+        page.activate_row("chat");
+        page.activate_row("Apps");
+        page.activate_row("b");
+        assert_eq!(page.depth(), 5, "workspaces › workspace › chat › Apps › b");
+        page
+    }
+
+    /// The scenario after the re-read: the record page is gone, its list is
+    /// on top, and the deletion on disk is still the file.
+    fn assert_the_vanish_was_kept(scratch: &Scratch, page: &Mounted) {
+        assert_eq!(page.title(), "Apps", "the vanished record's page came down");
+        assert_eq!(
+            Scratch::read(&scratch.overlay("workspaces")),
+            "[workspace.chat]\napps = [{ id = \"a\" }]\n",
+            "the vanished record was written back"
+        );
+    }
+
+    /// R7: the record goes away on disk, then one poll tick. Run by
+    /// [`a_record_vanishing_under_a_two_level_drill_down_aborts_nothing`];
+    /// does nothing unless its marker is set.
+    #[gtk::test]
+    fn nested_vanish_under_a_poll_inner() {
+        if std::env::var_os(NESTED_CHILD).is_none() {
+            return;
+        }
+        let scratch = Scratch::new();
+        let page = nested_record_page(&scratch);
+        Scratch::write(
+            &scratch.overlay("workspaces"),
+            "[workspace.chat]\napps = [{ id = \"a\" }]\n",
+        );
+        page.form.refresh_from_disk();
+        assert_the_vanish_was_kept(&scratch, &page);
+        println!("{NESTED_CHILD_OK}");
+    }
+
+    /// R7b: the record goes away on disk, then the operator saves a field on
+    /// its page — the save is refused and the refusal re-reads the
+    /// drill-down. Run by
+    /// [`a_record_vanishing_under_a_two_level_drill_down_aborts_nothing`];
+    /// does nothing unless its marker is set.
+    #[gtk::test]
+    fn nested_vanish_under_a_field_save_inner() {
+        if std::env::var_os(NESTED_CHILD).is_none() {
+            return;
+        }
+        let scratch = Scratch::new();
+        let page = nested_record_page(&scratch);
+        Scratch::write(
+            &scratch.overlay("workspaces"),
+            "[workspace.chat]\napps = [{ id = \"a\" }]\n",
+        );
+        page.type_into("Exec", "run");
+        settle_until("the refused save to take the page down", || {
+            page.title() == "Apps"
+        });
+        settle_nothing();
+        assert_the_vanish_was_kept(&scratch, &page);
+        println!("{NESTED_CHILD_OK}");
     }
 }

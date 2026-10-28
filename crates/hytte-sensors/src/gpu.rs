@@ -1464,6 +1464,12 @@ mod tests {
     /// zombie, while a child sent after the list drained is reaped.
     #[test]
     fn the_reaper_loop_stops_tracking_past_the_cap() {
+        // The test fills the real cap with live processes, so a cap raised
+        // far past today's is a failure here, not a process flood.
+        assert!(
+            REAPER_MAX_PENDING <= 256,
+            "REAPER_MAX_PENDING is {REAPER_MAX_PENDING}: the list is no longer bounded tightly"
+        );
         let (tx, rx) = std::sync::mpsc::channel();
         let reaper = std::thread::spawn(move || reaper_loop(&rx));
         let live: Vec<u32> = (0..REAPER_MAX_PENDING)

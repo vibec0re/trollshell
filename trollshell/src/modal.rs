@@ -3247,12 +3247,12 @@ mod gtk_tests {
         App::new(&crate::test_support::app_id(
             "mov.vibec0re.trollshell.test.modal-workspaces-width",
         ))
-            .run(|app| {
-                let first = app.monitors().first().cloned();
-                TEST_MONITOR.with(|cell| *cell.borrow_mut() = first);
-                app.quit();
-            })
-            .expect("App::run");
+        .run(|app| {
+            let first = app.monitors().first().cloned();
+            TEST_MONITOR.with(|cell| *cell.borrow_mut() = first);
+            app.quit();
+        })
+        .expect("App::run");
         TEST_MONITOR
             .with(|cell| cell.borrow().clone())
             .expect("the display server must report at least one output; `xvfb-run` provides one")

@@ -24,6 +24,10 @@ workspace = true
 # Also "feature", for `app_usage::page_size`'s
 # `nix::unistd::sysconf(PAGE_SIZE)` - a safe wrapper, no new resolved package.
 nix = { workspace = true, features = ["feature"] }
+# One `warn!` when the nvidia-smi reaper thread cannot start (`gpu.rs`). The
+# same facade `hytte-config` and `hytte-gl` already link: no new resolved
+# package.
+tracing.workspace = true
 
 [dev-dependencies]
 # `cpufreq.rs` and `hwmon.rs` build fixture sysfs directories to exercise the

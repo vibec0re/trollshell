@@ -3450,37 +3450,37 @@ where
     while settled.iter().any(Option::is_none) && tokio::time::Instant::now() < deadline {
         listings += 1;
         let pending = (0..waits.len()).filter(|&k| settled[k].is_none());
-        let ended: Vec<(usize, StopWait)> =
-            match tokio::time::timeout_at(deadline, list_units()).await {
-                Ok(Ok(units)) => pending
-                    .filter_map(|k| {
-                        let (id, awaiting) = waits[k];
-                        let blocking = units
-                            .iter()
-                            .find(|u| u.id == id && blocks_relaunch(&u.active_state));
-                        match blocking {
-                            None => Some((k, StopWait::Over)),
-                            Some(unit)
-                                if awaiting == Awaiting::Launch
-                                    && is_running(&unit.active_state) =>
-                            {
-                                Some((
-                                    k,
-                                    StopWait::BackUp {
-                                        sub_state: unit.sub_state.clone(),
-                                    },
-                                ))
-                            }
-                            Some(unit) => {
-                                last_seen[k] = Some(unit.sub_state.clone());
-                                None
-                            }
+        let ended: Vec<(usize, StopWait)> = match tokio::time::timeout_at(deadline, list_units())
+            .await
+        {
+            Ok(Ok(units)) => pending
+                .filter_map(|k| {
+                    let (id, awaiting) = waits[k];
+                    let blocking = units
+                        .iter()
+                        .find(|u| u.id == id && blocks_relaunch(&u.active_state));
+                    match blocking {
+                        None => Some((k, StopWait::Over)),
+                        Some(unit)
+                            if awaiting == Awaiting::Launch && is_running(&unit.active_state) =>
+                        {
+                            Some((
+                                k,
+                                StopWait::BackUp {
+                                    sub_state: unit.sub_state.clone(),
+                                },
+                            ))
                         }
-                    })
-                    .collect(),
-                Ok(Err(_)) => pending.map(|k| (k, StopWait::Over)).collect(),
-                Err(_) => Vec::new(),
-            };
+                        Some(unit) => {
+                            last_seen[k] = Some(unit.sub_state.clone());
+                            None
+                        }
+                    }
+                })
+                .collect(),
+            Ok(Err(_)) => pending.map(|k| (k, StopWait::Over)).collect(),
+            Err(_) => Vec::new(),
+        };
         if !ended.is_empty() {
             let settling = tokio::time::Instant::now();
             for (k, end) in ended {
@@ -6875,9 +6875,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_failed_listing_ends_the_wait_without_running_out() {
         let start = tokio::time::Instant::now();
-        let waited =
-            wait_until_stopped_listing("vibectl", Awaiting::Stop, || async { anyhow::bail!("no user manager") })
-                .await;
+        let waited = wait_until_stopped_listing("vibectl", Awaiting::Stop, || async {
+            anyhow::bail!("no user manager")
+        })
+        .await;
         assert_eq!(
             waited,
             Waited {
@@ -6931,7 +6932,9 @@ mod tests {
             || Err(anyhow::anyhow!("no user manager")),
         ];
         for listing in early {
-            let over = wait_until_stopped_listing("pet", Awaiting::Stop, || async move { listing() }).await;
+            let over =
+                wait_until_stopped_listing("pet", Awaiting::Stop, || async move { listing() })
+                    .await;
             assert_eq!(over.end, StopWait::Over);
         }
     }
@@ -7073,7 +7076,11 @@ mod tests {
                 Ok(vec![unit_in("pet", "deactivating", sub)])
             })
             .await;
-            assert_eq!(waited.end, ran_out(sub), "deactivating/{sub} is still stopping");
+            assert_eq!(
+                waited.end,
+                ran_out(sub),
+                "deactivating/{sub} is still stopping"
+            );
             assert!(t0.elapsed() >= STOP_WAIT, "{sub}: {:?}", t0.elapsed());
         }
     }
@@ -8254,25 +8261,26 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_batch_wait_ends_each_unit_on_its_own_rows() {
         let calls = std::cell::Cell::new(0_usize);
-        let waited = wait_until_all_stopped_listing(&["pet", "vibectl", "caw"], Awaiting::Stop, || {
-            let n = calls.get() + 1;
-            calls.set(n);
-            let pet = if n <= 10 {
-                "stop-sigterm"
-            } else {
-                "stop-sigkill"
-            };
-            let vibectl = if n < 5 { "deactivating" } else { "inactive" };
-            async move {
-                Ok(vec![
-                    unit_in("timer", "deactivating", "final-sigkill"),
-                    unit_in("caw", "deactivating", "final-sigterm"),
-                    unit_in("pet", "deactivating", pet),
-                    unit("vibectl", vibectl, false),
-                ])
-            }
-        })
-        .await;
+        let waited =
+            wait_until_all_stopped_listing(&["pet", "vibectl", "caw"], Awaiting::Stop, || {
+                let n = calls.get() + 1;
+                calls.set(n);
+                let pet = if n <= 10 {
+                    "stop-sigterm"
+                } else {
+                    "stop-sigkill"
+                };
+                let vibectl = if n < 5 { "deactivating" } else { "inactive" };
+                async move {
+                    Ok(vec![
+                        unit_in("timer", "deactivating", "final-sigkill"),
+                        unit_in("caw", "deactivating", "final-sigterm"),
+                        unit_in("pet", "deactivating", pet),
+                        unit("vibectl", vibectl, false),
+                    ])
+                }
+            })
+            .await;
         assert_eq!(
             waited,
             WaitedAll {
@@ -8555,9 +8563,11 @@ mod tests {
             || async { Some(declared(&[("pet", on.clone())])) },
             || std::future::ready(Ok(manager.listing())),
             || async {
-                wait_until_stopped_listing("pet", Awaiting::Launch, || std::future::ready(Ok(manager.listing())))
-                    .await
-                    .end
+                wait_until_stopped_listing("pet", Awaiting::Launch, || {
+                    std::future::ready(Ok(manager.listing()))
+                })
+                .await
+                .end
             },
             |_, _| {
                 let keys = manager.read_keys("pet");

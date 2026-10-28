@@ -276,13 +276,14 @@ pub async fn write_response(stream: &mut impl Stream, status: u16, body: &[u8]) 
 ///
 /// It **polls** the connection's readiness every [`HANG_UP_POLL`] rather than
 /// awaiting the hang-up as an event, because no readiness a connected socket
-/// can wait on fits. `READABLE` fires on a half-close too, and stays set after
-/// it, since tokio never clears a closed state. `WRITABLE` is set the whole
-/// time, and clearing it to wait for the next event would also park
-/// [`write_response`] on an edge that never comes. The flags themselves are
-/// kept current by the runtime whether or not anything waits on them, so
-/// reading them costs a timer tick, and that tick bounds how long a turn
-/// nobody will read runs on after its client has left.
+/// can wait on fits. Waiting for `READABLE` returns on a half-close too, and
+/// at once every time after it, because the read-closed state it matches is
+/// one tokio never clears. `WRITABLE` is set the whole time, and clearing it
+/// to wait for the next event would also park [`write_response`] on an edge
+/// that never comes. The flags themselves are kept current by the runtime
+/// whether or not anything waits on them, so reading them costs a timer tick,
+/// and that tick bounds how long a turn nobody will read runs on after its
+/// client has left.
 ///
 /// Never resolves if the readiness cannot be read at all (the runtime is
 /// shutting down): a turn is dropped for a hang-up and for nothing else.

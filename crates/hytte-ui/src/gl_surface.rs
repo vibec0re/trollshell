@@ -163,7 +163,7 @@
 //! item 2): the guard `error().is_none() && context().is_some()` is false only
 //! when there is no context, so no GL object can be waiting to be dropped
 //! there. GTK sets the area's error itself only in `realize`, and only when it
-//! got no context (`gtk/gtkglarea.c:318-324`, `:358`, `:372`); otherwise only
+//! got no context (`gtk/gtkglarea.c:318-326`, `:358`, `:372`); otherwise only
 //! through the public `gtk_gl_area_set_error`, which nothing in this tree
 //! calls; and with no context there was no `render`, so no `resources`. The
 //! live half of item 2 is the failed `make_current` above, and what to do
@@ -689,7 +689,7 @@ pub(crate) fn retire_context(area: &gtk::GLArea) {
 }
 
 /// Create `area`'s context the way GTK's own `create-context` handler does
-/// (`gtk/gtkglarea.c:347-376`), but **holding it once** — what both
+/// (`gtk/gtkglarea.c:347-379`), but **holding it once** — what both
 /// surfaces' `GLAreaImpl::create_context` returns.
 ///
 /// Overridden rather than inherited because gtk4-rs's default leaks the
@@ -708,7 +708,7 @@ pub(crate) fn retire_context(area: &gtk::GLArea) {
 /// and required version copied onto it, then `realize`. A failure is set as
 /// the area's error, as GTK does, which is what this module's `realize`
 /// reads. No surface yet is `None` with no error, which GTK itself turns into
-/// "OpenGL context creation failed" (`gtk/gtkglarea.c:323-325`).
+/// "OpenGL context creation failed" (`gtk/gtkglarea.c:323-326`).
 pub(crate) fn create_area_context(area: &gtk::GLArea) -> Option<gdk::GLContext> {
     let surface = area.native().and_then(|native| native.surface())?;
     let created = surface.create_gl_context().and_then(|context| {

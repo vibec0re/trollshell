@@ -10545,6 +10545,38 @@ mod tests {
             }
             let stopped = std::time::Instant::now();
             systemd::stop_unit(&unit).await.expect("StopUnit queued");
+            // `StopUnit` returns once the stop JOB is queued, not once the
+            // unit is `deactivating`: on a loaded user manager (several test
+            // processes sharing one, #1639) the first listings still show it
+            // `active`. The code under test is only ever handed a unit its
+            // caller SAW stopping, and a wait on a launch reads a running
+            // unit as one systemd brought back (`StopWait::BackUp`), so wait
+            // for the state the premise names. The unit's `TimeoutStopSec=`
+            // keeps it there for `STOPPING_TAKES`, far longer than this poll.
+            let mut first = None;
+            let seen = std::time::Instant::now();
+            loop {
+                let state = list_prefixed(prefix)
+                    .await
+                    .expect("listed")
+                    .into_iter()
+                    .find(|u| u.id == id)
+                    .map(|u| u.active_state);
+                first.get_or_insert_with(|| state.clone());
+                if state.as_deref().is_some_and(|s| s == "deactivating") {
+                    break;
+                }
+                assert!(
+                    seen.elapsed() < Duration::from_millis(1500),
+                    "{unit} is {state:?} {:?} after StopUnit, not deactivating",
+                    seen.elapsed()
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            eprintln!(
+                "{unit}: first listing after StopUnit {first:?}, deactivating after {:?}",
+                seen.elapsed()
+            );
             let refused = launch_stubborn(&unit, STOPPING_TAKES)
                 .await
                 .expect_err("rail: systemd refuses a unit under a name still stopping");

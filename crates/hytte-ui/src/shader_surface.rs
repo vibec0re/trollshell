@@ -1418,11 +1418,7 @@ mod imp {
             };
             eprintln!(
                 "{NAME}: the driver {} the first context's address",
-                if reused {
-                    "reused"
-                } else {
-                    "never reused"
-                },
+                if reused { "reused" } else { "never reused" },
             );
         }
 

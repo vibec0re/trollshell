@@ -1852,7 +1852,13 @@ mod tests {
         loader::retire(outlived);
         let newcomer = || Some(loader::identify(address));
 
-        assert!(!release("vertex array", 1, Some(outlived), newcomer, delete));
+        assert!(!release(
+            "vertex array",
+            1,
+            Some(outlived),
+            newcomer,
+            delete
+        ));
         assert_eq!(
             deletes.get(),
             0,

@@ -806,7 +806,10 @@ pub(crate) fn assert_an_outlived_handle_never_deletes_under_a_reused_address(
         let generation = hgl::context_generation_for_test(current);
         let context = area.context().map(|context| context.downgrade());
         window.set_child(None::<&gtk::Widget>);
-        assert!(!area.is_realized(), "unparenting must unrealize the surface");
+        assert!(
+            !area.is_realized(),
+            "unparenting must unrealize the surface"
+        );
         assert!(
             context.is_some_and(|context| context.upgrade().is_none()),
             "unrealize must leave nothing holding the surface's context — no frame was drawn, so \
@@ -1379,10 +1382,10 @@ mod imp {
     use super::{
         BuildKey, DataFailure, GLSL_HEADER, GlBlend, GlDraw, GlInput, GlPass, GlPipeline,
         GlProgram, GlTarget, GlUniforms, GlValue, PROGRAM_UNREGISTERED_REFUSED, PROGRAMS,
-        RefusedBuilds, SAMPLER_NAMES, WarnLatch, abandon_gl, fit_rect, fresh_last_drawn, gdk, glib,
-        create_area_context, last_drawn_after, program_key, refuse_data_strip, report_build_refusal,
-        resources_reusable,
-        retire_context, steps_owed, warn_on_target_failure,
+        RefusedBuilds, SAMPLER_NAMES, WarnLatch, abandon_gl, create_area_context, fit_rect,
+        fresh_last_drawn, gdk, glib, last_drawn_after, program_key, refuse_data_strip,
+        report_build_refusal, resources_reusable, retire_context, steps_owed,
+        warn_on_target_failure,
     };
     use gtk::prelude::*;
     use gtk::subclass::prelude::*;
@@ -2463,11 +2466,7 @@ mod imp {
             };
             eprintln!(
                 "{NAME}: the driver {} the first context's address",
-                if reused {
-                    "reused"
-                } else {
-                    "never reused"
-                },
+                if reused { "reused" } else { "never reused" },
             );
         }
 

@@ -10727,13 +10727,18 @@ mod tests {
         /// fingerprint.
         ///
         /// It also pins bullet 7's own point, that the start does not wait
-        /// out [`STOP_WAIT`]: it answers within half of it.
+        /// out [`STOP_WAIT`]: it answers within half of it of the moment the
+        /// unit's stop is ended.
         ///
-        /// `TimeoutStopSec=2`, not the launcher's 10 s, as in the review's
-        /// own state-sequence measurement: the sequence is the same, and the
-        /// crash's kill then lands well inside the wait's bound on a loaded
-        /// box. The unit is `ts1628-rev-<pid>-pet.service`, cleaned up by the
-        /// same guard.
+        /// The stop is ended by the test ([`Crasher::release`]), once the
+        /// start is waiting on the unit, not by a short `TimeoutStopSec=`
+        /// (#1639): the review's 2 s was a clock, and a start queued behind
+        /// other tests on `CONVERGE_LOCK` (or a Save, under a user manager
+        /// shared by several test processes) listed the unit after systemd
+        /// had already brought it back, took it for not stopping, and
+        /// launched onto the name it still held ("already loaded"). The
+        /// sequence is the review's, with the order forced. The unit is
+        /// `ts1628-rev-<pid>-pet.service`, cleaned up by the same guard.
         #[tokio::test]
         async fn a_start_onto_a_returning_unit_applies_the_new_values() {
             let prefix = format!("ts1628-rev-{}", std::process::id());
@@ -10767,15 +10772,30 @@ mod tests {
             // 2. "switch it off and on to start it with the new values".
             let launched = std::cell::Cell::new(false);
             let listed = prefix.as_str();
-            let started = std::time::Instant::now();
-            start_via(
+            // The unit is held `deactivating` until the start is waiting on
+            // it, and only then let go (#1639): the start must SEE the unit
+            // stopping, which the review's 2 s `TimeoutStopSec=` raced against however
+            // long the start queued for `CONVERGE_LOCK`.
+            let waiting = std::cell::Cell::new(false);
+            let released = std::cell::Cell::new(None);
+            let release = async {
+                while !waiting.get() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                crasher.release();
+                released.set(Some(std::time::Instant::now()));
+            };
+            let start = start_via(
                 "pet",
                 || async { Some(declared(&[("pet", new.clone())])) },
                 || list_prefixed(&prefix),
-                move |awaiting| async move {
-                    wait_until_stopped_listing("pet", awaiting, move || list_prefixed(listed))
-                        .await
-                        .end
+                |awaiting| {
+                    waiting.set(waiting.get() || matches!(awaiting, Awaiting::Launch));
+                    async move {
+                        wait_until_stopped_listing("pet", awaiting, move || list_prefixed(listed))
+                            .await
+                            .end
+                    }
                 },
                 || systemd::stop_unit(&unit),
                 |spec, _| {
@@ -10785,10 +10805,11 @@ mod tests {
                     async move { crasher.run(&value).await }
                 },
                 || async { panic!("declared") },
-            )
-            .await
-            .expect("the start answers");
-            let took = started.elapsed();
+            );
+            let (answer, ()) = tokio::join!(start, release);
+            let answered = std::time::Instant::now();
+            answer.expect("the start answers");
+            let took = answered.duration_since(released.get().expect("released"));
             eprintln!(
                 "start answered Ok after {took:?} (at {:?}), launched: {}",
                 t0.elapsed(),
@@ -10822,8 +10843,13 @@ mod tests {
         /// restart properties (`Restart=on-failure`, `RestartSec=2`) and
         /// `PET_NAME` on its environment. Its first run leaves a child that
         /// ignores SIGTERM and SIGSEGVs; every later run just sleeps.
-        /// `TimeoutStopSec=2` rather than the launcher's 10 s, as in the
-        /// review's own state-sequence measurement.
+        /// `TimeoutStopSec=` is [`Crasher::STOP_HOLD`], far longer than any
+        /// test: the unit stays `deactivating` until [`Crasher::release`]
+        /// kills the child, so how long it stays is the test's call and not
+        /// a clock a loaded box can outrun (#1639: with the review's 2 s,
+        /// a start queued behind other tests on [`CONVERGE_LOCK`] listed
+        /// the unit after systemd had already brought it back, and launched
+        /// onto a name it still held).
         struct Crasher {
             unit: String,
             mark: std::path::PathBuf,
@@ -10832,12 +10858,28 @@ mod tests {
         }
 
         impl Crasher {
+            /// How long the crashed unit's stop may take before systemd
+            /// SIGKILLs the child itself.
+            const STOP_HOLD: &'static str = "120s";
+
+            /// End the unit's stop now: SIGKILL what is left in its cgroup
+            /// (the child that ignored SIGTERM), so the unit fails and
+            /// `Restart=on-failure` brings it back.
+            fn release(&self) {
+                let status = std::process::Command::new("systemctl")
+                    .args(["--user", "kill", "--kill-whom=all", "--signal=SIGKILL"])
+                    .arg(&self.unit)
+                    .status()
+                    .expect("systemctl");
+                assert!(status.success(), "systemctl kill {}: {status}", self.unit);
+            }
+
             fn new(unit: &str) -> Self {
                 let dir = tempfile::tempdir().expect("tempdir");
                 let script = dir.path().join("crasher.sh");
                 std::fs::write(
                     &script,
-                    "if [ ! -e \"$MARK\" ]; then touch \"$MARK\"; ( trap '' TERM; exec sleep 30 ) \
+                    "if [ ! -e \"$MARK\" ]; then touch \"$MARK\"; ( trap '' TERM; exec sleep 150 ) \
                      & sleep 0.3; kill -SEGV $$; fi; exec sleep 300\n",
                 )
                 .expect("script");
@@ -10856,7 +10898,7 @@ mod tests {
                     .arg(format!("--unit={}", self.unit))
                     .arg("--property=Restart=on-failure")
                     .arg("--property=RestartSec=2")
-                    .arg("--property=TimeoutStopSec=2s")
+                    .arg(format!("--property=TimeoutStopSec={}", Self::STOP_HOLD))
                     .arg("--setenv=PATH")
                     .arg(format!("--setenv=MARK={}", self.mark.display()))
                     .arg(format!("--setenv=PET_NAME={value}"))

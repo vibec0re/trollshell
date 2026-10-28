@@ -334,7 +334,15 @@ fn reaper_loop(rx: &std::sync::mpsc::Receiver<std::process::Child>) {
             match rx.recv_timeout(REAPER_POLL) {
                 Ok(c) => Ok(c),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(()),
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    // No sender left: nothing new can arrive, but the
+                    // children already held must still be waited on.
+                    while !pending.is_empty() {
+                        std::thread::sleep(REAPER_POLL);
+                        pending.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
+                    }
+                    return;
+                }
             }
         };
         match next {
@@ -366,11 +374,20 @@ fn spawn_reaper() -> Option<std::sync::mpsc::Sender<std::process::Child>> {
 ///
 /// A failed spawn (or a reaper whose thread died) is retried on the next
 /// kill: the inbox is only kept while it works. While spawning keeps failing,
-/// each kill's child is dropped un-waited, as before the reaper existed, and
-/// one line on stderr says so per failure streak (this crate has no logger).
+/// each kill's child is dropped un-waited (a zombie until the process exits),
+/// as before the reaper existed, and one `warn!` says so per failure streak.
 fn reap_later(child: std::process::Child) {
+    reap_later_via(&REAPER, child);
+}
+
+/// [`reap_later`] against a given inbox slot, so a test can use its own
+/// instead of the process-wide one its siblings share.
+fn reap_later_via(
+    reaper: &std::sync::Mutex<Option<std::sync::mpsc::Sender<std::process::Child>>>,
+    child: std::process::Child,
+) {
     use std::sync::atomic::Ordering::Relaxed;
-    let mut slot = REAPER
+    let mut slot = reaper
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let child = match slot.as_ref() {
@@ -388,9 +405,9 @@ fn reap_later(child: std::process::Child) {
             *slot = Some(tx);
         }
     } else if !REAPER_SPAWN_FAILING.swap(true, Relaxed) {
-        eprintln!(
-            "hytte-sensors: could not start the nvidia-smi reaper thread; \
-             killed children are left un-waited until it can be"
+        tracing::warn!(
+            "could not start the nvidia-smi reaper thread; children killed while it \
+             cannot start are never waited on (zombies until the process exits)"
         );
     }
 }
@@ -1520,20 +1537,110 @@ mod tests {
     /// is replaced on the next kill instead of staying off for the process.
     #[test]
     fn a_dead_reaper_inbox_is_replaced_on_the_next_kill() {
+        // A local slot: the process-wide `REAPER` is shared with sibling
+        // tests, and replacing its sender would strand their children.
         let (dead_tx, dead_rx) = std::sync::mpsc::channel();
         drop(dead_rx);
-        *REAPER
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(dead_tx);
+        let slot = std::sync::Mutex::new(Some(dead_tx));
 
         let mut child = sleeper();
         let pid = child.id();
         child.kill().unwrap();
-        reap_later(child);
+        reap_later_via(&slot, child);
         assert!(
             wait_reaped(pid, Duration::from_secs(5)),
             "a dead reaper inbox was never replaced"
         );
+        assert!(
+            slot.lock().unwrap().is_some(),
+            "the replacement inbox was not kept"
+        );
+        // Dropping the slot drops the only sender; the new reaper exits.
+    }
+
+    /// With every sender gone the reaper still waits on the children it
+    /// already holds, instead of dropping them un-waited.
+    #[test]
+    fn a_reaper_whose_senders_are_gone_still_reaps_what_it_holds() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reaper = std::thread::spawn(move || reaper_loop(&rx));
+        let pid = send_live(&tx);
+        // Let the loop take it and enter its busy wait, then disconnect.
+        std::thread::sleep(REAPER_POLL * 2);
+        drop(tx);
+        std::thread::sleep(REAPER_POLL * 2);
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .status();
+        assert!(
+            wait_reaped(pid, Duration::from_secs(5)),
+            "a held child was dropped un-waited when the senders went away"
+        );
+        reaper.join().unwrap();
+    }
+
+    /// Wait until `pid` is no longer running: a zombie, or already reaped.
+    fn wait_exited(pid: u32) {
+        let end = Instant::now() + Duration::from_secs(5);
+        while !(is_zombie(pid) || is_reaped(pid)) {
+            assert!(Instant::now() < end, "child {pid} never exited");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn send_live(tx: &std::sync::mpsc::Sender<std::process::Child>) -> u32 {
+        let c = sleeper();
+        let pid = c.id();
+        tx.send(c).unwrap();
+        pid
+    }
+
+    /// The loop's call site, not just `admit`: a tracked child that finished
+    /// while the loop sat in its `REAPER_POLL` wait must be retired before the
+    /// next arrival is counted against the cap (#1561). Each round refills the
+    /// list to the cap with a live child (that message also restarts the wait),
+    /// then one tracked child finishes and a killed child arrives well inside
+    /// the same wait, so no timeout pass retires the finished one first.
+    #[test]
+    fn the_reaper_loop_retires_a_finished_child_before_counting_the_cap() {
+        let cap = std::hint::black_box(REAPER_MAX_PENDING);
+        assert!(cap <= 256, "REAPER_MAX_PENDING is {cap}");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reaper = std::thread::spawn(move || reaper_loop(&rx));
+        let mut live: Vec<u32> = (0..cap - 1).map(|_| send_live(&tx)).collect();
+        for round in 0..3 {
+            let mut late = sleeper();
+            let late_pid = late.id();
+            late.kill().unwrap();
+            wait_zombie(late_pid);
+            // Back to the cap; this message starts a fresh REAPER_POLL wait.
+            live.push(send_live(&tx));
+            let started = Instant::now();
+            let done = live.remove(0);
+            let _ = std::process::Command::new("kill")
+                .arg(done.to_string())
+                .status();
+            wait_exited(done);
+            tx.send(late).unwrap();
+            let took = started.elapsed();
+            assert!(
+                wait_reaped(late_pid, Duration::from_secs(2)),
+                "round {round}: a child arriving just after a tracked one finished was \
+                 refused, so finished children counted toward the cap (round took {took:?}, \
+                 REAPER_POLL is {REAPER_POLL:?})"
+            );
+        }
+        let _ = std::process::Command::new("kill")
+            .args(live.iter().map(u32::to_string))
+            .status();
+        for pid in &live {
+            assert!(
+                wait_reaped(*pid, Duration::from_secs(10)),
+                "child {pid} never reaped"
+            );
+        }
+        drop(tx);
+        reaper.join().unwrap();
     }
 
     /// End to end through the deadline path: the child that missed its

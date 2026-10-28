@@ -1296,13 +1296,17 @@ mod tests {
     /// [`production_wrappers_child`] alone, with `$XDG_STATE_HOME` and
     /// `$HOME` on a scratch directory. The child publishes a runtime store,
     /// sets the reader the way `main` does, registers through [`register`]
-    /// and reads back through [`snapshot`]; the parent then reads the cache
-    /// file the child wrote under the scratch state directory.
+    /// and reads back through [`snapshot`]. It checks the cache file at the
+    /// path the scratch `$XDG_STATE_HOME` gives, then hands [`snapshot`] a
+    /// reading that declares nothing once `pet` has left the runtime store,
+    /// which must forget `pet` and delete the file (#1628 review, F3). The
+    /// parent then checks the file is gone from the scratch directory.
     ///
     /// Falsified by [`PRODUCTION`] reading any cell but `PLUGIN_RUNTIME` or
     /// `DECLARED_READER`, by [`register`] or [`snapshot`] handing their seam
-    /// another host, and by [`production_cache_path`] resolving anything
-    /// but the state directory's `plugin-settings-schema.toml`.
+    /// another host, by [`snapshot`] dropping its `declared` argument, and by
+    /// [`production_cache_path`] resolving anything but the state
+    /// directory's `plugin-settings-schema.toml`.
     #[test]
     fn register_and_snapshot_drive_the_published_store() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1328,17 +1332,16 @@ mod tests {
              --- stderr ---\n{stderr}",
             out.status
         );
+        // The child persisted `pet` there and then, through `snapshot`'s
+        // own reading, forgot it (#1628 review, F3): the file is gone.
         let file = dir
             .path()
             .join("trollshell")
             .join(format!("{CACHE_SUBSYSTEM}.toml"));
-        assert_eq!(
-            Store::open(Some(file))
-                .snapshot(None, &set(&[]))
-                .keys()
-                .collect::<Vec<_>>(),
-            ["pet"],
-            "the child persisted the declared id under the scratch state directory"
+        assert!(
+            dir.path().join("trollshell").is_dir() && !file.exists(),
+            "the child wrote under the scratch state directory, and its last reading \
+             removed the cache file"
         );
     }
 
@@ -1377,6 +1380,35 @@ mod tests {
             snapshot(None).keys().collect::<Vec<_>>(),
             ["pet"],
             "snapshot reads the connected ids from the published store"
+        );
+        // #1628 review, F3: what `snapshot` does with the reading
+        // `ListPluginSettings` hands it. The path is derived from the
+        // scratch state directory, not from `production_cache_path`, so the
+        // resolver stays covered by the parent's check.
+        let expected =
+            PathBuf::from(std::env::var_os("XDG_STATE_HOME").expect("set by the parent"))
+                .join("trollshell")
+                .join(format!("{CACHE_SUBSYSTEM}.toml"));
+        assert_eq!(
+            Store::open(Some(expected.clone()))
+                .snapshot(None, &set(&[]))
+                .keys()
+                .collect::<Vec<_>>(),
+            ["pet"],
+            "persisted pet under the scratch state directory"
+        );
+        runtime
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove("pet");
+        assert!(
+            snapshot(Some(&BTreeSet::new())).is_empty(),
+            "snapshot hands its reading to the store: pet, neither declared nor connected, \
+             is forgotten"
+        );
+        assert!(
+            !expected.exists(),
+            "and that reading reached the cache file"
         );
         println!("production wrappers child: ok");
     }

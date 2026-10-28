@@ -233,6 +233,16 @@
 //! of its own. A unit still stopping when [`STOP_WAIT`] runs out is not
 //! launched, and the answer is [`StillStopping`] ([`launch_after_wait`]).
 //!
+//! **A unit that comes back up ends that wait** (#1555). A plugin that
+//! crashed and left child processes behind is `deactivating` with no stop
+//! job while systemd kills them, and then `Restart=on-failure` brings it
+//! back (`activating`, then `active`). A start or a reconcile landing in that
+//! window used to wait the whole [`STOP_WAIT`], under [`CONVERGE_LOCK`], and
+//! answer [`StillStopping`] while the plugin was running again. A launch's
+//! wait ([`Awaiting::Launch`]) now ends on the first listing that shows the
+//! unit running, and launches nothing: the plugin is up, which is what the
+//! launch was for. A restart's wait ([`Awaiting::Stop`]) is unchanged.
+//!
 //! ## The session target (#707)
 //!
 //! The transient unit's `PartOf=` used to be hardcoded to
@@ -1767,7 +1777,9 @@ enum Action {
     /// while the unit holds its name ([`blocks_relaunch`]), so → wait for it
     /// to go down, then launch (#1417 follow-up). [`reconcile`] waits for
     /// these in the same batch as its restarts ([`restart_all`]), sending
-    /// them no stop of their own.
+    /// them no stop of their own. A unit systemd brings back up meanwhile (a
+    /// crash, then `Restart=on-failure`) ends the wait with nothing launched
+    /// ([`Awaiting::Launch`], #1555).
     WaitThenLaunch,
     /// Declared enabled, not running and not stopping → launch it now.
     Launch,
@@ -2335,7 +2347,7 @@ fn merge_declared(
 /// the switch then fell back to off with "on" persisted, and nothing
 /// retried. A unit that is running is not waited for: the launch answers
 /// "already loaded" at once, as before. See [`start_via`] for what a wait
-/// that runs out answers.
+/// that runs out answers, and for a unit that comes back up during it.
 ///
 /// # Errors
 /// Unknown/invalid id, a still-running unit, a unit still stopping when
@@ -2345,7 +2357,7 @@ pub async fn start(id: &str) -> anyhow::Result<()> {
         id,
         load_declared,
         systemd::list_plugin_units,
-        || wait_until_stopped(id),
+        || wait_until_stopped(id, Awaiting::Launch),
         |spec: PluginSpec, target: String| async move {
             let extra_env = resolve_secret_env(id, &spec).await;
             launch(id, &spec, &extra_env, &target).await
@@ -2369,9 +2381,14 @@ pub async fn start(id: &str) -> anyhow::Result<()> {
 ///    stopping ([`stopping_unit`]) it is launched at once, as before; a
 ///    listing that fails launches at once too, and the launch finds out for
 ///    itself, as a failed listing in the wait does.
-/// 3. A unit still stopping is **waited for** (`wait_down`), and then
-///    decided by [`launch_after_wait`]: launched once it is down, and not
-///    launched if it was still stopping when [`STOP_WAIT`] ran out.
+/// 3. A unit still stopping is **waited for** (`wait_down`, on
+///    [`Awaiting::Launch`]), and then decided by [`launch_after_wait`]:
+///    launched once it is down, not launched if it was still stopping when
+///    [`STOP_WAIT`] ran out, and not launched, answering `Ok`, if systemd
+///    brought it back up meanwhile (#1555). That last one is a plugin that
+///    crashed with child processes left over, which `Restart=on-failure`
+///    restarted while the switch was being flipped on: it is running, which
+///    is what the start was for.
 ///
 /// What a wait that runs out answers is [`restart`]'s rule for a unit it
 /// started (#1417 item 1), and for the same reason: a launch now would be
@@ -2867,7 +2884,7 @@ async fn restart(id: &str, spec: &PluginSpec, target: &str, stamped: bool) -> an
         id,
         stamped,
         || stop_unit(id),
-        || wait_until_stopped(id),
+        || wait_until_stopped(id, Awaiting::Stop),
         || async {
             let extra_env = resolve_secret_env(id, spec).await;
             launch(id, spec, &extra_env, target).await
@@ -2918,7 +2935,8 @@ where
 /// - A `stamped` unit has no fallback, and is decided by
 ///   [`launch_after_wait`]: `waited` ran out → [`StillStopping`], and neither
 ///   `relaunch` nor `unit_file_start` runs; otherwise `relaunch` runs, and
-///   its answer is the answer.
+///   its answer is the answer. (`waited` is never [`StopWait::BackUp`]
+///   here: a restart waits on [`Awaiting::Stop`].)
 /// - Otherwise `relaunch` runs whatever `waited` says. If it fails,
 ///   `unit_file_start` runs, and the answer is the relaunch's error.
 async fn relaunch_after_wait<R, RF, U, UF>(
@@ -2954,7 +2972,8 @@ where
 
 /// What a launch with **no unit-file fallback** does once the wait for its
 /// unit has ended: `waited` ran out → [`StillStopping`], and `launch_now`
-/// does not run; otherwise `launch_now` runs, and its answer is the answer.
+/// does not run; the unit came back up → `Ok`, and `launch_now` does not run
+/// either; otherwise `launch_now` runs, and its answer is the answer.
 ///
 /// The one place a run-out is turned into "not launched" (#1417 item 1). It
 /// is [`relaunch_after_wait`]'s rule for a stamped unit, and since the #1417
@@ -2964,19 +2983,35 @@ where
 /// is still stopping is refused at once, every time (#1417's measurement),
 /// so trying it would only turn the run-out into systemd's "already loaded",
 /// which says less.
+///
+/// [`StopWait::BackUp`] reaches it only from those two launches, which wait
+/// on [`Awaiting::Launch`] (#1555): a plugin that crashed with child
+/// processes left over, which `Restart=on-failure` brought back while the
+/// launch waited. It is running, so the launch is done; a launch now would
+/// be refused as "already loaded". A restart waits on [`Awaiting::Stop`],
+/// which never answers `BackUp`, so a stamped restart never takes this arm.
 async fn launch_after_wait<R, RF>(id: &str, waited: StopWait, launch_now: R) -> anyhow::Result<()>
 where
     R: FnOnce() -> RF,
     RF: Future<Output = anyhow::Result<()>>,
 {
-    if let StopWait::RanOut { sub_state } = waited {
-        return Err(StillStopping {
+    match waited {
+        StopWait::RanOut { sub_state } => Err(StillStopping {
             id: id.to_owned(),
             sub_state,
         }
-        .into());
+        .into()),
+        StopWait::BackUp { sub_state } => {
+            tracing::info!(
+                plugin = %id,
+                %sub_state,
+                "its unit came back up on its own while it was still stopping (systemd \
+                 restarting it after a crash); not launching it a second time",
+            );
+            Ok(())
+        }
+        StopWait::Over => launch_now().await,
     }
-    launch_now().await
 }
 
 /// One plugin in [`restart_all`]'s batch (#1444): one of a reconcile's
@@ -2997,8 +3032,9 @@ struct Restarting<'a> {
     /// was planned: an [`Action::WaitThenLaunch`]. The batch then sends it no
     /// `StopUnit` (its stop was sent before this pass, and a second one
     /// fails once the unit is gone, which would end a launch that would have
-    /// gone through), waits for it with the rest, and launches it by
-    /// [`launch_after_wait`], without [`restart`]'s fallback.
+    /// gone through), waits for it with the rest on [`Awaiting::Launch`] (so
+    /// a unit systemd brings back up ends its wait, #1555), and launches it
+    /// by [`launch_after_wait`], without [`restart`]'s fallback.
     stopping: bool,
 }
 
@@ -3060,9 +3096,11 @@ async fn restart_all<'a>(
 /// Each unit is decided on its own wait ([`relaunch_after_wait`], where
 /// [`restart`]'s rules live), with its own keys. One unit's answer, a
 /// [`StillStopping`] included, never keeps another from being decided. A
-/// unit already stopping is a launch, not a restart: it is decided by
-/// [`launch_after_wait`], so it never gets the unit-file fallback, which a
-/// reconcile's launch has never had.
+/// unit already stopping is a launch, not a restart: it is waited for on
+/// [`Awaiting::Launch`], so systemd bringing it back up ends its wait too
+/// (#1555), and it is decided by [`launch_after_wait`], so it never gets the
+/// unit-file fallback, which a reconcile's launch has never had. A restart
+/// waits on [`Awaiting::Stop`], as it always has.
 ///
 /// The parameters are named so none shares a name with a function in this
 /// module, for [`restart_via`]'s reason.
@@ -3102,9 +3140,20 @@ where
             Err(err) => answers.push((k, r.id, Err(err))),
         }
     }
-    let ids: Vec<&str> = stopped.iter().map(|(_, r, _)| r.id).collect();
+    // A unit already stopping is a launch, which a return ends too (#1555).
+    let waits: Vec<(&str, Awaiting)> = stopped
+        .iter()
+        .map(|(_, r, _)| {
+            let awaiting = if r.stopping {
+                Awaiting::Launch
+            } else {
+                Awaiting::Stop
+            };
+            (r.id, awaiting)
+        })
+        .collect();
     let (relaunch, unit_file_start) = (&relaunch, &unit_file_start);
-    let settled = wait_then_settle(&ids, list_units, |j, end| {
+    let settled = wait_then_settle(&waits, list_units, |j, end| {
         let r = stopped[j].1;
         let keys = stopped[j].2.take();
         async move {
@@ -3207,6 +3256,16 @@ enum StopWait {
     /// Before its bound: a listing showed the unit no longer holding its
     /// name, or a listing failed and the relaunch finds out for itself.
     Over,
+    /// Before its bound, and only for a wait on [`Awaiting::Launch`]: a
+    /// listing showed the unit running again ([`is_running`]) after the
+    /// caller saw it stopping. systemd brought it back on its own, so there
+    /// is nothing left to launch (#1555).
+    BackUp {
+        /// The unit's `SubState` in that listing: `auto-restart` while
+        /// `Restart=on-failure` counts down `RestartSec=`, `running` once it
+        /// is up.
+        sub_state: String,
+    },
     /// [`STOP_WAIT`] ran out with the unit still holding its name.
     RanOut {
         /// The unit's `SubState` in the wait's last listing that answered,
@@ -3216,17 +3275,49 @@ enum StopWait {
     },
 }
 
+/// What ends a unit's wait besides the unit going down (#1555).
+///
+/// The difference is what a **running** unit means to the caller. A plugin
+/// that crashed and left child processes behind is `deactivating` with no
+/// stop job while systemd kills them (`stop-sigterm`, then `stop-sigkill`
+/// past `TimeoutStopSec=`), and then `Restart=on-failure` brings it back:
+/// `activating` (`auto-restart` for `RestartSec=`, 2 s here, then
+/// `auto-restart-queued` on systemd 254 and later) and `active`
+/// (`running`). The unit holds its name through all of it, so a wait that
+/// ends only when the unit goes down runs the whole [`STOP_WAIT`] and
+/// answers a run-out, naming `running`. The listing carries no job, only
+/// the two states ([`systemd::PluginUnit`]), so the only sign of the return
+/// is the unit running again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Awaiting {
+    /// A restart's own stop: [`restart`], and a [`restart_all`] restart.
+    /// Only a unit that no longer holds its name ends the wait. A running
+    /// one is waited through, because the first listings after `StopUnit`
+    /// can still show the unit `active`, its stop job queued but not yet
+    /// run; and a unit something else started again is not the relaunch
+    /// the restart owes, since it runs the old spec.
+    Stop,
+    /// A launch onto a unit the caller saw already stopping: [`start`], and
+    /// a reconcile's [`Action::WaitThenLaunch`]. Ends as [`Awaiting::Stop`]
+    /// does, and also once a listing shows the unit running again
+    /// ([`StopWait::BackUp`]): the plugin is running, which is all the
+    /// launch was for. A unit still `deactivating`, in any `SubState`, is
+    /// still waited for.
+    Launch,
+}
+
 /// Poll the plugin's unit until it no longer holds its name
 /// ([`blocks_relaunch`]: inactive, failed, or gone — a collected transient
 /// unit vanishes), bounded by [`STOP_WAIT`] so a stuck stop cannot wedge the
 /// relaunch, and say which of the two it was ([`StopWait`]). On a list error
 /// it returns early and lets the launch surface any "still exists" error
-/// itself.
+/// itself. For a launch ([`Awaiting::Launch`]) a unit running again ends it
+/// too ([`StopWait::BackUp`], #1555).
 ///
 /// The whole decision is [`wait_until_stopped_listing`]'s, which a test
 /// drives; this only hands it the real listing.
-async fn wait_until_stopped(id: &str) -> StopWait {
-    wait_until_stopped_listing(id, systemd::list_plugin_units)
+async fn wait_until_stopped(id: &str, awaiting: Awaiting) -> StopWait {
+    wait_until_stopped_listing(id, awaiting, systemd::list_plugin_units)
         .await
         .end
 }
@@ -3248,12 +3339,13 @@ struct Waited {
 /// This is [`wait_until_all_stopped_listing`] for one unit, i.e.
 /// [`wait_then_settle`], which is where the decision lives (#1444): a single
 /// plugin's restart and a batch wait by one rule.
-async fn wait_until_stopped_listing<L, Fut>(id: &str, list_units: L) -> Waited
+async fn wait_until_stopped_listing<L, Fut>(id: &str, awaiting: Awaiting, list_units: L) -> Waited
 where
     L: FnMut() -> Fut,
     Fut: Future<Output = anyhow::Result<Vec<systemd::PluginUnit>>>,
 {
-    let WaitedAll { listings, ends } = wait_until_all_stopped_listing(&[id], list_units).await;
+    let WaitedAll { listings, ends } =
+        wait_until_all_stopped_listing(&[id], awaiting, list_units).await;
     let end = ends
         .into_iter()
         .next()
@@ -3269,27 +3361,35 @@ struct WaitedAll<T = StopWait> {
     /// Each unit's settlement, in the order the units were given. For
     /// [`wait_until_all_stopped_listing`] that is how its wait ended:
     /// [`StopWait::Over`] when a listing showed that unit down or a listing
-    /// failed, [`StopWait::RanOut`] when [`STOP_WAIT`] ran out with that unit
-    /// still holding its name.
+    /// failed, [`StopWait::BackUp`] when one showed it running again on a
+    /// wait for a launch, [`StopWait::RanOut`] when [`STOP_WAIT`] ran out
+    /// with that unit still holding its name.
     ends: Vec<T>,
 }
 
-/// Wait for every unit in `ids` to stop holding its name, all together, and
-/// answer how each one's wait ended ([`wait_then_settle`], settling nothing).
-async fn wait_until_all_stopped_listing<L, Fut>(ids: &[&str], list_units: L) -> WaitedAll
+/// Wait for every unit in `ids` to stop holding its name, all together and
+/// each on `awaiting`, and answer how each one's wait ended
+/// ([`wait_then_settle`], settling nothing).
+async fn wait_until_all_stopped_listing<L, Fut>(
+    ids: &[&str],
+    awaiting: Awaiting,
+    list_units: L,
+) -> WaitedAll
 where
     L: FnMut() -> Fut,
     Fut: Future<Output = anyhow::Result<Vec<systemd::PluginUnit>>>,
 {
-    wait_then_settle(ids, list_units, |_, end| std::future::ready(end)).await
+    let waits: Vec<(&str, Awaiting)> = ids.iter().map(|&id| (id, awaiting)).collect();
+    wait_then_settle(&waits, list_units, |_, end| std::future::ready(end)).await
 }
 
-/// Wait for every unit in `ids` to stop holding its name, all together
+/// Wait for every unit in `waits` to stop holding its name, all together
 /// (#1444), and hand each unit to `settle` **as soon as** its wait has ended,
 /// with how it ended. This is the one place a restart's wait is decided: for
 /// a single plugin ([`wait_until_stopped_listing`], which settles nothing)
 /// and for a batch ([`restart_all_via`], which relaunches each unit in
-/// `settle`, #1446 review) alike.
+/// `settle`, #1446 review) alike. Each unit is waited for on its own
+/// [`Awaiting`].
 ///
 /// - **One deadline** for all of them, [`STOP_WAIT`] from the start of the
 ///   wait. The wait lasts as long as its slowest unit, and never longer than
@@ -3312,6 +3412,11 @@ where
 ///   sends every unit still stopping to its relaunch, where a stamped one is
 ///   refused and stays down until its next start. Before #1444 a failed
 ///   listing cost only the one unit being waited for.
+/// - **A launch's unit running again is back up** (#1555). For a unit on
+///   [`Awaiting::Launch`], a listing that shows it `active`, `activating` or
+///   `reloading` ([`is_running`]) ends its wait with [`StopWait::BackUp`],
+///   settled right then like a unit that went down. A unit on
+///   [`Awaiting::Stop`] is waited through those states, as before.
 /// - **A unit still holding its name at the deadline** has run out
 ///   ([`StopWait::RanOut`]), and is settled then. The answer names the
 ///   `SubState` of the **last** listing that showed it (#1445 review, L3).
@@ -3322,7 +3427,7 @@ where
 /// Each unit's end depends only on its own rows in the listings, so one unit
 /// that runs out never changes another's end.
 async fn wait_then_settle<L, LF, H, HF, T>(
-    ids: &[&str],
+    waits: &[(&str, Awaiting)],
     mut list_units: L,
     mut settle: H,
 ) -> WaitedAll<T>
@@ -3340,30 +3445,46 @@ where
     let mut listings = 0;
     // Each unit's settlement once it has one, and the SubState its last
     // listing showed while it still held its name.
-    let mut settled: Vec<Option<T>> = ids.iter().map(|_| None).collect();
-    let mut last_seen: Vec<Option<String>> = vec![None; ids.len()];
+    let mut settled: Vec<Option<T>> = waits.iter().map(|_| None).collect();
+    let mut last_seen: Vec<Option<String>> = vec![None; waits.len()];
     while settled.iter().any(Option::is_none) && tokio::time::Instant::now() < deadline {
         listings += 1;
-        let pending = (0..ids.len()).filter(|&k| settled[k].is_none());
-        let over: Vec<usize> = match tokio::time::timeout_at(deadline, list_units()).await {
-            Ok(Ok(units)) => pending
-                .filter(|&k| {
-                    let blocking = units
-                        .iter()
-                        .find(|u| u.id == ids[k] && blocks_relaunch(&u.active_state));
-                    if let Some(unit) = blocking {
-                        last_seen[k] = Some(unit.sub_state.clone());
-                    }
-                    blocking.is_none()
-                })
-                .collect(),
-            Ok(Err(_)) => pending.collect(),
-            Err(_) => Vec::new(),
-        };
-        if !over.is_empty() {
+        let pending = (0..waits.len()).filter(|&k| settled[k].is_none());
+        let ended: Vec<(usize, StopWait)> =
+            match tokio::time::timeout_at(deadline, list_units()).await {
+                Ok(Ok(units)) => pending
+                    .filter_map(|k| {
+                        let (id, awaiting) = waits[k];
+                        let blocking = units
+                            .iter()
+                            .find(|u| u.id == id && blocks_relaunch(&u.active_state));
+                        match blocking {
+                            None => Some((k, StopWait::Over)),
+                            Some(unit)
+                                if awaiting == Awaiting::Launch
+                                    && is_running(&unit.active_state) =>
+                            {
+                                Some((
+                                    k,
+                                    StopWait::BackUp {
+                                        sub_state: unit.sub_state.clone(),
+                                    },
+                                ))
+                            }
+                            Some(unit) => {
+                                last_seen[k] = Some(unit.sub_state.clone());
+                                None
+                            }
+                        }
+                    })
+                    .collect(),
+                Ok(Err(_)) => pending.map(|k| (k, StopWait::Over)).collect(),
+                Err(_) => Vec::new(),
+            };
+        if !ended.is_empty() {
             let settling = tokio::time::Instant::now();
-            for k in over {
-                settled[k] = Some(settle(k, StopWait::Over).await);
+            for (k, end) in ended {
+                settled[k] = Some(settle(k, end).await);
             }
             deadline += settling.elapsed();
         }
@@ -3379,7 +3500,7 @@ where
         let sub_state = last_seen[k]
             .take()
             .unwrap_or_else(|| "unknown (no listing answered in time)".to_owned());
-        tracing::warn!(plugin = %ids[k], %sub_state, "unit still stopping when the wait ran out");
+        tracing::warn!(plugin = %waits[k].0, %sub_state, "unit still stopping when the wait ran out");
         *slot = Some(settle(k, StopWait::RanOut { sub_state }).await);
     }
     WaitedAll {
@@ -6699,7 +6820,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_wait_lasts_through_deactivating() {
         let calls = std::cell::Cell::new(0_usize);
-        let waited = wait_until_stopped_listing("vibectl", || {
+        let waited = wait_until_stopped_listing("vibectl", Awaiting::Stop, || {
             let n = calls.get() + 1;
             calls.set(n);
             async move {
@@ -6733,7 +6854,7 @@ mod tests {
             .expect("PLUGIN_TIMEOUT_STOP is whole seconds");
         assert!(STOP_WAIT > Duration::from_secs(timeout_secs));
         let start = tokio::time::Instant::now();
-        let waited = wait_until_stopped_listing("vibectl", || async {
+        let waited = wait_until_stopped_listing("vibectl", Awaiting::Stop, || async {
             Ok(vec![unit("vibectl", "deactivating", false)])
         })
         .await;
@@ -6755,7 +6876,7 @@ mod tests {
     async fn a_failed_listing_ends_the_wait_without_running_out() {
         let start = tokio::time::Instant::now();
         let waited =
-            wait_until_stopped_listing("vibectl", || async { anyhow::bail!("no user manager") })
+            wait_until_stopped_listing("vibectl", Awaiting::Stop, || async { anyhow::bail!("no user manager") })
                 .await;
         assert_eq!(
             waited,
@@ -6783,7 +6904,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_wait_runs_out_only_on_a_unit_still_stopping() {
         let calls = std::cell::Cell::new(0_usize);
-        let stuck = wait_until_stopped_listing("pet", || {
+        let stuck = wait_until_stopped_listing("pet", Awaiting::Stop, || {
             let n = calls.get() + 1;
             calls.set(n);
             // systemd moves on from SIGTERM to SIGKILL partway through.
@@ -6810,7 +6931,7 @@ mod tests {
             || Err(anyhow::anyhow!("no user manager")),
         ];
         for listing in early {
-            let over = wait_until_stopped_listing("pet", || async move { listing() }).await;
+            let over = wait_until_stopped_listing("pet", Awaiting::Stop, || async move { listing() }).await;
             assert_eq!(over.end, StopWait::Over);
         }
     }
@@ -6822,12 +6943,139 @@ mod tests {
     /// nothing showed going down.
     #[tokio::test(start_paused = true)]
     async fn a_wait_no_listing_answered_runs_out_naming_no_state() {
-        let waited = wait_until_stopped_listing("pet", || async {
+        let waited = wait_until_stopped_listing("pet", Awaiting::Stop, || async {
             tokio::time::sleep(STOP_WAIT * 2).await;
             Ok(Vec::new())
         })
         .await;
         assert_eq!(waited.end, ran_out("unknown (no listing answered in time)"));
+    }
+
+    /// What a plugin that crashed with child processes left over looks like
+    /// in the wait's listings, one per poll (#1555): `deactivating` /
+    /// `stop-sigterm` for three polls while systemd kills the children (a
+    /// unit with no stop job, which the listing cannot show), then
+    /// `Restart=on-failure`'s `activating` / `auto-restart` for `RestartSec=`
+    /// (2 s, ten polls), then `active` / `running`. Another plugin's unit is
+    /// stuck stopping beside it the whole time.
+    fn crashed_and_restarted(listing: usize) -> Vec<systemd::PluginUnit> {
+        let (active, sub) = match listing {
+            1..=3 => ("deactivating", "stop-sigterm"),
+            4..=13 => ("activating", "auto-restart"),
+            _ => ("active", "running"),
+        };
+        vec![
+            unit_in("caw", "deactivating", "final-sigkill"),
+            unit_in("pet", active, sub),
+        ]
+    }
+
+    /// **A launch's wait ends when systemd brings the unit back up**
+    /// (#1555). Over [`crashed_and_restarted`]'s sequence, a wait on
+    /// [`Awaiting::Launch`] ends on the first listing that shows the unit
+    /// running again, the fourth, three polls in, with
+    /// [`StopWait::BackUp`] naming that listing's `SubState`. Before, it
+    /// waited the whole [`STOP_WAIT`] under the lock and ran out naming
+    /// `running`, which a start or a reconcile then answered as
+    /// [`StillStopping`] about a plugin that was running.
+    ///
+    /// A restart's wait, on [`Awaiting::Stop`], is unchanged: over the same
+    /// sequence it still waits the whole bound and runs out naming
+    /// `running`, because a unit back up is not the relaunch a restart owes.
+    ///
+    /// Falsified by deleting the `BackUp` arm (the launch runs out at 12 s,
+    /// naming `running`), by applying it to `Awaiting::Stop` too, and by
+    /// testing [`blocks_relaunch`] instead of [`is_running`] (the first
+    /// listing, still `deactivating`, would end it).
+    #[tokio::test(start_paused = true)]
+    async fn a_launch_wait_ends_when_the_unit_comes_back_up() {
+        let calls = std::cell::Cell::new(0_usize);
+        let listing = || {
+            calls.set(calls.get() + 1);
+            std::future::ready(Ok(crashed_and_restarted(calls.get())))
+        };
+        let t0 = tokio::time::Instant::now();
+        let launch = wait_until_stopped_listing("pet", Awaiting::Launch, listing).await;
+        assert_eq!(
+            launch,
+            Waited {
+                listings: 4,
+                end: StopWait::BackUp {
+                    sub_state: "auto-restart".to_owned()
+                }
+            },
+            "the launch's wait ends on the first listing that shows pet running"
+        );
+        assert_eq!(t0.elapsed(), STOP_POLL * 3);
+
+        calls.set(0);
+        let t0 = tokio::time::Instant::now();
+        let restart = wait_until_stopped_listing("pet", Awaiting::Stop, listing).await;
+        assert_eq!(restart.end, ran_out("running"), "a restart still waits");
+        assert!(t0.elapsed() >= STOP_WAIT, "{:?}", t0.elapsed());
+    }
+
+    /// **Which listings end a launch's wait, and how** (#1555). Every state
+    /// [`is_running`] counts as running ends it as [`StopWait::BackUp`], on
+    /// the first listing, naming its `SubState`. A unit down, failed or gone
+    /// ends it as [`StopWait::Over`], as it ends a restart's. And a unit
+    /// still `deactivating` is waited for to the bound in every `SubState` a
+    /// stop goes through, so a launch onto a unit that is really stopping
+    /// still waits for it.
+    ///
+    /// Falsified by the `BackUp` arm keyed on `active` alone (the
+    /// `activating` and `reloading` rows run out), and by any `SubState`
+    /// test that lets a stopping unit end the wait early.
+    #[tokio::test(start_paused = true)]
+    async fn only_a_running_unit_ends_a_launch_wait_as_back_up() {
+        for (active, sub) in [
+            ("activating", "auto-restart"),
+            ("activating", "auto-restart-queued"),
+            ("activating", "start"),
+            ("active", "running"),
+            ("reloading", "reload"),
+        ] {
+            let waited = wait_until_stopped_listing("pet", Awaiting::Launch, || async move {
+                Ok(vec![unit_in("pet", active, sub)])
+            })
+            .await;
+            assert_eq!(
+                waited,
+                Waited {
+                    listings: 1,
+                    end: StopWait::BackUp {
+                        sub_state: sub.to_owned()
+                    }
+                },
+                "{active}/{sub}"
+            );
+        }
+        let down: [fn() -> anyhow::Result<Vec<systemd::PluginUnit>>; 3] = [
+            || Ok(vec![unit("pet", "inactive", false)]),
+            || Ok(vec![unit("pet", "failed", false)]),
+            || Ok(vec![unit_in("caw", "activating", "auto-restart")]),
+        ];
+        for listing in down {
+            let waited =
+                wait_until_stopped_listing("pet", Awaiting::Launch, || async move { listing() })
+                    .await;
+            assert_eq!(waited.end, StopWait::Over, "{:?}", listing());
+        }
+        for sub in [
+            "stop-sigterm",
+            "stop-sigkill",
+            "stop-post",
+            "final-sigterm",
+            "final-sigkill",
+        ] {
+            let t0 = tokio::time::Instant::now();
+            let waited = wait_until_stopped_listing("pet", Awaiting::Launch, || async move {
+                Ok(vec![unit_in("pet", "deactivating", sub)])
+            })
+            .await;
+            assert_eq!(waited.end, ran_out(sub), "deactivating/{sub} is still stopping");
+            assert!(t0.elapsed() >= STOP_WAIT, "{sub}: {:?}", t0.elapsed());
+        }
     }
 
     /// The restart path waits between its stop and its relaunch, through the
@@ -6867,7 +7115,7 @@ mod tests {
         let effects: Vec<Option<usize>> = [
             "restart_via(id, stamped,",
             "|| stop_unit(id),",
-            "|| wait_until_stopped(id),",
+            "|| wait_until_stopped(id, Awaiting::Stop),",
             "let extra_env = resolve_secret_env(id, spec).await;",
             "launch(id, spec, &extra_env, target).await",
             "|| systemd::start_plugin(id),",
@@ -6914,31 +7162,35 @@ mod tests {
              and only then falls back: {order:?}\n{decide}"
         );
         let no_fallback = squash(body("async fn launch_after_wait<"));
+        // Since #1555 a unit back up is answered too, also without a launch.
         let order: Vec<Option<usize>> = [
-            "if let StopWait::RanOut { sub_state } = waited {",
-            "return Err(StillStopping {",
-            "launch_now().await",
+            "match waited {",
+            "StopWait::RanOut { sub_state } => Err(StillStopping {",
+            "StopWait::BackUp { sub_state } => {",
+            "StopWait::Over => launch_now().await,",
         ]
         .iter()
         .map(|needle| no_fallback.find(&squash(needle)))
         .collect();
         assert!(
             !order.contains(&None) && order.is_sorted(),
-            "a launch with no fallback answers a run-out before it launches: \
+            "a launch with no fallback answers a run-out and a return before it launches: \
              {order:?}\n{no_fallback}"
         );
         // The wrapper is the hand-over and nothing else: the decision, and
         // the SubState it names, are `wait_until_stopped_listing`'s, which
         // `the_wait_runs_out_only_on_a_unit_still_stopping` drives (#1445
-        // review, M1 and L3).
-        let wait = squash(body("async fn wait_until_stopped(id: &str)"));
+        // review, M1 and L3). Since #1555 it hands over the caller's
+        // `Awaiting` too, which `a_launch_wait_ends_when_the_unit_comes_back_up`
+        // drives.
+        let wait = squash(body("async fn wait_until_stopped(id: &str"));
         assert_eq!(
             wait,
             squash(
-                "async fn wait_until_stopped(id: &str) -> StopWait {
-                    wait_until_stopped_listing(id, systemd::list_plugin_units).await.end"
+                "async fn wait_until_stopped(id: &str, awaiting: Awaiting) -> StopWait {
+                    wait_until_stopped_listing(id, awaiting, systemd::list_plugin_units).await.end"
             ),
-            "the wait must hand the real listing to the seam that decides"
+            "the wait must hand the real listing and the caller's Awaiting to the seam that decides"
         );
         // The reconcile's restarts, which since #1444 go through one batch,
         // are `the_reconcile_restarts_through_one_batch_with_the_real_effects`'s
@@ -7193,7 +7445,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_wait_is_bounded_by_the_clock_even_when_listings_are_slow() {
         let start = tokio::time::Instant::now();
-        let end = wait_until_stopped_listing("vibectl", || async {
+        let end = wait_until_stopped_listing("vibectl", Awaiting::Stop, || async {
             tokio::time::sleep(Duration::from_secs(5)).await;
             Ok(vec![unit("vibectl", "deactivating", false)])
         })
@@ -7537,10 +7789,15 @@ mod tests {
         stops_failing: BTreeSet<&'static str>,
         relaunch_takes: Duration,
         stopped_at: std::cell::RefCell<BTreeMap<String, tokio::time::Instant>>,
+        crashed: std::cell::RefCell<BTreeSet<String>>,
         log: std::cell::RefCell<Vec<String>>,
         listings: std::cell::Cell<usize>,
         launched: std::cell::RefCell<Vec<(String, Duration)>>,
     }
+
+    /// The `RestartSec=` [`plugin_launch`] gives every plugin, for the
+    /// [`Manager`]'s crashed units.
+    const RESTART_SEC: Duration = Duration::from_secs(2);
 
     impl Manager {
         fn new(stop_takes: &[(&'static str, Option<Duration>)]) -> Self {
@@ -7550,6 +7807,7 @@ mod tests {
                 stops_failing: BTreeSet::new(),
                 relaunch_takes: Duration::ZERO,
                 stopped_at: std::cell::RefCell::default(),
+                crashed: std::cell::RefCell::default(),
                 log: std::cell::RefCell::default(),
                 listings: std::cell::Cell::new(0),
                 launched: std::cell::RefCell::default(),
@@ -7565,8 +7823,20 @@ mod tests {
             let Some(&at) = self.stopped_at.borrow().get(id) else {
                 return Some(unit(id, "active", false));
             };
+            let now = tokio::time::Instant::now();
             match self.stop_takes[id] {
-                Some(takes) if tokio::time::Instant::now() >= at + takes => None,
+                Some(takes) if now >= at + takes => {
+                    if !self.crashed.borrow().contains(id) {
+                        return None;
+                    }
+                    // `Restart=on-failure` counts down `RestartSec=`, then
+                    // starts the same unit again.
+                    Some(if now < at + takes + RESTART_SEC {
+                        unit_in(id, "activating", "auto-restart")
+                    } else {
+                        unit_in(id, "active", "running")
+                    })
+                }
                 _ => Some(unit(id, "deactivating", false)),
             }
         }
@@ -7631,6 +7901,16 @@ mod tests {
             self.stopped_at
                 .borrow_mut()
                 .insert(id.to_owned(), tokio::time::Instant::now());
+        }
+
+        /// `id`'s plugin crashed just now, leaving child processes behind
+        /// (#1555): `deactivating` for its `stop_takes` while systemd kills
+        /// them, with no stop job and nothing in the log, and then
+        /// `Restart=on-failure` brings the same unit back, `activating`
+        /// (`auto-restart`) for [`RESTART_SEC`] and `active` after.
+        fn crashed(&self, id: &str) {
+            self.stopped_elsewhere(id);
+            self.crashed.borrow_mut().insert(id.to_owned());
         }
 
         /// When each relaunched unit was relaunched, by id.
@@ -7974,7 +8254,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_batch_wait_ends_each_unit_on_its_own_rows() {
         let calls = std::cell::Cell::new(0_usize);
-        let waited = wait_until_all_stopped_listing(&["pet", "vibectl", "caw"], || {
+        let waited = wait_until_all_stopped_listing(&["pet", "vibectl", "caw"], Awaiting::Stop, || {
             let n = calls.get() + 1;
             calls.set(n);
             let pet = if n <= 10 {
@@ -8006,7 +8286,7 @@ mod tests {
         );
 
         let calls = std::cell::Cell::new(0_usize);
-        let waited = wait_until_all_stopped_listing(&["pet", "vibectl"], || {
+        let waited = wait_until_all_stopped_listing(&["pet", "vibectl"], Awaiting::Stop, || {
             let n = calls.get() + 1;
             calls.set(n);
             async move {
@@ -8031,7 +8311,7 @@ mod tests {
         );
 
         let t0 = tokio::time::Instant::now();
-        let waited = wait_until_all_stopped_listing(&[], || async {
+        let waited = wait_until_all_stopped_listing(&[], Awaiting::Stop, || async {
             panic!("a wait for no units lists nothing")
         })
         .await;
@@ -8054,7 +8334,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_failed_listing_ends_every_unit_still_waited_for() {
         let calls = std::cell::Cell::new(0_usize);
-        let waited = wait_until_all_stopped_listing(&["pet", "vibectl"], || {
+        let waited = wait_until_all_stopped_listing(&["pet", "vibectl"], Awaiting::Stop, || {
             let n = calls.get() + 1;
             calls.set(n);
             async move {
@@ -8081,13 +8361,26 @@ mod tests {
 
     /// [`launch_after_wait`], the rule for a launch with no fallback: a wait
     /// that ran out is [`StillStopping`], naming its `SubState`, and nothing
-    /// is launched; a wait that is over launches, and the launch's answer is
-    /// the answer, an error included, with nothing after it.
+    /// is launched; a unit that came back up is `Ok`, and nothing is
+    /// launched either (#1555); a wait that is over launches, and the
+    /// launch's answer is the answer, an error included, with nothing after
+    /// it.
     ///
     /// Falsified by launching after a run-out (the refusal comes back
-    /// instead), and by a run-out answered `Ok`.
+    /// instead), by a run-out answered `Ok`, and by launching, or answering
+    /// an error, on a return.
     #[tokio::test]
     async fn a_launch_with_no_fallback_launches_only_once_the_wait_is_over() {
+        launch_after_wait(
+            "pet",
+            StopWait::BackUp {
+                sub_state: "auto-restart".to_owned(),
+            },
+            || async { panic!("a unit back up is not launched a second time") },
+        )
+        .await
+        .expect("the plugin is running again");
+
         let err = launch_after_wait("pet", ran_out("final-sigkill"), || async {
             panic!("nothing is launched once the wait ran out")
         })
@@ -8208,6 +8501,49 @@ mod tests {
         assert_eq!(manager.t0.elapsed(), STOP_WAIT);
     }
 
+    /// **A reconcile's launch onto a plugin that crashed and comes back up
+    /// launches nothing, and holds nobody up** (#1555). `w` crashed with
+    /// child processes left over (one more second of systemd killing them,
+    /// then `Restart=on-failure`), so the pass planned it
+    /// [`Action::WaitThenLaunch`]; `a`'s spec changed, a 4 s stop. `w`'s wait
+    /// ends at 1 s, on the listing that shows it `activating`, with an `Ok`
+    /// and nothing launched; `a` is relaunched at 4 s, as before, and the
+    /// pass costs `a`'s stop. Before, `w` ran out at [`STOP_WAIT`] and
+    /// answered [`StillStopping`], and the pass took 12 s.
+    ///
+    /// Falsified by the batch waiting for a unit already stopping on
+    /// [`Awaiting::Stop`] (`w` runs out at 12 s), and by
+    /// [`launch_after_wait`] launching on a return (`launch w`, refused).
+    #[tokio::test(start_paused = true)]
+    async fn a_reconcile_launch_onto_a_plugin_that_comes_back_up_launches_nothing() {
+        let secs = Duration::from_secs;
+        let manager = Manager::new(&[("a", Some(secs(4))), ("w", Some(secs(1)))]);
+        manager.crashed("w");
+        let on = spec("/bin/x", true);
+        let restarts = [("a", false), ("w", true)].map(|(id, stopping)| Restarting {
+            id,
+            spec: &on,
+            stamped: true,
+            stopping,
+        });
+        let answers = manager.restart_all(&restarts).await;
+
+        for (id, answer) in &answers {
+            assert!(answer.is_ok(), "{id}: {answer:?}");
+        }
+        assert_eq!(answers.len(), 2);
+        assert_eq!(
+            manager.launched_at(),
+            BTreeMap::from([("a".to_owned(), secs(4))]),
+            "w is running again and is not launched"
+        );
+        assert_eq!(manager.t0.elapsed(), secs(4), "a's stop, not the bound");
+        assert_eq!(
+            *manager.log.borrow(),
+            ["keys a", "keys w", "stop a", "list", "launch a"]
+        );
+    }
+
     /// One [`start_via`] for a declared, switched-on `pet` against `manager`:
     /// the real wait over the manager's listings, the keyring read and the
     /// relaunch as the manager does them, and no `StartUnit` (a declared
@@ -8219,7 +8555,7 @@ mod tests {
             || async { Some(declared(&[("pet", on.clone())])) },
             || std::future::ready(Ok(manager.listing())),
             || async {
-                wait_until_stopped_listing("pet", || std::future::ready(Ok(manager.listing())))
+                wait_until_stopped_listing("pet", Awaiting::Launch, || std::future::ready(Ok(manager.listing())))
                     .await
                     .end
             },
@@ -8282,6 +8618,36 @@ mod tests {
         );
         assert!(manager.launched_at().is_empty());
         assert_eq!(manager.t0.elapsed(), STOP_WAIT);
+    }
+
+    /// **A start onto a plugin that crashed and comes back up launches
+    /// nothing, and does not wait out the bound** (#1555). `pet` crashed a
+    /// moment before its switch was flipped on, leaving child processes
+    /// behind: its unit is `deactivating` for one more second while systemd
+    /// kills them, and then `Restart=on-failure` brings it back. The start
+    /// waits for the unit, sees it `activating` at 1 s, and answers `Ok`
+    /// with nothing launched, since the plugin is running. Before, it held
+    /// the lock for the whole [`STOP_WAIT`] and answered [`StillStopping`]
+    /// (naming `running`), and the Plugins tab put the switch back to off.
+    ///
+    /// Falsified by deleting the wait's `BackUp` arm (a `StillStopping` at
+    /// 12 s) and by [`launch_after_wait`] launching on a return (refused,
+    /// "already loaded"). That [`start`] hands its seam a wait on
+    /// [`Awaiting::Launch`] is `start_hands_its_seam_the_real_effects`'.
+    #[tokio::test(start_paused = true)]
+    async fn a_start_onto_a_plugin_that_comes_back_up_launches_nothing() {
+        let manager = Manager::new(&[("pet", Some(Duration::from_secs(1)))]);
+        manager.crashed("pet");
+        start_against(&manager)
+            .await
+            .expect("the plugin is running again");
+        assert_eq!(
+            *manager.log.borrow(),
+            ["list"],
+            "no keys read, nothing launched"
+        );
+        assert!(manager.launched_at().is_empty());
+        assert_eq!(manager.t0.elapsed(), Duration::from_secs(1));
     }
 
     /// A start waits **only** for a unit still stopping (#1417 follow-up);
@@ -8397,13 +8763,16 @@ mod tests {
 
     /// The wiring the `a_start_*` tests stand in for, which a stand-in
     /// cannot check: [`start`] hands [`start_via`] the effective
-    /// declaration, the real listing, the restart's own wait, the keyring
-    /// read plus `systemd-run`, and `StartUnit`, in that order. A source
-    /// scan, on `the_restart_waits_for_the_stop_under_the_lock`'s precedent:
-    /// the real ones need a user manager.
+    /// declaration, the real listing, the restart's own wait (on
+    /// [`Awaiting::Launch`] since #1555, so a unit that comes back up ends
+    /// it), the keyring read plus `systemd-run`, and `StartUnit`, in that
+    /// order. A source scan, on
+    /// `the_restart_waits_for_the_stop_under_the_lock`'s precedent: the real
+    /// ones need a user manager.
     ///
     /// Falsified by `start` handing the seam a stand-in for any of the five,
-    /// in particular a wait that does not wait.
+    /// in particular a wait that does not wait, or one on
+    /// [`Awaiting::Stop`].
     #[test]
     fn start_hands_its_seam_the_real_effects() {
         let src = include_str!("plugin_launcher.rs");
@@ -8416,7 +8785,7 @@ mod tests {
         let start = squash(&prod[begin..begin + len]);
         let effects: Vec<Option<usize>> = [
             "start_via(id, load_declared, systemd::list_plugin_units,",
-            "|| wait_until_stopped(id),",
+            "|| wait_until_stopped(id, Awaiting::Launch),",
             "let extra_env = resolve_secret_env(id, &spec).await;",
             "launch(id, &spec, &extra_env, &target).await",
             "|| systemd::start_plugin(id),",
@@ -9900,7 +10269,7 @@ mod tests {
                 || async { Some(declared(&[("pet", on.clone())])) },
                 || list_prefixed(&prefix),
                 || async {
-                    wait_until_stopped_listing("pet", || list_prefixed(&prefix))
+                    wait_until_stopped_listing("pet", Awaiting::Launch, || list_prefixed(&prefix))
                         .await
                         .end
                 },

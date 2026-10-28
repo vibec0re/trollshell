@@ -10704,66 +10704,20 @@ mod tests {
         /// same guard.
         #[tokio::test]
         async fn a_start_onto_a_returning_unit_applies_the_new_values() {
-            const CRASH_STOP: &str = "2s";
             let prefix = format!("ts1628-rev-{}", std::process::id());
             let unit = format!("{prefix}-pet.service");
             let _cleanup = Cleanup(vec![unit.clone()]);
-            let dir = tempfile::tempdir().expect("tempdir");
-            let mark = dir.path().join("crashed-once");
-            let script = dir.path().join("crasher.sh");
-            // First run: leave a child that ignores SIGTERM, then crash.
-            std::fs::write(
-                &script,
-                "if [ ! -e \"$MARK\" ]; then touch \"$MARK\"; ( trap '' TERM; exec sleep 30 ) & \
-                 sleep 0.3; kill -SEGV $$; fi; exec sleep 300\n",
-            )
-            .expect("script");
-            // plugin_launch's restart properties, the value on the env.
-            let run = |value: &str| {
-                let (unit, mark, script) = (unit.clone(), mark.clone(), script.clone());
-                let value = value.to_owned();
-                async move {
-                    let out = tokio::process::Command::new("systemd-run")
-                        .args(["--user", "--quiet", "--collect", &format!("--unit={unit}")])
-                        .arg("--property=Restart=on-failure")
-                        .arg("--property=RestartSec=2")
-                        .arg(format!("--property=TimeoutStopSec={CRASH_STOP}"))
-                        .arg("--setenv=PATH")
-                        .arg(format!("--setenv=MARK={}", mark.display()))
-                        .arg(format!("--setenv=PET_NAME={value}"))
-                        .arg("--")
-                        .arg("/bin/sh")
-                        .arg(&script)
-                        .output()
-                        .await?;
-                    anyhow::ensure!(
-                        out.status.success(),
-                        "systemd-run: {}",
-                        String::from_utf8_lossy(&out.stderr).trim()
-                    );
-                    anyhow::Ok(())
-                }
-            };
-            if let Err(err) = run("old").await {
+            let crasher = Crasher::new(&unit);
+            if let Err(err) = crasher.run("old").await {
                 eprintln!("skipping: systemd-run --user could not start a unit: {err:#}");
                 return;
             }
             let t0 = std::time::Instant::now();
             // Until the crash shows: deactivating, the child being killed.
-            loop {
-                let units = list_prefixed(&prefix).await.expect("listed");
-                if units
-                    .iter()
-                    .any(|u| u.id == "pet" && u.active_state == "deactivating")
-                {
-                    break;
-                }
-                assert!(
-                    t0.elapsed() < Duration::from_secs(5),
-                    "never crashed: {units:?}"
-                );
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
+            assert!(
+                until_listed(&prefix, "deactivating", Duration::from_secs(5)).await,
+                "never crashed"
+            );
             eprintln!("crashed at {:?}", t0.elapsed());
             let mut new = spec("/bin/x", true);
             new.settings.insert("PET_NAME".to_owned(), "new".to_owned());
@@ -10795,8 +10749,8 @@ mod tests {
                 |spec, _| {
                     launched.set(true);
                     let value = spec.settings["PET_NAME"].clone();
-                    let run = &run;
-                    async move { run(&value).await }
+                    let crasher = &crasher;
+                    async move { crasher.run(&value).await }
                 },
                 || async { panic!("declared") },
             )
@@ -10808,45 +10762,8 @@ mod tests {
                 t0.elapsed(),
                 launched.get()
             );
-            for _ in 0..60 {
-                let units = list_prefixed(&prefix).await.expect("listed");
-                if units
-                    .iter()
-                    .any(|u| u.id == "pet" && u.active_state == "active")
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            let props = String::from_utf8(
-                std::process::Command::new("systemctl")
-                    .args([
-                        "--user",
-                        "show",
-                        "-p",
-                        "Environment",
-                        "-p",
-                        "ActiveState",
-                        "-p",
-                        "SubState",
-                        "-p",
-                        "NRestarts",
-                        &unit,
-                    ])
-                    .output()
-                    .expect("systemctl")
-                    .stdout,
-            )
-            .expect("utf-8");
-            let running_with: Vec<String> = props
-                .split_whitespace()
-                .filter(|kv| kv.starts_with("PET_NAME="))
-                .map(str::to_owned)
-                .collect();
-            let state: Vec<&str> = props
-                .lines()
-                .filter(|l| !l.starts_with("Environment="))
-                .collect();
+            until_listed(&prefix, "active", Duration::from_secs(6)).await;
+            let (state, running_with) = shown(&unit);
             eprintln!("the unit after the start: {state:?} {running_with:?}");
             // The consequence first: what the user was promised.
             assert_eq!(
@@ -10855,8 +10772,8 @@ mod tests {
                 "the start answered Ok, but the running plugin never got the saved value"
             );
             assert!(
-                props.contains("ActiveState=active"),
-                "running, from the start's own launch: {props}"
+                state.iter().any(|l| l == "ActiveState=active"),
+                "running, from the start's own launch: {state:?}"
             );
             assert!(
                 launched.get(),
@@ -10866,6 +10783,105 @@ mod tests {
                 took < STOP_WAIT / 2,
                 "took {took:?}: a unit that came back ends the wait, it is not waited out"
             );
+        }
+
+        /// The review's stand-in for a plugin that crashes once with a child
+        /// left over (#1628 review, F1): `<unit>` run with `plugin_launch`'s
+        /// restart properties (`Restart=on-failure`, `RestartSec=2`) and
+        /// `PET_NAME` on its environment. Its first run leaves a child that
+        /// ignores SIGTERM and SIGSEGVs; every later run just sleeps.
+        /// `TimeoutStopSec=2` rather than the launcher's 10 s, as in the
+        /// review's own state-sequence measurement.
+        struct Crasher {
+            unit: String,
+            mark: std::path::PathBuf,
+            script: std::path::PathBuf,
+            _dir: tempfile::TempDir,
+        }
+
+        impl Crasher {
+            fn new(unit: &str) -> Self {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let script = dir.path().join("crasher.sh");
+                std::fs::write(
+                    &script,
+                    "if [ ! -e \"$MARK\" ]; then touch \"$MARK\"; ( trap '' TERM; exec sleep 30 ) \
+                     & sleep 0.3; kill -SEGV $$; fi; exec sleep 300\n",
+                )
+                .expect("script");
+                Self {
+                    unit: unit.to_owned(),
+                    mark: dir.path().join("crashed-once"),
+                    script,
+                    _dir: dir,
+                }
+            }
+
+            /// Start the unit with `PET_NAME=<value>`.
+            async fn run(&self, value: &str) -> anyhow::Result<()> {
+                let out = tokio::process::Command::new("systemd-run")
+                    .args(["--user", "--quiet", "--collect"])
+                    .arg(format!("--unit={}", self.unit))
+                    .arg("--property=Restart=on-failure")
+                    .arg("--property=RestartSec=2")
+                    .arg("--property=TimeoutStopSec=2s")
+                    .arg("--setenv=PATH")
+                    .arg(format!("--setenv=MARK={}", self.mark.display()))
+                    .arg(format!("--setenv=PET_NAME={value}"))
+                    .arg("--")
+                    .arg("/bin/sh")
+                    .arg(&self.script)
+                    .output()
+                    .await?;
+                anyhow::ensure!(
+                    out.status.success(),
+                    "systemd-run: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+                Ok(())
+            }
+        }
+
+        /// Poll `<prefix>-pet` every 50 ms until it is listed in
+        /// `active_state`, for at most `bound`; whether it got there.
+        async fn until_listed(prefix: &str, active_state: &str, bound: Duration) -> bool {
+            let t0 = std::time::Instant::now();
+            while t0.elapsed() < bound {
+                let units = list_prefixed(prefix).await.expect("listed");
+                if units
+                    .iter()
+                    .any(|u| u.id == "pet" && u.active_state == active_state)
+                {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            false
+        }
+
+        /// `systemctl --user show` for `unit`: its state lines, and the
+        /// `PET_NAME=` entries of its `Environment=`.
+        fn shown(unit: &str) -> (Vec<String>, Vec<String>) {
+            let props = String::from_utf8(
+                std::process::Command::new("systemctl")
+                    .args(["--user", "show", "-p", "Environment", "-p", "ActiveState"])
+                    .args(["-p", "SubState", "-p", "NRestarts", unit])
+                    .output()
+                    .expect("systemctl")
+                    .stdout,
+            )
+            .expect("utf-8");
+            let state = props
+                .lines()
+                .filter(|l| !l.starts_with("Environment="))
+                .map(str::to_owned)
+                .collect();
+            let running_with = props
+                .split_whitespace()
+                .filter(|kv| kv.starts_with("PET_NAME="))
+                .map(str::to_owned)
+                .collect();
+            (state, running_with)
         }
     }
 }

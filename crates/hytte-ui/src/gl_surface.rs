@@ -91,6 +91,86 @@
 //! a question only a per-frame walk of every reconciled tree could ask is not
 //! one a host with a hot path is ever going to ask.
 //!
+//! # Teardown, as GTK's source has it (#1562)
+//!
+//! `hytte-gl`'s handles delete their GL objects in `Drop`, and since #1543 only
+//! under the context that made them. #1543 also argued that a surface cannot
+//! be dropped *without* going through `unrealize` — so its handles are never
+//! dropped from `finalize`, under whatever context happens to be current
+//! there — but checked that against no GTK source. Read since against
+//! **GTK 4.22.4**, the `gtk4` this flake pins (with `GLib` 2.88.3, glib-rs
+//! 0.22.5 and gtk4-rs 0.11.2), the argument holds:
+//!
+//! * **A realized `GtkGLArea` is never finalized.** On the last unref `GObject`
+//!   runs `dispose` and only then `finalize` (`GLib`'s `gobject/gobject.c:4839`,
+//!   `:4910`). `gtk_widget_dispose` unrealizes a widget that is still realized
+//!   (`gtk/gtkwidget.c:7670`), and taking a widget out of its parent
+//!   unrealizes it before unrooting it (`gtk/gtkwidget.c:2702`). Unrealizing
+//!   emits `unrealize` (`gtk/gtkwidget.c:3608`), whose class handler is the
+//!   `unrealize` vfunc (`gtk/gtkwidget.c:1799-1806`) — this subclass's
+//!   override, through gtk4-rs's trampoline (`src/subclass/widget.rs:897`).
+//!   That override empties `resources`, and glib-rs drops the Rust half of
+//!   the object only in `finalize` (`src/subclass/types.rs:1007`), so by then
+//!   there is nothing left in it to delete. Nor can `resources` be filled
+//!   while unrealized: only `render` builds it, and GTK emits `render` only
+//!   from a realized area that has a context (`gtk/gtkglarea.c:781`, `:809`).
+//! * **`GtkGLArea` owns its context from `realize` to `unrealize`, and frees
+//!   it nowhere else.** It overrides neither `dispose` nor `finalize`
+//!   (`gtk/gtkglarea.c:1006-1008` sets only the property and notify vfuncs),
+//!   takes the context in `realize` (`gtk/gtkglarea.c:320`) and lets go of it
+//!   in `unrealize` (`gtk/gtkglarea.c:681`).
+//! * **The context is current inside this override only because the override
+//!   makes it so.** GTK's own `unrealize` makes it current
+//!   (`gtk/gtkglarea.c:672`), but that runs in `parent_unrealize`, after this
+//!   body. Calling `make_current` here is legal — the widget reads as realized
+//!   until `gtk_widget_real_unrealize`, the end of the chain, clears the flag
+//!   (`gtk/gtkwidget.c:8015`) — but it can fail: `gdk_gl_context_make_current`
+//!   warns and returns with the thread's previous binding still current
+//!   (`gdk/gdkglcontext.c:1958`). That is the one teardown path on which a
+//!   delete could land under another context, and `hytte-gl`'s owner check
+//!   turns it into a logged leak.
+//! * **Once this override returns, the context can die and its address can be
+//!   reused.** GTK clears GDK's thread-current slot (`gtk/gtkglarea.c:677`;
+//!   GDK holds a reference there while a context is current,
+//!   `gdk/gdkglcontext.c:1962-1963`) and drops its own reference
+//!   (`gtk/gtkglarea.c:681`). The last reference runs `eglDestroyContext`
+//!   (`gdk/gdkglcontext.c:222`) — possibly a little later, since a frame's
+//!   `GdkGLTexture` holds the context too (`gdk/gdkgltexture.c:270`) — and
+//!   from then on the driver may hand that `EGLContext` address to the next
+//!   context anyone creates. So the override's last act before
+//!   `parent_unrealize` is `retire_context`, which drops the address's
+//!   identity in `hytte-gl` so that a handle which outlived this realization
+//!   cannot match the newcomer.
+//! * **Until #1562 these contexts never died at all — not GTK's doing but
+//!   gtk4-rs's.** A Rust `GtkGLArea` subclass that inherits
+//!   `GLAreaImpl::create_context` gets gtk4-rs 0.11.2's
+//!   `parent_create_context`, which takes GTK's `(transfer full)` context
+//!   (`gtk/gtkglarea.c:1083`) with `from_glib_none`
+//!   (`src/subclass/gl_area.rs:33`): one reference too many, never dropped.
+//!   Measured under llvmpipe, a `GlSurface`'s context outlived `unrealize`
+//!   holding exactly that one extra reference, while a plain `GtkGLArea`'s
+//!   was finalized there and the next realize got **the same `EGLContext`
+//!   address** back — so every realization of either surface leaked a whole
+//!   context, and the address reuse above was hidden only by that leak.
+//!   Both surfaces now create their context themselves
+//!   (`create_area_context`, GTK's own steps), which ends the leak and makes
+//!   the retire above load-bearing.
+//!
+//! `ShaderSurface` subclasses `GtkGLArea` the same way and tears down the same
+//! way, so all of this is true of it too.
+//!
+//! What the reading settles about `unrealize` skipping `make_current` (#1562
+//! item 2): the guard `error().is_none() && context().is_some()` is false only
+//! when there is no context, so no GL object can be waiting to be dropped
+//! there. GTK sets the area's error itself only while realizing, and only when
+//! it got no context (`gtk/gtkglarea.c:318-326`, `:358`, `:372`); otherwise
+//! only through the public `gtk_gl_area_set_error`, which this tree calls in
+//! one place, `create_area_context`, on that same no-context failure; and
+//! with no context there was no `render`, so no `resources`. The
+//! live half of item 2 is the failed `make_current` above, and what to do
+//! about it — keep the objects until a matching context is current, or count
+//! the leak — is still a design question.
+//!
 //! # Sizing and fractional scale
 //!
 //! The surface measures exactly like [`PixelSurface`](crate::PixelSurface): the
@@ -572,6 +652,217 @@ pub fn abandon_gl(reason: &str) {
         handler(reason);
         ON_CONTEXT_FAILURE.with_borrow_mut(|slot| *slot = Some(handler));
     }
+}
+
+/// Retire `area`'s context in `hytte-gl` (#1562) — the last GL act of both
+/// surfaces' `unrealize`, after they have dropped their own handles and right
+/// before `parent_unrealize`.
+///
+/// That is the last point at which the context is certainly alive: GTK's
+/// `unrealize` drops the area's reference to it (`gtk/gtkglarea.c:681`), and
+/// the `EGLContext` is destroyed when the last reference goes
+/// (`gdk/gdkglcontext.c:222`), after which the driver may give its address to
+/// the next context anyone creates. Retiring first drops that address's
+/// identity, so a handle that outlived this realization can never match
+/// whatever is at that address later — see `hytte_gl::Gl::retire_current_context`.
+///
+/// **Only when GDK says the area's own context is current.** The
+/// `make_current` just before can fail: GDK `g_warning`s and returns with the
+/// thread's previous binding left in place (`gdk/gdkglcontext.c:1958`).
+/// Retiring *that* context would not delete anything wrongly, but every live
+/// handle it owns — another surface's, say — would leak on its next drop.
+/// `gdk::GLContext::current()` is GDK's own answer, checked against
+/// `eglGetCurrentContext` (`gdk/gdkglcontext.c:545`), which is the same
+/// question `hytte-gl`'s probe asks. When the check fails the context is left
+/// unretired, i.e. on the address-only identity #1543 shipped: no worse than
+/// before, and this surface's own handles were already dropped (and, with no
+/// matching context current, leaked) one line earlier.
+pub(crate) fn retire_context(area: &gtk::GLArea) {
+    let Some(context) = area.context() else {
+        return;
+    };
+    if gdk::GLContext::current().as_ref() != Some(&context) {
+        return;
+    }
+    if let Ok(gl) = hgl::Gl::current() {
+        gl.retire_current_context();
+    }
+}
+
+/// Create `area`'s context the way GTK's own `create-context` handler does
+/// (`gtk/gtkglarea.c:347-379`), but **holding it once** — what both
+/// surfaces' `GLAreaImpl::create_context` returns.
+///
+/// Overridden rather than inherited because gtk4-rs's default leaks the
+/// context. GTK's handler returns it `(transfer full)`
+/// (`gtk/gtkglarea.c:1083`), and gtk4-rs 0.11.2's `parent_create_context`
+/// wraps that pointer with `from_glib_none` (`src/subclass/gl_area.rs:33`),
+/// i.e. takes a second reference that nothing ever drops. Measured under
+/// llvmpipe (#1562): a `GlSurface`'s context carried one reference more than
+/// a plain `GtkGLArea`'s and was still alive after `unrealize`, while the
+/// plain area's was finalized there. So every realization of either surface
+/// leaked a whole `GdkGLContext` — its `EGLContext`, and every per-context
+/// object in it — for the life of the process.
+///
+/// The same steps as GTK's, through bindings that each take ownership
+/// correctly: a context for the native's surface, the area's allowed APIs
+/// and required version copied onto it, then `realize`. A failure is set as
+/// the area's error, as GTK does, which is what this module's `realize`
+/// reads. No surface yet is `None` with no error, which GTK itself turns into
+/// "OpenGL context creation failed" (`gtk/gtkglarea.c:323-326`).
+pub(crate) fn create_area_context(area: &gtk::GLArea) -> Option<gdk::GLContext> {
+    let surface = area.native().and_then(|native| native.surface())?;
+    let created = surface.create_gl_context().and_then(|context| {
+        context.set_allowed_apis(area.allowed_apis());
+        let (major, minor) = area.required_version();
+        context.set_required_version(major, minor);
+        context.realize()?;
+        Ok(context)
+    });
+    match created {
+        Ok(context) => Some(context),
+        Err(error) => {
+            area.set_error(Some(&error));
+            None
+        }
+    }
+}
+
+/// The #1562 check both surfaces' gated tests run, through the widget's own
+/// `unrealize`: every unrealize must retire the context it is about to lose,
+/// and a handle made under the surface's first context and kept past the
+/// unrealize must **not** delete its object under a later context — above
+/// all one the driver put at the **same address**, which is the hazard
+/// itself.
+///
+/// `area` is a fresh, unparented surface. It is realized in a window that is
+/// never presented, as `real_gl()` does it, because a presented window draws
+/// frames, a frame's `GdkGLTexture` holds the context
+/// (`gdk/gdkgltexture.c:270`), and GSK keeps those textures cached past the
+/// unrealize — measured under llvmpipe, still alive a second later — which
+/// would keep the old address from coming back.
+///
+/// The retire is asserted on the identity table itself, every round, so
+/// it holds whether or not the driver reuses an address; so is the context
+/// being finalized by the unrealize, which is what [`create_area_context`]
+/// restores and what lets the address come back at all. The handle is a
+/// texture because textures are shared across GDK's contexts, so the later
+/// context can see it (asserted as the premise) and a delete issued there
+/// would remove it. Re-realizes up to `ROUNDS` times, keeping the first
+/// context's handle, until the driver hands a context the first one's
+/// address. Returns `None` for a skip (honouring `TROLLSHELL_REQUIRE_GL` like
+/// every GL test here), else whether the address came back: without a reused
+/// address the drop check cannot tell a retired context from a merely
+/// different one, so each caller says which it saw.
+#[cfg(all(test, feature = "system-tests"))]
+pub(crate) fn assert_an_outlived_handle_never_deletes_under_a_reused_address(
+    area: &gtk::GLArea,
+    test_name: &str,
+) -> Option<bool> {
+    /// Context recreates to try for a reused address before settling for a
+    /// different one.
+    const ROUNDS: usize = 8;
+
+    let window = gtk::Window::new();
+    window.set_child(Some(area));
+    gtk::prelude::WidgetExt::realize(&window);
+    area.realize();
+    let gl = if let Some(error) = area.error() {
+        Err(format!("the surface could not create a context: {error}"))
+    } else {
+        area.make_current();
+        hgl::Gl::current().map_err(|error| format!("GDK made a context current, but {error}"))
+    };
+    let gl = match gl {
+        Ok(gl) => gl,
+        Err(why) => {
+            window.destroy();
+            let required =
+                std::env::var_os("TROLLSHELL_REQUIRE_GL").is_some_and(|want| want == "1");
+            assert!(
+                !required,
+                "TROLLSHELL_REQUIRE_GL=1, but no GL context is available for {test_name}: {why}"
+            );
+            eprintln!("SKIPPED {test_name}: {why}");
+            return None;
+        }
+    };
+    let address = |gl: &hgl::Gl| {
+        hgl::current_context_address_for_test(gl)
+            .expect("the probe must see the area's own EGL context, or there is no owner to check")
+    };
+
+    let first = address(&gl);
+    let outlived = hgl::Texture::new(&gl, hgl::Format::R8, 1, 1)
+        .unwrap_or_else(|error| panic!("a 1x1 R8 texture: {error}"));
+    let name = outlived.name_for_test();
+
+    let mut current = first;
+    let mut reused = false;
+    for _ in 0..ROUNDS {
+        // Out of the window and back in: GTK unrealizes an unparented widget
+        // (`gtk/gtkwidget.c:2702`), which runs the override under test, and
+        // `GtkGLArea` makes a fresh context on the way back.
+        // A handle made and dropped under this round's context gives its
+        // address an entry (the first round's already has the outlived
+        // texture's), so the retire below has something to take away.
+        drop(
+            hgl::Texture::new(&gl, hgl::Format::R8, 1, 1)
+                .unwrap_or_else(|error| panic!("a 1x1 R8 texture: {error}")),
+        );
+        assert!(
+            hgl::context_id_for_test(current).is_some(),
+            "the premise: a handle made under the context at {current:#x} gave it an identity",
+        );
+        let context = area.context().map(|context| context.downgrade());
+        window.set_child(None::<&gtk::Widget>);
+        assert!(
+            !area.is_realized(),
+            "unparenting must unrealize the surface"
+        );
+        assert!(
+            context.is_some_and(|context| context.upgrade().is_none()),
+            "unrealize must leave nothing holding the surface's context — no frame was drawn, so \
+             nothing else does — or every realization leaks a whole GdkGLContext and its address \
+             can never come back (gtk4-rs's default create_context; see create_area_context)",
+        );
+        assert!(
+            hgl::context_id_for_test(current).is_none(),
+            "unrealize must retire the context it is about to lose (at {current:#x}), or a \
+             handle that outlives it can match whatever the driver puts at that address next",
+        );
+        window.set_child(Some(area));
+        area.realize();
+        assert!(
+            area.is_realized() && area.error().is_none(),
+            "the surface must come back with a context of its own",
+        );
+        area.make_current();
+        current = address(&gl);
+        if current == first {
+            reused = true;
+            break;
+        }
+    }
+
+    assert!(
+        hgl::is_texture_for_test(&gl, name),
+        "the premise: the later context can see the first one's texture {name} (GDK's contexts \
+         share), so a delete issued under it would remove it",
+    );
+    drop(outlived);
+    assert!(
+        hgl::is_texture_for_test(&gl, name),
+        "a handle made under a context the surface has since unrealized must leak, not delete \
+         texture {name} under the context now current{}",
+        if reused {
+            " — which the driver put at the old context's address (#1562)"
+        } else {
+            ""
+        },
+    );
+    window.destroy();
+    Some(reused)
 }
 
 /// What one render owes the accumulator: how many step passes to replay, and
@@ -1101,9 +1392,10 @@ mod imp {
     use super::{
         BuildKey, DataFailure, GLSL_HEADER, GlBlend, GlDraw, GlInput, GlPass, GlPipeline,
         GlProgram, GlTarget, GlUniforms, GlValue, PROGRAM_UNREGISTERED_REFUSED, PROGRAMS,
-        RefusedBuilds, SAMPLER_NAMES, WarnLatch, abandon_gl, fit_rect, fresh_last_drawn, gdk, glib,
-        last_drawn_after, program_key, refuse_data_strip, report_build_refusal, resources_reusable,
-        steps_owed, warn_on_target_failure,
+        RefusedBuilds, SAMPLER_NAMES, WarnLatch, abandon_gl, create_area_context, fit_rect,
+        fresh_last_drawn, gdk, glib, last_drawn_after, program_key, refuse_data_strip,
+        report_build_refusal, resources_reusable, retire_context, steps_owed,
+        warn_on_target_failure,
     };
     use gtk::prelude::*;
     use gtk::subclass::prelude::*;
@@ -1268,7 +1560,11 @@ mod imp {
         /// The handles' `Drop` calls `glDelete*`, which needs a current
         /// context. GTK makes one current inside its own `unrealize`, but that
         /// runs *after* this override's body, so the `make_current` here is
-        /// what actually holds the crate's contract.
+        /// what actually holds the crate's contract. With every handle gone,
+        /// the context is then retired in `hytte-gl`
+        /// ([`retire_context`], #1562) — the last
+        /// point at which it is certainly alive; see the module docs'
+        /// teardown section for what GTK does next.
         ///
         /// **Three things are per context, and all three are reset here**
         /// (PR #1199 review, MEDIUM 1): `resources` (GL objects), `last_drawn`
@@ -1296,11 +1592,22 @@ mod imp {
             self.resources.replace(None);
             self.last_drawn.set(0);
             self.refused_builds.borrow_mut().clear();
+            // Last, with every handle of ours already gone: GTK lets go of
+            // the context in `parent_unrealize`, after which its address may
+            // be reused (#1562; see the module docs' teardown section).
+            retire_context(obj.upcast_ref());
             self.parent_unrealize();
         }
     }
 
     impl GLAreaImpl for GlSurface {
+        /// GTK's own context creation, minus the reference gtk4-rs's default
+        /// leaks per realization — see
+        /// [`create_area_context`].
+        fn create_context(&self) -> Option<gdk::GLContext> {
+            create_area_context(self.obj().upcast_ref())
+        }
+
         fn render(&self, _context: &gdk::GLContext) -> glib::Propagation {
             self.draw();
             glib::Propagation::Stop
@@ -2087,6 +2394,254 @@ mod imp {
 
             window_a.destroy();
             window_b.destroy();
+        }
+
+        /// **#1562, `hytte-gl`'s half, on a real driver.** After
+        /// `retire_current_context`, a handle made before the retire must
+        /// leak even though the context current at its drop has **the same
+        /// address** — which is exactly what a context the driver later puts
+        /// at a destroyed one's address looks like to the probe. A handle
+        /// made after the retire must still delete, or the next realization's
+        /// every resize would leak.
+        ///
+        /// Asked of the real probe and a real `Drop`, so it pins what the
+        /// hermetic tests cannot reach: that the live probe goes through the
+        /// identity table at all, on both the creating and the dropping side.
+        ///
+        /// **Falsified** by `loader::current_context` building its identity
+        /// from the address alone (bypassing `identify`), or by
+        /// `retire_current_context` doing nothing: the first assertion reds.
+        #[gtk::test]
+        fn a_handle_made_before_a_retire_leaks_under_the_same_address() {
+            let Some((window, area, gl)) =
+                real_gl_or_skip("a_handle_made_before_a_retire_leaks_under_the_same_address")
+            else {
+                return;
+            };
+            area.make_current();
+            let address = hgl::current_context_address_for_test(&gl);
+            assert!(
+                address.is_some(),
+                "the premise: the probe sees this driver's EGL context"
+            );
+            let outlived = hgl::Texture::new(&gl, hgl::Format::R8, 1, 1).expect("a 1x1 texture");
+            let name = outlived.name_for_test();
+
+            gl.retire_current_context();
+            assert_eq!(
+                hgl::current_context_address_for_test(&gl),
+                address,
+                "the premise: same context, same address — only its identity was retired",
+            );
+            drop(outlived);
+            assert!(
+                hgl::is_texture_for_test(&gl, name),
+                "a handle made before its context was retired must leak texture {name}, though \
+                 the context current at its drop has its owner's address",
+            );
+
+            let fresh = hgl::Texture::new(&gl, hgl::Format::R8, 1, 1).expect("a 1x1 texture");
+            let fresh_name = fresh.name_for_test();
+            drop(fresh);
+            assert!(
+                !hgl::is_texture_for_test(&gl, fresh_name),
+                "a handle made after the retire gets a fresh identity and must still \
+                 delete texture {fresh_name}",
+            );
+
+            window.destroy();
+        }
+
+        /// **#1562, through `GlSurface`'s own `unrealize`.** A handle made
+        /// under the surface's context and kept past an unrealize never
+        /// deletes under a later context, including one the driver put at the
+        /// old context's address — see
+        /// [`assert_an_outlived_handle_never_deletes_under_a_reused_address`](super::super::assert_an_outlived_handle_never_deletes_under_a_reused_address),
+        /// which this and `ShaderSurface`'s twin share.
+        ///
+        /// **Falsified** by deleting the `retire_context` call from
+        /// `unrealize`: the retire assertion reds on the first round, on any
+        /// driver.
+        #[gtk::test]
+        fn a_handle_that_outlives_its_context_never_matches_the_next_one() {
+            const NAME: &str = "a_handle_that_outlives_its_context_never_matches_the_next_one";
+            let surface = super::super::GlSurface::new();
+            let Some(reused) =
+                super::super::assert_an_outlived_handle_never_deletes_under_a_reused_address(
+                    surface.upcast_ref(),
+                    NAME,
+                )
+            else {
+                return;
+            };
+            eprintln!(
+                "{NAME}: the driver {} the first context's address",
+                if reused { "reused" } else { "never reused" },
+            );
+        }
+
+        /// **#1562 review, finding 1.** `unrealize` must delete the surface's
+        /// own GL objects **before** it retires the context. Retiring first
+        /// would move the context to a new identity while every handle in
+        /// `resources` still carries the old one, so each of them would leak
+        /// on its drop — and textures and programs live in the share group,
+        /// which GDK's display context keeps alive for the whole process, so
+        /// that is every program and texture of every preem widget, leaked
+        /// on every unrealize. The surface tests above cannot see it: they
+        /// only follow a handle kept *outside* `resources`.
+        ///
+        /// Observed from a second context in the same share group, which can
+        /// still see the surface's textures after its own context is gone.
+        /// The test comes from the #1562 review.
+        ///
+        /// **Falsified** by moving `retire_context` above
+        /// `self.resources.replace(None)` in `unrealize`: the deletion
+        /// assertion fails.
+        #[gtk::test]
+        fn unrealize_deletes_its_own_objects_before_the_retire() {
+            let Some((window_observer, observer, gl)) =
+                real_gl_or_skip("unrealize_deletes_its_own_objects_before_the_retire")
+            else {
+                return;
+            };
+            let surface = super::super::GlSurface::new();
+            let window = gtk::Window::new();
+            window.set_child(Some(&surface));
+            gtk::prelude::WidgetExt::realize(&window);
+            surface.realize();
+            assert!(
+                surface.error().is_none(),
+                "the surface must get a context of its own"
+            );
+            surface.make_current();
+            let one = GlPipeline {
+                aux: 0,
+                step: &[],
+                frame: &ONE_PASS,
+            };
+            let program = GlProgram("gl_surface_test.own_objects_before_the_retire");
+            assert!(
+                surface
+                    .imp()
+                    .ensure_resources(&gl, &one, program, (4, 4), 0),
+                "the premise: this driver builds a one-pass pipeline",
+            );
+            let names: Vec<u32> = {
+                let held = surface.imp().resources.borrow();
+                let resources = held.as_ref().expect("resources were just built");
+                resources
+                    .accumulator
+                    .iter()
+                    .map(hgl::Texture::name_for_test)
+                    .chain([resources.data.name_for_test()])
+                    .collect()
+            };
+            observer.make_current();
+            for &name in &names {
+                assert!(
+                    hgl::is_texture_for_test(&gl, name),
+                    "the premise: the surface's texture {name} is shared, so visible here",
+                );
+            }
+
+            window.set_child(None::<&gtk::Widget>);
+            assert!(!surface.is_realized(), "unparenting must unrealize");
+            observer.make_current();
+            for &name in &names {
+                assert!(
+                    !hgl::is_texture_for_test(&gl, name),
+                    "unrealize leaked the surface's own texture {name}, which is share-group-wide \
+                     and so outlives the context: the retire ran before the deletes",
+                );
+            }
+            window.destroy();
+            window_observer.destroy();
+        }
+
+        /// **#1562 review, finding 2.** `retire_context(area)` must retire
+        /// only `area`'s own context. On a failed `make_current` another
+        /// context is still current, and retiring *that* one would leak every
+        /// live handle it owns on its next drop. GDK's own "is the area's
+        /// context current" check is the guard; this pins it by calling the
+        /// helper for area A while B is current, which is exactly what a
+        /// failed `make_current` leaves behind. The test comes from the #1562
+        /// review.
+        ///
+        /// **Falsified** by deleting the `gdk::GLContext::current()` guard
+        /// from `retire_context`: B is retired and B's texture leaks.
+        #[gtk::test]
+        fn retire_context_leaves_another_current_context_alone() {
+            let Some((window_a, area_a, gl)) =
+                real_gl_or_skip("retire_context_leaves_another_current_context_alone")
+            else {
+                return;
+            };
+            let (window_b, area_b, _) = real_gl().unwrap_or_else(|why| {
+                panic!("the display gave one GL context but not a second: {why}")
+            });
+            area_b.make_current();
+            let texture = hgl::Texture::new(&gl, hgl::Format::R8, 1, 1).expect("a 1x1 texture");
+            let name = texture.name_for_test();
+            super::super::retire_context(area_a.upcast_ref());
+            drop(texture);
+            assert!(
+                !hgl::is_texture_for_test(&gl, name),
+                "retire_context(A) with B current retired B, so B's live texture {name} leaked \
+                 on drop",
+            );
+            window_a.destroy();
+            window_b.destroy();
+        }
+
+        /// **#1562 review, finding 5.** `create_area_context` is a hand copy
+        /// of GTK's own `create-context` handler, so a GTK change to that
+        /// handler would not reach these widgets. This catches the drift: a
+        /// surface's context must come out exactly like a plain
+        /// `GtkGLArea`'s, setting for setting, and in the same share group.
+        /// It doubles as a one-line check for the live-verify on a real GPU.
+        /// The test comes from the #1562 review.
+        ///
+        /// **Falsified** by dropping the `set_allowed_apis` line from
+        /// `create_area_context`: the descriptions differ.
+        #[gtk::test]
+        fn a_surface_context_comes_out_like_a_plain_areas() {
+            let Some((window_plain, plain_area, _gl)) =
+                real_gl_or_skip("a_surface_context_comes_out_like_a_plain_areas")
+            else {
+                return;
+            };
+            let surface = super::super::GlSurface::new();
+            let window = gtk::Window::new();
+            window.set_child(Some(&surface));
+            gtk::prelude::WidgetExt::realize(&window);
+            surface.realize();
+            let plain = plain_area.context().expect("the plain area's context");
+            let ours = surface.context().expect("the surface's context");
+            let describe = |context: &gdk::GLContext| {
+                format!(
+                    "api={:?} version={:?} legacy={} es={} allowed={:?} required={:?} debug={} \
+                     forward_compatible={}",
+                    context.api(),
+                    context.version(),
+                    context.is_legacy(),
+                    context.uses_es(),
+                    context.allowed_apis(),
+                    context.required_version(),
+                    context.is_debug_enabled(),
+                    context.is_forward_compatible(),
+                )
+            };
+            assert_eq!(
+                describe(&plain),
+                describe(&ours),
+                "the surface's hand-built context must match what GTK's own handler builds",
+            );
+            assert!(
+                plain.is_shared(&ours),
+                "…and share with it, as every context GDK makes for a surface does",
+            );
+            window.destroy();
+            window_plain.destroy();
         }
 
         /// **#979.** `ensure_resources` must rebuild — not reuse — when the

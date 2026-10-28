@@ -91,6 +91,19 @@
 //! A shader that hangs the GPU takes the whole shell with it, which is the same
 //! trust the plugin's own native code already has.
 //!
+//! # Teardown
+//!
+//! Exactly `GlSurface`'s: the same `GtkGLArea` parent and the same
+//! `unrealize` (make the context current, drop every GL object, retire the
+//! context in `hytte-gl`, then hand back to GTK), so the same reading of GTK
+//! 4.22.4's source applies — a realized area is never finalized, the context
+//! is current inside the override only because it calls `make_current`
+//! (which can fail), and once `parent_unrealize` runs the context may be
+//! destroyed and its address reused. The citations live in
+//! [`gl_surface`](crate::gl_surface)'s module docs, under "Teardown, as GTK's
+//! source has it" (#1562), and are not repeated here, so a GTK bump has one
+//! place to re-check.
+//!
 //! # Sizing
 //!
 //! Measured exactly like [`PixelSurface`](crate::PixelSurface) and
@@ -719,7 +732,7 @@ mod imp {
         ShaderState, WarnLatch, abandon_gl, first_line, fit_rect, gdk, glib, refuse_data_grid,
         source_key, would_upload, wrapped_seconds,
     };
-    use crate::gl_surface::{GLSL_HEADER, GlValue};
+    use crate::gl_surface::{GLSL_HEADER, GlValue, create_area_context, retire_context};
     use gtk::prelude::*;
     use gtk::subclass::prelude::*;
     use hytte_gl as hgl;
@@ -859,11 +872,21 @@ mod imp {
             self.resources.replace(ResourceSlot::Unbuilt);
             self.warned_compile.borrow_mut().said.clear();
             self.origin.set(None);
+            // Last, with every handle of ours already gone — `GlSurface`'s
+            // reason (#1562; its module docs' teardown section).
+            retire_context(obj.upcast_ref());
             self.parent_unrealize();
         }
     }
 
     impl GLAreaImpl for ShaderSurface {
+        /// `GlSurface`'s: GTK's own context creation, minus the reference
+        /// gtk4-rs's default leaks per realization — see
+        /// [`create_area_context`].
+        fn create_context(&self) -> Option<gdk::GLContext> {
+            create_area_context(self.obj().upcast_ref())
+        }
+
         fn render(&self, _context: &gdk::GLContext) -> glib::Propagation {
             self.draw();
             glib::Propagation::Stop
@@ -1370,6 +1393,85 @@ mod imp {
                     ("u_bg", GlValue::Vec4([0.0, 0.0, 0.0, 1.0])),
                 ],
             })
+        }
+
+        /// **#1562, through `ShaderSurface`'s own `unrealize`** — the twin of
+        /// `gl_surface`'s
+        /// `a_handle_that_outlives_its_context_never_matches_the_next_one`,
+        /// over the same shared check, since this widget's `unrealize` has to
+        /// retire its context on its own.
+        ///
+        /// **Falsified** by deleting the `retire_context` call from this
+        /// widget's `unrealize`: the retire assertion reds on the first
+        /// round, on any driver.
+        #[gtk::test]
+        fn an_outlived_handle_never_deletes_under_the_next_context() {
+            const NAME: &str = "an_outlived_handle_never_deletes_under_the_next_context";
+            let surface = ShaderSurface::new();
+            let Some(reused) =
+                crate::gl_surface::assert_an_outlived_handle_never_deletes_under_a_reused_address(
+                    surface.upcast_ref(),
+                    NAME,
+                )
+            else {
+                return;
+            };
+            eprintln!(
+                "{NAME}: the driver {} the first context's address",
+                if reused { "reused" } else { "never reused" },
+            );
+        }
+
+        /// **#1562 review, finding 1**, for this widget's own `unrealize`:
+        /// it must delete the surface's GL objects **before** it retires the
+        /// context, or every handle in `resources` would carry an identity
+        /// that no longer matches, and leak. The twin of `gl_surface`'s
+        /// `unrealize_deletes_its_own_objects_before_the_retire`, since this
+        /// `unrealize` is a separate body. Observed from a plain `GtkGLArea`'s
+        /// context, which shares textures with the surface's.
+        ///
+        /// **Falsified** by moving `retire_context` above
+        /// `self.resources.replace(ResourceSlot::Unbuilt)` in `unrealize`:
+        /// the deletion assertion fails.
+        #[gtk::test]
+        fn unrealize_deletes_its_own_objects_before_the_retire() {
+            const BODY: &str = "void main() { fragColor = texture(u_data, v_uv).rrrr; }";
+            let Some((window, surface, gl)) =
+                realised_surface_or_skip("unrealize_deletes_its_own_objects_before_the_retire")
+            else {
+                return;
+            };
+            surface.set_state(8, 4, &state_with(BODY));
+            surface.make_current();
+            surface.imp().draw();
+            let name = match &*surface.imp().resources.borrow() {
+                ResourceSlot::Built(resources) => resources.data.name_for_test(),
+                _ => panic!("the premise: a realised surface builds its GL objects"),
+            };
+
+            let observer_window = gtk::Window::new();
+            let observer = gtk::GLArea::new();
+            observer.set_allowed_apis(gtk::gdk::GLAPI::GLES);
+            observer_window.set_child(Some(&observer));
+            gtk::prelude::WidgetExt::realize(&observer_window);
+            observer.realize();
+            assert!(observer.error().is_none(), "an observer context");
+            observer.make_current();
+            assert!(
+                hgl::is_texture_for_test(&gl, name),
+                "the premise: the surface's data texture {name} is shared, so visible here",
+            );
+
+            window.set_child(None::<&gtk::Widget>);
+            assert!(!surface.is_realized(), "unparenting must unrealize");
+            observer.make_current();
+            assert!(
+                !hgl::is_texture_for_test(&gl, name),
+                "unrealize leaked the surface's own data texture {name}, which is \
+                 share-group-wide and so outlives the context: the retire ran before the deletes",
+            );
+            window.destroy();
+            observer_window.destroy();
         }
 
         /// **#1180 item 9.** The widget that runs untrusted GLSL compiles it,

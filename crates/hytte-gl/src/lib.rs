@@ -62,6 +62,15 @@
 //!    current can `abort()` on the libepoxy route (see `loader`). A leaked object lives until its context is
 //!    destroyed, and in this tree that is the next thing that happens to it.
 //!
+//!    "The context that created it" is an `EGLContext` address **paired with
+//!    an id** that never repeats (#1562): an address can be handed to a new
+//!    context once the old one is destroyed, and a handle that outlived its
+//!    context would otherwise match the newcomer. A context's owner calls
+//!    [`Gl::retire_current_context`] as its last act in that context, which
+//!    drops the address's id, so no handle made before it can match whatever
+//!    is at that address afterwards. `loader`'s module docs carry the argument
+//!    that this is sound, what it does not cover, and how big its table gets.
+//!
 //!    The check reaches EGL contexts only. A handle created where the probe
 //!    sees none (a GLX context, or a process with no glvnd `libEGL.so.1`)
 //!    records no owner, and its `Drop` keeps the unchecked delete — exactly
@@ -289,6 +298,34 @@ impl Gl {
         Ok(Self(PhantomData))
     }
 
+    /// Declare the context current now **finished**: no handle created in it
+    /// before this call will delete its object after it, under this context
+    /// or under any later one EGL puts at the same address (#1562; the
+    /// safety contract's invariant 2).
+    ///
+    /// For the owner of a context, as its **last act in it**: after dropping
+    /// every handle it holds (those deletes need the context to still match)
+    /// and before letting the context go. `hytte-ui`'s two `GtkGLArea`
+    /// subclasses call it at the end of `unrealize`, ahead of GTK's own
+    /// `unrealize`, which is where GTK drops the area's reference to the
+    /// context. A handle that outlives that point — kept somewhere its owner
+    /// did not drop — leaks its object on drop instead of deleting it under
+    /// a context that only shares its address.
+    ///
+    /// Nothing to undo and nothing to fail: when the probe sees no EGL
+    /// context (see `loader`), there is no identity to retire and this does
+    /// nothing, which leaves such handles on the address-blind behaviour they
+    /// already had. Call it with the **owner's** context current — a retire
+    /// of some other context does not delete anything wrongly, but it does
+    /// make that context's live handles leak on their next drop, so a caller
+    /// whose `make_current` may have failed should check first, as
+    /// `hytte-ui` does.
+    pub fn retire_current_context(&self) {
+        if let Some(context) = loader::current_context() {
+            loader::retire(context);
+        }
+    }
+
     /// The first GL error pending, **draining the whole queue**.
     ///
     /// `glGetError` pops *one* entry: GL keeps a queue and returns
@@ -337,8 +374,11 @@ impl Gl {
 /// The token is the claim that *a* context is current; the probe is what says
 /// *which* one. `None` when the probe can see no context at all — see
 /// [`release`] for what a handle with no recorded owner does.
+///
+/// The one caller that *identifies* the context — gives its address an id if
+/// it has none (#1562); a drop and a retire only look it up.
 fn owner_now(_gl: &Gl) -> Option<ContextId> {
-    loader::current_context()
+    loader::current_context_for_handle()
 }
 
 /// The line a handle writes when it leaks its object instead of deleting it.
@@ -366,7 +406,9 @@ const LEAKED_OBJECT: &str = "a GL object's handle was dropped while the context 
 /// * **`owner` is current**: delete. The normal case, and the one that must
 ///   keep working — a check that leaked everything would be a GPU memory leak
 ///   per resize.
-/// * **anything else** — another context current, or none: leak, and say so.
+/// * **anything else** — another context current, or none, or a context at
+///   the owner's address after the owner [retired](Gl::retire_current_context)
+///   it (#1562): leak, and say so.
 ///   The first leak in the process is a `warn`; later ones are `debug`, since
 ///   one failed `make_current` drops a whole surface's worth of handles at
 ///   once and they share one cause.
@@ -1551,6 +1593,35 @@ pub fn is_texture_for_test(_gl: &Gl, name: u32) -> bool {
     unsafe { gl::IsTexture(name) == gl::TRUE }
 }
 
+/// **Test-only.** The `EGLContext` address current on this thread, with no
+/// id, or `None` where the probe sees no context.
+///
+/// For a live-driver test to report whether the driver actually **reused** an
+/// address across a context recreate — the precondition of #1562's hazard,
+/// which a test cannot arrange, only observe. Never compared against a
+/// handle's owner by anything shipped: the owner check compares the address
+/// *and* its id.
+#[cfg(feature = "system-tests")]
+#[must_use]
+pub fn current_context_address_for_test(_gl: &Gl) -> Option<usize> {
+    loader::current_raw_address()
+}
+
+/// **Test-only.** The id an `EGLContext` address holds in this crate's
+/// identity table now, or `None` when it holds none — no handle made under it
+/// since it was last retired (#1562).
+///
+/// So a live-driver test can assert that a widget's `unrealize` retired the
+/// context it was about to lose, which no drop can show unless the driver
+/// happens to reuse the address. Takes no `Gl` token because it touches no GL
+/// state: it reads this crate's own table, and is asked after the context is
+/// gone.
+#[cfg(feature = "system-tests")]
+#[must_use]
+pub fn context_id_for_test(address: usize) -> Option<u64> {
+    std::num::NonZeroUsize::new(address).and_then(loader::id_of)
+}
+
 /// **Test-only.** Whether `name` is a vertex array object in the **current**
 /// context (`glIsVertexArray`) — [`is_texture_for_test`]'s twin, and the one
 /// that sees the container-object hazard: another context's VAO of the same
@@ -1607,7 +1678,7 @@ pub fn read_rgba8(_gl: &Gl, width: u32, height: u32) -> Vec<u8> {
 mod tests {
     use super::{
         Blend, ContextId, Error, Format, Framebuffer, HashMap, NonZeroU32, PhantomData, Program,
-        RefCell, Stage, UNKNOWN_MAX_TEXTURE_SIZE, VertexArray, checked_extent, release,
+        RefCell, Stage, UNKNOWN_MAX_TEXTURE_SIZE, VertexArray, checked_extent, loader, release,
         usable_limit,
     };
     use std::cell::Cell;
@@ -1758,6 +1829,55 @@ mod tests {
             asked,
             "…decided without asking the probe, so no Drop is ever first to resolve it",
         );
+    }
+
+    /// **#1562.** The table above's second row, for the one "other context"
+    /// an address-only owner check cannot see: the context EGL put at the
+    /// owner's address after the owner was destroyed. With the owner retired
+    /// first — what `Gl::retire_current_context` does, and what `hytte-ui`'s
+    /// surfaces do at the end of `unrealize` — a handle made before the
+    /// retire must leak, while a handle the newcomer makes at the same
+    /// address must still delete.
+    ///
+    /// Through [`release`] itself, with the probe answering what
+    /// `loader::current_context` would for that address now
+    /// ([`loader::identify`]), so the id is checked where the delete is
+    /// decided rather than only in the loader's own table test.
+    ///
+    /// **Falsified** by `loader::retire` leaving the entry in place, which is
+    /// #1543's address-only identity: the first `release` deletes.
+    #[test]
+    fn a_handle_made_before_its_context_was_retired_is_never_deleted() {
+        let address = std::num::NonZeroUsize::new(0x1562_8000).expect("non-zero");
+        let deletes = Cell::new(0_u32);
+        let delete = || deletes.set(deletes.get() + 1);
+
+        let outlived = loader::identify_for_handle(address);
+        loader::retire(outlived);
+        let newcomer = || Some(loader::identify(address));
+
+        assert!(!release(
+            "vertex array",
+            1,
+            Some(outlived),
+            newcomer,
+            delete
+        ));
+        assert_eq!(
+            deletes.get(),
+            0,
+            "a handle made in a retired context must not delete under the next context at the \
+             same address: VAO 1 there is the newcomer's own",
+        );
+
+        let fresh = loader::identify_for_handle(address);
+        assert!(release("vertex array", 1, Some(fresh), newcomer, delete));
+        assert_eq!(
+            deletes.get(),
+            1,
+            "…while a handle the newcomer made itself still deletes, or every resize would leak",
+        );
+        loader::retire(fresh);
     }
 
     /// The same table, through a **real** `Drop`: handles whose owner no live

@@ -3236,11 +3236,17 @@ mod gtk_tests {
     /// A real `Monitor`, captured from a one-shot `App::run` — same pattern
     /// as `widgets::tasks`'s `test_monitor` (see that module's doc comment
     /// for why it's cached rather than re-run per test).
+    ///
+    /// The app id is this process's own ([`crate::test_support::app_id`]):
+    /// with a fixed one, a second test process registering it at the same
+    /// moment made `App::run` fail with `NonZeroExit(1)` (#1631).
     fn test_monitor() -> Monitor {
         if let Some(monitor) = TEST_MONITOR.with(|cell| cell.borrow().clone()) {
             return monitor;
         }
-        App::new("mov.vibec0re.trollshell.test.modal-workspaces-width")
+        App::new(&crate::test_support::app_id(
+            "mov.vibec0re.trollshell.test.modal-workspaces-width",
+        ))
             .run(|app| {
                 let first = app.monitors().first().cloned();
                 TEST_MONITOR.with(|cell| *cell.borrow_mut() = first);

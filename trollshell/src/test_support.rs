@@ -29,6 +29,22 @@ pub(crate) fn gio_ready() {
     }
 }
 
+/// The application id for a test's one-shot `App::run`: `base`, plus a suffix
+/// unique to this process (#1631).
+///
+/// `App::run` registers its id on the session bus, and every test process on
+/// the machine shares that bus, whatever X display each one is on. Two
+/// processes that reach the same `App::run` at once (two worktrees' gates, or a
+/// campaign) race for one bus name. The loser becomes the *remote* instance,
+/// which runs no body at all. Worse, if the primary quits between the loser's
+/// `RequestName` and its fetch of the primary's actions, the loser fails to
+/// register (`No such interface "org.gtk.Actions"`), and `App::run` returns
+/// `NonZeroExit(1)`. A name per process takes the other process out of it.
+#[cfg(feature = "system-tests")]
+pub(crate) fn app_id(base: &str) -> String {
+    format!("{base}.pid{}", std::process::id())
+}
+
 /// Real pointer input for display tests: `XTest` events through `xdotool` into
 /// the test's X display, so a press, a drag and a release go down GTK's own
 /// capture/target/bubble dispatch the way a user's would (#1413).
@@ -36,6 +52,16 @@ pub(crate) fn gio_ready() {
 /// Used by `plugins::region`'s press-tracker tests and `panels::power`'s
 /// brightness slider test (#1559). One copy, so the cleanup a review settled on
 /// (#1416, MEDIUM 2) cannot drift between them.
+///
+/// **These tests need the X display to themselves** (#1631). The pointer is
+/// one per display, and with no window manager every window maps at the same
+/// top-left corner. So a second test process on the same display moves this
+/// one's pointer mid-drag and takes its clicks. Two processes end up there
+/// whenever two `xvfb-run -a` start together: `-a` picks the first number with
+/// no `/tmp/.X<n>-lock` *before* its Xvfb creates one, so all of them pick the
+/// same number, the losers' Xvfbs exit, and every command runs on the winner's
+/// display. `xvfb-run -d` (Xvfb's own `-displayfd`) gives each run a display
+/// of its own.
 #[cfg(feature = "system-tests")]
 pub(crate) mod real_pointer {
     use std::cell::Cell;

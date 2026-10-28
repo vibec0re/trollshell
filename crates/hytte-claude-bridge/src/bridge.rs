@@ -1481,8 +1481,12 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"answered"}
                         shed.push(String::from_utf8(reply).expect("ASCII"));
                     }
                 }
-                // Three ticks of a watch, had it been watching.
-                tokio::time::sleep(crate::http::HANG_UP_POLL * 3).await;
+                // Three of a watch's tenth-of-a-second ticks, had it been
+                // watching. A literal, not a multiple of `HANG_UP_POLL`: all
+                // four connections are served from the start, so each
+                // `read_request` is counting its 5 s from then, and the last
+                // request must land inside it whatever the poll is set to.
+                tokio::time::sleep(Duration::from_millis(300)).await;
             }
             let started = calls.load(Ordering::SeqCst);
             let free = bridge.permits.available_permits();

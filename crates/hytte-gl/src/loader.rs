@@ -694,8 +694,8 @@ fn open(soname: Option<&str>) -> Result<&'static libloading::Library, String> {
 mod tests {
     use super::{
         EPOXY_SONAMES, GLVND_EGL_SONAME, GetProcAddress, Source, UNIDENTIFIED, context_probe,
-        current_context, identities,
-        identify, identify_for_handle, install, load_once, loader_for, open, retire,
+        current_context, identify, identify_for_handle, identities, install, load_once, loader_for,
+        open, retire,
     };
     use std::num::NonZeroUsize;
 
@@ -938,7 +938,6 @@ mod tests {
         );
     }
 
-
     /// **#1562.** Once a context is retired, no handle made under it matches
     /// its address again, and the retire takes its entry out of the table —
     /// the property that stops a handle which outlived its context from
@@ -968,12 +967,7 @@ mod tests {
     fn a_retired_address_never_matches_a_handle_made_before_the_retire() {
         let here = NonZeroUsize::new(0x1562_0000).expect("non-zero");
         let next_door = NonZeroUsize::new(0x1562_1000).expect("non-zero");
-        let entry = |address: NonZeroUsize| {
-            identities()
-                .by_address
-                .get(&address.get())
-                .copied()
-        };
+        let entry = |address: NonZeroUsize| identities().by_address.get(&address.get()).copied();
 
         let unseen = identify(here);
         assert_eq!(unseen.id, UNIDENTIFIED, "no handle has been made here yet");

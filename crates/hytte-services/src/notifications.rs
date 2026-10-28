@@ -16,7 +16,7 @@
 use futures_signals::signal::{Mutable, Signal};
 use hytte_bus::{OwnNameBuilder, OwnNameSignal, OwnState};
 use hytte_reactive::{Service, registry, runtime, shared};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -374,9 +374,13 @@ fn close(id: u32, reason: u32, expiry: Option<u64>) {
         return;
     };
 
-    // The live-set half: the arming check, the removal and the timer entry's
-    // reclaim, as one step under the `active` guard (see `remove_closable`).
-    let Some(n) = shared.iface.remove_closable(id, expiry) else {
+    // The live-set half and the history half: the arming check, the removal,
+    // the timer entry's reclaim, the history entry and the callback sweep (see
+    // `close_local`).
+    if !shared
+        .iface
+        .close_local(id, reason, expiry, &shared.history)
+    {
         tracing::debug!(
             id,
             reason,
@@ -384,38 +388,6 @@ fn close(id: u32, reason: u32, expiry: Option<u64>) {
             "close for an id that is not live, or by a superseded expiry; nothing to do"
         );
         return;
-    };
-
-    let dismissed_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let entry = HistoryEntry {
-        id: n.id,
-        app_name: n.app_name,
-        app_icon: n.app_icon,
-        summary: n.summary,
-        body: n.body,
-        urgency: n.urgency,
-        image: n.image,
-        actions: n.actions,
-        reason,
-        created_at: n.created_at,
-        dismissed_at,
-    };
-    {
-        let mut hist = shared.history.lock_mut();
-        hist.insert(0, entry);
-        hist.truncate(100);
-    }
-
-    // Drop any local-dispatch callback still registered for `id` — this
-    // close path (expiry, user dismiss, or `close_notification`'s call
-    // into `dismiss`) means the action can never be invoked again. A
-    // cheap no-op for externally-posted notifications, which never
-    // populate this map.
-    if let Ok(mut map) = shared.iface.local_actions.lock() {
-        clear_local_actions(&mut map, id);
     }
 
     // Emit the NotificationClosed signal directly on the owned connection.
@@ -1191,6 +1163,15 @@ struct NotificationsIface {
     /// here for the same reason as `POST_LOCAL_SEEN`: every critical section
     /// is non-async map surgery.
     local_actions: Arc<Mutex<LocalActionMap>>,
+    /// Ids of live shell-local toasts that carry action buttons (#1630).
+    /// Inserted by `post_local_timed` beside the callbacks, and removed when
+    /// the id closes ([`NotificationsIface::close_local`]) or a client's
+    /// `Notify` replaces it. It is a set of its own rather than a read of
+    /// `local_actions` because a click *consumes* its callback: the toast's
+    /// own buttons dismiss right after `invoke_action`, so by the time `close`
+    /// runs a clicked single-action toast has no entry left in
+    /// `local_actions`, yet its history copy would still show a dead button.
+    local_toasts: Arc<Mutex<HashSet<u32>>>,
     /// Hover-pausable per-id expiry timers (#567). Keyed by notification id,
     /// each entry pairs the pure [`TimerState`] bookkeeping with the live
     /// `sleep → dismiss` task's abort handle. One entry per **live**
@@ -1215,6 +1196,7 @@ impl NotificationsIface {
             active: Mutable::new(Vec::new()),
             next_id: Arc::new(AtomicU32::new(1)),
             local_actions: Arc::new(Mutex::new(LocalActionMap::new())),
+            local_toasts: Arc::new(Mutex::new(HashSet::new())),
             timers: Arc::new(Mutex::new(TimerMap::new())),
         }
     }
@@ -1288,6 +1270,12 @@ impl NotificationsIface {
             );
         }
 
+        if !ui_actions.is_empty()
+            && let Ok(mut local) = self.local_toasts.lock()
+        {
+            local.insert(id);
+        }
+
         let created_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -1347,6 +1335,66 @@ impl NotificationsIface {
             clear_timer(&mut timers, id);
             list.remove(at)
         })
+    }
+
+    /// Everything [`close`] does to this live set and to `history`, short of
+    /// the bus signal: remove `id` if [`closable`] allows it, file it in
+    /// `history` (newest first, capped at 100), and sweep its local-dispatch
+    /// callbacks. `false` makes the close a no-op, history untouched.
+    ///
+    /// **The history copy of a shell-local toast carries no actions** (#1630).
+    /// Its callbacks are swept here, and a local toast's click is never
+    /// broadcast as `ActionInvoked`, so a button kept in history would do
+    /// nothing. An externally-posted notification keeps its actions: its click
+    /// there still broadcasts `ActionInvoked` to the client. The signal is
+    /// membership in `local_toasts`, read here at the single point every close
+    /// path (expiry, user, `CloseNotification`, `dismiss_all`) funnels through.
+    fn close_local(
+        &self,
+        id: u32,
+        reason: u32,
+        expiry: Option<u64>,
+        history: &Mutable<Vec<HistoryEntry>>,
+    ) -> bool {
+        let Some(n) = self.remove_closable(id, expiry) else {
+            return false;
+        };
+        let was_local = self
+            .local_toasts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&id);
+
+        let dismissed_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let entry = HistoryEntry {
+            id: n.id,
+            app_name: n.app_name,
+            app_icon: n.app_icon,
+            summary: n.summary,
+            body: n.body,
+            urgency: n.urgency,
+            image: n.image,
+            actions: if was_local { Vec::new() } else { n.actions },
+            reason,
+            created_at: n.created_at,
+            dismissed_at,
+        };
+        {
+            let mut hist = history.lock_mut();
+            hist.insert(0, entry);
+            hist.truncate(100);
+        }
+
+        // Drop any local-dispatch callback still registered for `id`: the
+        // action can never be invoked again. A cheap no-op for
+        // externally-posted notifications, which never populate this map.
+        if let Ok(mut map) = self.local_actions.lock() {
+            clear_local_actions(&mut map, id);
+        }
+        true
     }
 
     /// [`pause_expiry`]'s work on this live set's timers.
@@ -1456,6 +1504,13 @@ impl NotificationsIface {
             // `active` -> `local_actions`; nothing takes them the other way.
             if let Ok(mut map) = self.local_actions.lock() {
                 forget_replaced_local_actions(&mut map, &list, replaces_id);
+            }
+            if replaces_live(&list, replaces_id)
+                && let Ok(mut local) = self.local_toasts.lock()
+            {
+                // The replacement is the client's: its actions are live on
+                // the bus and must survive into history (#1630).
+                local.remove(&replaces_id);
             }
             let id = notify_id(&list, replaces_id, &self.next_id);
             set_expiry(&self.timers, id, timeout);
@@ -1929,12 +1984,12 @@ fn char_reference(s: &str) -> Option<(char, usize)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_TIMEOUT, HashMap, LocalActionMap, MIN_RESUME, Mutable, Notification,
-        NotificationImage, NotificationsIface, OwnedValue, RateLimitMap, TimerAction, TimerEntry,
-        TimerMap, TimerState, Urgency, apply_expiry, apply_pause, clear_local_actions, clear_timer,
-        closable, forget_replaced_local_actions, image_data_consistent, mount_live_set, notify_id,
-        parse_image, parse_urgency, rate_limit_check, register_local_action, resolve_timeout,
-        strip_markup, take_local_action,
+        DEFAULT_TIMEOUT, HashMap, HashSet, HistoryEntry, LocalActionMap, MIN_RESUME, Mutable,
+        Notification, NotificationImage, NotificationsIface, OwnedValue, RateLimitMap, TimerAction,
+        TimerEntry, TimerMap, TimerState, Urgency, apply_expiry, apply_pause, clear_local_actions,
+        clear_timer, closable, forget_replaced_local_actions, image_data_consistent,
+        mount_live_set, notify_id, parse_image, parse_urgency, rate_limit_check,
+        register_local_action, resolve_timeout, strip_markup, take_local_action,
     };
     use std::cell::Cell;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -2761,12 +2816,17 @@ mod tests {
             active,
             next_id,
             local_actions,
+            local_toasts,
             timers,
         } = &served;
         assert!(Arc::ptr_eq(next_id, &kept.next_id), "next_id");
         assert!(
             Arc::ptr_eq(local_actions, &kept.local_actions),
             "local_actions"
+        );
+        assert!(
+            Arc::ptr_eq(local_toasts, &kept.local_toasts),
+            "local_toasts"
         );
         assert!(Arc::ptr_eq(timers, &kept.timers), "timers");
         // `Mutable` has no `ptr_eq`: write through one half, read the other.
@@ -2993,6 +3053,7 @@ mod tests {
             active: Mutable::new(vec![live(1), live(2)]),
             next_id: Arc::new(AtomicU32::new(3)),
             local_actions: Arc::clone(&local_actions),
+            local_toasts: Arc::new(Mutex::new(HashSet::new())),
             timers: Arc::new(Mutex::new(TimerMap::new())),
         };
 
@@ -3017,6 +3078,190 @@ mod tests {
             map.contains_key(&(2, "open".to_string())),
             "another toast's callback is untouched"
         );
+    }
+
+    // ── History copies of local toasts carry no actions (#1630) ─────────────
+    //
+    // A shell-local toast's callbacks are swept when it closes, and a local
+    // click is never broadcast as `ActionInvoked`, so a button its history
+    // copy kept would do nothing. An external notification's history buttons
+    // still broadcast to the client and stay. These drive `close_local`, the
+    // one function `dismiss`, `dismiss_all`, expiry and `CloseNotification`
+    // all end in, against a live set and a history of the test's own.
+
+    fn local_toast(iface: &NotificationsIface, keys: &[&str]) -> u32 {
+        let actions = keys
+            .iter()
+            .map(|key| super::LocalAction::new(*key, "Label", || {}))
+            .collect();
+        iface.post_local_timed(
+            "shell",
+            "local toast",
+            "",
+            Urgency::Normal,
+            actions,
+            Some(DEFAULT_TIMEOUT),
+        )
+    }
+
+    fn external_toast(iface: &NotificationsIface) -> u32 {
+        futures_executor::block_on(iface.notify(
+            "client",
+            0,
+            "",
+            "external toast",
+            "",
+            vec!["open".to_string(), "Open".to_string()],
+            HashMap::new(),
+            -1,
+        ))
+    }
+
+    fn history_of(history: &Mutable<Vec<HistoryEntry>>, id: u32) -> HistoryEntry {
+        history
+            .lock_ref()
+            .iter()
+            .find(|h| h.id == id)
+            .cloned()
+            .expect("the close filed a history entry")
+    }
+
+    fn action_keys(entry: &HistoryEntry) -> Vec<String> {
+        entry.actions.iter().map(|a| a.key.clone()).collect()
+    }
+
+    /// The live toast keeps its buttons until it closes; only the history
+    /// copy loses them.
+    #[test]
+    fn a_local_toast_dismissed_unclicked_files_history_without_actions() {
+        let iface = NotificationsIface::new();
+        let history = Mutable::new(Vec::new());
+        let id = local_toast(&iface, &["open", "copy"]);
+        let live_keys: Vec<_> = iface.active.lock_ref()[0]
+            .actions
+            .iter()
+            .map(|a| a.key.clone())
+            .collect();
+        assert_eq!(
+            live_keys,
+            ["open", "copy"],
+            "the live toast has its buttons"
+        );
+
+        assert!(iface.close_local(id, 2, None, &history));
+
+        let entry = history_of(&history, id);
+        assert_eq!(entry.reason, 2);
+        assert!(action_keys(&entry).is_empty(), "no dead buttons in history");
+    }
+
+    /// `dismiss_all` closes every live id with reason 2 through the same
+    /// step; a local and an external toast side by side show the strip is
+    /// per notification.
+    #[test]
+    fn dismiss_all_strips_local_history_actions_only() {
+        let iface = NotificationsIface::new();
+        let history = Mutable::new(Vec::new());
+        let local = local_toast(&iface, &["open"]);
+        let external = external_toast(&iface);
+
+        let ids: Vec<u32> = iface.active.lock_ref().iter().map(|n| n.id).collect();
+        for id in ids {
+            assert!(iface.close_local(id, 2, None, &history));
+        }
+
+        assert!(action_keys(&history_of(&history, local)).is_empty());
+        assert_eq!(action_keys(&history_of(&history, external)), ["open"]);
+    }
+
+    /// Expiry closes with reason 1 and the arming its sleep was armed with.
+    #[test]
+    fn an_expired_local_toast_files_history_without_actions() {
+        let iface = NotificationsIface::new();
+        let history = Mutable::new(Vec::new());
+        let id = local_toast(&iface, &["open"]);
+        let arming = arming_of(&iface, id);
+
+        assert!(iface.close_local(id, 1, Some(arming), &history));
+
+        let entry = history_of(&history, id);
+        assert_eq!(entry.reason, 1);
+        assert!(action_keys(&entry).is_empty());
+    }
+
+    /// A refused close (stale arming, unknown id) files nothing and leaves the
+    /// local marker for the close that does go ahead.
+    #[test]
+    fn a_refused_close_files_nothing_and_keeps_the_strip_for_the_real_one() {
+        let iface = NotificationsIface::new();
+        let history = Mutable::new(Vec::new());
+        let id = local_toast(&iface, &["open"]);
+        let stale = arming_of(&iface, id) + 1;
+
+        assert!(!iface.close_local(id, 1, Some(stale), &history));
+        assert!(!iface.close_local(999, 2, None, &history));
+        assert!(history.lock_ref().is_empty());
+
+        assert!(iface.close_local(id, 2, None, &history));
+        assert!(action_keys(&history_of(&history, id)).is_empty());
+    }
+
+    /// Positive control: an external client's buttons stay in history, since
+    /// a click there still broadcasts `ActionInvoked` to it.
+    #[test]
+    fn an_external_notification_keeps_its_actions_in_history() {
+        let iface = NotificationsIface::new();
+        let history = Mutable::new(Vec::new());
+        let id = external_toast(&iface);
+
+        assert!(iface.close_local(id, 2, None, &history));
+
+        assert_eq!(action_keys(&history_of(&history, id)), ["open"]);
+    }
+
+    /// A client's `replaces_id` re-post of a live local toast is the client's
+    /// notification from then on: its actions survive into history.
+    #[test]
+    fn a_client_replacing_a_local_toast_keeps_its_actions_in_history() {
+        let iface = NotificationsIface::new();
+        let history = Mutable::new(Vec::new());
+        let id = local_toast(&iface, &["open"]);
+        let replaced = futures_executor::block_on(iface.notify(
+            "client",
+            id,
+            "",
+            "replaced",
+            "",
+            vec!["open".to_string(), "Open".to_string()],
+            HashMap::new(),
+            -1,
+        ));
+        assert_eq!(replaced, id);
+
+        assert!(iface.close_local(id, 2, None, &history));
+
+        assert_eq!(action_keys(&history_of(&history, id)), ["open"]);
+    }
+
+    /// Pinned: the toast's own buttons run `invoke_action` and then dismiss.
+    /// The click consumes the callback, so a single-action toast has nothing
+    /// left in `local_actions` by the time it closes; its history copy must
+    /// still carry no (dead) button, which is why the signal is not a read of
+    /// that map.
+    #[test]
+    fn a_clicked_local_toast_files_history_without_actions() {
+        let iface = NotificationsIface::new();
+        let history = Mutable::new(Vec::new());
+        let id = local_toast(&iface, &["open"]);
+        {
+            let mut map = iface.local_actions.lock().expect("not poisoned");
+            take_local_action(&mut map, id, "open").expect("registered")();
+            assert!(map.is_empty(), "the click consumed the only callback");
+        }
+
+        assert!(iface.close_local(id, 2, None, &history));
+
+        assert!(action_keys(&history_of(&history, id)).is_empty());
     }
 
     #[test]
@@ -3893,6 +4138,14 @@ mod system_tests {
                     .iter()
                     .any(|h| h.id == id && h.reason == 2),
                 "and files it in the history the handles hand the history page"
+            );
+            assert!(
+                handles
+                    .history
+                    .lock_ref()
+                    .iter()
+                    .any(|h| h.id == id && h.actions.is_empty()),
+                "without the buttons its swept callbacks can no longer serve (#1630)"
             );
 
             held_posts_act_on_the_registered_live_set(&kept, &handles);

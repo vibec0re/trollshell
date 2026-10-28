@@ -141,6 +141,20 @@
 //!   `parent_unrealize` is [`retire_context`], which moves the address to a
 //!   new generation in `hytte-gl` so that a handle which outlived this
 //!   realization cannot match the newcomer.
+//! * **Until #1562 these contexts never died at all — not GTK's doing but
+//!   gtk4-rs's.** A Rust `GtkGLArea` subclass that inherits
+//!   `GLAreaImpl::create_context` gets gtk4-rs 0.11.2's
+//!   `parent_create_context`, which takes GTK's `(transfer full)` context
+//!   (`gtk/gtkglarea.c:1083`) with `from_glib_none`
+//!   (`src/subclass/gl_area.rs:33`): one reference too many, never dropped.
+//!   Measured under llvmpipe, a `GlSurface`'s context outlived `unrealize`
+//!   holding exactly that one extra reference, while a plain `GtkGLArea`'s
+//!   was finalized there and the next realize got **the same `EGLContext`
+//!   address** back — so every realization of either surface leaked a whole
+//!   context, and the address reuse above was hidden only by that leak.
+//!   Both surfaces now create their context themselves
+//!   ([`create_area_context`], GTK's own steps), which ends the leak and makes
+//!   the retire above load-bearing.
 //!
 //! `ShaderSurface` subclasses `GtkGLArea` the same way and tears down the same
 //! way, so all of this is true of it too.
@@ -674,6 +688,45 @@ pub(crate) fn retire_context(area: &gtk::GLArea) {
     }
 }
 
+/// Create `area`'s context the way GTK's own `create-context` handler does
+/// (`gtk/gtkglarea.c:347-376`), but **holding it once** — what both
+/// surfaces' `GLAreaImpl::create_context` returns.
+///
+/// Overridden rather than inherited because gtk4-rs's default leaks the
+/// context. GTK's handler returns it `(transfer full)`
+/// (`gtk/gtkglarea.c:1083`), and gtk4-rs 0.11.2's `parent_create_context`
+/// wraps that pointer with `from_glib_none` (`src/subclass/gl_area.rs:33`),
+/// i.e. takes a second reference that nothing ever drops. Measured under
+/// llvmpipe (#1562): a `GlSurface`'s context carried one reference more than
+/// a plain `GtkGLArea`'s and was still alive after `unrealize`, while the
+/// plain area's was finalized there. So every realization of either surface
+/// leaked a whole `GdkGLContext` — its `EGLContext`, and every per-context
+/// object in it — for the life of the process.
+///
+/// The same steps as GTK's, through bindings that each take ownership
+/// correctly: a context for the native's surface, the area's allowed APIs
+/// and required version copied onto it, then `realize`. A failure is set as
+/// the area's error, as GTK does, which is what this module's `realize`
+/// reads. No surface yet is `None` with no error, which GTK itself turns into
+/// "OpenGL context creation failed" (`gtk/gtkglarea.c:323-325`).
+pub(crate) fn create_area_context(area: &gtk::GLArea) -> Option<gdk::GLContext> {
+    let surface = area.native().and_then(|native| native.surface())?;
+    let created = surface.create_gl_context().and_then(|context| {
+        context.set_allowed_apis(area.allowed_apis());
+        let (major, minor) = area.required_version();
+        context.set_required_version(major, minor);
+        context.realize()?;
+        Ok(context)
+    });
+    match created {
+        Ok(context) => Some(context),
+        Err(error) => {
+            area.set_error(Some(&error));
+            None
+        }
+    }
+}
+
 /// The #1562 check both surfaces' gated tests run, through the widget's own
 /// `unrealize`: every unrealize must retire the context it is about to lose,
 /// and a handle made under the surface's first context and kept past the
@@ -689,7 +742,9 @@ pub(crate) fn retire_context(area: &gtk::GLArea) {
 /// would keep the old address from coming back.
 ///
 /// The retire is asserted on the generation table itself, every round, so
-/// it holds whether or not the driver reuses an address. The handle is a
+/// it holds whether or not the driver reuses an address; so is the context
+/// being finalized by the unrealize, which is what [`create_area_context`]
+/// restores and what lets the address come back at all. The handle is a
 /// texture because textures are shared across GDK's contexts, so the later
 /// context can see it (asserted as the premise) and a delete issued there
 /// would remove it. Re-realizes up to `ROUNDS` times, keeping the first
@@ -749,8 +804,15 @@ pub(crate) fn assert_an_outlived_handle_never_deletes_under_a_reused_address(
         // (`gtk/gtkwidget.c:2702`), which runs the override under test, and
         // `GtkGLArea` makes a fresh context on the way back.
         let generation = hgl::context_generation_for_test(current);
+        let context = area.context().map(|context| context.downgrade());
         window.set_child(None::<&gtk::Widget>);
         assert!(!area.is_realized(), "unparenting must unrealize the surface");
+        assert!(
+            context.is_some_and(|context| context.upgrade().is_none()),
+            "unrealize must leave nothing holding the surface's context — no frame was drawn, so \
+             nothing else does — or every realization leaks a whole GdkGLContext and its address \
+             can never come back (gtk4-rs's default create_context; see create_area_context)",
+        );
         assert!(
             hgl::context_generation_for_test(current) > generation,
             "unrealize must retire the context it is about to lose (at {current:#x}), or a \
@@ -1318,7 +1380,8 @@ mod imp {
         BuildKey, DataFailure, GLSL_HEADER, GlBlend, GlDraw, GlInput, GlPass, GlPipeline,
         GlProgram, GlTarget, GlUniforms, GlValue, PROGRAM_UNREGISTERED_REFUSED, PROGRAMS,
         RefusedBuilds, SAMPLER_NAMES, WarnLatch, abandon_gl, fit_rect, fresh_last_drawn, gdk, glib,
-        last_drawn_after, program_key, refuse_data_strip, report_build_refusal, resources_reusable,
+        create_area_context, last_drawn_after, program_key, refuse_data_strip, report_build_refusal,
+        resources_reusable,
         retire_context, steps_owed, warn_on_target_failure,
     };
     use gtk::prelude::*;
@@ -1525,6 +1588,13 @@ mod imp {
     }
 
     impl GLAreaImpl for GlSurface {
+        /// GTK's own context creation, minus the reference gtk4-rs's default
+        /// leaks per realization — see
+        /// [`create_area_context`](super::create_area_context).
+        fn create_context(&self) -> Option<gdk::GLContext> {
+            create_area_context(self.obj().upcast_ref())
+        }
+
         fn render(&self, _context: &gdk::GLContext) -> glib::Propagation {
             self.draw();
             glib::Propagation::Stop

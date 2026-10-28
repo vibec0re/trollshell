@@ -732,7 +732,7 @@ mod imp {
         ShaderState, WarnLatch, abandon_gl, first_line, fit_rect, gdk, glib, refuse_data_grid,
         source_key, would_upload, wrapped_seconds,
     };
-    use crate::gl_surface::{GLSL_HEADER, GlValue, retire_context};
+    use crate::gl_surface::{GLSL_HEADER, GlValue, create_area_context, retire_context};
     use gtk::prelude::*;
     use gtk::subclass::prelude::*;
     use hytte_gl as hgl;
@@ -880,6 +880,13 @@ mod imp {
     }
 
     impl GLAreaImpl for ShaderSurface {
+        /// `GlSurface`'s: GTK's own context creation, minus the reference
+        /// gtk4-rs's default leaks per realization — see
+        /// [`create_area_context`](crate::gl_surface::create_area_context).
+        fn create_context(&self) -> Option<gdk::GLContext> {
+            create_area_context(self.obj().upcast_ref())
+        }
+
         fn render(&self, _context: &gdk::GLContext) -> glib::Propagation {
             self.draw();
             glib::Propagation::Stop

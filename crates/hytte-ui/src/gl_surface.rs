@@ -138,7 +138,7 @@
 //!   `GdkGLTexture` holds the context too (`gdk/gdkgltexture.c:270`) — and
 //!   from then on the driver may hand that `EGLContext` address to the next
 //!   context anyone creates. So the override's last act before
-//!   `parent_unrealize` is [`retire_context`], which moves the address to a
+//!   `parent_unrealize` is `retire_context`, which moves the address to a
 //!   new generation in `hytte-gl` so that a handle which outlived this
 //!   realization cannot match the newcomer.
 //! * **Until #1562 these contexts never died at all — not GTK's doing but
@@ -153,7 +153,7 @@
 //!   address** back — so every realization of either surface leaked a whole
 //!   context, and the address reuse above was hidden only by that leak.
 //!   Both surfaces now create their context themselves
-//!   ([`create_area_context`], GTK's own steps), which ends the leak and makes
+//!   (`create_area_context`, GTK's own steps), which ends the leak and makes
 //!   the retire above load-bearing.
 //!
 //! `ShaderSurface` subclasses `GtkGLArea` the same way and tears down the same
@@ -1551,7 +1551,7 @@ mod imp {
         /// runs *after* this override's body, so the `make_current` here is
         /// what actually holds the crate's contract. With every handle gone,
         /// the context is then retired in `hytte-gl`
-        /// ([`retire_context`](super::retire_context), #1562) — the last
+        /// ([`retire_context`], #1562) — the last
         /// point at which it is certainly alive; see the module docs'
         /// teardown section for what GTK does next.
         ///
@@ -1592,7 +1592,7 @@ mod imp {
     impl GLAreaImpl for GlSurface {
         /// GTK's own context creation, minus the reference gtk4-rs's default
         /// leaks per realization — see
-        /// [`create_area_context`](super::create_area_context).
+        /// [`create_area_context`].
         fn create_context(&self) -> Option<gdk::GLContext> {
             create_area_context(self.obj().upcast_ref())
         }

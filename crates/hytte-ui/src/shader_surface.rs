@@ -882,7 +882,7 @@ mod imp {
     impl GLAreaImpl for ShaderSurface {
         /// `GlSurface`'s: GTK's own context creation, minus the reference
         /// gtk4-rs's default leaks per realization — see
-        /// [`create_area_context`](crate::gl_surface::create_area_context).
+        /// [`create_area_context`].
         fn create_context(&self) -> Option<gdk::GLContext> {
             create_area_context(self.obj().upcast_ref())
         }

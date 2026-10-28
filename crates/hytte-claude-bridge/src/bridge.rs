@@ -203,18 +203,20 @@ impl Bridge {
         //
         // It is a *deadline* handed down, not a timeout wrapped around
         // `answer`, and that difference is the fix for a hung `claude` being
-        // orphaned: a wrapper's only move is to drop the future, which drops
-        // the `hive-claude` turn with no `kill_on_drop` on its child — and
-        // releases this permit and the title lock while that child still runs.
-        // With the deadline below, the backend kills and reaps its own child
-        // (`backend::run_until`), so by the time `answer` returns there is
-        // nothing left running, and only then does `_permit` drop.
+        // orphaned: a wrapper's only move is to drop the future, and the
+        // `hive-claude` turn sets no `kill_on_drop` on its child — so a drop
+        // can at best kill the child (`backend::run_until`'s guard does, #1550)
+        // and never wait for it, releasing this permit and the title lock
+        // before it is reaped. With the deadline below, the backend kills and
+        // reaps its own child, so by the time `answer` returns there is nothing
+        // left running, and only then does `_permit` drop.
         let deadline = Instant::now() + self.budget;
         // The backstop. Every wait inside `answer` is bounded by `deadline`
         // itself, and the one that owns a child gives it at most `REAP_GRACE`
         // past it to die, so this cannot fire while they hold — it is here so
-        // that an unbounded await added later costs one orphan, said loudly,
-        // rather than a permit wedged forever.
+        // that an unbounded await added later costs one dropped turn — its
+        // child killed but not waited for — said loudly, rather than a permit
+        // wedged forever.
         let backstop = deadline + REAP_GRACE * 2;
         match tokio::time::timeout_at(
             backstop,
@@ -228,7 +230,8 @@ impl Bridge {
                     title = %title,
                     budget_s = self.budget.as_secs(),
                     "a turn outlived its deadline by more than the reap grace — something in it \
-                     is not deadline-bounded; any claude child it held may still be running",
+                     is not deadline-bounded; any claude child it held was killed on the drop \
+                     but is left to tokio to reap",
                 );
                 Err(Failure::new(
                     504,

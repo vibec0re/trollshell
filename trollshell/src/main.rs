@@ -355,6 +355,7 @@ fn main() -> hytte::ui::Result<()> {
                         overlays::prompt::close_all();
                         overlays::consent::close_all();
                         overlays::dialog::close_all();
+                        overlays::bluetooth_prompt::close_all();
                         // Abort the per-monitor fullscreen watchers (they pin
                         // their Monitor, so they can't self-terminate) before
                         // re-keying below (#404).
@@ -380,6 +381,9 @@ fn main() -> hytte::ui::Result<()> {
                             // built on whichever output is focused when a
                             // sidebar card opens its page.
                             overlays::dialog::install(monitor);
+                            // A pending Bluetooth prompt toasts while no
+                            // output's drawer shows the Bluetooth page (#1608).
+                            overlays::bluetooth_prompt::install(monitor);
                         }
 
                         // Fullscreen auto-inhibit (#404): one watcher per

@@ -126,7 +126,8 @@ pub struct Notification {
     /// - `>0`            → `Some(millis)` (as requested, at any urgency)
     ///
     /// A [`post_local`] toast always carries the 5 s default, at every
-    /// urgency (see [`post_local`]).
+    /// urgency (see [`post_local`]). A [`post_local_until_closed`] toast
+    /// carries `None`: it stays until it is closed.
     pub timeout: Option<Duration>,
     /// Action buttons to display below the notification body.
     pub actions: Vec<Action>,
@@ -1048,7 +1049,8 @@ fn rate_limit_allow(app_name: &str, summary: &str, body: &str) -> bool {
 /// the 5 s server default at every urgency. That differs from a D-Bus client's
 /// `Critical` notification with `expire_timeout = -1`, which the `Notify`
 /// handler keeps on screen until dismissed (#1542). The shell's own error
-/// toasts were not part of that decision, so they keep expiring.
+/// toasts were not part of that decision, so they keep expiring. A toast that
+/// must stay until something ends goes through [`post_local_until_closed`].
 ///
 /// # Rate-limiting
 ///
@@ -1099,6 +1101,47 @@ pub fn post_local_with_actions(
     shared
         .iface
         .post_local(app_name, summary, body, urgency, actions);
+}
+
+/// Like [`post_local_with_actions`], but the toast **stays until it is
+/// closed**, and the id it got is returned so the caller can close it.
+///
+/// For a toast that reports something with a lifetime of its own, such as a
+/// request waiting for an answer, where the toast must go when that ends and
+/// not after a fixed time. Close it with [`dismiss`], reason 3 (closed by a
+/// call), when it ends. The user can still dismiss it sooner, and a
+/// [`dismiss`] for an id that has already closed does nothing, so the caller
+/// does not need to know whether that happened.
+///
+/// Two differences from [`post_local_with_actions`]:
+///
+/// - **No expiry**, at any urgency: the toast carries no timeout, and
+///   nothing closes it on a timer. [`post_local`]'s 5 s default is for
+///   fire-and-forget reports, which is what this is not.
+/// - **No rate limit.** [`post_local`] drops a repeat of the same
+///   `(app_name, summary, body)` inside 10 s, so a flapping daemon cannot
+///   stack identical error toasts. Here the caller closes each toast it
+///   posts, and a new request can read exactly like the one before it (the
+///   same device asking for the same service again). The limiter would drop
+///   that toast, and the new request would have nothing on screen. A held
+///   post neither checks the limiter nor records itself in it.
+///
+/// Returns `None`, posting nothing, if the notifications service isn't
+/// registered (headless tests), as [`post_local`] does nothing there.
+#[must_use = "a toast that stays until closed needs its id, to be closed"]
+pub fn post_local_until_closed(
+    app_name: &str,
+    summary: &str,
+    body: &str,
+    urgency: Urgency,
+    actions: Vec<LocalAction>,
+) -> Option<u32> {
+    let shared = shared::get::<NotificationsShared>()?;
+    Some(
+        shared
+            .iface
+            .post_local_timed(app_name, summary, body, urgency, actions, None),
+    )
 }
 
 // ── D-Bus interface ───────────────────────────────────────────────────────────
@@ -1190,6 +1233,31 @@ impl NotificationsIface {
         urgency: Urgency,
         actions: Vec<LocalAction>,
     ) -> u32 {
+        // The shell's own fire-and-forget toasts expire after the default at
+        // every urgency, `Critical` included: here `Critical` is the DND/mute
+        // bypass, not a client leaving the timeout to us (see `post_local`).
+        self.post_local_timed(
+            app_name,
+            summary,
+            body,
+            urgency,
+            actions,
+            Some(DEFAULT_TIMEOUT),
+        )
+    }
+
+    /// [`post_local`](Self::post_local) with the timeout spelled out: `Some`
+    /// expires after it, `None` stays until closed. [`post_local_until_closed`]
+    /// passes `None`.
+    fn post_local_timed(
+        &self,
+        app_name: &str,
+        summary: &str,
+        body: &str,
+        urgency: Urgency,
+        actions: Vec<LocalAction>,
+        timeout: Option<Duration>,
+    ) -> u32 {
         // Allocate from the SAME atomic the D-Bus `Notify` handler uses — one
         // monotonic sequence, so this id can never collide with a
         // `Notify`-issued one (see `NotificationsIface::next_id`).
@@ -1225,12 +1293,8 @@ impl NotificationsIface {
             .unwrap_or_default()
             .as_secs();
 
-        // The shell's own toasts expire after the default at every urgency,
-        // `Critical` included: here `Critical` is the DND/mute bypass, not a
-        // client leaving the timeout to us (see `post_local`). One binding, so
-        // the field and the timer cannot disagree.
-        let timeout = Some(DEFAULT_TIMEOUT);
-
+        // `timeout` is one binding, used for both the field and the timer, so
+        // the two cannot disagree.
         let notification = Notification {
             id,
             app_name: app_name.to_string(),
@@ -1525,7 +1589,8 @@ fn forget_replaced_local_actions(
 /// leaves the timeout to us (`expire_timeout < 0`, conventionally `-1`) for a
 /// `Low` or `Normal` urgency notification; a `Critical` one that does so gets
 /// no timeout at all (see [`resolve_timeout`]). The shell's own toasts
-/// ([`post_local`]) carry it at every urgency, `Critical` included.
+/// ([`post_local`]) carry it at every urgency, `Critical` included, except a
+/// [`post_local_until_closed`] one, which carries none.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Resolve a D-Bus `Notify` call's `expire_timeout` and urgency into a finite
@@ -2602,6 +2667,53 @@ mod tests {
         }
     }
 
+    /// A held post (`post_local_until_closed`'s body) returns the id its toast
+    /// got, registers its actions under that id, and arms no expiry at any
+    /// urgency (#1608). The id is what the caller closes the toast with, so a
+    /// post that returned any other number would leave the toast up for good
+    /// and let the caller close somebody else's.
+    ///
+    /// **Falsification:** return `id + 1` (or a fresh `fetch_add`) from
+    /// `post_local_timed`, or hand `set_expiry` `Some(DEFAULT_TIMEOUT)` in
+    /// place of `timeout`, and this fails.
+    #[test]
+    fn a_held_post_returns_its_toasts_id_and_never_expires() {
+        let iface = NotificationsIface::new();
+        // Something already live, so the id under test is not simply the
+        // counter's first value.
+        let before = iface.post_local("Wi-Fi", "earlier", "", Urgency::Normal, Vec::new());
+        for urgency in ALL_URGENCIES {
+            let id = iface.post_local_timed(
+                "Bluetooth",
+                "Pixel 7 wants to pair",
+                "",
+                urgency,
+                vec![super::LocalAction::new("open", "Open Bluetooth", || {})],
+                None,
+            );
+            assert_ne!(id, before);
+            let newest = iface
+                .active
+                .lock_ref()
+                .last()
+                .map(|n| (n.id, n.summary.clone()));
+            assert_eq!(
+                newest,
+                Some((id, "Pixel 7 wants to pair".to_string())),
+                "the returned id is the toast's ({urgency:?})"
+            );
+            assert!(
+                iface
+                    .local_actions
+                    .lock()
+                    .expect("not poisoned")
+                    .contains_key(&(id, "open".to_string())),
+                "its action is registered under that id ({urgency:?})"
+            );
+            assert_eq!(Posted::of(&iface, id), Posted::STAYS, "{urgency:?}");
+        }
+    }
+
     // ── One live set: the bus and the shared side share one timer map (#1604)
     //
     // `Service::start` takes both halves from `mount_live_set`: the bus serves
@@ -3453,9 +3565,9 @@ mod tests {
 #[cfg(all(test, feature = "system-tests"))]
 mod system_tests {
     use super::{
-        LocalAction, NotificationsIface, NotificationsShared, Urgency, dismiss, dismiss_all,
-        invoke_action, pause_expiry, post_local, post_local_with_actions, resume_expiry,
-        serve_live_set, start_on,
+        LocalAction, NotificationsHandles, NotificationsIface, NotificationsShared, Urgency,
+        dismiss, dismiss_all, invoke_action, pause_expiry, post_local, post_local_until_closed,
+        post_local_with_actions, resume_expiry, serve_live_set, start_on,
     };
     use futures_signals::signal::SignalExt as _;
     use futures_util::StreamExt as _;
@@ -3630,6 +3742,51 @@ mod system_tests {
         iface.active.lock_ref().iter().any(|n| n.id == id)
     }
 
+    /// `post_local_until_closed` (#1608) on the live set `start_on`
+    /// registered, which `kept` and `handles` are: it returns the id its toast
+    /// got in the list the handles hand the overlay, arms no expiry for it, and
+    /// is not rate-limited, so the same words posted twice are two toasts.
+    /// Part of [`the_free_functions_act_on_the_registered_live_set`], run
+    /// under its `TEST_LOCK` while the set is registered.
+    fn held_posts_act_on_the_registered_live_set(
+        kept: &NotificationsIface,
+        handles: &NotificationsHandles,
+    ) {
+        let held: Vec<u32> = (0..2)
+            .map(|_| {
+                post_local_until_closed(
+                    "review-1608",
+                    "held until closed",
+                    "",
+                    Urgency::Critical,
+                    Vec::new(),
+                )
+                .expect("the service is registered")
+            })
+            .collect();
+        assert_ne!(held[0], held[1], "a repeat is a second toast");
+        for &id in &held {
+            assert!(
+                handles
+                    .active
+                    .lock_ref()
+                    .iter()
+                    .any(|n| n.id == id && n.summary == "held until closed"),
+                "post_local_until_closed returns the id of the toast it posted"
+            );
+            assert!(
+                kept.timers
+                    .lock()
+                    .expect("not poisoned")
+                    .get(&id)
+                    .is_some_and(|entry| entry.state.timeout.is_none() && entry.abort.is_none()),
+                "and arms no expiry for it"
+            );
+            dismiss(id, 3);
+            assert!(!is_live(kept, id), "dismiss with the id closes it");
+        }
+    }
+
     /// `serve_live_set`'s mount closure: a client's `Notify` on the served
     /// object lands in the live set `serve_live_set` returns, which is what
     /// `start_on` registers, timer included.
@@ -3655,8 +3812,9 @@ mod system_tests {
 
     /// `start_on`, which is `start()` minus the session bus, and the free
     /// functions' registry lookups. `post_local_with_actions`,
-    /// `pause_expiry`, `resume_expiry`, `invoke_action`, `dismiss` and
-    /// `dismiss_all` all act on the live set `start_on` registers.
+    /// `post_local_until_closed`, `pause_expiry`, `resume_expiry`,
+    /// `invoke_action`, `dismiss` and `dismiss_all` all act on the live set
+    /// `start_on` registers.
     /// `NotificationsHandles` hands the toast overlay and the history page
     /// that same set's list and history. A client's `Notify` on the served
     /// object lands in it too.
@@ -3736,6 +3894,8 @@ mod system_tests {
                     .any(|h| h.id == id && h.reason == 2),
                 "and files it in the history the handles hand the history page"
             );
+
+            held_posts_act_on_the_registered_live_set(&kept, &handles);
 
             post_local(
                 "review-1609",

@@ -171,7 +171,100 @@ pub fn toggle_mute() {
 
 #[cfg(test)]
 mod tests {
-    use super::types::{AudioRole, SpectrumAction};
+    use super::types::{AudioRole, DefaultKind, PendingDefaults, SpectrumAction};
+
+    /// A pick made before the `default` metadata binds is held, not dropped —
+    /// the last one per kind, since a later pick supersedes an earlier one —
+    /// and handed over exactly once when it binds. Dropping it was what lost
+    /// `bluetooth_audio`'s switch, which never re-sends.
+    ///
+    /// The effectful half — `write_default` parking it and the registry walker
+    /// writing it on bind — needs a bound metadata proxy, i.e. a live daemon;
+    /// it is on the PR's live-verify list.
+    #[test]
+    fn a_default_picked_before_the_metadata_binds_is_held_until_it_does() {
+        let mut pending = PendingDefaults::default();
+        assert!(
+            pending.drain().is_empty(),
+            "nothing parked, nothing written"
+        );
+
+        pending.park(DefaultKind::Sink, "alsa_output.analog".to_owned());
+        pending.park(DefaultKind::Source, "alsa_input.analog".to_owned());
+        pending.park(
+            DefaultKind::Sink,
+            "bluez_output.AC_C5_8B_11_22_33.1".to_owned(),
+        );
+        assert_eq!(
+            pending.drain(),
+            vec![
+                (
+                    DefaultKind::Sink,
+                    "bluez_output.AC_C5_8B_11_22_33.1".to_owned()
+                ),
+                (DefaultKind::Source, "alsa_input.analog".to_owned()),
+            ],
+            "the last pick per kind is the one written",
+        );
+        assert_eq!(
+            pending,
+            PendingDefaults::default(),
+            "a drained pick must not be written a second time on the next bind",
+        );
+    }
+
+    /// A user's pick is **written** to the configured key and the default is
+    /// **read** back off the effective one — the pair `WirePlumber` keeps (see
+    /// `DefaultKind`'s doc for the scripts). Writing the effective key was the
+    /// bug: the default flipped, and the next rescan (a device plugged, a
+    /// Bluetooth sink connecting, a jack's `Route` change) wrote the old choice
+    /// back, and nothing reached the state file.
+    ///
+    /// Falsify by pointing `configured_key` back at `default.audio.*`: the
+    /// write and read keys collapse into one and this fails.
+    #[test]
+    fn a_default_pick_is_written_to_the_configured_key_and_read_off_the_effective_one() {
+        assert_eq!(
+            DefaultKind::Sink.configured_key(),
+            "default.configured.audio.sink",
+        );
+        assert_eq!(
+            DefaultKind::Source.configured_key(),
+            "default.configured.audio.source",
+        );
+        assert_eq!(DefaultKind::Sink.effective_key(), "default.audio.sink");
+        assert_eq!(DefaultKind::Source.effective_key(), "default.audio.source");
+        for kind in [DefaultKind::Sink, DefaultKind::Source] {
+            assert_ne!(
+                kind.configured_key(),
+                kind.effective_key(),
+                "{kind:?}: a pick written where the default is read is overwritten on the next rescan",
+            );
+        }
+    }
+
+    /// The metadata listener follows the effective keys and nothing else — the
+    /// configured key's own change event (which our write produces) must not
+    /// flip `is_default` before the session manager has resolved it.
+    #[test]
+    fn the_listener_follows_only_the_effective_keys() {
+        assert_eq!(
+            DefaultKind::from_effective_key("default.audio.sink"),
+            Some(DefaultKind::Sink),
+        );
+        assert_eq!(
+            DefaultKind::from_effective_key("default.audio.source"),
+            Some(DefaultKind::Source),
+        );
+        for other in [
+            "default.configured.audio.sink",
+            "default.configured.audio.source",
+            "default.video.source",
+            "",
+        ] {
+            assert_eq!(DefaultKind::from_effective_key(other), None, "{other:?}");
+        }
+    }
 
     /// #581: the tap is demand-built, so the (requested, currently-built) truth
     /// table is the whole contract. Pinned here because the effectful half needs a

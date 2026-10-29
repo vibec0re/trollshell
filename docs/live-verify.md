@@ -174,7 +174,13 @@ range above is a floor, not a ceiling.
       `grants.toml` (next `auth` is silent); **Deny** persists a standing no;
       **This session** authorizes `get departures` without a durable grant;
       **Allow once** authorizes exactly one `get` then the next is denied. Let
-      a prompt sit **60 s** unanswered → resolves to Deny with a denied toast.
+      a prompt sit **60 s** unanswered → the card closes, and about 5 s later
+      the CLI gets a retryable "timed out" refusal with a denied toast; nothing
+      is written to `grants.toml`, and the next `auth` prompts again (#1542
+      item 5: only a **Deny** click persists a no). Restart the shell first if
+      it predates #1542: the broker answers such a shell's _timeout_ Deny as
+      silence (it arrives after the card closed), but its Deny on `Esc` or
+      with no output arrives at once, like a click, and is still persisted.
       Multi-monitor: the prompt lands on the focused output; hot-plug re-keys
       cleanly.
 - [ ] **(#996)** Two shells racing for the socket. With the deployed unit up,
@@ -1235,7 +1241,9 @@ the first thing to diff.
 - [ ] **(#947 P3)** **The datasource prompt is unchanged.** Trigger the
       infobroker's own consent prompt (an agent asking for data it has no
       standing grant for) and confirm it still draws **four** buttons with
-      `Always` focused, and that its 60 s timeout still denies. The
+      `Always` focused, and that its 60 s timeout sends nothing — the agent
+      gets the broker's retryable "timed out" refusal and no `deny` row is
+      written (#1542 item 5). The
       `RequestConsent` bytes for that path are unchanged by this PR and CI pins
       that, but this is the one path a human should look at once.
 - [ ] **(#947 P3)** **Re-record the approval fixtures.** Capture a real

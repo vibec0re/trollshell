@@ -169,7 +169,7 @@ impl SocketTransport {
         };
         let socket = Socket::new(Domain::UNIX, Type::STREAM, None).map_err(|e| unreachable(&e))?;
         socket
-            .set_write_timeout(Some(self.remaining(deadline)?))
+            .set_write_timeout(Some(kernel_timeout(self.remaining(deadline)?)))
             .map_err(|e| unreachable(&e))?;
         let addr = SockAddr::unix(path).map_err(|e| unreachable(&e))?;
         socket.connect(&addr).map_err(|e| unreachable(&e))?;
@@ -192,6 +192,15 @@ impl SocketTransport {
         let stream = self.connect(path, deadline)?;
         self.exchange(&stream, request, deadline)
     }
+}
+
+/// `left` as a socket timeout the kernel will honour. `socket2` writes a
+/// `timeval` and truncates to whole microseconds, and an all-zero `timeval`
+/// means "no timeout", so a remainder under 1 µs would turn the bounded
+/// connect into an unbounded one. std's own `set_write_timeout` rounds such a
+/// value up for the same reason; `socket2` does not.
+fn kernel_timeout(left: Duration) -> Duration {
+    left.max(Duration::from_micros(1))
 }
 
 impl Transport for SocketTransport {
@@ -873,6 +882,20 @@ mod tests {
             .count();
         assert_eq!(leftover, 0, "a connect helper thread is left behind");
         drop((held, listener));
+    }
+
+    /// A remainder below one microsecond must not reach the socket as zero,
+    /// which the kernel reads as "block forever".
+    #[test]
+    fn a_sub_microsecond_remainder_is_not_an_unbounded_connect() {
+        use std::time::Duration;
+
+        for nanos in [1, 500, 999] {
+            let armed = super::kernel_timeout(Duration::from_nanos(nanos));
+            assert_eq!(armed.as_micros(), 1, "{nanos} ns armed {armed:?}");
+        }
+        let second = Duration::from_secs(1);
+        assert_eq!(super::kernel_timeout(second), second);
     }
 
     /// The ordinary case still works: a listener that accepts is reached, and

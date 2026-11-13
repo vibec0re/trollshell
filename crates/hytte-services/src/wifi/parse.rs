@@ -9,6 +9,11 @@ use zbus::zvariant::OwnedValue;
 
 use crate::wifi::types::{Adapter, Station, StationState};
 
+/// iwd's adapter (wiphy) D-Bus interface. iwd 3.12 `doc/adapter-api.txt:5`
+/// and `src/dbus.h:29` (`IWD_WIPHY_INTERFACE`): `net.connman.iwd.Adapter`,
+/// with no version suffix (#1648).
+pub(super) const IWD_ADAPTER_IFACE: &str = "net.connman.iwd.Adapter";
+
 pub(super) type ManagedObjects =
     HashMap<zbus::zvariant::OwnedObjectPath, HashMap<String, HashMap<String, OwnedValue>>>;
 
@@ -123,7 +128,7 @@ pub(super) fn apply_station_props_delta(
     }
 }
 
-/// Apply a `PropertiesChanged` delta for `net.connman.iwd.Adapter1`.
+/// Apply a `PropertiesChanged` delta for `net.connman.iwd.Adapter`.
 pub(super) fn apply_adapter_props_delta(
     changed: &HashMap<String, OwnedValue>,
     adapter_mutable: &Mutable<Option<Adapter>>,
@@ -156,7 +161,7 @@ pub(super) fn refresh_adapter_from_managed(
     let adapter_props = managed
         .iter()
         .find(|(p, _)| p.as_str() == adapter_path)
-        .and_then(|(_, ifaces)| ifaces.get("net.connman.iwd.Adapter1"));
+        .and_then(|(_, ifaces)| ifaces.get(IWD_ADAPTER_IFACE));
 
     if let Some(props) = adapter_props {
         adapter_mutable.set(Some(Adapter {
@@ -206,6 +211,59 @@ pub(super) fn refresh_station_from_managed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every iwd interface name this module speaks, written out as a literal
+    /// (never derived from the constants under test) and cited from iwd
+    /// 3.12's own documentation (nixpkgs `iwd.src`). Nothing checked these
+    /// against iwd before: the fixtures shared the code's typo (#1648).
+    const IWD_INTERFACES: [&str; 7] = [
+        "net.connman.iwd.Adapter",      // doc/adapter-api.txt:5
+        "net.connman.iwd.Device",       // doc/device-api.txt:5
+        "net.connman.iwd.Station",      // doc/station-api.txt:5
+        "net.connman.iwd.Network",      // doc/network-api.txt:5
+        "net.connman.iwd.KnownNetwork", // doc/knownnetwork-api.txt:5
+        "net.connman.iwd.AgentManager", // doc/agent-api.txt:5
+        "net.connman.iwd.Agent",        // doc/agent-api.txt:75
+    ];
+
+    #[test]
+    fn the_adapter_interface_is_iwds_own_name() {
+        assert_eq!(IWD_ADAPTER_IFACE, "net.connman.iwd.Adapter");
+    }
+
+    /// Every quoted `net.connman.iwd.*` literal in the wifi module's non-test
+    /// code is one of iwd's interfaces above or one of its error names, so a
+    /// misspelt interface in a call site with no constant fails here too.
+    #[test]
+    fn every_iwd_name_literal_in_the_module_is_a_real_one() {
+        const ERRORS: [&str; 4] = [
+            "net.connman.iwd.AlreadyExists",
+            "net.connman.iwd.InvalidArgs",
+            "net.connman.iwd.Failed",
+            "net.connman.iwd.Agent.Error.Canceled",
+        ];
+        let sources = [
+            include_str!("client.rs"),
+            include_str!("mod.rs"),
+            include_str!("parse.rs"),
+            include_str!("watcher.rs"),
+            include_str!("agent.rs"),
+        ];
+        let mut seen = 0;
+        for src in sources {
+            let code = src.split("#[cfg(test)]").next().unwrap_or(src);
+            for piece in code.split('"').skip(1).step_by(2) {
+                if piece.starts_with("net.connman.iwd.") {
+                    seen += 1;
+                    assert!(
+                        IWD_INTERFACES.contains(&piece) || ERRORS.contains(&piece),
+                        "unknown iwd name {piece:?}"
+                    );
+                }
+            }
+        }
+        assert!(seen > 5, "scan found only {seen} literals");
+    }
 
     /// A `PropertiesChanged` delta carrying an unknown `State` value must not
     /// panic — it should fall through `parse_state`'s wildcard arm and leave

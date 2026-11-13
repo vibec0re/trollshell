@@ -13,8 +13,9 @@ use super::client::{
     register_iwd_agent,
 };
 use super::parse::{
-    adapter_path_from_station, apply_adapter_props_delta, apply_station_props_delta,
-    refresh_adapter_from_managed, refresh_station_from_managed, station_removed_from_event,
+    IWD_ADAPTER_IFACE, adapter_path_from_station, apply_adapter_props_delta,
+    apply_station_props_delta, refresh_adapter_from_managed, refresh_station_from_managed,
+    station_removed_from_event,
 };
 use super::types::{Adapter, PromptRequest, Station, StationState, WifiNetwork};
 use super::{AGENT_PATH, IwdPaths};
@@ -741,7 +742,7 @@ async fn pump_iwd_events<O, E, H, R, RF, S, SF>(
 }
 
 /// Decode `PropertiesChanged` body. Applies the delta directly for known
-/// interfaces (Station/Adapter1) to avoid a full `GetAll` round-trip, and
+/// interfaces (Station/Adapter) to avoid a full `GetAll` round-trip, and
 /// signals whether the caller should refresh the network list.
 async fn handle_station_props_event(
     evt: &hytte_bus::SignalEvent,
@@ -762,7 +763,7 @@ async fn handle_station_props_event(
     if iface == "net.connman.iwd.Station" {
         apply_station_props_delta(&changed, station_mutable);
         true
-    } else if iface == "net.connman.iwd.Adapter1" {
+    } else if iface == IWD_ADAPTER_IFACE {
         apply_adapter_props_delta(&changed, adapter_mutable);
         false
     } else {

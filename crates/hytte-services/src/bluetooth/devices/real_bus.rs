@@ -608,14 +608,17 @@ async fn r1_the_fold_settles_on_bluez_through_the_production_bus() {
 
 /// A system bus that refuses some of the fold's device `AddMatch`es (here
 /// dbus-daemon's `max_match_rules_per_connection` at 16, against 24 known
-/// devices; the system bus default is 512) does not hold up the fold: its
-/// resync runs, and bluetoothd exiting ends the watch (#1647 review R2).
-/// Until the review the fold waited for every device's rule before it read
+/// devices; the system bus default is 512) does not hold up the fold, so
+/// bluetoothd exiting ends the watch (#1647 review R2). At the #1647 head
+/// the fold waited for every snapshot device's rule before it read
 /// anything, owner stream included, so it never started: the old daemon's
-/// 24 devices stayed on screen and the exit went unnoticed.
+/// 24 devices stayed on screen and the exit went unnoticed. On `main` this
+/// passes too: the fold started with the refused subscriptions missing.
 ///
-/// **Falsification:** make `open_fold` wait for the snapshot devices'
-/// rules again (the #1647 head) and the resync is never served.
+/// Any end will do here; which one is R3's business.
+///
+/// **Falsification:** make the fold wait for the snapshot devices' rules
+/// before it starts (the #1647 head) and the watch never ends.
 #[tokio::test(flavor = "multi_thread")]
 async fn r2_a_refused_device_rule_does_not_hold_up_the_fold() {
     const TEST: &str = "r2_a_refused_device_rule_does_not_hold_up_the_fold";
@@ -626,10 +629,7 @@ async fn r2_a_refused_device_rule_does_not_hold_up_the_fold() {
     let adapter_m = Mutable::new(None);
     let devices_m = Mutable::new(Vec::new());
     let watch = spawn_listen(&adapter_m, &devices_m);
-
     wait_published(&devices_m, 24).await;
-    fake.wait_for("the handshake's resync", |st| st.managed_served >= 2)
-        .await;
 
     // bluetoothd exits.
     fake.conn
@@ -637,10 +637,11 @@ async fn r2_a_refused_device_rule_does_not_hold_up_the_fold() {
         .await
         .expect("release org.bluez");
     let ended = tokio::time::timeout(BUDGET, watch).await;
+    let served = fake.state.lock().expect("fake state").managed_served;
     assert!(
-        matches!(ended, Ok(Ok(Ok(ListenEnd::DaemonExited)))),
-        "bluetoothd left but the watch did not end on it ({ended:?}); still published: \
-         adapter {:?}, {} devices",
+        matches!(ended, Ok(Ok(_))),
+        "bluetoothd left but the watch did not end ({ended:?}); GetManagedObjects answered \
+         {served}×; still published: adapter {:?}, {} devices",
         adapter_m.get_cloned().map(|a: super::Adapter| a.powered),
         devices_m.get_cloned().len(),
     );

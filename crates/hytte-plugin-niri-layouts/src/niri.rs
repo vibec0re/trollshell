@@ -23,10 +23,10 @@ use niri_ipc::socket::SOCKET_PATH_ENV;
 use niri_ipc::{
     Action, Output, Reply, Request, Response, SizeChange, Window, Workspace, WorkspaceReferenceArg,
 };
+use socket2::{Domain, SockAddr, Socket, Type};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
-use socket2::{Domain, SockAddr, Socket, Type};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -859,7 +859,10 @@ mod tests {
             err.starts_with("cannot reach niri") && err.contains("timed out"),
             "got {err:?}"
         );
-        assert!(took >= Duration::from_millis(250), "returned early: {took:?}");
+        assert!(
+            took >= Duration::from_millis(250),
+            "returned early: {took:?}"
+        );
         assert!(took < Duration::from_secs(2), "not bounded: {took:?}");
         // The old path left a named helper thread parked behind a full
         // backlog (`comm` keeps 15 bytes); there is none to find now.

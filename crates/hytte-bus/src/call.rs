@@ -84,6 +84,7 @@ pub struct CallBuilder<A> {
     args: A,
     timeout: Duration,
     retry: RetryPolicy,
+    auto_start: bool,
 }
 
 /// Owned version of `CallBuilder` used internally for `fire_and_forget` spawning.
@@ -98,6 +99,8 @@ struct OwnedCall<A> {
     args: A,
     timeout: Duration,
     retry: RetryPolicy,
+    /// `false` sends the call with `NO_AUTO_START` ([`CallBuilder::no_auto_start`]).
+    auto_start: bool,
 }
 
 impl<A> OwnedCall<A>
@@ -117,11 +120,28 @@ where
                 let method = self.method.clone();
                 let args = self.args.clone();
                 let timeout = self.timeout;
+                let auto_start = self.auto_start;
                 async move {
                     let proxy =
                         zbus::Proxy::new(&conn, dest.as_str(), path.as_str(), iface.as_str())
                             .await?;
-                    let fut = proxy.call::<_, _, R>(method.as_str(), &args);
+                    let fut = async {
+                        if auto_start {
+                            proxy.call::<_, _, R>(method.as_str(), &args).await
+                        } else {
+                            // `call_with_flags` answers `None` only for a
+                            // call sent with `NoReplyExpected`, which this
+                            // one is not.
+                            proxy
+                                .call_with_flags::<_, _, R>(
+                                    method.as_str(),
+                                    zbus::proxy::MethodFlags::NoAutoStart.into(),
+                                    &args,
+                                )
+                                .await?
+                                .ok_or(zbus::Error::InvalidReply)
+                        }
+                    };
                     // The deadline is not a zbus error, so it does not travel
                     // as one: it passes `with_conn` as `Ok(Err(elapsed))` and
                     // becomes `BusError::Timeout` below. Until #1551 it was a
@@ -190,6 +210,7 @@ pub fn call_with(shared: &SharedConnection, destination: impl Into<String>) -> C
         args: (),
         timeout: Duration::from_secs(25),
         retry: RetryPolicy::Once,
+        auto_start: true,
     }
 }
 
@@ -231,6 +252,33 @@ impl<A> CallBuilder<A> {
         self
     }
 
+    /// Send the call with the `NO_AUTO_START` flag: if the destination name
+    /// has no owner, the bus answers with an error instead of
+    /// D-Bus-activating the service that ships it (#1551).
+    ///
+    /// Without it, a call to an unowned well-known name starts the daemon
+    /// behind it: on a system bus that is the activation file's
+    /// `SystemdService`, e.g. `bluetooth.service` for `org.bluez`. That is
+    /// right for a call a user asked for. It is wrong for one a watch sends
+    /// on its own, such as a re-read the daemon's own exit can race: the call
+    /// lands just after the daemon has gone and brings it back, undoing the
+    /// user's `systemctl stop`.
+    ///
+    /// With the flag, that call fails as a [`BusError::Permanent`] whose
+    /// `dbus_name` is `org.freedesktop.DBus.Error.NameHasNoOwner`, as
+    /// `dbus-daemon` answers it (another broker may answer
+    /// `org.freedesktop.DBus.Error.ServiceUnknown`). Either is the bus's own
+    /// answer and says nothing about the object or method called, so a caller
+    /// must not read it as one. A name that has an owner is called as without
+    /// the flag. The default is off: a call auto-starts, as D-Bus specifies.
+    /// `tests/call.rs` pins all three cases against a broker that counts its
+    /// activations.
+    #[must_use]
+    pub fn no_auto_start(mut self) -> Self {
+        self.auto_start = false;
+        self
+    }
+
     /// Set the call arguments, changing the type parameter.
     #[must_use]
     pub fn args<NewA>(self, args: NewA) -> CallBuilder<NewA>
@@ -246,6 +294,7 @@ impl<A> CallBuilder<A> {
             args,
             timeout: self.timeout,
             retry: self.retry,
+            auto_start: self.auto_start,
         }
     }
 
@@ -260,6 +309,7 @@ impl<A> CallBuilder<A> {
             args: self.args,
             timeout: self.timeout,
             retry: self.retry,
+            auto_start: self.auto_start,
         }
     }
 }

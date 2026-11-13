@@ -322,3 +322,76 @@ async fn a_call_past_its_deadline_is_a_timeout() {
         "a deadline must not force a reconnect"
     );
 }
+
+/// A call sent with `no_auto_start()` to a name nobody owns fails at the bus
+/// and starts nothing; the same call without it starts the service (#1551).
+/// That difference is the whole option: a watch that re-reads a daemon on its
+/// own (the `BlueZ` device fold) must not bring back a daemon the user just
+/// stopped, and on a system bus a call to an unowned activatable name does.
+///
+/// The broker's activation file counts every start
+/// ([`common::ephemeral_bus_activating`]); the plain call is the positive
+/// control that the count sees one. A flagged call to the name once it has an
+/// owner goes through as any call does.
+///
+/// **Falsification:** make `no_auto_start()` a no-op (or drop the flag where
+/// the call is sent) and the flagged call starts the service: the count reads
+/// 1 after it.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_auto_start_leaves_an_unowned_activatable_name_unstarted() {
+    const NAME: &str = "org.example.Activatable";
+    let (conn, guard, marker) = common::ephemeral_bus_activating(NAME).await;
+    let shared = SharedConnection::for_test_session(conn);
+    shared.spawn_supervisor_for_test();
+    let activations = || std::fs::read_to_string(&marker).map_or(0, |s| s.lines().count());
+    let introspect = || {
+        call_with(&shared, NAME)
+            .at_path("/")
+            .iface("org.freedesktop.DBus.Introspectable")
+            .method("Introspect")
+            .args(())
+            .retry(RetryPolicy::Never)
+    };
+
+    let flagged: Result<String, BusError> = introspect().no_auto_start().send().await;
+    assert_eq!(
+        activations(),
+        0,
+        "a no_auto_start() call started the service ({flagged:?})"
+    );
+    match &flagged {
+        Err(BusError::Permanent {
+            dbus_name: Some(name),
+            ..
+        }) if name == "org.freedesktop.DBus.Error.NameHasNoOwner" => {}
+        other => panic!("expected the bus's NameHasNoOwner, got {other:?}"),
+    }
+
+    let plain: Result<String, BusError> = introspect().send().await;
+    assert_eq!(
+        activations(),
+        1,
+        "the control: a plain call starts the service ({plain:?})"
+    );
+    match &plain {
+        Err(BusError::Permanent {
+            dbus_name: Some(name),
+            ..
+        }) if name == "org.freedesktop.DBus.Error.Spawn.ChildExited" => {}
+        other => panic!("expected the activation's ChildExited, got {other:?}"),
+    }
+
+    // Owned now: the flag changes nothing about a call that has a recipient.
+    let owner = common::connect(&guard.address).await;
+    owner.request_name(NAME).await.expect("own the name");
+    let xml: String =
+        tokio::time::timeout(common::PROBE_BUDGET, introspect().no_auto_start().send())
+            .await
+            .expect("the owner answered within the budget")
+            .expect("a no_auto_start() call to an owned name");
+    assert!(
+        xml.contains("org.freedesktop.DBus.Introspectable"),
+        "unexpected introspection reply: {xml}"
+    );
+    assert_eq!(activations(), 1, "nothing was started for an owned name");
+}

@@ -299,8 +299,14 @@ impl Drop for BusGuard {
 /// returning the config file's path. Split out of [`ephemeral_bus`] so
 /// [`restart_on_same_address`] (#1175) can reuse the identical config — same
 /// address, same policy — for a *second* daemon boot in the same `TempDir`.
-fn write_session_conf(tmp: &TempDir, address: &str) -> PathBuf {
+///
+/// `servicedir`, when given, is where the broker looks for D-Bus activation
+/// files ([`ephemeral_bus_activating`]).
+fn write_session_conf(tmp: &TempDir, address: &str, servicedir: Option<&Path>) -> PathBuf {
     let config = tmp.path().join("session.conf");
+    let servicedir = servicedir.map_or_else(String::new, |dir| {
+        format!("<servicedir>{}</servicedir>", dir.display())
+    });
     std::fs::write(
         &config,
         format!(
@@ -311,6 +317,7 @@ fn write_session_conf(tmp: &TempDir, address: &str) -> PathBuf {
   <type>session</type>
   <listen>{address}</listen>
   <auth>EXTERNAL</auth>
+  {servicedir}
   <policy context="default">
     <allow send_destination="*" eavesdrop="true"/>
     <allow eavesdrop="true"/>
@@ -381,7 +388,7 @@ pub async fn ephemeral_bus() -> (Connection, BusGuard) {
     let socket: PathBuf = tmp.path().join("bus");
     let address = format!("unix:path={}", socket.display());
 
-    let config = write_session_conf(&tmp, &address);
+    let config = write_session_conf(&tmp, &address, None);
     let child = spawn_daemon(&config).await;
     let conn = connect(&address).await;
 
@@ -392,6 +399,48 @@ pub async fn ephemeral_bus() -> (Connection, BusGuard) {
             tmp,
             address,
         },
+    )
+}
+
+/// [`ephemeral_bus`] whose broker can D-Bus-activate `name`, and counts
+/// every time it does (#1551).
+///
+/// The broker gets a service directory holding one activation file for
+/// `name`. Its `Exec` appends a line to the returned file and exits 1, so the
+/// activation fails (`org.freedesktop.DBus.Error.Spawn.ChildExited`) and
+/// `name` stays unowned, but the line stays behind: the file's line count is
+/// how many times the bus started the service. The broker answers the call
+/// that caused an activation only once the helper has exited, so by the time
+/// that call's reply is in, its line is written and no wait is needed.
+#[allow(dead_code)] // not every test binary that pulls in `common` activates
+pub async fn ephemeral_bus_activating(name: &str) -> (Connection, BusGuard, PathBuf) {
+    let tmp = TempDir::new().expect("create tempdir for dbus-daemon");
+    let socket: PathBuf = tmp.path().join("bus");
+    let address = format!("unix:path={}", socket.display());
+    let services = tmp.path().join("services");
+    std::fs::create_dir(&services).expect("create the service directory");
+    let marker = tmp.path().join("activations");
+    std::fs::write(
+        services.join(format!("{name}.service")),
+        format!(
+            "[D-BUS Service]\nName={name}\nExec=/bin/sh -c \"echo activated >> {}; exit 1\"\n",
+            marker.display()
+        ),
+    )
+    .expect("write the activation file");
+
+    let config = write_session_conf(&tmp, &address, Some(&services));
+    let child = spawn_daemon(&config).await;
+    let conn = connect(&address).await;
+
+    (
+        conn,
+        BusGuard {
+            child: Some(child),
+            tmp,
+            address,
+        },
+        marker,
     )
 }
 

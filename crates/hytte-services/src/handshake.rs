@@ -10,13 +10,16 @@
 //!
 //! [`subscribe_then_snapshot`] serves every site where the read comes after
 //! one wait and nothing else may go on meanwhile: `bluetooth`'s `listen` (its
-//! owner subscription, then the snapshot), its `event_loop` (the fold's three
-//! top-level subscriptions, then one resync), and its `wait_for_bluez` (the
-//! owner subscription, then `NameHasOwner`). `wifi`'s `open_discovery` has an
-//! extra step between the receivers and the wait, so it orders its own. The
-//! iwd station's subscription is waited for by `wifi`'s event pump, as one of
-//! its arms, so the network read and the agent registration do not wait on it
-//! (#1647 review).
+//! owner subscription, then the snapshot) and its `wait_for_bluez` (the owner
+//! subscription, then `NameHasOwner`). `wifi`'s `open_discovery` has an
+//! extra step between the receivers and the wait, so it orders its own. Two
+//! sites must go on meanwhile, so they wait beside their work rather than
+//! before it: the iwd station's subscription is waited for by `wifi`'s event
+//! pump, as one of its arms, so the network read and the agent registration
+//! do not wait on it (#1647 review); and `bluetooth`'s fold reads bluetoothd's
+//! owner while it waits for its three top-level rules, then arms its resync
+//! (`arm_once_subscribed`), so a rule the bus refuses cannot hide
+//! bluetoothd's exit (#1647 second review).
 
 use hytte_bus::SignalSubscription;
 

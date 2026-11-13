@@ -1366,7 +1366,7 @@ async fn launch(
     Ok(())
 }
 
-/// [`launch`]'s error for a `systemd-run` that exited `status` with
+/// [`launch()`]'s error for a `systemd-run` that exited `status` with
 /// `stderr`: [`UnitExists`] when systemd refused because a unit already
 /// holds the name, which `systemd-run` prints as "Unit … was already loaded
 /// or has a fragment file." (systemd 260; the gated tests read it off
@@ -3894,7 +3894,7 @@ impl std::fmt::Display for StillStopping {
 
 impl std::error::Error for StillStopping {}
 
-/// [`launch`]'s error when systemd refused the launch because a unit still
+/// [`launch()`]'s error when systemd refused the launch because a unit still
 /// holds the plugin's name ([`launch_failed`]). systemd answers so for a
 /// unit that is running, one stopping or held, and a static unit's file
 /// alike; only a caller that waited on a unit this launcher started knows it
@@ -8418,7 +8418,7 @@ mod tests {
 
     /// What systemd answers a relaunch while the old unit is still
     /// `deactivating` (#1417's measurement: `StartTransientUnit` refuses at
-    /// once, and `systemd-run` passes the refusal on), as [`launch`] types
+    /// once, and `systemd-run` passes the refusal on), as [`launch()`] types
     /// it ([`UnitExists`]).
     fn refused() -> anyhow::Error {
         refused_for("pet")
@@ -11593,7 +11593,7 @@ mod tests {
 
     // ── a name still held, owed (#1555 follow-up) ───────────────────────────
 
-    /// **[`launch`] types systemd's refusal of a held name**
+    /// **[`launch()`] types systemd's refusal of a held name**
     /// ([`launch_failed`]): "already loaded" is [`UnitExists`], with the
     /// message it always had; any other failure is not. The gated tests
     /// check the words against systemd itself (`stopping_stand_in_for`,
@@ -13146,7 +13146,7 @@ mod tests {
         /// pass's launch was refused and the plugin lost.
         ///
         /// Since the #1555 follow-up, while the name is held, the refusal is
-        /// also checked to be typed as [`launch`] types it ([`UnitExists`],
+        /// also checked to be typed as [`launch()`] types it ([`UnitExists`],
         /// on systemd's own words), and the switch's start and a Save to owe
         /// the plugin its launch ([`start_and_save_owe_a_held_name`]).
         ///

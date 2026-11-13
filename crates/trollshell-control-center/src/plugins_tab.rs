@@ -2919,10 +2919,14 @@ const APPLYING: &str = "Saved. Asking the shell to apply it…";
 ///   starts nothing, so the plugin is down once its stuck process exits.
 ///   Since #1555 bullet 6 the shell brings it back by itself: it watches the
 ///   unit and, once it is gone, launches the plugin from what is declared
-///   then, if it is still switched on. So the line says that, and asks for
-///   nothing: the "switch it off and on" it used to ask for is no longer
-///   needed, and a switch flipped before the old unit is gone would only
-///   wait for it as well.
+///   then, if it is still switched on, a shell restarted meanwhile included.
+///   So the line says that, and asks for nothing: the "switch it off and on"
+///   it used to ask for is no longer needed, and a switch flipped on before
+///   the old unit is gone fails (at once, or after the shell's own 12 s
+///   wait), since systemd keeps the unit until its last process has exited.
+///   The line also says that the process may never exit (one stuck on a
+///   hung mount), since then nothing brings the plugin back, the shell or
+///   the switch (#1644 review, MEDIUM 1).
 fn restart_status(answer: &str, enabled: bool) -> &'static str {
     match answer {
         "relaunched" => "Saved, and the plugin restarted.",
@@ -2937,8 +2941,9 @@ fn restart_status(answer: &str, enabled: bool) -> &'static str {
         }
         "still-stopping" => {
             "Saved, but the running plugin did not stop within 12 s, so it was not restarted yet. \
-             The shell starts it with the new values by itself once the old process has stopped, \
-             if it is still switched on then."
+             The shell starts it with the new values by itself once the old process has exited, \
+             if it is still switched on then. Until then it stays down, and a process stuck on a \
+             hung mount may never exit."
         }
         "not-declared" => {
             "Saved, but this plugin runs from a unit file of its own, which does not read \
@@ -6096,13 +6101,18 @@ mod tests {
             // relaunched nothing and started nothing. Never "restarted".
             // #1555 bullet 6: the shell launches it once the old unit is
             // gone, so the line says so and no longer asks for the switch.
+            // #1644 review, MEDIUM 1: "gone" is once the old process has
+            // exited, which one stuck on a hung mount may never do, and the
+            // line does not promise otherwise.
             let still = super::restart_status("still-stopping", enabled);
             assert!(
                 still.contains("did not stop within 12 s")
                     && still.contains("not restarted yet")
                     && still.contains("starts it with the new values by itself")
-                    && still.contains("once the old process has stopped")
+                    && still.contains("once the old process has exited")
                     && still.contains("still switched on")
+                    && still.contains("Until then it stays down")
+                    && still.contains("may never exit")
                     && !still.contains("switch it off and on")
                     && !still.contains("plugin restarted"),
                 "{still}"

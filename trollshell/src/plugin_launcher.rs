@@ -201,25 +201,51 @@
 //! was gone. That fallback now runs only for a unit this launcher did not
 //! start.
 //!
-//! **A plugin left down that way is launched once its unit has stopped**
-//! (#1555 bullet 6). A [`StillStopping`] answer from a start or a restart,
-//! about a unit this launcher started and a plugin switched on, puts the
-//! plugin's id in [`OWED_LAUNCHES`]. Until then it stayed down, with "on"
-//! saved, until the next start, `ReloadPlugins` or shell start, since nothing
-//! watches `plugins.toml` or the unit. The `plugins.json` watch now looks at
-//! those ids on each of its ticks ([`observe_owed`]): one unit listing, outside
-//! [`CONVERGE_LOCK`], and only while an id is owed. A unit still stopping
-//! keeps its id, and costs the tick nothing more. Once a listing shows it
-//! gone, inactive or failed, the id leaves the set and the tick runs one
-//! ordinary reconcile, under the lock like any other, which reads the
-//! declaration then: a plugin still switched on is launched with its current
-//! settings and keys, and one switched off or no longer declared meanwhile is
-//! launched by nobody. A unit found running again, something else having
-//! started it, just leaves the set. A tick never waits for an owed unit,
-//! because it runs no pass until the listing shows the unit down; a bare
-//! "reconcile again" flag would have planned another [`STOP_WAIT`] under the
-//! lock on every tick. A hand-installed static unit never enters the set, and
-//! keeps its legacy behaviour.
+//! **A plugin left down that way is launched once its unit is gone** (#1555
+//! bullet 6). A [`StillStopping`] answer from a start or a restart, about a
+//! unit this launcher started and a plugin switched on, puts the plugin's id
+//! in [`OWED_LAUNCHES`]. Until then it stayed down, with "on" saved, until
+//! the next start, `ReloadPlugins` or shell start, since nothing watches
+//! `plugins.toml` or the unit. The `plugins.json` watch now looks at those
+//! ids on each of its ticks ([`observe_owed`]): one unit listing, outside
+//! [`CONVERGE_LOCK`], and only while an id is owed. A unit still listed keeps
+//! its id, and costs the tick nothing more: `deactivating`, and also
+//! `inactive` or `failed`, since systemd collects a `--collect` unit only
+//! once its cgroup is empty, and until then refuses a launch under its name
+//! (#1644 review, MEDIUM 1, measured on systemd 260.5; `reset-failed` turns
+//! `failed` into `inactive` and frees nothing). Once a listing shows the unit
+//! gone, the id leaves the set and the tick runs one ordinary reconcile,
+//! under the lock like any other, which reads the declaration then: a plugin
+//! still switched on is launched with its current settings and keys, and one
+//! switched off or no longer declared meanwhile is launched by nobody.
+//!
+//! The launcher's own launches clear the debt ([`OwedLaunches::settle`]): a
+//! start, a reconcile's launch, a restart or a relaunch that went through
+//! ran the current declaration. So a unit of an owed plugin found **running
+//! again** was started by something else from its old properties: systemd's
+//! `Restart=` after a crash (the start and a reconcile's wait send no stop,
+//! so nothing set systemd's `forbid_restart`), or a start by hand. It runs
+//! its previous launch's environment, without the settings or keys saved
+//! since, which the fingerprint does not cover, so the look makes a pass due
+//! that restarts it from the declaration ([`plan_with_owed`]), as #1628 does
+//! for a start's own wait ([`replace_or_launch`]).
+//!
+//! A pass never launches into, or waits for, a unit an owed id still holds:
+//! it leaves the id to the look ([`plan_with_owed`]), so a tick never waits
+//! for an owed unit (#1644 review, LOW 2). A bare "reconcile again" flag
+//! would have planned another [`STOP_WAIT`] under the lock on every tick. A
+//! pass that plans a launch onto a stopped unit of this launcher's that is
+//! still listed owes it instead, since the launch would be refused: that is
+//! how a shell started while such a unit is left over picks the plugin up.
+//! A hand-installed static unit never enters the set, and keeps its legacy
+//! behaviour.
+//!
+//! The cost of the wait is a process that never exits, e.g. one stuck on a
+//! hung mount: its unit is never collected, the plugin stays down, and the
+//! look lists the units every tick
+//! ([`POLL_INTERVAL`](hytte_config::subsystem::watch::POLL_INTERVAL), 3 s)
+//! for the rest of the session, running no pass. A launch under the name is
+//! refused for as long, by hand or not.
 //!
 //! **Several restarts stop together** (#1444). A rebuild restarts every plugin
 //! whose exec path changed, and a key change every running plugin that reads
@@ -2016,24 +2042,36 @@ async fn reconcile_from(sources: Sources, trigger: Trigger) -> Outcome {
             let extra_env = resolve_secret_env(&id, &spec).await;
             launch(&id, &spec, &extra_env, &target).await
         },
+        &OWED_LAUNCHES,
     )
     .await
 }
 
 /// [`reconcile_from`] with the unit listing and the launch of a plugin that
-/// is not running passed in. Production always passes
-/// [`systemd::list_plugin_units`], and the keyring read plus `systemd-run`
-/// (handed the id, the spec and the target). The listing seam exists because
-/// that call fails only without a reachable user manager, and what a failed
-/// listing returns for each [`Trigger`] is what the #1404 retry runs on; the
-/// launch seam, so a test can see which spec a pass launches a plugin owed a
-/// launch with (#1555 bullet 6). The stops and restarts are not seams: a test
-/// that reaches them has planned against a real user manager.
+/// is not running passed in, and the launches owed. Production always passes
+/// [`systemd::list_plugin_units`], the keyring read plus `systemd-run`
+/// (handed the id, the spec and the target), and [`OWED_LAUNCHES`]. The
+/// listing seam exists because that call fails only without a reachable user
+/// manager, and what a failed listing returns for each [`Trigger`] is what
+/// the #1404 retry runs on; the launch seam and `owed`, so a test can see
+/// which spec a pass launches a plugin owed a launch with, and what a pass
+/// does with what is owed (#1555 bullet 6). The stops and restarts are not
+/// seams: a test that reaches them has planned against a real user manager,
+/// and the batch ([`restart_all`]) settles into the process's own set.
+///
+/// A pass that listed the units plans with [`plan_with_owed`]: it leaves an
+/// owed id whose unit still holds the name to the watch's look, owes a launch
+/// planned onto a stopped unit still holding it, and restarts a unit the
+/// look found running again from its previous launch. A blind pass (startup
+/// or `ReloadPlugins` with no listing) plans with [`plan`] alone, as before.
+/// Each launch that goes through clears its plugin's debt
+/// ([`OwedLaunches::settle`]).
 async fn reconcile_listing<L, Fut, R, RF>(
     sources: Sources,
     trigger: Trigger,
     list_units: L,
     mut launch_now: R,
+    owed: &OwedLaunches,
 ) -> Outcome
 where
     L: FnOnce() -> Fut,
@@ -2073,7 +2111,11 @@ where
                 };
             }
         };
-        let actions = plan(&declared, &units);
+        let actions = if outcome == Outcome::Settled {
+            plan_with_owed(&declared, &units, owed)
+        } else {
+            plan(&declared, &units)
+        };
         // No early return: once the listing is answered this fn has one exit, so
         // the test that drives a failed listing (an empty plan) pins the same
         // `outcome` a blind pass with launches to make returns (#1407 review,
@@ -2130,7 +2172,11 @@ where
             let Some(spec) = declared.plugins.get(id) else {
                 continue;
             };
-            if let Err(err) = launch_now(id.to_owned(), spec.clone(), declared.target.clone()).await {
+            let launched = launch_now(id.to_owned(), spec.clone(), declared.target.clone()).await;
+            // Not onto a unit still stopping, so never a run-out: the stamp
+            // is not read, and a launch that went through clears the debt.
+            owed.settle(id, spec.enabled, false, &launched);
+            if let Err(err) = launched {
                 tracing::warn!(plugin = %id, %err, "plugin launch failed");
             }
         }
@@ -2230,13 +2276,15 @@ fn reconcile_then_watch(
 /// raised the flag can still warn once more (see [`RELOAD_UNLISTED`]).
 ///
 /// Every tick also asks `owed_due` whether a plugin owed a launch (#1555
-/// bullet 6, [`OWED_LAUNCHES`]) can be launched now: in production
+/// bullet 6, [`OWED_LAUNCHES`]) needs a pass now: in production
 /// [`observe_owed`], which lists the units only while an id is owed and
-/// answers `true` once one of their units has stopped. That runs one
-/// [`Trigger::Watch`] pass too, the same pass a moved stamp runs, so a tick
-/// still runs at most one. A unit still stopping answers `false`, so no tick
-/// plans a wait for it. If that pass cannot list the units, it is left
-/// pending like any other, and the next tick's pass launches the plugin.
+/// answers `true` once one of their units is gone, or is running again from
+/// its previous launch. That runs one [`Trigger::Watch`] pass too, the same
+/// pass a moved stamp runs, so a tick still runs at most one. A unit still
+/// listed and not running answers `false`, and no pass plans a wait for, or
+/// a launch into, a unit an owed id still holds ([`plan_with_owed`]). If that
+/// pass cannot list the units, it is left pending like any other, and the
+/// next tick's pass does what it would have.
 async fn converge_then_watch<C, F, O, OF>(
     paths: Vec<PathBuf>,
     cadence: Duration,
@@ -2261,7 +2309,8 @@ async fn converge_then_watch<C, F, O, OF>(
         if moved.is_empty() {
             if due {
                 tracing::info!(
-                    "a plugin owed a launch has stopped; reconciling to launch it from the current declaration"
+                    "a plugin owed a launch is gone, or back up from its previous launch; reconciling \
+                     it from the current declaration"
                 );
             } else if pending {
                 tracing::debug!("retrying the reconcile a failed unit listing left pending");
@@ -2317,10 +2366,10 @@ fn moved_since<'a>(paths: &'a [PathBuf], seen: &mut Vec<Stamp>) -> Vec<&'a Path>
 
 // ── Launches owed after a stop outlasted the wait (#1555 bullet 6) ───────────
 
-/// The plugins owed a launch once their unit has stopped: each one's start
-/// or restart answered [`StillStopping`], so it was not launched, and its
-/// unit is still on its way down (#1555 bullet 6). See the module doc's "A
-/// plugin left down that way…".
+/// The plugins owed a launch once their unit is gone: each one's start or
+/// restart answered [`StillStopping`], so it was not launched, and its unit
+/// still holds the name (#1555 bullet 6). See the module doc's "A plugin
+/// left down that way…".
 ///
 /// Only ids. What a plugin is launched with is read when it is launched, by
 /// the reconcile the watch then runs, never kept from the run-out: the
@@ -2329,92 +2378,221 @@ fn moved_since<'a>(paths: &'a [PathBuf], seen: &mut Vec<Stamp>) -> Vec<&'a Path>
 ///
 /// In memory, for the life of the process. A shell restart loses it, and
 /// needs nothing from it: its startup reconcile launches an enabled plugin
-/// whose unit is gone, and waits for one still stopping.
+/// whose unit is gone, waits for one still stopping (and owes it, if that
+/// runs out), and owes one whose stopped unit still holds the name
+/// ([`plan_with_owed`]).
 struct OwedLaunches {
-    ids: std::sync::Mutex<BTreeSet<String>>,
+    /// Both halves under one lock, so the look outside [`CONVERGE_LOCK`] and
+    /// a pass under it never take two locks in opposite orders.
+    state: std::sync::Mutex<Owed>,
 }
 
-/// The process's own [`OwedLaunches`]: what [`start`], [`restart_all`] and
-/// [`restart_for_settings`] owe, and what the `plugins.json` watch looks at
-/// ([`reconcile_then_watch`]). A test hands the seams one of its own, so
-/// none ever reaches this one.
+/// What [`OwedLaunches`] holds.
+#[derive(Debug, Default)]
+struct Owed {
+    /// Plugins owed a launch once their unit is gone, which the watch's look
+    /// ([`OwedLaunches::take_stopped`]) watches for.
+    launch: BTreeSet<String>,
+    /// Plugins whose owed unit the look found running again from its
+    /// previous launch, which the pass the look made due restarts from the
+    /// declaration ([`plan_with_owed`] takes them all).
+    replace: BTreeSet<String>,
+}
+
+/// The process's own [`OwedLaunches`]: what [`start`], [`restart_all`],
+/// [`restart_for_settings`] and the reconcile owe and settle, and what the
+/// `plugins.json` watch looks at ([`reconcile_then_watch`]). A test hands the
+/// seams one of its own, so none ever reaches this one.
 static OWED_LAUNCHES: OwedLaunches = OwedLaunches::new();
 
 impl OwedLaunches {
     const fn new() -> Self {
         Self {
-            ids: std::sync::Mutex::new(BTreeSet::new()),
+            state: std::sync::Mutex::new(Owed {
+                launch: BTreeSet::new(),
+                replace: BTreeSet::new(),
+            }),
         }
     }
 
-    /// The ids, recovering from poisoning as [`watch_state`] does: nothing
-    /// here can panic while holding them, and the launcher must keep working.
-    fn owed_ids(&self) -> std::sync::MutexGuard<'_, BTreeSet<String>> {
-        self.ids
+    /// What is owed, recovering from poisoning as [`watch_state`] does:
+    /// nothing here can panic while holding it, and the launcher must keep
+    /// working.
+    fn state(&self) -> std::sync::MutexGuard<'_, Owed> {
+        self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Owe plugin `id` a launch if `answer` is a run-out ([`StillStopping`])
-    /// on a unit this launcher started (`stamped`, [`is_stamped`]), for a
-    /// plugin switched on (`enabled`).
+    /// Settle plugin `id`'s debt with the `answer` of one of this launcher's
+    /// launches of it — a start, a reconcile's launch, a restart or a
+    /// relaunch; `enabled` is whether it is switched on, and `stamped`
+    /// whether the unit a run-out is about is one this launcher started
+    /// ([`is_stamped`]):
+    /// - **went through**: it runs the current declaration, so nothing is
+    ///   owed for it and nothing is to be replaced. This is what lets the
+    ///   look read an owed unit found running again as one this launcher
+    ///   did not start ([`take_stopped`](Self::take_stopped)).
+    /// - **a run-out** ([`StillStopping`]) on a unit this launcher started,
+    ///   for a plugin switched on: owed a launch.
+    /// - anything else: unchanged. A launch refused while the unit still
+    ///   holds the name keeps a debt the plugin already had.
     ///
     /// A unit this launcher did not start, a hand-installed static unit, is
     /// never owed: once it has stopped it stays loaded from its unit file, a
     /// launch under its name is refused, and it keeps its legacy behaviour
     /// (the module doc's "Legacy static units"). A plugin switched off has
     /// nothing owed either; that is the start of one by hand.
-    fn owe_if_still_stopping(
-        &self,
-        id: &str,
-        enabled: bool,
-        stamped: bool,
-        answer: &anyhow::Result<()>,
-    ) {
-        let ran_out = answer
-            .as_ref()
-            .is_err_and(|err| err.downcast_ref::<StillStopping>().is_some());
-        if ran_out && enabled && stamped && self.owed_ids().insert(id.to_owned()) {
+    fn settle(&self, id: &str, enabled: bool, stamped: bool, answer: &anyhow::Result<()>) {
+        let mut state = self.state();
+        let Err(err) = answer else {
+            let owed = state.launch.remove(id);
+            if state.replace.remove(id) || owed {
+                tracing::info!(plugin = %id, "launched from the current declaration; no longer owed a launch");
+            }
+            return;
+        };
+        let ran_out = err.downcast_ref::<StillStopping>().is_some();
+        if ran_out && enabled && stamped && state.launch.insert(id.to_owned()) {
             tracing::info!(
                 plugin = %id,
                 "its unit is still stopping; launching it from the current declaration once \
-                 the unit has stopped",
+                 the unit is gone",
             );
         }
     }
 
     /// Settle every owed id against one listing, `units`, and answer whether
-    /// a reconcile is due, i.e. whether one of their units has stopped:
-    /// - **still stopping** (`deactivating`, [`stopping_unit`]): kept, and
-    ///   nothing is due for it;
-    /// - **stopped** (gone, inactive or failed: no longer
-    ///   [`blocks_relaunch`]): dropped, and a reconcile is due, which
-    ///   launches it if it is still switched on;
-    /// - **running again** ([`running_unit`]): dropped, and nothing is due.
-    ///   Something else started it (the switch, a `ReloadPlugins`), or
-    ///   systemd's `Restart=` did after a crash, and a reconcile leaves a
-    ///   running unit's settings and keys alone, so a pass would add nothing.
+    /// a reconcile is due:
+    /// - **still listed, not running** (`deactivating`; or `inactive` or
+    ///   `failed` with a process still in its cgroup, which keeps systemd
+    ///   from collecting a `--collect` unit and refuses a launch under its
+    ///   name, #1644 review, MEDIUM 1): kept, and nothing is due for it. A
+    ///   process that never exits keeps it here for the life of the shell, at
+    ///   one listing a tick.
+    /// - **gone**: dropped, and a reconcile is due, which launches it if it
+    ///   is still switched on.
+    /// - **running again**, stamped ([`running_unit`], [`is_stamped`]):
+    ///   dropped, marked to be replaced, and a reconcile is due, which
+    ///   restarts it from the declaration ([`plan_with_owed`]). Every launch
+    ///   of this launcher's clears the debt ([`settle`](Self::settle)), so
+    ///   this one was started from the unit's old properties: systemd's
+    ///   `Restart=` after a crash, which nothing stopped (the start and a
+    ///   reconcile's wait send no stop, #1644 review, LOW 3), or a start by
+    ///   hand. It runs the previous launch's environment, without the settings
+    ///   or keys saved since, and neither is in the fingerprint.
+    /// - **running again, unstamped**: dropped, and nothing is due. A unit
+    ///   this launcher did not start is left alone, as [`plan`] leaves it.
     fn take_stopped(&self, units: &[systemd::PluginUnit]) -> bool {
         let mut due = false;
-        self.owed_ids().retain(|id| {
-            if stopping_unit(units, id).is_some() {
+        let mut state = self.state();
+        let Owed { launch, replace } = &mut *state;
+        launch.retain(|id| {
+            let Some(unit) = units.iter().find(|u| u.id == *id) else {
+                tracing::info!(plugin = %id, "the unit owed a launch is gone");
+                due = true;
+                return false;
+            };
+            if !is_running(&unit.active_state) {
                 return true;
             }
-            if let Some(unit) = running_unit(units, id) {
+            if is_stamped(unit) {
                 tracing::info!(
                     plugin = %id,
                     sub_state = %unit.sub_state,
-                    "the unit owed a launch is running again, started by something else; no \
-                     longer owed",
+                    "the unit owed a launch is running again from its previous launch (systemd's \
+                     Restart=, or a start by hand); restarting it from the current declaration",
                 );
-            } else {
-                tracing::info!(plugin = %id, "the unit owed a launch has stopped");
+                replace.insert(id.clone());
                 due = true;
+            } else {
+                tracing::info!(
+                    plugin = %id,
+                    sub_state = %unit.sub_state,
+                    "the unit owed a launch is running again, a unit this launcher did not start; \
+                     no longer owed",
+                );
             }
             false
         });
         due
     }
+}
+
+/// [`plan`] for a pass that listed `units`, with what the launches owed
+/// (`owed`, #1555 bullet 6) change about it:
+/// - **An owed id whose unit is still listed** (still stopping, or stopped
+///   with a process left in its cgroup) gets no launch and no wait: it stays
+///   owed, and the watch's look makes the pass that launches it once the
+///   unit is gone. Otherwise the pass one owed unit makes due would wait
+///   [`STOP_WAIT`] under [`CONVERGE_LOCK`] for another still stopping, and
+///   launch the plugin only after it (#1644 review, LOW 2), and a launch into
+///   a held name is refused.
+/// - **A launch onto a stopped unit of this launcher's that is still
+///   listed** (`inactive` or `failed`: held by a process left in its cgroup)
+///   is owed instead of tried, since systemd refuses it. That is a shell
+///   started while such a unit was left over: its startup pass used to try
+///   the launch, log the refusal, and leave the plugin down for good. An
+///   unstamped unit (a hand-installed static unit) keeps its launch, and its
+///   legacy refusal.
+/// - **An owed unit the look found running again from its previous launch**
+///   ([`OwedLaunches::take_stopped`]) is restarted ([`Action::Restart`]) if
+///   its plugin is declared and switched on, its running unit is stamped, and
+///   nothing else is planned for it. That is the reconcile's own restart
+///   ([`restart_all`]: stop, wait, relaunch with the current spec and keys),
+///   the same three steps [`replace_or_launch`] takes for a start's wait
+///   (#1628 review, F1). A plugin switched off or undeclared gets [`plan`]'s
+///   own stop. The marks are taken whatever they lead to, so each costs at
+///   most this one pass.
+///
+/// A blind pass has no listing to read any of this from, and plans with
+/// [`plan`] alone ([`reconcile_listing`]).
+fn plan_with_owed(
+    declared: &Declared,
+    units: &[systemd::PluginUnit],
+    owed: &OwedLaunches,
+) -> Vec<(String, Action)> {
+    let mut actions = plan(declared, units);
+    let mut state = owed.state();
+    let replace = std::mem::take(&mut state.replace);
+    actions.retain(|(id, action)| {
+        if !matches!(action, Action::Launch | Action::WaitThenLaunch) {
+            return true;
+        }
+        let Some(unit) = units.iter().find(|u| u.id == *id) else {
+            return true;
+        };
+        if state.launch.contains(id) {
+            tracing::debug!(
+                plugin = %id,
+                active_state = %unit.active_state,
+                "owed a launch, and its unit still holds the name; launching it once the unit is gone",
+            );
+            return false;
+        }
+        if *action == Action::Launch && is_stamped(unit) {
+            tracing::info!(
+                plugin = %id,
+                active_state = %unit.active_state,
+                sub_state = %unit.sub_state,
+                "its stopped unit still holds the name (a process is left in it); launching it once \
+                 the unit is gone",
+            );
+            state.launch.insert(id.clone());
+            return false;
+        }
+        true
+    });
+    drop(state);
+    for id in replace {
+        let switched_on = declared.plugins.get(&id).is_some_and(|spec| spec.enabled);
+        let planned = actions.iter().any(|(planned, _)| *planned == id);
+        if switched_on && !planned && running_unit(units, &id).is_some_and(is_stamped) {
+            actions.push((id, Action::Restart));
+        }
+    }
+    actions.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    actions
 }
 
 /// The `plugins.json` watch's look at the launches owed, once per tick
@@ -2427,7 +2605,7 @@ where
     L: FnOnce() -> LF,
     LF: Future<Output = anyhow::Result<Vec<systemd::PluginUnit>>>,
 {
-    let nothing_owed = owed.owed_ids().is_empty();
+    let nothing_owed = owed.state().launch.is_empty();
     if nothing_owed {
         return false;
     }
@@ -2607,10 +2785,14 @@ pub async fn start(id: &str) -> anyhow::Result<()> {
 /// so the stamp does not enter into what it answers. The plugin is down, its
 /// switch's "on" persisted. Since #1555 bullet 6 the stamp decides what
 /// comes next: a unit this launcher started, for a plugin switched on, is
-/// owed a launch ([`OwedLaunches::owe_if_still_stopping`]), which the
-/// `plugins.json` watch makes once the unit has stopped, as after a
-/// restart's `still-stopping`. A hand-installed static unit is not, and
-/// comes up at its own next start.
+/// owed a launch ([`OwedLaunches::settle`]), which the `plugins.json` watch
+/// makes once the unit is gone, as after a restart's `still-stopping`. If
+/// systemd brings the unit back up meanwhile (`Restart=` after a crash: this
+/// path sends no stop, so nothing forbids the restart), the watch restarts
+/// it from the declaration rather than leave it on its old environment
+/// ([`plan_with_owed`]). A hand-installed static unit is not owed, and comes
+/// up at its own next start. A launch that goes through, either branch,
+/// clears whatever the plugin was owed.
 ///
 /// The parameters are named so none shares a name with a function in this
 /// module, for [`restart_via`]'s reason.
@@ -2655,11 +2837,15 @@ where
                 None
             }
         };
+        let enabled = spec.enabled;
         let Some(stamped) = stopping else {
-            return launch_now(spec, target).await;
+            let launched = launch_now(spec, target).await;
+            // Not onto a unit still stopping, so never a run-out: the stamp
+            // is not read, and a launch that went through clears the debt.
+            owed.settle(id, enabled, false, &launched);
+            return launched;
         };
         tracing::info!(plugin = %id, "its unit is still stopping; starting it once it is down");
-        let enabled = spec.enabled;
         let waited = wait_down(Awaiting::Launch).await;
         let answer = replace_or_launch(
             id,
@@ -2669,7 +2855,7 @@ where
             move || launch_now(spec, target),
         )
         .await;
-        owed.owe_if_still_stopping(id, enabled, stamped, &answer);
+        owed.settle(id, enabled, stamped, &answer);
         answer
     })
     .await
@@ -3079,10 +3265,11 @@ fn stopping_unit<'a>(
 /// - **Stamped, and the wait ran out** ([`STOP_WAIT`]): nothing is launched
 ///   and nothing is started, and the answer is a [`StillStopping`] error that
 ///   names the unit's `SubState`. systemd finishes the stop on its own timers
-///   and collects the unit. The plugin comes up with the new spec once it
-///   has: its caller owes it a launch ([`OwedLaunches`], #1555 bullet 6),
-///   which the `plugins.json` watch makes as soon as a listing shows the unit
-///   gone.
+///   and collects the unit once its last process has exited. The plugin
+///   comes up with the new spec then: its caller owes it a launch
+///   ([`OwedLaunches`], #1555 bullet 6), which the `plugins.json` watch makes
+///   as soon as a listing shows the unit gone. A process that never exits
+///   keeps the unit, and the plugin down, for as long as it lives.
 /// - **Stamped, and the relaunch failed** anyway: the relaunch's error, and
 ///   nothing is started either.
 /// - **Not stamped**: if the relaunch fails, `StartUnit` is queued for the
@@ -3394,10 +3581,10 @@ async fn restart_all<'a>(
 /// [`Awaiting::Stop`], as it always has.
 ///
 /// A unit whose answer is a run-out ([`StillStopping`]) is owed a launch
-/// once it has stopped, if it is stamped and its plugin switched on
-/// ([`OwedLaunches::owe_if_still_stopping`], #1555 bullet 6): a reconcile's
-/// restart or launch onto a unit still stopping, and a key change's
-/// relaunch, alike.
+/// once it is gone, if it is stamped and its plugin switched on, and a
+/// relaunch that went through clears what its plugin was owed
+/// ([`OwedLaunches::settle`], #1555 bullet 6): a reconcile's restart or
+/// launch onto a unit still stopping, and a key change's relaunch, alike.
 ///
 /// The parameters are named so none shares a name with a function in this
 /// module, for [`restart_via`]'s reason.
@@ -3484,7 +3671,7 @@ where
     })
     .await;
     for ((k, r, _), answer) in stopped.into_iter().zip(settled.ends) {
-        owed.owe_if_still_stopping(r.id, r.spec.enabled, r.stamped, &answer);
+        owed.settle(r.id, r.spec.enabled, r.stamped, &answer);
         answers.push((k, r.id, answer));
     }
     answers.sort_by_key(|(k, _, _)| *k);
@@ -3505,7 +3692,8 @@ fn is_stamped(unit: &systemd::PluginUnit) -> bool {
 /// [`STOP_WAIT`] (#1417 item 1): the unit was stopped, and nothing was
 /// launched or started in its place. Whoever gets it about a unit this
 /// launcher started, for a plugin switched on, owes the plugin a launch once
-/// the unit has stopped ([`OwedLaunches`], #1555 bullet 6).
+/// the unit is gone, i.e. once its last process has exited ([`OwedLaunches`],
+/// #1555 bullet 6). The message says so, and that a process may never exit.
 ///
 /// Typed, so [`restart_for_settings`] can answer
 /// [`SettingsRestart::StillStopping`] rather than fail. The message names the
@@ -3530,7 +3718,9 @@ impl std::fmt::Display for StillStopping {
             f,
             "plugin {}'s unit was still stopping after {} s (SubState {}), so it was not \
              relaunched; a switched-on plugin whose unit the shell started is launched with \
-             the new spec once that unit has stopped, and any other the next time it is started",
+             the new spec once that unit is gone, which is once its last process has exited (a \
+             process stuck on a hung mount may never exit), and any other the next time it is \
+             started",
             self.id,
             STOP_WAIT.as_secs(),
             self.sub_state
@@ -3853,7 +4043,10 @@ pub enum SettingsRestart {
     /// unit again ([`StillStopping`]). It is owed a launch instead
     /// ([`OwedLaunches`], #1555 bullet 6): once its stuck process is gone and
     /// its unit with it, the `plugins.json` watch launches it, with the file
-    /// as it reads then, if it is still switched on.
+    /// as it reads then, if it is still switched on. A process that never
+    /// exits keeps it down for as long as it lives. The Save's own
+    /// `StopUnit` forbids systemd's `Restart=`, so the old unit does not come
+    /// back meanwhile.
     StillStopping,
 }
 
@@ -3901,7 +4094,9 @@ impl SettingsRestart {
 /// the old unit back with its old values once its process was gone, while
 /// the tab showed only the refusal. Since #1555 bullet 6 the plugin is owed a
 /// launch then ([`OwedLaunches`]), which the `plugins.json` watch makes once
-/// the unit has stopped, so it does not stay down until someone starts it.
+/// the unit is gone, so it does not stay down until someone starts it; a
+/// launch by hand would be refused until then anyway. A process that never
+/// exits keeps the unit, and the plugin down, for as long as it lives.
 ///
 /// **Every** Save calls this, whatever the tab last saw (#1415 second review
 /// M1): the tab's own poll can be two seconds stale, and a Save that lands
@@ -3972,7 +4167,7 @@ where
             Reapply::Relaunch => {
                 let (enabled, stamped) = (spec.enabled, running.is_some_and(is_stamped));
                 let relaunched = relaunch(spec, declared.target, stamped).await;
-                owed.owe_if_still_stopping(id, enabled, stamped, &relaunched);
+                owed.settle(id, enabled, stamped, &relaunched);
                 match relaunched {
                     Ok(()) => {
                         tracing::info!(plugin = %id, "relaunched to apply its saved settings");
@@ -5230,7 +5425,8 @@ mod tests {
         for (trigger, launches_blind) in [(Trigger::OneShot, 1), (Trigger::Watch, 0)] {
             let before = blind();
             assert_eq!(
-                reconcile_listing(sources.clone(), trigger, failing, no_launch).await,
+                reconcile_listing(sources.clone(), trigger, failing, no_launch, scratch_owed())
+                    .await,
                 Outcome::Unlisted {
                     error: "no user manager".to_owned()
                 },
@@ -5246,7 +5442,8 @@ mod tests {
         let listed = || async { Ok(Vec::new()) };
         for trigger in [Trigger::OneShot, Trigger::Watch] {
             assert_eq!(
-                reconcile_listing(sources.clone(), trigger, listed, no_launch).await,
+                reconcile_listing(sources.clone(), trigger, listed, no_launch, scratch_owed())
+                    .await,
                 Outcome::Settled,
                 "{trigger:?}: a pass that listed owes nothing"
             );
@@ -5274,6 +5471,8 @@ mod tests {
     /// replaces), and [`reconcile_then_watch`] hands the loop
     /// [`observe_owed`] over the process's own [`OWED_LAUNCHES`] and the real
     /// listing, so a tick looks at the ids the production seams owe into.
+    /// Since the #1644 review `reconcile_from` hands its pass that same set
+    /// too, which the pass plans with and settles its launches into.
     /// Red if either hands over a stand-in, a set of its own or nothing.
     #[test]
     fn production_hands_the_seam_the_real_listing_and_the_callers_trigger() {
@@ -5291,6 +5490,9 @@ mod tests {
             "|id: String, spec: PluginSpec, target: String| async move {",
             "let extra_env = resolve_secret_env(&id, &spec).await;",
             "launch(&id, &spec, &extra_env, &target).await",
+            // #1644 review: the pass plans and settles against the set the
+            // watch looks at and the production seams owe into.
+            "&OWED_LAUNCHES,",
         ]
         .iter()
         .map(|needle| from.find(&squash(needle)))
@@ -8247,7 +8449,7 @@ mod tests {
 
         /// The ids [`OwedLaunches`] holds for this manager, in order.
         fn owed_ids(&self) -> Vec<String> {
-            self.owed.owed_ids().iter().cloned().collect()
+            self.owed.state().launch.iter().cloned().collect()
         }
 
         fn note(&self, event: String) {
@@ -9548,11 +9750,17 @@ mod tests {
     /// [`Action::WaitThenLaunch`], chained after the restarts, and the
     /// Launch loop only what is left.
     ///
+    /// Since the #1644 review a pass that listed plans with
+    /// [`plan_with_owed`], and the Launch loop settles each launch into the
+    /// launches owed ([`OwedLaunches::settle`]), so a launch that went
+    /// through clears its plugin's debt.
+    ///
     /// Falsified by `planned(Action::Launch)` building the batch, by the
     /// filter's `==` turned `!=`, by `.take(1)` before the batch's
     /// `.collect()`, by the Stop loop no longer calling `stop_unit`, by the
-    /// Launch loop skipping its ids, and by the waiting ids reaching the bare
-    /// Launch loop instead of the batch.
+    /// Launch loop skipping its ids, by the waiting ids reaching the bare
+    /// Launch loop instead of the batch, by a listed pass planning with
+    /// [`plan`] alone, and by the Launch loop settling nothing.
     #[test]
     fn the_reconcile_hands_each_action_to_its_own_loop() {
         let src = include_str!("plugin_launcher.rs");
@@ -9596,7 +9804,11 @@ mod tests {
                  let Some(spec) = declared.plugins.get(id) else {
                      continue;
                  };
-                 if let Err(err) = launch_now(id.to_owned(), spec.clone(), declared.target.clone()).await {",
+                 let launched = launch_now(id.to_owned(), spec.clone(), declared.target.clone()).await;
+                 // Not onto a unit still stopping, so never a run-out: the stamp
+                 // is not read, and a launch that went through clears the debt.
+                 owed.settle(id, spec.enabled, false, &launched);
+                 if let Err(err) = launched {",
         ]
         .iter()
         .map(|needle| reconcile.find(&squash(needle)))
@@ -9610,6 +9822,18 @@ mod tests {
             reconcile.matches("planned(Action::").count(),
             4,
             "one loop per Action, the batch's two counted once each:\n{reconcile}"
+        );
+        // #1644 review: a pass that listed plans with what is owed; only a
+        // blind one, which has no listing to read it from, plans without.
+        assert!(
+            reconcile.contains(&squash(
+                "let actions = if outcome == Outcome::Settled {
+                     plan_with_owed(&declared, &units, owed)
+                 } else {
+                     plan(&declared, &units)
+                 };"
+            )),
+            "a pass that listed plans with the launches owed:\n{reconcile}"
         );
     }
 
@@ -10656,14 +10880,15 @@ mod tests {
     /// An [`OwedLaunches`] holding `ids`.
     fn owing(ids: &[&str]) -> OwedLaunches {
         let owed = OwedLaunches::new();
-        owed.owed_ids()
+        owed.state()
+            .launch
             .extend(ids.iter().map(|id| (*id).to_owned()));
         owed
     }
 
     /// What `owed` still holds, in order.
     fn held(owed: &OwedLaunches) -> Vec<String> {
-        owed.owed_ids().iter().cloned().collect()
+        owed.state().launch.iter().cloned().collect()
     }
 
     /// `pet`'s unit as the launcher stamps its own, in `active`.
@@ -10674,62 +10899,416 @@ mod tests {
         }
     }
 
+    /// What `owed` holds to replace, in order.
+    fn replacing(owed: &OwedLaunches) -> Vec<String> {
+        owed.state().replace.iter().cloned().collect()
+    }
+
+    /// `id`'s unit as the launcher stamps its own, in `active`/`sub_state`.
+    fn stamped_in(id: &str, active: &str, sub_state: &str) -> systemd::PluginUnit {
+        systemd::PluginUnit {
+            description: unit_description(id, "0123456789abcdef"),
+            ..unit_in(id, active, sub_state)
+        }
+    }
+
     /// **One listing settles each launch owed on its own unit's row**
-    /// ([`OwedLaunches::take_stopped`]): a unit still stopping, in any
-    /// `SubState` a stop passes through, keeps its id and makes nothing due;
-    /// one gone, inactive or failed lets its id go and makes a reconcile due;
-    /// one running again (another plugin's start, or `Restart=` after a
-    /// crash) lets its id go and makes nothing due. Another plugin's unit
-    /// stopping keeps nothing.
+    /// ([`OwedLaunches::take_stopped`]):
+    /// - a unit still listed and not running keeps its id and makes nothing
+    ///   due: still stopping, in any `SubState` a stop passes through, and
+    ///   since the #1644 review (MEDIUM 1) also `inactive` or `failed`, which
+    ///   a `--collect` unit only is while a process holds its cgroup, and
+    ///   while it is listed systemd refuses a launch under its name;
+    /// - one gone lets its id go and makes a reconcile due;
+    /// - one running again from its previous launch (stamped: `Restart=`
+    ///   after a crash, or a start by hand) lets its id go, is marked to be
+    ///   replaced, and makes a reconcile due (#1644 review, LOW 3);
+    /// - one running again that this launcher did not start lets its id go
+    ///   and makes nothing due.
+    ///
+    /// Another plugin's row keeps nothing.
     ///
     /// Falsified by freeing a unit still stopping (the tick would plan
-    /// another [`STOP_WAIT`] under the lock), by keeping a stopped one (a
-    /// pass every tick), by a running one making a pass due, and by reading
-    /// another plugin's row.
+    /// another [`STOP_WAIT`] under the lock), by freeing a stopped unit still
+    /// listed (the pass's launch is refused, and the plugin is lost), by
+    /// keeping a gone one (a pass every tick), by a running one of this
+    /// launcher's making nothing due or not being marked, by an unstamped
+    /// one being marked, and by reading another plugin's row.
     #[test]
     fn a_listing_settles_each_launch_owed_on_its_own_units_row() {
-        for sub in [
-            "stop-sigterm",
-            "stop-sigkill",
-            "stop-post",
-            "final-sigterm",
-            "final-sigkill",
+        for (active, sub) in [
+            ("deactivating", "stop-sigterm"),
+            ("deactivating", "stop-sigkill"),
+            ("deactivating", "stop-post"),
+            ("deactivating", "final-sigterm"),
+            ("deactivating", "final-sigkill"),
+            ("inactive", "dead"),
+            ("failed", "failed"),
         ] {
-            let owed = owing(&["pet"]);
-            assert!(
-                !owed.take_stopped(&[unit_in("pet", "deactivating", sub)]),
-                "{sub}: nothing due"
-            );
-            assert_eq!(held(&owed), ["pet"], "{sub}: still owed");
+            for row in [stamped_in("pet", active, sub), unit_in("pet", active, sub)] {
+                let owed = owing(&["pet"]);
+                assert!(!owed.take_stopped(&[row]), "{active}/{sub}: nothing due");
+                assert_eq!(held(&owed), ["pet"], "{active}/{sub}: still owed");
+                assert!(replacing(&owed).is_empty(), "{active}/{sub}");
+            }
         }
         for listing in [
             Vec::new(),
-            vec![unit("pet", "inactive", false)],
-            vec![unit("pet", "failed", false)],
-            vec![unit("caw", "deactivating", false)],
+            vec![stamped_in("caw", "deactivating", "stop-sigkill")],
         ] {
             let owed = owing(&["pet"]);
             assert!(owed.take_stopped(&listing), "{listing:?}: a pass is due");
             assert!(held(&owed).is_empty(), "{listing:?}: no longer owed");
+            assert!(
+                replacing(&owed).is_empty(),
+                "{listing:?}: nothing to replace"
+            );
         }
         for (active, sub) in [
             ("activating", "auto-restart"),
+            ("activating", "auto-restart-queued"),
             ("activating", "start"),
             ("active", "running"),
             ("reloading", "reload"),
         ] {
             let owed = owing(&["pet"]);
             assert!(
-                !owed.take_stopped(&[unit_in("pet", active, sub)]),
-                "{active}/{sub}: nothing due"
+                owed.take_stopped(&[stamped_in("pet", active, sub)]),
+                "{active}/{sub}: back up from its previous launch, a pass is due"
             );
             assert!(held(&owed).is_empty(), "{active}/{sub}: no longer owed");
+            assert_eq!(replacing(&owed), ["pet"], "{active}/{sub}: to be replaced");
+
+            let owed = owing(&["pet"]);
+            assert!(
+                !owed.take_stopped(&[unit_in("pet", active, sub)]),
+                "{active}/{sub}: not this launcher's unit, nothing due"
+            );
+            assert!(held(&owed).is_empty(), "{active}/{sub}: no longer owed");
+            assert!(replacing(&owed).is_empty(), "{active}/{sub}: left alone");
         }
-        let owed = owing(&["a", "b", "c"]);
-        assert!(
-            owed.take_stopped(&[unit("b", "deactivating", false), unit("c", "active", false),])
+        let owed = owing(&["a", "b", "c", "d"]);
+        assert!(owed.take_stopped(&[
+            unit("b", "deactivating", false),
+            unit("c", "active", false),
+            unit("d", "failed", false),
+        ]));
+        assert_eq!(held(&owed), ["b", "d"], "each id on its own unit's row");
+    }
+
+    /// **A launch of this launcher's clears what its plugin was owed**
+    /// ([`OwedLaunches::settle`], #1644 review, LOW 3): a launch that went
+    /// through ran the current declaration, so the plugin is no longer owed
+    /// a launch, nor to be replaced. That is what lets the look read an owed
+    /// unit found running as one this launcher did not start. A run-out owes
+    /// (stamped and switched on only); any other failure changes nothing, so
+    /// a launch refused while the unit still holds the name keeps the debt.
+    ///
+    /// Falsified by a launch that went through leaving the id owed (the
+    /// look would then restart a plugin this launcher had just launched), or
+    /// leaving it marked, and by a refused launch dropping the debt.
+    #[test]
+    fn a_launch_that_went_through_clears_the_debt_and_a_refusal_keeps_it() {
+        let owed = owing(&["pet", "caw"]);
+        owed.state().replace.insert("emu".to_owned());
+        owed.settle("pet", true, true, &Ok(()));
+        owed.settle("emu", true, true, &Ok(()));
+        assert_eq!(held(&owed), ["caw"]);
+        assert!(replacing(&owed).is_empty());
+        owed.settle("caw", true, true, &Err(refused()));
+        assert_eq!(held(&owed), ["caw"], "a refusal keeps the debt");
+        let ran_out = || -> anyhow::Result<()> {
+            Err(StillStopping {
+                id: "x".to_owned(),
+                sub_state: "stop-sigkill".to_owned(),
+            }
+            .into())
+        };
+        owed.settle("off", false, true, &ran_out());
+        owed.settle("static", true, false, &ran_out());
+        owed.settle("on", true, true, &ran_out());
+        assert_eq!(held(&owed), ["caw", "on"]);
+    }
+
+    /// **The pass one owed unit makes due plans no wait for another**
+    /// (#1644 review, LOW 2; the review's own test, on the pass's own plan).
+    /// `pet` and `caw` both ran out; `pet`'s unit is gone and `caw`'s still
+    /// `deactivating`. The look makes a pass due for `pet` and keeps `caw`.
+    /// That pass must launch `pet` and plan nothing for `caw`: a
+    /// [`Action::WaitThenLaunch`] would hold [`CONVERGE_LOCK`] up to
+    /// [`STOP_WAIT`] for a unit the look is already watching, and launch
+    /// `pet` only after it. `caw` stays owed, so the look launches it once
+    /// its unit is gone.
+    ///
+    /// Falsified by the pass planning with [`plan`] alone (the review
+    /// measured `[("caw", WaitThenLaunch), ("pet", Launch)]` on `2e24e459`).
+    #[test]
+    fn a_pass_for_one_launch_owed_plans_no_wait_for_another() {
+        let owed = owing(&["caw", "pet"]);
+        let listing = vec![stamped_in("caw", "deactivating", "stop-sigkill")];
+        assert!(owed.take_stopped(&listing), "pet is gone: a pass is due");
+        assert_eq!(held(&owed), ["caw"], "caw is still owed");
+        let both = declared(&[
+            ("caw", spec("/bin/caw", true)),
+            ("pet", spec("/bin/pet", true)),
+        ]);
+        let actions = plan_with_owed(&both, &listing, &owed);
+        assert_eq!(
+            actions,
+            [("pet".to_owned(), Action::Launch)],
+            "the pass plans a STOP_WAIT under the lock for caw, which is owed and still \
+             stopping, and launches pet only after it"
         );
-        assert_eq!(held(&owed), ["b"], "each id on its own unit's row");
+        assert_eq!(held(&owed), ["caw"], "caw is left to the look");
+        // A plugin nobody owes keeps its wait (#1417 follow-up).
+        let fresh = OwedLaunches::new();
+        assert_eq!(
+            plan_with_owed(&both, &listing, &fresh),
+            [
+                ("caw".to_owned(), Action::WaitThenLaunch),
+                ("pet".to_owned(), Action::Launch)
+            ]
+        );
+        assert!(held(&fresh).is_empty());
+    }
+
+    /// **A launch planned onto a stopped unit that still holds its name is
+    /// owed instead** (#1644 review, MEDIUM 1): a `--collect` unit listed
+    /// `inactive` or `failed` has a process left in its cgroup, and systemd
+    /// refuses a launch under its name until it exits. That is a shell
+    /// started while such a unit is left over: its startup pass used to try
+    /// the launch, log the refusal and leave the plugin down for good, so the
+    /// Plugins tab's "the shell starts it by itself" was false after a shell
+    /// restart. An owed id whose unit is listed so gets nothing planned. An
+    /// unstamped unit (a hand-installed static unit) keeps its launch, and
+    /// its legacy refusal; a unit gone is launched.
+    ///
+    /// Falsified by planning the launch into the held name, by not owing
+    /// it, and by owing a unit this launcher did not start.
+    #[test]
+    fn a_launch_onto_a_unit_still_holding_its_name_is_owed_instead() {
+        let on = declared(&[("pet", spec("/bin/pet", true))]);
+        for state in ["inactive", "failed"] {
+            let owed = OwedLaunches::new();
+            let held_row = [stamped_in("pet", state, "dead")];
+            assert_eq!(
+                plan(&on, &held_row),
+                [("pet".to_owned(), Action::Launch)],
+                "rail: {state}"
+            );
+            assert!(plan_with_owed(&on, &held_row, &owed).is_empty(), "{state}");
+            assert_eq!(held(&owed), ["pet"], "{state}: owed, for the look");
+            assert!(
+                plan_with_owed(&on, &held_row, &owed).is_empty(),
+                "{state}: and while owed, nothing is planned for it"
+            );
+            assert_eq!(held(&owed), ["pet"], "{state}");
+
+            let owed = OwedLaunches::new();
+            assert_eq!(
+                plan_with_owed(&on, &[unit_in("pet", state, "dead")], &owed),
+                [("pet".to_owned(), Action::Launch)],
+                "{state}: a static unit keeps its launch"
+            );
+            assert!(held(&owed).is_empty(), "{state}: and is never owed");
+        }
+        let owed = owing(&["pet"]);
+        assert_eq!(
+            plan_with_owed(&on, &[], &owed),
+            [("pet".to_owned(), Action::Launch)],
+            "an owed unit gone is launched"
+        );
+    }
+
+    /// **An owed unit found running again from its previous launch is
+    /// restarted from the declaration** (#1644 review, LOW 3). The look
+    /// marks it ([`OwedLaunches::take_stopped`]); the pass it makes due
+    /// plans one [`Action::Restart`] for it, through the reconcile's own
+    /// batch, if it is declared and switched on and its running unit is
+    /// stamped. That unit runs its previous launch's environment (systemd's
+    /// `Restart=` after a crash, on the start's and the reconcile's wait,
+    /// which send no stop), which the fingerprint does not cover, so [`plan`]
+    /// alone plans nothing. A restart already planned (the spec changed) is
+    /// not doubled; a plugin switched off gets [`plan`]'s stop, and one
+    /// undeclared its orphan stop; a unit no longer running gets [`plan`]'s
+    /// launch. Each mark is taken by the pass whatever it leads to.
+    ///
+    /// Falsified by the pass planning nothing for a mark (the plugin keeps
+    /// the old settings and keys for good), by a doubled restart, by
+    /// restarting a plugin switched off, and by a mark outliving its pass.
+    #[test]
+    fn a_unit_back_up_from_its_previous_launch_is_restarted_from_the_declaration() {
+        let on = spec("/bin/pet", true);
+        let running = [unit_for("pet", "active", &on)];
+        let marked = || {
+            let owed = OwedLaunches::new();
+            owed.state().replace.insert("pet".to_owned());
+            owed
+        };
+        let declared_on = declared(&[("pet", on.clone())]);
+        assert!(
+            plan(&declared_on, &running).is_empty(),
+            "rail: same fingerprint"
+        );
+        let owed = marked();
+        assert_eq!(
+            plan_with_owed(&declared_on, &running, &owed),
+            [("pet".to_owned(), Action::Restart)]
+        );
+        assert!(replacing(&owed).is_empty(), "the mark is taken");
+        assert!(
+            plan_with_owed(&declared_on, &running, &owed).is_empty(),
+            "and costs one pass"
+        );
+
+        let changed = declared(&[("pet", spec("/bin/pet-2", true))]);
+        assert_eq!(
+            plan_with_owed(&changed, &running, &marked()),
+            [("pet".to_owned(), Action::Restart)],
+            "one restart, not two"
+        );
+        let off = declared(&[("pet", spec("/bin/pet", false))]);
+        assert_eq!(
+            plan_with_owed(&off, &running, &marked()),
+            [("pet".to_owned(), Action::Stop)],
+            "switched off: plan's own stop"
+        );
+        assert_eq!(
+            plan_with_owed(&declared(&[]), &running, &marked()),
+            [("pet".to_owned(), Action::Stop)],
+            "undeclared: plan's own orphan stop"
+        );
+        let owed = marked();
+        assert_eq!(
+            plan_with_owed(&declared_on, &[], &owed),
+            [("pet".to_owned(), Action::Launch)],
+            "gone again by the pass: launched"
+        );
+        assert!(replacing(&owed).is_empty());
+        assert!(
+            plan_with_owed(&off, &[unit("pet", "active", false)], &marked()).is_empty(),
+            "a unit this launcher did not start, switched off, is left alone"
+        );
+    }
+
+    /// **A start whose returned unit runs out is owed its launch** (#1644
+    /// review, X3; the review's own test). A start whose unit came back up
+    /// (`Restart=`), was stopped by the start and then outlasted the second
+    /// wait answers [`StillStopping`] too, and is owed its launch like a
+    /// first-wait run-out.
+    ///
+    /// Falsified by `start_via` owing only when its first wait ran out
+    /// (the review's mutant X3, green against every other test).
+    #[tokio::test]
+    async fn a_start_whose_returned_unit_runs_out_is_owed_its_launch() {
+        let owed = OwedLaunches::new();
+        let on = spec("/bin/pet", true);
+        // Popped from the back: the first wait sees it back up, the second
+        // runs out.
+        let waits = std::cell::RefCell::new(vec![
+            ran_out("stop-sigkill"),
+            StopWait::BackUp {
+                sub_state: "auto-restart".to_owned(),
+            },
+        ]);
+        let answer = start_via(
+            "pet",
+            || async { Some(declared(&[("pet", on.clone())])) },
+            || async { Ok(vec![own_unit("deactivating")]) },
+            |_| std::future::ready(waits.borrow_mut().pop().expect("two waits")),
+            || async { Ok(()) },
+            |_, _| async { panic!("nothing is launched while the unit is still stopping") },
+            || async { panic!("a declared plugin is never started from a unit file") },
+            &owed,
+        )
+        .await;
+        assert!(
+            answer
+                .as_ref()
+                .is_err_and(|e| e.downcast_ref::<StillStopping>().is_some()),
+            "{answer:?}"
+        );
+        assert_eq!(held(&owed), ["pet"]);
+    }
+
+    /// **Every launch of this launcher's clears the debt, at each seam**
+    /// (#1644 review, LOW 3): a start onto a unit already gone, a
+    /// reconcile's launch, a Save's relaunch and a batch's relaunch each
+    /// settle what they launched, so the look never takes a plugin this
+    /// launcher just launched for one started from its old properties.
+    ///
+    /// Falsified by deleting any one seam's settling.
+    #[tokio::test]
+    async fn every_launch_of_this_launchers_clears_the_debt() {
+        let on = spec("/bin/pet", true);
+        let marked = || {
+            let owed = owing(&["pet"]);
+            owed.state().replace.insert("pet".to_owned());
+            owed
+        };
+        let cleared = |owed: &OwedLaunches| held(owed).is_empty() && replacing(owed).is_empty();
+
+        let owed = marked();
+        start_via(
+            "pet",
+            || async { Some(declared(&[("pet", on.clone())])) },
+            || async { Ok(Vec::new()) },
+            |_| async { panic!("nothing is stopping") },
+            || async { panic!("nothing came back") },
+            |_, _| async { Ok(()) },
+            || async { panic!("declared") },
+            &owed,
+        )
+        .await
+        .expect("launched");
+        assert!(cleared(&owed), "a start");
+
+        let owed = marked();
+        let answer = restart_for_settings_via(
+            "pet",
+            || async { Some(declared(&[("pet", on.clone())])) },
+            || async { Ok(vec![unit_for("pet", "active", &on)]) },
+            |_, _, _| async { Ok(()) },
+            || async { panic!("switched on") },
+            &owed,
+        )
+        .await
+        .expect("relaunched");
+        assert_eq!(answer, SettingsRestart::Relaunched);
+        assert!(cleared(&owed), "a Save");
+
+        let owed = marked();
+        let restarts = [Restarting {
+            id: "pet",
+            spec: &on,
+            stamped: true,
+            stopping: false,
+        }];
+        let answers = restart_all_via(
+            &restarts,
+            |_| std::future::ready(()),
+            |_| async { Ok(()) },
+            || async { Ok(Vec::new()) },
+            |_, ()| async { Ok(()) },
+            |_| async { panic!("relaunched") },
+            &owed,
+        )
+        .await;
+        assert!(answers[0].1.is_ok(), "{answers:?}");
+        assert!(cleared(&owed), "a batch");
+
+        let (_dir, sources) = pet_saved("x");
+        let owed = marked();
+        let outcome = reconcile_listing(
+            sources,
+            Trigger::Watch,
+            || async { Ok(Vec::new()) },
+            |_, _, _| async { Ok(()) },
+            &owed,
+        )
+        .await;
+        assert_eq!(outcome, Outcome::Settled);
+        assert!(cleared(&owed), "a reconcile's launch");
     }
 
     /// **The watch lists only while a launch is owed** ([`observe_owed`]):
@@ -10748,7 +11327,7 @@ mod tests {
             })
             .await
         );
-        owed.owed_ids().insert("pet".to_owned());
+        owed.state().launch.insert("pet".to_owned());
         assert!(
             !observe_owed(&owed, || async { Err(anyhow::anyhow!("no user manager")) }).await,
             "a failed listing frees nothing"
@@ -10977,18 +11556,21 @@ mod tests {
     /// runs exactly one [`Trigger::Watch`] pass; with nothing owed after it,
     /// the ticks after list nothing and run nothing. That pass could not
     /// list here, so it is left pending and retried once on the next tick,
-    /// as any watch pass is. A unit found running again just lets its id go.
+    /// as any watch pass is. A unit found running again from its previous
+    /// launch (stamped) lets its id go and runs one pass, which restarts it
+    /// from the declaration (#1644 review, LOW 3; [`plan_with_owed`]).
     ///
     /// Falsified by a pass on a tick whose unit is still stopping, by a
     /// stopped unit kept owed (a pass every tick), by a listing every tick
-    /// with nothing owed, and by the loop ignoring `owed_due`.
+    /// with nothing owed, by the loop ignoring `owed_due`, and by a unit back
+    /// up from its previous launch running no pass.
     #[tokio::test(start_paused = true)]
     async fn a_launch_owed_runs_one_pass_once_its_unit_has_stopped() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("plugins.json");
         write_store_file(&path, SPEC_A);
         let owed: &'static OwedLaunches = scratch_owed();
-        owed.owed_ids().insert("pet".to_owned());
+        owed.state().launch.insert("pet".to_owned());
         // `pet`'s unit as the next listing shows it; `None` once it is gone.
         let pet = Arc::new(std::sync::Mutex::new(Some("deactivating")));
         let listed = Arc::new(AtomicUsize::new(0));
@@ -11052,13 +11634,19 @@ mod tests {
             "nothing owed, nothing listed"
         );
 
-        // Found running again: something else started it.
-        owed.owed_ids().insert("pet".to_owned());
+        // Found running again from its previous launch: systemd's
+        // `Restart=`, which nothing this launcher did cleared.
+        owed.state().launch.insert("pet".to_owned());
         *pet.lock().expect("pet") = Some("active");
         tick(TICK).await;
         tick(TICK).await;
         assert!(held(owed).is_empty(), "no longer owed");
-        assert_eq!(calls.lock().expect("calls").len(), 3, "and no pass for it");
+        assert_eq!(replacing(owed), ["pet"], "to be replaced by the pass");
+        assert_eq!(
+            calls.lock().expect("calls").len(),
+            4,
+            "and one pass for it, which restarts it from the declaration"
+        );
         assert_eq!(listed.load(Ordering::SeqCst), 6, "one look, then none");
         task.abort();
     }
@@ -11079,6 +11667,8 @@ mod tests {
         held_back: std::cell::Cell<usize>,
         /// Each launch, with the `PET_NAME` it was handed.
         launched: std::cell::RefCell<Vec<(String, Option<String>)>>,
+        /// Other plugins' units every listing shows beside `pet`'s.
+        others: std::cell::RefCell<Vec<systemd::PluginUnit>>,
     }
 
     impl OwedRun {
@@ -11090,11 +11680,14 @@ mod tests {
                 passes: std::cell::RefCell::default(),
                 held_back: std::cell::Cell::new(0),
                 launched: std::cell::RefCell::default(),
+                others: std::cell::RefCell::default(),
             }
         }
 
         fn listing(&self) -> Vec<systemd::PluginUnit> {
-            self.pet.get().map(own_unit).into_iter().collect()
+            let mut units: Vec<_> = self.pet.get().map(own_unit).into_iter().collect();
+            units.extend(self.others.borrow().iter().cloned());
+            units
         }
 
         /// Wait for `n` more ticks than have been.
@@ -11126,7 +11719,9 @@ mod tests {
     ///
     /// The rail: a pass whose plan holds anything but launches (a stop, a
     /// restart, or a wait for a unit still stopping) would reach the real
-    /// user manager, so it is counted in `held_back` and not run.
+    /// user manager, so it is counted in `held_back` and not run. The plan it
+    /// reads is the pass's own ([`plan_with_owed`]), dry-run on a copy of
+    /// what is owed, so taking it changes nothing the pass then sees.
     async fn watch_owed(
         sources: &Sources,
         owed: &OwedLaunches,
@@ -11146,7 +11741,13 @@ mod tests {
             }
             run.passes.borrow_mut().push(run.pet.get());
             let declared = load_declared_from(sources).await.expect("parses");
-            if plan(&declared, &run.listing())
+            let dry_run = OwedLaunches::new();
+            {
+                let (now, mut copy) = (owed.state(), dry_run.state());
+                copy.launch.clone_from(&now.launch);
+                copy.replace.clone_from(&now.replace);
+            }
+            if plan_with_owed(&declared, &run.listing(), &dry_run)
                 .iter()
                 .any(|(_, action)| *action != Action::Launch)
             {
@@ -11162,6 +11763,7 @@ mod tests {
                     run.launched.borrow_mut().push((id, pet_name));
                     std::future::ready(Ok(()))
                 },
+                owed,
             )
             .await
         };
@@ -11320,6 +11922,45 @@ mod tests {
             })
             .await;
         }
+    }
+
+    /// **The pass one owed plugin makes due launches it without waiting for
+    /// another still stopping** (#1644 review, LOW 2), end to end against
+    /// scratch files: `caw` and `pet` both ran out (a rebuild's restart on
+    /// one stuck mount, say). `pet`'s unit goes; `caw`'s stays
+    /// `deactivating`. The tick that sees `pet` gone runs one pass, which
+    /// launches `pet` and plans nothing for `caw`, so it holds
+    /// [`CONVERGE_LOCK`] for no [`STOP_WAIT`]; `caw` stays owed, to the look.
+    ///
+    /// Falsified by the pass planning with [`plan`] alone: it plans a
+    /// [`Action::WaitThenLaunch`] for `caw`, which the rail holds back, so
+    /// `pet` is never launched.
+    #[tokio::test]
+    async fn the_pass_for_one_owed_plugin_waits_for_no_other() {
+        let (_dir, sources, _toml) = scratch_sources(
+            r#"{"version":1,"plugins":{"caw":{"exec":"/bin/caw","enabled":true},"pet":{"exec":"/bin/pet","enabled":true}}}"#,
+        );
+        let owed = owing(&["caw", "pet"]);
+        let run = OwedRun::new();
+        run.others
+            .borrow_mut()
+            .push(stamped_in("caw", "deactivating", "final-sigkill"));
+        watch_owed(&sources, &owed, &run, async {
+            run.ticks(3).await;
+            assert!(run.passes.borrow().is_empty(), "both still stopping");
+            run.pet.set(None);
+            until("pet is launched", || !run.launched.borrow().is_empty()).await;
+            run.ticks(3).await;
+            assert_eq!(
+                run.held_back.get(),
+                0,
+                "the pass planned a wait under the lock for caw, which the look is watching"
+            );
+            assert_eq!(*run.launched.borrow(), [("pet".to_owned(), None)]);
+            assert_eq!(*run.passes.borrow(), [None], "one pass");
+            assert_eq!(held(&owed), ["caw"], "caw is left to the look");
+        })
+        .await;
     }
 
     /// Against a real user manager, where one runs (#1444): this container has
@@ -11561,8 +12202,35 @@ mod tests {
         /// unit is still stopping (#1417's measurement). `None` where
         /// `systemd-run --user` cannot start a unit, i.e. the test skips.
         async fn stopping_stand_in(prefix: &str, id: &str) -> Option<std::time::Instant> {
+            stopping_stand_in_for(prefix, id, STOPPING_TAKES).await
+        }
+
+        /// How long a stand-in the test releases itself may take to stop:
+        /// far longer than any test, so its stop ends on the test's cue
+        /// ([`release`]) and never on a clock a loaded box can outrun (#1639,
+        /// #1641's pattern; #1644 review, LOW 4).
+        const HOLD: Duration = Duration::from_mins(2);
+
+        /// End `unit`'s stop now: SIGKILL everything left in its cgroup, the
+        /// call [`Crasher::release`] makes. A unit whose stop was held, or
+        /// whose stop is over with a process left in it, is then collected.
+        fn release(unit: &str) {
+            let status = std::process::Command::new("systemctl")
+                .args(["--user", "kill", "--kill-whom=all", "--signal=SIGKILL"])
+                .arg(unit)
+                .status()
+                .expect("systemctl");
+            assert!(status.success(), "systemctl kill {unit}: {status}");
+        }
+
+        /// [`stopping_stand_in`] with a stand-in that takes `takes` to stop.
+        async fn stopping_stand_in_for(
+            prefix: &str,
+            id: &str,
+            takes: Duration,
+        ) -> Option<std::time::Instant> {
             let unit = format!("{prefix}-{id}.service");
-            if let Err(err) = launch_stubborn(&unit, STOPPING_TAKES).await {
+            if let Err(err) = launch_stubborn(&unit, takes).await {
                 eprintln!("skipping: systemd-run --user could not start a unit: {err:#}");
                 return None;
             }
@@ -11575,7 +12243,7 @@ mod tests {
             // caller SAW stopping, and a wait on a launch reads a running
             // unit as one systemd brought back (`StopWait::BackUp`), so wait
             // for the state the premise names. The unit's `TimeoutStopSec=`
-            // keeps it there for `STOPPING_TAKES`, far longer than this poll.
+            // keeps it there for `takes`, far longer than this poll.
             let mut first = None;
             let seen = std::time::Instant::now();
             loop {
@@ -11676,32 +12344,35 @@ mod tests {
         /// **A real unit still stopping keeps its launch owed until systemd
         /// takes a launch under its name** (#1555 bullet 6): the premise the
         /// watch's look rests on, on systemd itself. The stand-in is stopped
-        /// and still `deactivating` ([`stopping_stand_in`]); `pet` is owed a
-        /// launch, and [`observe_owed`] looks at real listings until it
-        /// answers that a pass is due. Every look that listed the unit
-        /// `deactivating` kept the id and made nothing due, so no pass would
-        /// have planned a wait for it; the look that made a pass due let the
-        /// id go, and a `systemd-run` under the name straight after it is
-        /// accepted, which is what the pass's launch needs.
+        /// and held `deactivating` ([`stopping_stand_in_for`], [`HOLD`]);
+        /// `pet` is owed a launch, and [`observe_owed`] looks at real
+        /// listings. While the stop is held, every look keeps the id and
+        /// makes nothing due, so no pass would plan a wait for it. Then the
+        /// test ends the stop ([`release`]), and the looks go on until one
+        /// makes a pass due: every look before it kept the id, and the one
+        /// that made it due let the id go, and a `systemd-run` under the
+        /// name straight after it is accepted, which is what the pass's
+        /// launch needs.
         ///
-        /// Driven by what each listing shows, never by the stand-in's clock.
-        /// The unit is `ts1555-owed-<pid>-pet.service`, never named like a
-        /// plugin's. A guard SIGKILLs, stops and resets it however the test
-        /// ends.
+        /// Driven by the test's own cue, never by the stand-in's clock (#1644
+        /// review, LOW 4: with a 2 s `TimeoutStopSec=` the "it was seen
+        /// stopping" rail held only if the first look beat systemd's SIGKILL,
+        /// and setup under load spent up to 0.7 s of those 2 s). The unit is
+        /// `ts1555-owed-<pid>-pet.service`, never named like a plugin's. A
+        /// guard SIGKILLs, stops and resets it however the test ends.
         #[tokio::test]
         async fn a_real_unit_still_stopping_keeps_its_launch_owed_until_it_is_gone() {
             let prefix = format!("ts1555-owed-{}", std::process::id());
             let unit = format!("{prefix}-pet.service");
             let _cleanup = Cleanup(vec![unit.clone()]);
-            if stopping_stand_in(&prefix, "pet").await.is_none() {
+            if stopping_stand_in_for(&prefix, "pet", HOLD).await.is_none() {
                 return;
             }
             let owed = owing(&["pet"]);
             // What each look's listing showed of `pet`.
             let shown = std::cell::RefCell::new(Vec::new());
-            let began = std::time::Instant::now();
-            loop {
-                let due = observe_owed(&owed, || async {
+            let look = || {
+                observe_owed(&owed, || async {
                     let units = list_prefixed(&prefix).await?;
                     shown.borrow_mut().push(
                         units
@@ -11711,37 +12382,281 @@ mod tests {
                     );
                     Ok(units)
                 })
-                .await;
+            };
+            for k in 0..3 {
+                let due = look().await;
                 let last = shown.borrow().last().cloned().expect("it listed");
-                if last.as_deref() == Some("deactivating") {
-                    assert!(!due, "no pass while the unit is still stopping");
-                    assert_eq!(held(&owed), ["pet"], "still owed");
-                } else {
-                    assert!(due, "a pass is due once the unit is {last:?}");
+                assert_eq!(
+                    last.as_deref(),
+                    Some("deactivating"),
+                    "rail: look {k} while the stop is held"
+                );
+                assert!(!due, "no pass while the unit is still stopping");
+                assert_eq!(held(&owed), ["pet"], "still owed");
+            }
+            release(&unit);
+            let began = std::time::Instant::now();
+            loop {
+                let due = look().await;
+                let last = shown.borrow().last().cloned().expect("it listed");
+                if last.is_none() {
+                    assert!(due, "a pass is due once the unit is gone");
                     assert!(held(&owed).is_empty(), "no longer owed");
                     break;
                 }
+                assert!(!due, "no pass while the unit is listed {last:?}");
+                assert_eq!(held(&owed), ["pet"], "still owed while listed {last:?}");
                 assert!(
                     began.elapsed() < Duration::from_secs(20),
-                    "{unit} never stopped: {:?}",
+                    "{unit} never went after its release: {:?}",
                     shown.borrow()
                 );
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            let shown = shown.into_inner();
             eprintln!(
-                "{unit}: {} looks over {:?}, the last showing {:?}",
-                shown.len(),
-                began.elapsed(),
-                shown.last()
-            );
-            assert!(
-                shown.len() > 1,
-                "rail: at least one look saw it still stopping: {shown:?}"
+                "{unit}: looks {:?}, gone {:?} after its release",
+                shown.borrow(),
+                began.elapsed()
             );
             launch_stubborn(&unit, STOPPING_TAKES)
                 .await
                 .expect("systemd takes a launch under the name once the look says it is gone");
+        }
+
+        /// **A stopped unit that still holds its name keeps its launch owed**
+        /// (#1644 review, MEDIUM 1; the review's test, driven by the test's
+        /// own cue). A `--collect` unit whose stop is over while its cgroup
+        /// still holds a process stays loaded, listed `inactive`, or `failed`
+        /// for a stop that timed out, and systemd refuses a launch under its
+        /// name until that process exits; only then is it collected. That is
+        /// what a process SIGKILL cannot end leaves once systemd gives up on
+        /// the stop (`final-sigkill` timed out: "Entering failed mode";
+        /// `unit_may_gc` keeps a unit whose cgroup is populated).
+        /// `KillMode=process` puts the stand-in there without one: the stop
+        /// signals the main process only, and its child lives on in the
+        /// cgroup until the test [`release`]s it. The stop is sent once the
+        /// stand-in says it is ready (its child forked, its signal handling
+        /// set), never after a sleep: sent sooner, it can end the shell before
+        /// either, and the unit is simply gone.
+        ///
+        /// For both states, every look keeps the id and makes nothing due
+        /// while the unit is listed and a launch under the name is refused;
+        /// once the test releases the child, the look that sees the unit gone
+        /// makes the pass due, and a launch is accepted. Red on `2e24e459`,
+        /// whose look let the id go and made the pass due at once, so the
+        /// pass's launch was refused and the plugin lost.
+        ///
+        /// The units are `ts1644-held-<pid>-<state>-pet.service`; the same
+        /// guard cleans each up.
+        #[tokio::test]
+        async fn a_stopped_unit_still_holding_its_name_keeps_its_launch_owed() {
+            // Each stand-in leaves its child, sets its own signal handling,
+            // and only then says it is ready, so the stop never lands before
+            // either (the stop is sent on that cue, not after a sleep).
+            for (state, main) in [
+                // The main process ends on SIGTERM: `inactive`.
+                ("inactive", ": > \"$READY\"; exec sleep 1000"),
+                // It ignores SIGTERM and is SIGKILLed at `TimeoutStopSec=`:
+                // `failed`, with `Result=timeout`.
+                (
+                    "failed",
+                    "trap '' TERM; : > \"$READY\"; while :; do sleep 0.2; done",
+                ),
+            ] {
+                let prefix = format!("ts1644-held-{}-{state}", std::process::id());
+                let unit = format!("{prefix}-pet.service");
+                let _cleanup = Cleanup(vec![unit.clone()]);
+                let dir = tempfile::tempdir().expect("tempdir");
+                let ready = dir.path().join("ready");
+                let out = tokio::process::Command::new("systemd-run")
+                    .args([
+                        "--user",
+                        "--quiet",
+                        "--collect",
+                        &format!("--unit={unit}"),
+                        "--property=KillMode=process",
+                        "--property=TimeoutStopSec=1",
+                        "--setenv=PATH",
+                        &format!("--setenv=READY={}", ready.display()),
+                        "--",
+                        "/bin/sh",
+                        "-c",
+                        &format!("sleep 1000 & {main}"),
+                    ])
+                    .output()
+                    .await
+                    .expect("spawn systemd-run");
+                if !out.status.success() {
+                    eprintln!(
+                        "skipping: systemd-run --user could not start a unit: {}",
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    );
+                    return;
+                }
+                let began = std::time::Instant::now();
+                while !ready.exists() {
+                    assert!(
+                        began.elapsed() < Duration::from_secs(10),
+                        "rail: {unit} never got ready"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                systemd::stop_unit(&unit).await.expect("StopUnit queued");
+                loop {
+                    let units = list_prefixed(&prefix).await.expect("listed");
+                    if units
+                        .iter()
+                        .any(|u| u.id == "pet" && u.active_state == state)
+                    {
+                        break;
+                    }
+                    assert!(
+                        began.elapsed() < Duration::from_secs(10),
+                        "rail: {unit} never listed {state}: {units:?}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                let owed = owing(&["pet"]);
+                for k in 0..3 {
+                    let due = observe_owed(&owed, || list_prefixed(&prefix)).await;
+                    assert!(
+                        !due && held(&owed) == ["pet"],
+                        "look {k}: the look made a pass due while the unit is listed {state} and \
+                         a launch under its name is refused, so the pass's launch fails and the \
+                         id is gone"
+                    );
+                }
+                let refused = launch_stubborn(&unit, STOPPING_TAKES)
+                    .await
+                    .expect_err("rail: systemd still holds the name while the unit is listed");
+                assert!(
+                    format!("{refused:#}").contains("already loaded"),
+                    "{state}: {refused:#}"
+                );
+                release(&unit);
+                let released = std::time::Instant::now();
+                while !observe_owed(&owed, || list_prefixed(&prefix)).await {
+                    assert_eq!(held(&owed), ["pet"], "{state}: still owed while listed");
+                    assert!(
+                        released.elapsed() < Duration::from_secs(10),
+                        "{unit} never collected after its release"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                assert!(held(&owed).is_empty(), "{state}");
+                eprintln!(
+                    "{unit}: listed {state} until its release, {:?} after its start; gone {:?} \
+                     after the release",
+                    released.duration_since(began),
+                    released.elapsed()
+                );
+                launch_stubborn(&unit, STOPPING_TAKES)
+                    .await
+                    .expect("accepted once the unit is collected");
+            }
+        }
+
+        /// **An owed unit systemd brings back up from its previous launch is
+        /// restarted from the declaration** (#1644 review, LOW 3), on
+        /// systemd itself, with the #1628 review's stand-in ([`Crasher`]): it
+        /// crashes with a child left over, so it is `deactivating` with no
+        /// stop job, held there until the test [`release`]s the child. `pet`
+        /// is owed a launch, as after a start's or a reconcile's wait that ran
+        /// out on it; neither sends a stop, so nothing forbids `Restart=`.
+        ///
+        /// While the stop is held, every look keeps the id. Once released,
+        /// `Restart=on-failure` brings the unit back with `PET_NAME=old`, and
+        /// the look that sees it running (stamped as the launcher's own, as
+        /// [`systemd::list_plugin_units`] shows it) marks it and makes a pass
+        /// due. That unit's fingerprint matches the declaration, so [`plan`]
+        /// alone plans nothing and the old values would run for good;
+        /// [`plan_with_owed`] plans one restart, and the reconcile's own batch
+        /// ([`restart_all_via`], with the real stop and listing) relaunches it
+        /// from the declaration: the unit runs `PET_NAME=new`, and nothing is
+        /// owed or marked after.
+        ///
+        /// Red on `2e24e459`, whose look let the id go with nothing due. The
+        /// unit is `ts1644-back-<pid>-pet.service`; the same guard cleans it
+        /// up.
+        #[tokio::test]
+        async fn an_owed_unit_back_up_from_its_previous_launch_is_restarted() {
+            let prefix = format!("ts1644-back-{}", std::process::id());
+            let unit = format!("{prefix}-pet.service");
+            let _cleanup = Cleanup(vec![unit.clone()]);
+            let crasher = Crasher::new(&unit);
+            if let Err(err) = crasher.run("old").await {
+                eprintln!("skipping: systemd-run --user could not start a unit: {err:#}");
+                return;
+            }
+            assert!(
+                until_listed(&prefix, "deactivating", Duration::from_secs(5)).await,
+                "never crashed"
+            );
+            let mut new = spec("/bin/x", true);
+            new.settings.insert("PET_NAME".to_owned(), "new".to_owned());
+            let declared_now = declared(&[("pet", new.clone())]);
+            let stamped = || list_stamped(&prefix, &new);
+            let owed = owing(&["pet"]);
+            for k in 0..3 {
+                let due = observe_owed(&owed, stamped).await;
+                assert!(!due && held(&owed) == ["pet"], "look {k}: still stopping");
+            }
+            crasher.release();
+            let listing = look_until_due(&owed, stamped).await;
+            eprintln!("{unit}: the look that made a pass due listed {listing:?}");
+            assert!(
+                listing
+                    .iter()
+                    .any(|u| u.id == "pet" && is_running(&u.active_state)),
+                "rail: the look made the pass due on the unit back up: {listing:?}"
+            );
+            assert!(
+                held(&owed).is_empty() && replacing(&owed) == ["pet"],
+                "marked"
+            );
+            assert!(
+                plan(&declared_now, &listing).is_empty(),
+                "rail: the old values run under the declared fingerprint, so plan alone would \
+                 leave them"
+            );
+            let actions = plan_with_owed(&declared_now, &listing, &owed);
+            assert_eq!(actions, [("pet".to_owned(), Action::Restart)]);
+            // The pass's batch, as the reconcile builds it for a Restart.
+            let restarts = [Restarting {
+                id: "pet",
+                spec: &declared_now.plugins["pet"],
+                stamped: true,
+                stopping: false,
+            }];
+            let answers = restart_all_via(
+                &restarts,
+                |r| std::future::ready(r.spec.settings["PET_NAME"].clone()),
+                |_| {
+                    let unit = unit.clone();
+                    async move { systemd::stop_unit(&unit).await }
+                },
+                || list_prefixed(&prefix),
+                |_, value: String| {
+                    let crasher = &crasher;
+                    async move { crasher.run(&value).await }
+                },
+                |_| async { panic!("the launcher's own unit never falls back") },
+                &owed,
+            )
+            .await;
+            assert!(
+                answers.iter().all(|(_, answer)| answer.is_ok()),
+                "{answers:?}"
+            );
+            until_listed(&prefix, "active", Duration::from_secs(6)).await;
+            let (state, running_with) = shown(&unit);
+            eprintln!("the unit after the pass: {state:?} {running_with:?}");
+            assert_eq!(
+                running_with,
+                ["PET_NAME=new"],
+                "the unit systemd brought back ran the previous launch's values"
+            );
+            assert!(held(&owed).is_empty() && replacing(&owed).is_empty());
         }
 
         /// **A reconcile's launch onto a real unit still stopping waits in
@@ -12012,6 +12927,52 @@ mod tests {
                 );
                 Ok(())
             }
+        }
+
+        /// Look at `owed` ([`observe_owed`]) over `list` every 50 ms until a
+        /// look makes a pass due, for at most 20 s, and answer what that
+        /// look listed. Every look before it must have kept `pet` owed: the
+        /// id is let go only with a pass due.
+        async fn look_until_due<L, LF>(owed: &OwedLaunches, list: L) -> Vec<systemd::PluginUnit>
+        where
+            L: Fn() -> LF,
+            LF: Future<Output = anyhow::Result<Vec<systemd::PluginUnit>>>,
+        {
+            let began = std::time::Instant::now();
+            let seen = std::cell::RefCell::new(Vec::new());
+            let list = &list;
+            while !observe_owed(owed, || async {
+                let units = list().await?;
+                seen.borrow_mut().clone_from(&units);
+                Ok(units)
+            })
+            .await
+            {
+                assert_eq!(held(owed), ["pet"], "let go with no pass due: {seen:?}");
+                assert!(
+                    began.elapsed() < Duration::from_secs(20),
+                    "no look made a pass due: {seen:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            seen.into_inner()
+        }
+
+        /// [`list_prefixed`] as [`systemd::list_plugin_units`] shows the
+        /// launcher's own units: stamped, with the fingerprint of `spec`,
+        /// which its settings are not part of.
+        async fn list_stamped(
+            prefix: &str,
+            spec: &PluginSpec,
+        ) -> anyhow::Result<Vec<systemd::PluginUnit>> {
+            Ok(list_prefixed(prefix)
+                .await?
+                .into_iter()
+                .map(|u| systemd::PluginUnit {
+                    description: unit_description(&u.id, &fp(spec)),
+                    ..u
+                })
+                .collect())
         }
 
         /// Poll `<prefix>-pet` every 50 ms until it is listed in

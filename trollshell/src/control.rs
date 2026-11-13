@@ -233,7 +233,12 @@ impl ControlIface {
     /// If the unit is still stopping when that wait runs out, the call fails,
     /// but a plugin switched on whose unit the launcher started is launched
     /// by the launcher once the unit is gone (#1555 bullet 6), as after a
-    /// [`restart_plugin`](Self::restart_plugin) answering `still-stopping`.
+    /// [`restart_plugin`](Self::restart_plugin) answering `still-stopping`:
+    /// that is once its last process has exited, which a process stuck on a
+    /// hung mount may never do, and until then a start is refused. This call
+    /// sends the unit no stop, so if systemd brings it back up meanwhile
+    /// (`Restart=` after a crash) it runs its previous launch's environment;
+    /// the launcher then restarts it from the current declaration.
     ///
     /// # Errors
     /// Unknown/invalid id, a unit that is already running, a unit still
@@ -431,7 +436,11 @@ impl ControlIface {
     ///   it a launch (#1555 bullet 6): its `plugins.json` watch looks at the
     ///   unit on every tick and, once it is gone, runs one ordinary reconcile,
     ///   which launches the plugin with the values saved by then if it is
-    ///   still declared and switched on. Nobody has to start it by hand.
+    ///   still declared and switched on. Nobody has to start it by hand, and
+    ///   a start by hand is refused until then: systemd keeps the unit, and
+    ///   its name, until its last process has exited, `inactive` or `failed`
+    ///   included. A process stuck on a hung mount may never exit, and then
+    ///   the plugin stays down for as long as it lives, whoever tries.
     ///
     /// The tab sends this after **every** Save, whatever its own last poll
     /// said: the answer is decided here, after any restart already under way,

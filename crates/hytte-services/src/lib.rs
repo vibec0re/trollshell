@@ -28,6 +28,7 @@ mod eds_labels;
 mod eds_retry;
 pub mod fullscreen_inhibit;
 pub mod geoclue;
+mod handshake;
 pub mod hooks;
 pub mod idle_notify;
 pub mod logind;

@@ -3,6 +3,7 @@
 
 use super::parse::{parse_adapter_props, parse_device_props, prop_bool, prop_str, property};
 use super::types::{Adapter, Device};
+use crate::handshake::Handshake;
 use futures_signals::signal::Mutable;
 use futures_util::StreamExt;
 use hytte_bus::{BusKind, SignalEvent, SignalItem, SignalSubscription};
@@ -113,22 +114,32 @@ pub(super) async fn set_adapter_path(path: &str, store: &Arc<tokio::sync::RwLock
     *store.write().await = path.to_string();
 }
 
-/// Subscribe (`subscribe`, which takes its receiver too), then take the
-/// snapshot (`snapshot`), in that order, for [`listen`] (#1551).
+/// Subscribe (`subscribe`, which takes its receiver too), wait for the bus
+/// to have the match rule, then take the snapshot (`snapshot`), in that
+/// order, for [`listen`] (#1551).
 ///
-/// A helper rather than two lines in `listen` so the order is pinned (#1573
-/// review): the pre-#1551 regression was the two lines swapped, which no test
-/// could see.
-async fn subscribe_then_snapshot<S, T, F>(
-    subscribe: impl FnOnce() -> S,
+/// A helper rather than three lines in `listen` so the order is pinned (#1573
+/// review): the pre-#1551 regression was the subscribe and the snapshot
+/// swapped, which no test could see.
+///
+/// The wait in the middle is `hytte-bus`'s handshake
+/// ([`hytte_bus::SignalSubscription::subscribed`]). A subscription installs
+/// its match rule from a spawned task, so without the wait the snapshot could
+/// be answered before the bus routed anything here. It is made here, on what
+/// `subscribe` returned, and not handed in as a step, so `listen` cannot
+/// leave it out.
+async fn subscribe_then_snapshot<H, R, T, F>(
+    subscribe: impl FnOnce() -> (H, R),
     snapshot: impl FnOnce() -> F,
-) -> (S, T)
+) -> ((H, R), T)
 where
+    H: Handshake,
     F: std::future::Future<Output = T>,
 {
-    let subscribed = subscribe();
+    let (subscription, receiver) = subscribe();
+    subscription.subscribed().await;
     let taken = snapshot().await;
-    (subscribed, taken)
+    ((subscription, receiver), taken)
 }
 
 pub(super) async fn listen(
@@ -151,9 +162,11 @@ pub(super) async fn listen(
     // older device's properties over the snapshot's.
     //
     // `SignalsBuilder::start` installs its match rule from a spawned task,
-    // with nothing to wait on for it, so this orders the `AddMatch` ahead of
-    // `GetManagedObjects` in practice, not by proof. The window left is that
-    // one round trip, not the snapshot plus a publish.
+    // so `subscribe_then_snapshot` waits for the bus to have it before it
+    // asks for the snapshot: `GetManagedObjects` is sent after the `AddMatch`
+    // was answered. The wait has no deadline. With the system bus down it
+    // stays here, where the snapshot would have failed into the supervised
+    // loop's backoff, and resumes when the subscription is back.
     let ((owner_sub, owner_items), managed) = subscribe_then_snapshot(
         || {
             let sub = name_owner_changed();
@@ -914,18 +927,45 @@ mod tests {
     /// **Falsification:** take the snapshot first in
     /// `subscribe_then_snapshot` (the pre-#1551 order) and the recorded order
     /// flips.
+    ///
+    /// Between the two it waits for the bus to have the match rule, and the
+    /// snapshot is not asked for until that wait is over.
+    ///
+    /// **Falsification:** drop the `subscribed().await` from
+    /// `subscribe_then_snapshot` and "match rule installed" never reaches the
+    /// log; move it below the snapshot and the order flips.
     #[tokio::test]
     async fn the_owner_subscription_comes_before_the_snapshot() {
+        /// A subscription whose handshake is not ready until polled twice,
+        /// so a helper that only *creates* the wait without awaiting it to
+        /// the end is caught too.
+        struct Recording<'a>(&'a std::cell::RefCell<Vec<&'static str>>);
+        impl Handshake for Recording<'_> {
+            fn subscribed(&self) -> impl Future<Output = ()> {
+                let log = self.0;
+                async move {
+                    tokio::task::yield_now().await;
+                    log.borrow_mut().push("match rule installed");
+                }
+            }
+        }
+
         let log = std::cell::RefCell::new(Vec::new());
-        let ((), ()) = subscribe_then_snapshot(
-            || log.borrow_mut().push("subscribe"),
+        let ((_subscription, ()), ()) = subscribe_then_snapshot(
+            || {
+                log.borrow_mut().push("subscribe");
+                (Recording(&log), ())
+            },
             || {
                 log.borrow_mut().push("snapshot");
                 async {}
             },
         )
         .await;
-        assert_eq!(log.into_inner(), ["subscribe", "snapshot"]);
+        assert_eq!(
+            log.into_inner(),
+            ["subscribe", "match rule installed", "snapshot"]
+        );
     }
 
     // ── #1201: bluetooth_marker_or_event routes markers to a resync ─────────
@@ -1577,5 +1617,62 @@ mod system_tests {
             .await
             .expect("forwarder did not exit with its subscription")
             .expect("forwarder task panicked");
+    }
+
+    /// `subscribe_then_snapshot` with a **real** subscription: the snapshot
+    /// is not asked for while the bus has no match rule, and is once it has.
+    /// The order test drives a recording double, so it cannot see the
+    /// production `impl Handshake for SignalSubscription` the watchers go
+    /// through (`listen` here, `open_discovery` in `wifi::watcher`, both the
+    /// same impl); this does (#1645 review).
+    ///
+    /// **Falsification:** return `std::future::ready(())` from that impl and
+    /// the snapshot is taken on the first poll.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_snapshot_waits_for_a_real_subscriptions_match_rule() {
+        use futures_util::FutureExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let guard = ephemeral_bus().await;
+        let conn = Builder::address(guard.address.as_str())
+            .expect("bus address")
+            .build()
+            .await
+            .expect("connect to ephemeral bus");
+        let shared = SharedConnection::for_test_system(conn.clone());
+        // No connection until the test installs one, so the rule cannot be
+        // installed before then.
+        shared.drop_connection_for_test().await;
+
+        let taken = AtomicBool::new(false);
+        let mut opened = std::pin::pin!(super::subscribe_then_snapshot(
+            || {
+                let sub = signals_with(&shared, "org.bluez")
+                    .at_path("/")
+                    .iface("org.freedesktop.DBus.ObjectManager")
+                    .signal("InterfacesAdded")
+                    .start();
+                let items = sub.items();
+                (sub, items)
+            },
+            || {
+                taken.store(true, Ordering::SeqCst);
+                async {}
+            },
+        ));
+        assert!(
+            opened.as_mut().now_or_never().is_none(),
+            "subscribe_then_snapshot finished with no match rule installed"
+        );
+        assert!(
+            !taken.load(Ordering::SeqCst),
+            "the snapshot was asked for before the bus had the match rule"
+        );
+
+        shared.install_fresh_connection_for_test(conn).await;
+        let ((_subscription, _items), ()) = tokio::time::timeout(DBUS_REPLY_BUDGET, opened)
+            .await
+            .expect("the helper never went on once the rule was installed");
+        assert!(taken.load(Ordering::SeqCst));
     }
 }

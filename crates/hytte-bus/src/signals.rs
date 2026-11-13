@@ -119,6 +119,10 @@ impl Drop for SignalSubscription {
 
 struct SubInner {
     sender: tokio::sync::broadcast::Sender<Arc<SignalItem>>,
+    /// Whether the subscription task currently holds an installed match rule.
+    /// Written only by the task (it has a clone of this sender); read by
+    /// [`SignalSubscription::subscribed`].
+    live: tokio::sync::watch::Sender<bool>,
     /// A oneshot receiver that resolves when the internal task exits.
     /// Exposed via `task_done_receiver()` for integration tests.
     task_done_rx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
@@ -195,6 +199,110 @@ impl SignalSubscription {
         })
     }
 
+    /// Resolves once this subscription's match rule is installed on the bus:
+    /// the bus has answered the `AddMatch`, and the stream that feeds
+    /// [`Self::items`]/[`Self::events`] exists. This is the "subscribed"
+    /// handshake of #1551.
+    ///
+    /// [`SignalsBuilder::start`] returns before any of that has happened. It
+    /// installs the rule from a spawned task, so a caller that subscribes and
+    /// then reads the peer's state can have its read answered before the bus
+    /// routes anything to it, and an emission made in between is lost with no
+    /// marker: there was no earlier subscription for a
+    /// [`SignalItem::Resubscribed`] to report a hole in. To close that window:
+    ///
+    /// 1. take a receiver ([`Self::items`]);
+    /// 2. await `subscribed()`;
+    /// 3. read the state.
+    ///
+    /// The read is then sent after the bus installed the rule, so every
+    /// emission the bus routes after the read was answered reaches that
+    /// receiver, or is followed on it by a [`SignalItem::Resubscribed`] /
+    /// [`SignalItem::Lagged`] marker. The receiver comes first because a
+    /// broadcast receiver sees only what is sent after it exists.
+    ///
+    /// An emission made between the `AddMatch` and the read may or may not be
+    /// delivered. zbus adds this subscription's sender to the connection only
+    /// once the `AddMatch` reply has arrived, and the connection's socket
+    /// reader hands each message to the senders registered when it reads it,
+    /// so an emission the broker routes right behind that reply can be read
+    /// and dropped before the sender exists. The state read covers it either
+    /// way. A dropped emission reached this process before `subscribed()`
+    /// resolved, so the peer made it before the read was even sent, and the
+    /// read's answer already reflects it. A delivered one is older than the
+    /// read, and the consumer has to tolerate that replay.
+    ///
+    /// # Across a reconnect
+    ///
+    /// "Subscribed" is a statement about the subscription task's **current**
+    /// match rule, not a latch. When the task sees its stream end or the
+    /// connection's epoch advance, this goes back to pending until the
+    /// replacement rule is installed on the new connection, and it can be
+    /// awaited again at any time; each call returns a fresh future that reads
+    /// the current state, so on a rule that is installed it resolves at once
+    /// rather than waiting for the next change. The
+    /// [`SignalItem::Resubscribed`] marker for a rebuild is queued *before*
+    /// the rebuild counts as subscribed, so a receiver taken earlier has the
+    /// marker by the time this resolves again.
+    ///
+    /// One window stays open by nature: a connection that has died but whose
+    /// death the task has not seen yet still reads as subscribed. That is the
+    /// case the marker covers. A receiver taken before the state was read
+    /// gets `Resubscribed` once the rule is back, which says to read again.
+    /// So the handshake covers the first subscription, the marker covers
+    /// every later one, and a consumer needs both: [`Self::items`], not
+    /// [`Self::events`].
+    ///
+    /// # Liveness
+    ///
+    /// The future has no deadline. It stays pending for as long as the
+    /// subscription cannot be established, because the task retries every
+    /// failure the same way, on the crate's backoff ramp (up to 30 s between
+    /// attempts) and with no deadline of its own. That covers two cases:
+    ///
+    /// - **The bus is unreachable.** A state read would fail for as long.
+    /// - **The bus is up but refuses this `AddMatch`**: past the broker's
+    ///   `max_match_rules_per_connection`, or by a bus or LSM policy. Here a
+    ///   state read would succeed. A caller that waits gets no snapshot at
+    ///   all until the rule lands, where without the wait it would have had
+    ///   one with no live updates. The journal says why only through the
+    ///   task's one `warn!` for the failed subscription.
+    ///
+    /// A destination with no owner does not hold it up: the rule is installed
+    /// against the name, not its owner. A future that outlives every
+    /// [`SignalSubscription`] handle before the rule is installed never
+    /// resolves: the task exits and the watch closes, and a closed watch is
+    /// not read as "subscribed".
+    ///
+    /// `+ use<>` for the reason [`Self::events`] carries it: the future owns
+    /// its receiver and borrows nothing, so it can be a `select!` arm or be
+    /// spawned.
+    pub fn subscribed(&self) -> impl Future<Output = ()> + Send + use<> {
+        self.wait_for_live(true)
+    }
+
+    /// Resolves once the subscription task holds **no** installed match rule:
+    /// before its first `AddMatch` has been answered, or between a teardown it
+    /// has seen and the rebuild. The other edge of [`Self::subscribed`], for
+    /// integration tests that need to know the task has noticed a dead bus
+    /// without guessing a delay.
+    #[doc(hidden)]
+    pub fn unsubscribed_for_test(&self) -> impl Future<Output = ()> + Send + use<> {
+        self.wait_for_live(false)
+    }
+
+    fn wait_for_live(&self, want: bool) -> impl Future<Output = ()> + Send + use<> {
+        let mut live = self.inner.live.subscribe();
+        async move {
+            let closed = live.wait_for(|live| *live == want).await.is_err();
+            if closed {
+                // Every sender is gone: the handles and the task. Nothing will
+                // ever install a rule, so this must not read as "subscribed".
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
     /// Take the oneshot receiver that fires when the internal subscription
     /// task exits. May only be called once per subscription; returns `None`
     /// on subsequent calls. Intended for integration tests that need to verify
@@ -213,6 +321,8 @@ struct RunCtx {
     iface: String,
     signal_name: String,
     tx: tokio::sync::broadcast::Sender<Arc<SignalItem>>,
+    /// The task's end of [`SubInner::live`].
+    live: tokio::sync::watch::Sender<bool>,
     /// Live-handle tracker. When every `SignalSubscription` clone has been
     /// dropped, `all_dropped()` becomes true — the definitive signal that no
     /// consumer will ever call `events()` again and the task can exit.
@@ -254,14 +364,20 @@ impl SignalsBuilder {
 
     /// Spawn the subscription task. Returns a [`SignalSubscription`] handle
     /// from which independent event streams can be obtained.
+    ///
+    /// This returns at once; the match rule is installed by the task. A
+    /// caller that reads the peer's state after subscribing awaits
+    /// [`SignalSubscription::subscribed`] in between.
     #[must_use]
     pub fn start(self) -> SignalSubscription {
         let (tx, _) = tokio::sync::broadcast::channel(64);
         let (task_done_tx, task_done_rx) = tokio::sync::oneshot::channel::<()>();
         let tracker = HandleTracker::new();
+        let (live, _) = tokio::sync::watch::channel(false);
 
         let inner = Arc::new(SubInner {
             sender: tx.clone(),
+            live: live.clone(),
             task_done_rx: tokio::sync::Mutex::new(Some(task_done_rx)),
         });
         let sub = SignalSubscription {
@@ -275,6 +391,7 @@ impl SignalsBuilder {
             iface: self.iface,
             signal_name: self.signal,
             tx,
+            live,
             tracker,
             task_done_tx,
         };
@@ -387,6 +504,7 @@ async fn run_subscription(ctx: RunCtx) {
         iface,
         signal_name,
         tx,
+        live,
         tracker,
         task_done_tx,
     } = ctx;
@@ -468,6 +586,12 @@ async fn run_subscription(ctx: RunCtx) {
                     let _ = tx.send(Arc::new(SignalItem::Resubscribed));
                 }
                 subscribed_before = true;
+                // The handshake (#1551): `receive_signal` has returned, so the
+                // bus has answered the `AddMatch` and the stream exists. After
+                // the marker above, so a receiver that waits on
+                // `subscribed()` across a rebuild already has its
+                // `Resubscribed` queued when the wait ends.
+                live.send_replace(true);
                 s
             }
             Err(e) => {
@@ -502,6 +626,11 @@ async fn run_subscription(ctx: RunCtx) {
             return;
         }
 
+        // This rule is gone (stream ended) or on a connection that has been
+        // replaced (epoch advanced). Re-arm the handshake, so `subscribed()`
+        // waits for the replacement rule instead of answering for this one.
+        live.send_replace(false);
+
         // Brief pause before re-subscribing to avoid a tight loop when the bus
         // is cycling rapidly.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -533,6 +662,7 @@ mod tests {
         SignalSubscription {
             inner: Arc::new(SubInner {
                 sender: tx,
+                live: tokio::sync::watch::channel(false).0,
                 task_done_rx: tokio::sync::Mutex::new(Some(done_rx)),
             }),
             tracker: crate::handle::HandleTracker::new(),

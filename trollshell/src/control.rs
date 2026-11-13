@@ -230,21 +230,25 @@ impl ControlIface {
     /// A declared plugin whose unit is still stopping (`deactivating`, e.g. a
     /// `StopPlugin` a moment ago) is launched once the unit is gone, so the
     /// answer can take up to the launcher's 12 s stop wait (#1417 follow-up).
-    /// If the unit is still stopping when that wait runs out, the call fails,
-    /// but a plugin switched on whose unit the launcher started is launched
-    /// by the launcher once the unit is gone (#1555 bullet 6), as after a
+    /// If the unit still holds its name when that wait runs out (still
+    /// stopping, or stopped with a process left in it), the call fails, but a
+    /// plugin switched on whose unit the launcher started is launched by the
+    /// launcher once the unit is gone (#1555 bullet 6), as after a
     /// [`restart_plugin`](Self::restart_plugin) answering `still-stopping`:
     /// that is once its last process has exited, which a process stuck on a
-    /// hung mount may never do, and until then a start is refused. This call
+    /// hung mount may never do, and until then this call is refused. This call
     /// sends the unit no stop, so if systemd brings it back up meanwhile
     /// (`Restart=` after a crash) it runs its previous launch's environment;
-    /// the launcher then restarts it from the current declaration.
+    /// the launcher then stops it and launches the plugin from the current
+    /// declaration, once the unit is gone if that stop leaves it holding its
+    /// name too.
     ///
     /// # Errors
     /// Unknown/invalid id, a unit that is already running, a unit still
-    /// stopping when that wait ran out, a stopped unit that still holds its
-    /// name because a process is left in it (refused at once), or an
-    /// unreachable user manager — see [`plugin_launcher::start`].
+    /// holding its name when that wait ran out, a stopped unit that still
+    /// holds its name because a process is left in it (refused at once, not
+    /// waited for), or an unreachable user manager — see
+    /// [`plugin_launcher::start`].
     async fn start_plugin(&self, id: String) -> zbus::fdo::Result<()> {
         plugin_launcher::start(&id)
             .await
@@ -437,11 +441,17 @@ impl ControlIface {
     ///   it a launch (#1555 bullet 6): its `plugins.json` watch looks at the
     ///   unit on every tick and, once it is gone, runs one ordinary reconcile,
     ///   which launches the plugin with the values saved by then if it is
-    ///   still declared and switched on. Nobody has to start it by hand, and
-    ///   a start by hand is refused until then: systemd keeps the unit, and
-    ///   its name, until its last process has exited, `inactive` or `failed`
-    ///   included. A process stuck on a hung mount may never exit, and then
-    ///   the plugin stays down for as long as it lives, whoever tries.
+    ///   still declared and switched on. Nobody has to start it by hand.
+    ///   systemd keeps the unit, and its name, until its last process has
+    ///   exited, `inactive` or `failed` included, so the switch's start (a
+    ///   `systemd-run` under that name) is refused until then. A
+    ///   `systemctl --user start` of the stopped unit is not: systemd starts
+    ///   the old unit again, stuck process and all, and once the launcher has
+    ///   seen the unit stopped it lets that run, no longer owed, on the values
+    ///   it was launched with, until something stops or restarts it (the
+    ///   switch, a Save, a key change it reads, or a rebuild that changes
+    ///   it). A process stuck on a hung mount may never exit, and then nothing
+    ///   else brings the plugin back.
     ///
     /// The tab sends this after **every** Save, whatever its own last poll
     /// said: the answer is decided here, after any restart already under way,

@@ -395,3 +395,75 @@ async fn no_auto_start_leaves_an_unowned_activatable_name_unstarted() {
     );
     assert_eq!(activations(), 1, "nothing was started for an owned name");
 }
+
+/// `no_auto_start()` holds on the retry `RetryPolicy::Once` and `Backoff`
+/// make after a lost connection, not only on the first attempt (#1651
+/// review). That retry is the case the flag exists for: the call went out to
+/// a peer that then went away with its bus, and the retry lands on a bus where
+/// the name has no owner yet. The test above sends one attempt only
+/// (`RetryPolicy::Never`), so it cannot see a retry that drops the flag.
+///
+/// Bus A serves the name and never answers; the call is in flight there when
+/// the shared connection is moved to bus B and A dies, so the first attempt
+/// fails as a lost connection and the retry goes to B, where the name is
+/// activatable and unowned.
+///
+/// **Falsification:** send the retry without the flag (in `execute`'s `Once`
+/// arm or its `Backoff` closure) and B starts the service: one activation.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_auto_start_holds_on_the_retry_after_a_reconnect() {
+    for policy in [RetryPolicy::Once, RetryPolicy::Backoff { max_attempts: 2 }] {
+        let (conn_a, guard_a) = ephemeral_bus().await;
+        let (conn_b, _guard_b, marker) = common::ephemeral_bus_activating(STALL).await;
+        let arrived = Arc::new(AtomicUsize::new(0));
+        let _peer_a = serve_stall(&guard_a.address, Some(arrived.clone())).await;
+        let shared = SharedConnection::for_test_session(conn_a);
+        shared.spawn_supervisor_for_test();
+
+        let call = {
+            let shared = shared.clone();
+            tokio::spawn(async move {
+                call_with(&shared, STALL)
+                    .at_path(STALL_PATH)
+                    .iface(STALL)
+                    .method("Ping")
+                    .retry(policy)
+                    .no_auto_start()
+                    .send::<u32>()
+                    .await
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while arrived.load(Ordering::SeqCst) < 1 {
+            assert!(Instant::now() < deadline, "the call never reached A");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let before = shared.epoch();
+        shared.simulate_disconnect_for_test(conn_b).await;
+        while shared.epoch() == before {
+            assert!(
+                Instant::now() < deadline,
+                "the supervisor never reconnected"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        drop(guard_a);
+
+        let answer = tokio::time::timeout(Duration::from_secs(20), call)
+            .await
+            .expect("the call answered")
+            .expect("the call task did not panic");
+        let started = std::fs::read_to_string(&marker).map_or(0, |s| s.lines().count());
+        assert_eq!(
+            started, 0,
+            "{policy:?}: the retry started the service ({answer:?})"
+        );
+        match &answer {
+            Err(BusError::Permanent {
+                dbus_name: Some(name),
+                ..
+            }) if name == "org.freedesktop.DBus.Error.NameHasNoOwner" => {}
+            other => panic!("{policy:?}: expected the retry's NameHasNoOwner, got {other:?}"),
+        }
+    }
+}

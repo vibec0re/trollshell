@@ -19,7 +19,9 @@
 //! do not wait on it (#1647 review); and `bluetooth`'s fold reads bluetoothd's
 //! owner while it waits for its three top-level rules, then arms its resync
 //! (`arm_once_subscribed`), so a rule the bus refuses cannot hide
-//! bluetoothd's exit (#1647 second review).
+//! bluetoothd's exit (#1647 second review). That wait is the one with a
+//! deadline: past it the resync is armed without the missing rule, and once
+//! more when the rule lands (#1651 review).
 
 use hytte_bus::SignalSubscription;
 

@@ -265,14 +265,19 @@ impl<A> CallBuilder<A> {
     /// user's `systemctl stop`.
     ///
     /// With the flag, that call fails as a [`BusError::Permanent`] whose
-    /// `dbus_name` is `org.freedesktop.DBus.Error.NameHasNoOwner`, as
-    /// `dbus-daemon` answers it (another broker may answer
-    /// `org.freedesktop.DBus.Error.ServiceUnknown`). Either is the bus's own
-    /// answer and says nothing about the object or method called, so a caller
-    /// must not read it as one. A name that has an owner is called as without
-    /// the flag. The default is off: a call auto-starts, as D-Bus specifies.
-    /// `tests/call.rs` pins all three cases against a broker that counts its
-    /// activations.
+    /// `dbus_name` is `org.freedesktop.DBus.Error.NameHasNoOwner`. Both
+    /// brokers answer that, measured: `dbus-daemon`, and `dbus-broker` 37 for
+    /// an activatable and a non-activatable name alike (#1651 review).
+    /// `org.freedesktop.DBus.Error.ServiceUnknown` is what the same call gets
+    /// *without* the flag when the name is not activatable, so a caller that
+    /// means "nobody owns it" may as well accept both, as `bluetooth`'s fold
+    /// does. Either is the bus's own answer and says nothing about the object
+    /// or method called, so a caller must not read it as one. A name that has
+    /// an owner is called as without the flag. The flag holds on every
+    /// attempt, the [`RetryPolicy::Once`] and [`RetryPolicy::Backoff`]
+    /// retries after a lost connection included. The default is off: a call
+    /// auto-starts, as D-Bus specifies. `tests/call.rs` pins these cases
+    /// against a broker that counts its activations.
     #[must_use]
     pub fn no_auto_start(mut self) -> Self {
         self.auto_start = false;

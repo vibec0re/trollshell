@@ -104,13 +104,47 @@ pub(super) type ManagedObjects =
 /// `InterfacesAdded` carry them.
 type Interfaces = HashMap<String, HashMap<String, OwnedValue>>;
 
-/// bluez's `GetManagedObjects`, as [`listen`]'s snapshot asks it: a plain
-/// call, which D-Bus-activates bluetoothd if nothing owns `org.bluez`.
-/// [`listen`] runs at the shell's start and after [`wait_for_bluez`] has seen
-/// an owner. The fold's own resync asks without activating
+/// How [`listen`] sends its snapshot's `GetManagedObjects`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Snapshot {
+    /// A plain call, which D-Bus-activates bluetoothd if nothing owns
+    /// `org.bluez`: the shell's first watch, as before.
+    MayStart,
+    /// With `no_auto_start()`: every later watch. Each follows a
+    /// [`wait_for_bluez`] that saw an owner a few milliseconds before, so an
+    /// `org.bluez` with no owner by now is a bluetoothd stopped in between,
+    /// and the call must not start it again (#1651 review).
+    NoAutoStart,
+}
+
+/// bluez's `GetManagedObjects`, as [`listen`]'s snapshot asks it
+/// ([`Snapshot`]). The fold's own resync always asks without activating
 /// ([`SystemBluez`]).
-pub(super) async fn get_managed_objects() -> Result<ManagedObjects, hytte_bus::BusError> {
-    managed_objects_call().send::<ManagedObjects>().await
+pub(super) async fn get_managed_objects(
+    snapshot: Snapshot,
+) -> Result<ManagedObjects, hytte_bus::BusError> {
+    let call = managed_objects_call();
+    let call = match snapshot {
+        Snapshot::MayStart => call,
+        Snapshot::NoAutoStart => call.no_auto_start(),
+    };
+    call.send::<ManagedObjects>().await
+}
+
+/// Whether the bus refused a call sent `no_auto_start()` because nothing
+/// owns `org.bluez`: `NameHasNoOwner`, what `dbus-daemon` and `dbus-broker`
+/// both answer (measured, #1651 review), or `ServiceUnknown`, accepted as the
+/// same answer from a bus that words it so.
+fn bus_found_no_owner(error: &BusError) -> bool {
+    matches!(
+        error,
+        BusError::Permanent { dbus_name: Some(name), .. }
+            if matches!(
+                name.as_str(),
+                "org.freedesktop.DBus.Error.NameHasNoOwner"
+                    | "org.freedesktop.DBus.Error.ServiceUnknown"
+            )
+    )
 }
 
 /// The `GetManagedObjects` call on bluez's root object, not yet sent.
@@ -183,10 +217,17 @@ fn devices_from_managed(managed: &ManagedObjects, adapter_path: &str) -> HashMap
         .collect()
 }
 
+/// One watch: the snapshot, sent as `snapshot` says, then [`event_loop`]
+/// until bluetoothd exits or a stream or read fails.
+///
+/// A [`Snapshot::NoAutoStart`] snapshot that the bus refuses for want of an
+/// owner ends the watch as [`ListenEnd::DaemonExited`]: bluetoothd left
+/// after [`wait_for_bluez`] saw it, and nothing has been published yet.
 pub(super) async fn listen(
     adapter_mutable: &Mutable<Option<Adapter>>,
     devices_mutable: &Mutable<Vec<Device>>,
     adapter_path_store: &Arc<tokio::sync::RwLock<String>>,
+    snapshot: Snapshot,
 ) -> Result<ListenEnd, anyhow::Error> {
     // bluetoothd itself (see `on_owner_item`), subscribed **before** the
     // snapshot below and with its receiver taken right away, so an owner
@@ -216,10 +257,17 @@ pub(super) async fn listen(
             let items = sub.items();
             (sub, items)
         },
-        get_managed_objects,
+        || get_managed_objects(snapshot),
     )
     .await;
-    let managed = managed.map_err(|e| anyhow::anyhow!("GetManagedObjects: {e}"))?;
+    let managed = match managed {
+        Ok(managed) => managed,
+        Err(e) if snapshot == Snapshot::NoAutoStart && bus_found_no_owner(&e) => {
+            tracing::debug!(error = %e, "bluetooth: bluetoothd left before the snapshot");
+            return Ok(ListenEnd::DaemonExited);
+        }
+        Err(e) => return Err(anyhow::anyhow!("GetManagedObjects: {e}")),
+    };
 
     // ── Find the first adapter ────────────────────────────────────────────────
 
@@ -360,7 +408,19 @@ fn on_owner_item(item: SignalItem, wake: &ResyncWake) -> Option<ListenEnd> {
 /// It is a backstop; the wake is the `NameOwnerChanged` for the new owner.
 const BLUEZ_RECHECK: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Wait until `org.bluez` has an owner again, without starting one.
+/// Sleep `backoff`, then wait until `org.bluez` has an owner again, without
+/// starting one: the supervised loop's pause between two watches.
+///
+/// **The backoff goes first** (#1651 review). [`listen`]'s snapshot follows
+/// this at once, so the owner it saw is a few milliseconds old when the
+/// snapshot goes out. With the backoff after the wait, as it was until then,
+/// that was up to 30 s (`retry.rs`'s `RECONNECT_RETRY`), and a bluetoothd
+/// stopped meanwhile was started again by a plain snapshot:
+/// `systemctl restart bluetooth && systemctl stop bluetooth` landed in it. Now
+/// such a stop lands in the backoff, before this asks, and the later
+/// snapshots are sent without activating anyway ([`Snapshot::NoAutoStart`]).
+/// It also brings the panel back as soon as bluetoothd does, not a backoff
+/// later.
 ///
 /// This asks the bus (`NameHasOwner`), never `org.bluez` itself. Any method
 /// call to `org.bluez` D-Bus-activates `bluetooth.service` (`BlueZ` ships an
@@ -381,8 +441,9 @@ const BLUEZ_RECHECK: std::time::Duration = std::time::Duration::from_secs(10);
 /// one [`listen`]'s owner subscription installs next (and the pairing agent
 /// holds for the process's life), so a bus that refuses it would park
 /// `listen` in the same wait.
-pub(super) async fn wait_for_bluez() {
+pub(super) async fn wait_for_bluez(backoff: std::time::Duration) {
     wait_for_bluez_with(
+        backoff,
         || {
             let sub = name_owner_changed();
             let items = sub.items();
@@ -398,12 +459,13 @@ pub(super) async fn wait_for_bluez() {
 /// re-check interval injected, so a test can record the order and drive it
 /// without a bus under paused time.
 ///
-/// Subscribes (`subscribe`, which takes the receiver too), waits for the
-/// bus to have the match rule, then asks `has_owner`, and returns on the
-/// first `Ok(true)`. Otherwise waits for the next sign that bluetoothd may be
-/// back ([`next_bluez_owner`]) or `recheck`, whichever comes first, and asks
-/// again.
+/// Sleeps `backoff`, then subscribes (`subscribe`, which takes the receiver
+/// too), waits for the bus to have the match rule, then asks `has_owner`,
+/// and returns on the first `Ok(true)`. Otherwise waits for the next sign
+/// that bluetoothd may be back ([`next_bluez_owner`]) or `recheck`,
+/// whichever comes first, and asks again.
 async fn wait_for_bluez_with<H, S, A, F>(
+    backoff: std::time::Duration,
     subscribe: impl FnOnce() -> (H, S),
     has_owner: A,
     recheck: std::time::Duration,
@@ -413,6 +475,7 @@ async fn wait_for_bluez_with<H, S, A, F>(
     A: Fn() -> F,
     F: Future<Output = Result<bool, BusError>>,
 {
+    tokio::time::sleep(backoff).await;
     // The handle has to outlive the loop: its stream ends when the last
     // handle goes.
     let ((_owner_sub, mut items), mut answer) =
@@ -504,7 +567,8 @@ const RESYNC_WAKE_QUEUE: usize = 8;
 /// the one that runs, plus one for whatever arrives while it runs.
 ///
 /// [`arm_once_subscribed`] arms it once too, when every subscription is in
-/// place (#1551).
+/// place (#1551), and once before that if they take longer than
+/// [`FOLD_RULES_DEADLINE`] (#1651 review).
 ///
 /// The shape is `networkd_nm`'s wake channel (`DeviceWatches`'s `wake_tx` and
 /// the watcher's `while wake_rx.try_recv().is_ok() {}` drain), which is why
@@ -661,23 +725,47 @@ impl<H: Handshake> Handshake for FoldSubscriptions<H> {
 /// resync is what subscribes the snapshot's devices, one `GetAll` per known
 /// device once its rule is in place.
 ///
-/// The wait has no deadline: with the bus down it waits for it, and a bus
-/// that refuses one of these three `AddMatch`es never lets it end, with that
-/// subscription's one `warn!` in the journal (`hytte-bus`'s `subscribed()`,
-/// "Liveness"). That holds up this resync and nothing else (#1647 review,
-/// R5): the fold reads the owner stream and the rules the bus did install
-/// meanwhile, so bluetoothd exiting still ends the watch. Until then the fold
-/// started only once this wait was over, so one refused rule left the old
-/// device list and `Powered: true` on screen with bluetoothd's exit unseen.
-/// What a refused rule still costs is the snapshot's devices' live updates:
-/// they are subscribed by this resync, so they wait for a marker's.
+/// The wait runs beside the fold (#1647 review, R5): the fold reads the owner
+/// stream and the rules the bus did install meanwhile, so bluetoothd exiting
+/// ends the watch whatever this wait is doing. Until then the fold started
+/// only once this wait was over, so one refused rule left the old device
+/// list and `Powered: true` on screen with bluetoothd's exit unseen.
+///
+/// If a rule is still missing after [`FOLD_RULES_DEADLINE`], one resync is
+/// armed anyway, with a `warn!`, and the wait goes on: the resync once every
+/// rule is in still follows (#1651 review). This resync is the only thing
+/// that subscribes the snapshot's devices and repairs an emission made
+/// before the installed rules landed. Without the deadline, a rule the bus
+/// refuses for good left those devices with no live updates for the whole
+/// watch: a headset that connected kept its "disconnected" row. (`hytte-bus`
+/// retries a refused `AddMatch` on its ramp, so a passing refusal heals by
+/// itself.) Firing early costs one more `GetManagedObjects`, which the fold
+/// is built to take. With the bus down, the overdue resync fails and ends
+/// the watch into the supervised loop's backoff, as any failed resync does.
 async fn arm_once_subscribed<H: Handshake>(
     subscriptions: &FoldSubscriptions<H>,
     resync: &ResyncWake,
 ) {
-    subscriptions.subscribed().await;
+    if tokio::time::timeout(FOLD_RULES_DEADLINE, subscriptions.subscribed())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            deadline = ?FOLD_RULES_DEADLINE,
+            "bluetooth: a fold subscription is still not installed; re-syncing without it"
+        );
+        arm_resync(resync, "fold subscriptions overdue");
+        subscriptions.subscribed().await;
+    }
     arm_resync(resync, "every fold subscription installed");
 }
+
+/// How long [`arm_once_subscribed`] waits for the fold's three top-level
+/// rules before it arms a resync without the missing one. Each is an
+/// `AddMatch` round trip that takes milliseconds; this is far past that on a
+/// loaded box, and short enough that the panel's devices are live a few
+/// seconds into a watch whose rule the bus refuses.
+const FOLD_RULES_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Shared reaction to one item from any of bluetooth's three top-level
 /// signal subscriptions (`InterfacesAdded`, `InterfacesRemoved`, adapter
@@ -778,7 +866,8 @@ where
     ));
     let end = tokio::select! {
         end = fold.as_mut() => end,
-        // Armed: the fold goes on alone. Never, with a refused rule.
+        // Armed: the fold goes on alone. Never, with a refused rule (whose
+        // overdue resync it has armed by then).
         () = arm_once_subscribed(&subscriptions, &resync_tx) => fold.await,
     };
     // The three streams end when their last handle goes, so the handles have
@@ -1569,6 +1658,7 @@ mod tests {
     use super::*;
     use hytte_bus::SignalEvent;
     use std::cell::{Cell, RefCell};
+    use std::time::Duration;
 
     /// A forwarder handed no handshake, so it never asks for a re-read.
     const NO_REREAD: Option<std::future::Ready<()>> = None;
@@ -1601,7 +1691,8 @@ mod tests {
     /// read again, and an emission between the snapshot and the rules was
     /// lost. No device rule is waited for (#1647 review): that resync
     /// subscribes the devices, and each reads its own device again. The wait
-    /// runs beside the fold (`event_loop`), which R5 in `real_bus` pins.
+    /// runs beside the fold (`event_loop`), which `real_bus`'s `r5_refused_*`
+    /// pin.
     ///
     /// **Falsification:** drop the wait from `arm_once_subscribed`, or the
     /// loop in `FoldSubscriptions`' `subscribed`, and rules go missing from
@@ -1654,6 +1745,7 @@ mod tests {
         tokio::time::timeout(
             BLUEZ_RECHECK,
             wait_for_bluez_with(
+                Duration::ZERO,
                 || {
                     log.borrow_mut().push(("subscribe", false));
                     let rule = Recording {
@@ -1701,6 +1793,7 @@ mod tests {
         let log = RefCell::new(Vec::new());
 
         wait_for_bluez_with(
+            Duration::ZERO,
             || {
                 let rule = Recording {
                     log: &log,
@@ -1720,6 +1813,131 @@ mod tests {
 
         assert_eq!(asked.get(), 3, "a no, a failure, then the yes");
         assert_eq!(started.elapsed(), BLUEZ_RECHECK * 2);
+    }
+
+    /// The supervised loop's backoff is slept **before** the wait for an
+    /// owner, not after it (#1651 review). `listen`'s snapshot follows the
+    /// wait at once, so the owner the wait saw is milliseconds old when the
+    /// snapshot goes out. Slept after the owner was seen, as until then, the
+    /// backoff (up to 30 s) was a window in which a bluetoothd stopped
+    /// meanwhile was started again by that snapshot.
+    ///
+    /// **Falsification:** sleep the backoff once the owner is seen (the old
+    /// order: the wait, then the sleep) and the subscription and the
+    /// question move to the start; drop the sleep and they move there too.
+    #[tokio::test(start_paused = true)]
+    async fn waiting_for_bluez_backs_off_before_it_asks() {
+        const BACKOFF: Duration = Duration::from_secs(4);
+        let started = tokio::time::Instant::now();
+        let (wake, _wakes) = tokio::sync::mpsc::channel::<()>(RESYNC_WAKE_QUEUE);
+        let rules = RefCell::new(Vec::new());
+        let asked = RefCell::new(Vec::new());
+
+        wait_for_bluez_with(
+            BACKOFF,
+            || {
+                asked.borrow_mut().push(("subscribe", started.elapsed()));
+                let rule = Recording {
+                    log: &rules,
+                    name: "owner rule installed",
+                    armed: &wake,
+                };
+                (rule, futures_util::stream::pending::<SignalItem>())
+            },
+            || {
+                asked.borrow_mut().push(("NameHasOwner", started.elapsed()));
+                async { Ok(true) }
+            },
+            BLUEZ_RECHECK,
+        )
+        .await;
+
+        assert_eq!(
+            asked.into_inner(),
+            [("subscribe", BACKOFF), ("NameHasOwner", BACKOFF)],
+            "the owner is looked for only once the backoff is over"
+        );
+        assert_eq!(
+            started.elapsed(),
+            BACKOFF,
+            "and the wait ends as soon as the bus says yes"
+        );
+    }
+
+    /// A rule that lands when its sender says so, or never.
+    struct Lands(tokio::sync::watch::Receiver<bool>);
+
+    impl Handshake for Lands {
+        fn subscribed(&self) -> impl Future<Output = ()> {
+            let mut landed = self.0.clone();
+            async move {
+                landed
+                    .wait_for(|landed| *landed)
+                    .await
+                    .expect("the test holds every rule's sender");
+            }
+        }
+    }
+
+    /// A top-level rule still missing at `FOLD_RULES_DEADLINE` does not hold
+    /// the first resync back for good (#1651 review): one is armed then,
+    /// without that rule, and one more once it lands. That resync is what
+    /// subscribes the snapshot's devices, so a rule the bus refused for good
+    /// used to leave every one of them without live updates for the whole
+    /// watch. `real_bus`'s `r5_refused_*` see the overdue resync reach a real
+    /// broker.
+    ///
+    /// **Falsification:** drop the deadline (await the rules alone, the old
+    /// `arm_once_subscribed`) and nothing is armed at it; arm before it and
+    /// the wake shows early; leave out the arm after the rules and the
+    /// landed rule arms nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_rule_missing_at_the_deadline_gets_a_resync_without_it() {
+        const TICK: Duration = Duration::from_millis(1);
+        let (wake, mut wakes) = tokio::sync::mpsc::channel::<()>(RESYNC_WAKE_QUEUE);
+        let (_installed, installed) = tokio::sync::watch::channel(true);
+        let (land, refused) = tokio::sync::watch::channel(false);
+        let subscriptions = FoldSubscriptions {
+            added: Lands(installed.clone()),
+            removed: Lands(refused),
+            adapter: Lands(installed),
+        };
+        let mut arm = std::pin::pin!(arm_once_subscribed(&subscriptions, &wake));
+
+        assert!(futures_util::FutureExt::now_or_never(arm.as_mut()).is_none());
+        tokio::time::advance(
+            FOLD_RULES_DEADLINE
+                .checked_sub(TICK)
+                .expect("the deadline is longer than a tick"),
+        )
+        .await;
+        tokio::task::yield_now().await;
+        assert!(
+            futures_util::FutureExt::now_or_never(arm.as_mut()).is_none(),
+            "a rule is missing"
+        );
+        assert!(
+            wakes.try_recv().is_err(),
+            "nothing is armed before the deadline"
+        );
+
+        tokio::time::advance(TICK).await;
+        tokio::task::yield_now().await;
+        assert!(
+            futures_util::FutureExt::now_or_never(arm.as_mut()).is_none(),
+            "past the deadline it still waits for the missing rule"
+        );
+        assert!(wakes.try_recv().is_ok(), "one resync at the deadline");
+        assert!(wakes.try_recv().is_err(), "exactly one");
+
+        land.send(true).expect("the wait holds the rule's receiver");
+        assert_eq!(
+            futures_util::FutureExt::now_or_never(arm.as_mut()),
+            Some(()),
+            "the wait is over once the rule is in"
+        );
+        assert!(wakes.try_recv().is_ok(), "one more resync once it landed");
+        assert!(wakes.try_recv().is_err(), "exactly one more");
     }
 
     // ── #1551: the fold's merge, against a resync and its replays ───────────

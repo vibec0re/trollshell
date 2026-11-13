@@ -344,7 +344,11 @@ async fn spawn_daemon(config: &Path) -> Child {
         .arg("--print-address=1")
         .arg("--nofork")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        // Nothing reads it, and a pipe nobody reads blocks the broker once it
+        // is full: an activating broker ([`ephemeral_bus_activating`]) writes
+        // about 250 B per activation, so some 130 would wedge it (#1651
+        // review).
+        .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()
         .expect("spawn dbus-daemon — install package `dbus` if missing");

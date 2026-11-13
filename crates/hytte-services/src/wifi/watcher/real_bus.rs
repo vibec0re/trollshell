@@ -198,7 +198,7 @@ fn managed_objects(station: &Props) -> HashMap<OwnedObjectPath, Ifaces> {
         (
             OwnedObjectPath::try_from(ADAPTER).expect("a path"),
             HashMap::from([(
-                "net.connman.iwd.Adapter1".to_owned(),
+                "net.connman.iwd.Adapter".to_owned(),
                 HashMap::from([
                     ("Powered".to_owned(), v(true)),
                     ("Name".to_owned(), v("phy0")),

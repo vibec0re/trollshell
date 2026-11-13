@@ -26,7 +26,7 @@ pub struct Station {
     pub connected_ssid: Option<String>,
 }
 
-/// Snapshot of the iwd Adapter (`net.connman.iwd.Adapter1`).
+/// Snapshot of the iwd Adapter (`net.connman.iwd.Adapter`).
 #[derive(Clone, Debug, Default)]
 pub struct Adapter {
     /// D-Bus object path, e.g. `"/net/connman/iwd/0"`.

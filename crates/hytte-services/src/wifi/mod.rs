@@ -127,7 +127,7 @@ impl IwdPaths {
         self.station.read().await.clone()
     }
 
-    /// The current `net.connman.iwd.Adapter1` object path, or empty before
+    /// The current `net.connman.iwd.Adapter` object path, or empty before
     /// discovery.
     pub(super) async fn adapter_path(&self) -> String {
         self.adapter.read().await.clone()
@@ -1305,7 +1305,7 @@ pub fn disconnect() {
 
 /// Fire-and-forget: set the radio powered state.
 ///
-/// For iwd, sets `Powered` on the `Adapter1` object.
+/// For iwd, sets `Powered` on the `Adapter` object.
 /// For `NetworkManager`, sets `WirelessEnabled` on the manager.
 pub fn set_powered(on: bool) {
     match get_backend() {
@@ -1571,7 +1571,7 @@ async fn do_set_powered(adapter_path: &str, on: bool) -> Result<(), hytte_bus::B
         .at_path(adapter_path.to_string())
         .iface("org.freedesktop.DBus.Properties")
         .method("Set")
-        .args(("net.connman.iwd.Adapter1", "Powered", value))
+        .args((parse::IWD_ADAPTER_IFACE, "Powered", value))
         .send::<()>()
         .await
 }

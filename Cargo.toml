@@ -223,6 +223,10 @@ serde = { version = "1", features = ["derive"] }
 serde_ignored = "0.1.14"
 serde_json = "1"
 tempfile = "3"
+# Safe `socket(2)`/`connect(2)` with the options set before the call; the niri
+# plugin's kernel-bounded connect (#1560). Already in the lockfile through
+# tokio, so it adds no resolved package.
+socket2 = "0.6"
 # Drift this centralizes: 1.40 (plugin side) vs 1.52.1 (shell side) — the
 # lockfile already unified to one resolved version, this just makes the
 # manifests stop lying about it. Feature lists vary too much per consumer to

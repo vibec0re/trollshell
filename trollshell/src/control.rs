@@ -230,13 +230,16 @@ impl ControlIface {
     /// A declared plugin whose unit is still stopping (`deactivating`, e.g. a
     /// `StopPlugin` a moment ago) is launched once the unit is gone, so the
     /// answer can take up to the launcher's 12 s stop wait (#1417 follow-up).
-    /// If the unit still holds its name when that wait runs out (still
-    /// stopping, or stopped with a process left in it), the call fails, but a
-    /// plugin switched on whose unit the launcher started is launched by the
+    /// If the unit still holds its name when that wait runs out, or is
+    /// already stopped with a process left in it (answered at once, since no
+    /// wait frees that name: #1555 follow-up), the call fails, but a plugin
+    /// switched on whose unit the launcher started is launched by the
     /// launcher once the unit is gone (#1555 bullet 6), as after a
     /// [`restart_plugin`](Self::restart_plugin) answering `still-stopping`:
     /// that is once its last process has exited, which a process stuck on a
-    /// hung mount may never do, and until then this call is refused. This call
+    /// hung mount may never do, and until then this call fails the same way.
+    /// The same holds when the launch after that wait is refused because the
+    /// unit still holds its name (a listing failed during the wait). This call
     /// sends the unit no stop, so if systemd brings it back up meanwhile
     /// (`Restart=` after a crash) it runs its previous launch's environment;
     /// the launcher then stops it and launches the plugin from the current
@@ -246,8 +249,8 @@ impl ControlIface {
     /// # Errors
     /// Unknown/invalid id, a unit that is already running, a unit still
     /// holding its name when that wait ran out, a stopped unit that still
-    /// holds its name because a process is left in it (refused at once, not
-    /// waited for), or an unreachable user manager — see
+    /// holds its name because a process is left in it (answered at once, not
+    /// waited for, and owed as above), or an unreachable user manager — see
     /// [`plugin_launcher::start`].
     async fn start_plugin(&self, id: String) -> zbus::fdo::Result<()> {
         plugin_launcher::start(&id)
@@ -427,24 +430,31 @@ impl ControlIface {
     ///
     /// - `"relaunched"` — it was running, and now runs with the saved values;
     /// - `"not-running"` — declared but stopped: nothing was started, and the
-    ///   values apply at its next start;
+    ///   values apply at its next start. A switched-on plugin whose stopped
+    ///   unit of the launcher's still holds its name is `"still-stopping"`
+    ///   instead (#1555 follow-up);
     /// - `"not-declared"` — a hand-installed static unit, which the launcher
     ///   does not launch and which never reads the file: left alone;
     /// - `"switched-off"` — declared and running, but switched off (#1417
     ///   item 1b): nothing was relaunched, a unit the launcher started was
     ///   stopped, and the values apply when the plugin is next started. A
     ///   switch flipped off while this call waited is what reaches it.
-    /// - `"still-stopping"` — declared, running and switched on, but its unit,
-    ///   which the launcher started, did not stop within 12 s (#1417 item 1):
-    ///   nothing was relaunched and nothing started the old unit again, so the
-    ///   plugin is down once its stuck process exits. The launcher then owes
-    ///   it a launch (#1555 bullet 6): its `plugins.json` watch looks at the
-    ///   unit on every tick and, once it is gone, runs one ordinary reconcile,
+    /// - `"still-stopping"` — declared and switched on, and its unit, which
+    ///   the launcher started, still holds its name, because a process in it
+    ///   has not exited: a running plugin's unit did not stop within 12 s
+    ///   (#1417 item 1), or stopped with a process left in it, or its
+    ///   relaunch was refused while it still held the name (a listing failed
+    ///   during the wait); or, since the #1555 follow-up, the plugin is not
+    ///   running and its stopped unit is held so. Nothing was relaunched and
+    ///   nothing started the old unit again, so the plugin is down once its
+    ///   stuck process exits. The launcher then owes it a launch (#1555
+    ///   bullet 6): its `plugins.json` watch looks at the unit on every tick
+    ///   and, once it is gone, runs one ordinary reconcile,
     ///   which launches the plugin with the values saved by then if it is
     ///   still declared and switched on. Nobody has to start it by hand.
     ///   systemd keeps the unit, and its name, until its last process has
     ///   exited, `inactive` or `failed` included, so the switch's start (a
-    ///   `systemd-run` under that name) is refused until then. A
+    ///   `systemd-run` under that name) fails until then. A
     ///   `systemctl --user start` of the stopped unit is not: systemd starts
     ///   the old unit again, stuck process and all, and once the launcher has
     ///   seen the unit stopped it lets that run, no longer owed, on the values

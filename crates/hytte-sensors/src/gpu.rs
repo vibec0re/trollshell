@@ -235,9 +235,12 @@ pub const NVIDIA_SMI_DEADLINE: Duration = Duration::from_secs(2);
 /// slow first call finish.
 ///
 /// The cost: until the first reading, each attempt can block its caller this
-/// long. On a driver that never answers, every attempt does (one per retry
-/// backoff, [`NVIDIA_BACKOFF_INITIAL`] up to [`NVIDIA_BACKOFF_MAX`]). A call
-/// that runs out this deadline is killed and reaped like any other.
+/// long. On a driver that never answers, every attempt does. The retry
+/// backoff ([`NVIDIA_BACKOFF_INITIAL`] up to [`NVIDIA_BACKOFF_MAX`]) is
+/// counted from when such an attempt *returns*, so each stall is followed by
+/// at least one full backoff of live readings rather than by a gate that
+/// opened while the call ran (#1643 review). A call that runs out this
+/// deadline is killed and reaped like any other.
 pub const NVIDIA_SMI_FIRST_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Set once any `nvidia-smi` call in this process has returned a reading,
@@ -258,6 +261,11 @@ fn nvidia_smi_deadline(answered_before: bool) -> Duration {
 /// First retry delay after a transient `nvidia-smi` failure (timeout,
 /// non-zero exit, unparseable output). Doubles per consecutive failure up to
 /// [`NVIDIA_BACKOFF_MAX`], and resets on the first success.
+///
+/// Each delay is counted from the moment the failed call **returned**, not
+/// from when it started: a call that ran out a 10 s
+/// [`NVIDIA_SMI_FIRST_DEADLINE`] would otherwise come back to a 5 s gate
+/// that had already opened, and retry at once.
 pub const NVIDIA_BACKOFF_INITIAL: Duration = Duration::from_secs(5);
 
 /// Ceiling of the `nvidia-smi` retry backoff: a GPU that stays broken costs
@@ -309,9 +317,10 @@ fn parse_nvidia_csv(s: &str) -> Option<GpuState> {
 /// until the kernel lets it go. How fast new ones can arrive depends on the
 /// caller:
 ///
-/// - On the retry backoff alone, at most one per backoff
-///   ([`NVIDIA_BACKOFF_INITIAL`] doubling to [`NVIDIA_BACKOFF_MAX`]), so 64
-///   means about 4.8 h of continuous failures (5 + 10 + ... + 160 s, then
+/// - On the retry backoff alone, at most one per backoff plus the killed
+///   call's own deadline ([`NVIDIA_BACKOFF_INITIAL`] doubling to
+///   [`NVIDIA_BACKOFF_MAX`], counted from when the call returned), so 64
+///   means at least 4.8 h of continuous failures (5 + 10 + ... + 160 s, then
 ///   57 x 300 s).
 /// - [`GpuCache::forget_readings`] clears that backoff, and
 ///   `hytte-plugin-stats` calls it (`Sampler::reset`) when its sidebar
@@ -601,9 +610,12 @@ pub struct GpuCache {
     /// caller's own park/unpark edge.
     pub(super) nvidia_last: Option<(GpuState, Instant)>,
     /// Retry gate after a *transient* `nvidia-smi` failure: do not fork again
-    /// before `.0`; `.1` is the delay that produced it (the next consecutive
-    /// failure doubles it, capped at [`NVIDIA_BACKOFF_MAX`]). `None` while
-    /// calls succeed or none has failed yet.
+    /// before `.0`, which is `.1` after the instant the failed call
+    /// *returned* (unlike [`nvidia_last`](Self::nvidia_last)'s instant, which
+    /// is when its fork started); `.1` is the delay that produced it (the
+    /// next consecutive failure doubles it, capped at
+    /// [`NVIDIA_BACKOFF_MAX`]). `None` while calls succeed or none has failed
+    /// yet.
     pub(super) nvidia_backoff: Option<(Instant, Duration)>,
 }
 
@@ -634,9 +646,9 @@ impl GpuCache {
 /// Isolated from the composed function (and from `Instant::now()`/
 /// `nvidia-smi` directly) purely for testability: the AMD and Intel arms are
 /// sysfs reads a test can't hermetically fake without touching `/sys`, but
-/// this arm's only external calls are the injected `now` and `read` — see
-/// this module's tests for the counting-fake-reader cases the issue asked
-/// for.
+/// this arm's only external calls are the injected `now`, `read` and
+/// `ended` — see this module's tests for the counting-fake-reader cases the
+/// issue asked for.
 ///
 /// Availability semantics of `cache.nvidia_available`: `None` probes,
 /// `Some(false)` never forks again, and since this fix `Some(false)` is set
@@ -649,10 +661,18 @@ impl GpuCache {
 /// without a bar instance (which cannot park) forking at 1 Hz meanwhile.
 /// The `Some(true)` arm forks only when [`NVIDIA_READING_TTL`] has elapsed
 /// since the last successful reading, and otherwise returns a clone of it.
+///
+/// Two clocks, because a call can take up to [`NVIDIA_SMI_FIRST_DEADLINE`]:
+/// `now` is the instant the call *starts*. The TTL and the retry gate are
+/// checked against it, and a reading's `sampled_at` is it (see
+/// [`GpuCache::nvidia_last`]). `ended` is read once, after a transient
+/// failure, and the next retry gate is counted from it, so a backoff never
+/// runs out while the call it follows is still running (#1643 review).
 fn read_nvidia_with_cache_at(
     cache: GpuCache,
     now: Instant,
     read: impl FnOnce() -> Result<GpuState, NvidiaFailure>,
+    ended: impl FnOnce() -> Instant,
 ) -> (Option<GpuState>, GpuCache) {
     let nv_available = cache.nvidia_available.unwrap_or(true); // unknown → optimistically try once
     if !nv_available {
@@ -729,7 +749,7 @@ fn read_nvidia_with_cache_at(
                     nvidia_available: cache.nvidia_available,
                     intel_rc6_prev: None,
                     nvidia_last: None,
-                    nvidia_backoff: Some((now + delay, delay)),
+                    nvidia_backoff: Some((ended() + delay, delay)),
                 },
             )
         }
@@ -756,20 +776,26 @@ pub fn read_gpu_with_cache(cache: GpuCache) -> (Option<GpuState>, GpuCache) {
         read_amd_gpu,
         read_intel_gpu,
         read_nvidia_gpu,
+        // Read after the call, not the `now` above: a backoff counts from
+        // when the failed call returned.
+        Instant::now,
     )
 }
 
-/// [`read_gpu_with_cache`] over an injected clock and injected probe arms —
+/// [`read_gpu_with_cache`] over injected clocks and injected probe arms —
 /// the seam that makes the *composition* (which arm the cache is handed to,
 /// in what order) testable, not just the Nvidia arm's TTL in isolation
 /// (#1297 review MEDIUM 2). The public function above is the one-line real
-/// wiring: `Instant::now()` plus the three real `read_*` functions.
+/// wiring: `Instant::now()` as `now`, `Instant::now` itself as `ended`, and
+/// the three real `read_*` functions. `now` and `ended` mean what they do in
+/// [`read_nvidia_with_cache_at`], which is the only arm that reads `ended`.
 fn read_gpu_with_cache_at(
     cache: GpuCache,
     now: Instant,
     amd: impl FnOnce() -> Option<GpuState>,
     intel: impl FnOnce(Option<(u64, Instant)>) -> Option<(GpuState, Option<(u64, Instant)>)>,
     nvidia: impl FnOnce() -> Result<GpuState, NvidiaFailure>,
+    ended: impl FnOnce() -> Instant,
 ) -> (Option<GpuState>, GpuCache) {
     // AMD sysfs reads don't need caching — `read_amd_gpu` only walks
     // `/sys/class/drm` and exits on the first AMD card it finds.
@@ -802,7 +828,7 @@ fn read_gpu_with_cache_at(
 
     // No AMD or Intel GPU. Nvidia arm carries its own reading-TTL throttle —
     // and, critically, gets the CALLER's cache, not a fresh default one.
-    read_nvidia_with_cache_at(cache, now, nvidia)
+    read_nvidia_with_cache_at(cache, now, nvidia, ended)
 }
 
 #[cfg(test)]
@@ -909,12 +935,24 @@ mod tests {
         }
     }
 
+    /// [`read_nvidia_with_cache_at`] for a `read` that takes no time: the
+    /// call ends at the instant it starts. The tests of the TTL and of the
+    /// gate's arithmetic use it; the ones about how long a call ran pass
+    /// their own `ended`.
+    fn read_nvidia_instantly(
+        cache: GpuCache,
+        now: Instant,
+        read: impl FnOnce() -> Result<GpuState, NvidiaFailure>,
+    ) -> (Option<GpuState>, GpuCache) {
+        read_nvidia_with_cache_at(cache, now, read, || now)
+    }
+
     #[test]
     fn nvidia_reading_ttl_collapses_repeated_calls_to_one_fork() {
         let fork_count = Cell::new(0u32);
         let t0 = Instant::now();
 
-        let (first, cache) = read_nvidia_with_cache_at(GpuCache::default(), t0, || {
+        let (first, cache) = read_nvidia_instantly(GpuCache::default(), t0, || {
             fork_count.set(fork_count.get() + 1);
             Ok(fake_reading("fake nvidia"))
         });
@@ -929,7 +967,7 @@ mod tests {
         // window, must all be served the cached reading with no further fork.
         for step in 1..=5u64 {
             let now = t0 + Duration::from_millis(step * 80); // up to 400ms, well under the 1.5s TTL
-            let (state, _) = read_nvidia_with_cache_at(cache.clone(), now, || {
+            let (state, _) = read_nvidia_instantly(cache.clone(), now, || {
                 fork_count.set(fork_count.get() + 1);
                 Ok(fake_reading("should not be forked"))
             });
@@ -958,16 +996,15 @@ mod tests {
     fn forks_after(after_ms: u64) -> bool {
         let fork_count = Cell::new(0u32);
         let t0 = Instant::now();
-        let (_, cache) = read_nvidia_with_cache_at(GpuCache::default(), t0, || {
+        let (_, cache) = read_nvidia_instantly(GpuCache::default(), t0, || {
             fork_count.set(fork_count.get() + 1);
             Ok(fake_reading("first"))
         });
         assert_eq!(fork_count.get(), 1);
-        let (state, _) =
-            read_nvidia_with_cache_at(cache, t0 + Duration::from_millis(after_ms), || {
-                fork_count.set(fork_count.get() + 1);
-                Ok(fake_reading("second"))
-            });
+        let (state, _) = read_nvidia_instantly(cache, t0 + Duration::from_millis(after_ms), || {
+            fork_count.set(fork_count.get() + 1);
+            Ok(fake_reading("second"))
+        });
         let forked = fork_count.get() == 2;
         let want = if forked { "second" } else { "first" };
         assert_eq!(state.as_ref().map(|s| s.name.as_str()), Some(want));
@@ -1004,14 +1041,14 @@ mod tests {
         let fork_count = Cell::new(0u32);
         let t0 = Instant::now();
 
-        let (_, cache) = read_nvidia_with_cache_at(GpuCache::default(), t0, || {
+        let (_, cache) = read_nvidia_instantly(GpuCache::default(), t0, || {
             fork_count.set(fork_count.get() + 1);
             Ok(fake_reading("first"))
         });
         assert_eq!(fork_count.get(), 1);
 
         // Landing exactly on the TTL boundary must no longer be "inside" it.
-        let (state, _) = read_nvidia_with_cache_at(cache, t0 + NVIDIA_READING_TTL, || {
+        let (state, _) = read_nvidia_instantly(cache, t0 + NVIDIA_READING_TTL, || {
             fork_count.set(fork_count.get() + 1);
             Ok(fake_reading("second"))
         });
@@ -1036,7 +1073,7 @@ mod tests {
             nvidia_last: Some((fake_reading("stale"), t0)),
             nvidia_backoff: None,
         };
-        let (state, cache) = read_nvidia_with_cache_at(seeded, t0 + NVIDIA_READING_TTL, || {
+        let (state, cache) = read_nvidia_instantly(seeded, t0 + NVIDIA_READING_TTL, || {
             Err(NvidiaFailure::NotInstalled)
         });
         assert!(
@@ -1061,7 +1098,7 @@ mod tests {
             Err(NvidiaFailure::Transient)
         };
 
-        let (state, cache) = read_nvidia_with_cache_at(GpuCache::default(), t0, fail);
+        let (state, cache) = read_nvidia_instantly(GpuCache::default(), t0, fail);
         assert!(state.is_none());
         assert_ne!(
             cache.nvidia_available,
@@ -1071,14 +1108,13 @@ mod tests {
         assert_eq!(forks.get(), 1);
 
         // Inside the 5 s gate: no fork.
-        let (state, cache) =
-            read_nvidia_with_cache_at(cache, t0 + Duration::from_millis(4_999), fail);
+        let (state, cache) = read_nvidia_instantly(cache, t0 + Duration::from_millis(4_999), fail);
         assert!(state.is_none());
         assert_eq!(forks.get(), 1, "forked inside the backoff window");
 
         // At the gate: forks again, fails again, the delay doubles.
         let t1 = t0 + NVIDIA_BACKOFF_INITIAL;
-        let (_, cache) = read_nvidia_with_cache_at(cache, t1, fail);
+        let (_, cache) = read_nvidia_instantly(cache, t1, fail);
         assert_eq!(forks.get(), 2);
         assert_eq!(
             cache.nvidia_backoff,
@@ -1088,7 +1124,7 @@ mod tests {
         // Recovery: the driver is back, the next due fork succeeds and the
         // gate clears.
         let t2 = t1 + 2 * NVIDIA_BACKOFF_INITIAL;
-        let (state, cache) = read_nvidia_with_cache_at(cache, t2, || Ok(fake_reading("recovered")));
+        let (state, cache) = read_nvidia_instantly(cache, t2, || Ok(fake_reading("recovered")));
         assert_eq!(state.as_ref().map(|s| s.name.as_str()), Some("recovered"));
         assert_eq!(cache.nvidia_available, Some(true));
         assert!(cache.nvidia_backoff.is_none());
@@ -1098,11 +1134,11 @@ mod tests {
     fn forget_readings_clears_the_retry_gate() {
         let t0 = Instant::now();
         let (_, mut cache) =
-            read_nvidia_with_cache_at(GpuCache::default(), t0, || Err(NvidiaFailure::Transient));
+            read_nvidia_instantly(GpuCache::default(), t0, || Err(NvidiaFailure::Transient));
         assert!(cache.nvidia_backoff.is_some());
         cache.forget_readings();
         assert!(cache.nvidia_backoff.is_none());
-        let (state, _) = read_nvidia_with_cache_at(cache, t0, || Ok(fake_reading("back")));
+        let (state, _) = read_nvidia_instantly(cache, t0, || Ok(fake_reading("back")));
         assert!(state.is_some(), "the gate survived a park/unpark");
     }
 
@@ -1111,13 +1147,78 @@ mod tests {
         let mut t = Instant::now();
         let mut cache = GpuCache::default();
         for _ in 0..20 {
-            let (_, next) = read_nvidia_with_cache_at(cache, t, || Err(NvidiaFailure::Transient));
+            let (_, next) = read_nvidia_instantly(cache, t, || Err(NvidiaFailure::Transient));
             let (not_before, delay) = next.nvidia_backoff.expect("transient sets a gate");
             assert!(delay <= NVIDIA_BACKOFF_MAX);
             t = not_before;
             cache = next;
         }
         assert_eq!(cache.nvidia_backoff.map(|b| b.1), Some(NVIDIA_BACKOFF_MAX));
+    }
+
+    /// A retry's backoff is counted from the end of the failed call: a call
+    /// that ran out the 10 s first deadline must not come back to a gate
+    /// that opened while it ran (#1643 review, MEDIUM 1). Counted from the
+    /// start, the 5 s gate had opened 5 s before such a call returned, so
+    /// the caller's next tick forked again at once, and a wedged driver froze
+    /// a 1 Hz card for 30 s without a break.
+    #[test]
+    fn a_backoff_is_counted_from_the_end_of_the_failed_call() {
+        let forks = Cell::new(0u32);
+        let wedged = || {
+            forks.set(forks.get() + 1);
+            Err(NvidiaFailure::Transient)
+        };
+        let t0 = Instant::now();
+        let ended = t0 + NVIDIA_SMI_FIRST_DEADLINE;
+        let (_, mut cache) = read_nvidia_with_cache_at(GpuCache::default(), t0, wedged, || ended);
+        assert_eq!(
+            cache.nvidia_backoff,
+            Some((ended + NVIDIA_BACKOFF_INITIAL, NVIDIA_BACKOFF_INITIAL))
+        );
+
+        // The caller ticks again as soon as the call returns, and on through
+        // the backoff: none of those ticks forks.
+        for after_ms in [0, 1_000, 4_999] {
+            let at = ended + Duration::from_millis(after_ms);
+            let (_, next) = read_nvidia_with_cache_at(cache, at, wedged, || at);
+            cache = next;
+            assert_eq!(
+                forks.get(),
+                1,
+                "a retry forked {after_ms} ms after the failed call returned, inside its backoff"
+            );
+        }
+
+        // A full backoff after the return, the gate opens. That attempt runs
+        // out its deadline too, and its doubled backoff counts from its own
+        // end.
+        let t1 = ended + NVIDIA_BACKOFF_INITIAL;
+        let ended1 = t1 + NVIDIA_SMI_FIRST_DEADLINE;
+        let (_, cache) = read_nvidia_with_cache_at(cache, t1, wedged, || ended1);
+        assert_eq!(forks.get(), 2, "the gate never opened after the backoff");
+        assert_eq!(
+            cache.nvidia_backoff,
+            Some((
+                ended1 + 2 * NVIDIA_BACKOFF_INITIAL,
+                2 * NVIDIA_BACKOFF_INITIAL
+            ))
+        );
+    }
+
+    /// The end clock is for the backoff only. A reading stays stamped with
+    /// the instant its call *started* (see [`GpuCache::nvidia_last`]), even
+    /// when the call took a while.
+    #[test]
+    fn a_reading_is_stamped_with_the_start_of_its_call() {
+        let t0 = Instant::now();
+        let (_, cache) = read_nvidia_with_cache_at(
+            GpuCache::default(),
+            t0,
+            || Ok(fake_reading("slow")),
+            || t0 + Duration::from_secs(3),
+        );
+        assert_eq!(cache.nvidia_last.map(|(_, at)| at), Some(t0));
     }
 
     // ── query_nvidia_smi (real child processes, hermetic scripts) ────────────
@@ -1198,8 +1299,10 @@ mod tests {
 
     // ── the first-call deadline (#1561 bullet 2) ─────────────────────────────
 
-    /// The two values are the maintainer's decision on #1561, so they are
-    /// pinned as literals rather than through the constants.
+    /// The two values are pinned as literals rather than through the
+    /// constants, so changing either one has to change this test. 2 s is the
+    /// existing deadline. 10 s is this PR's own choice (#1643), not a
+    /// decision anyone made on #1561, and is waiting on the owner's read.
     #[test]
     fn the_deadline_is_generous_until_nvidia_smi_first_answers() {
         assert_eq!(nvidia_smi_deadline(false), Duration::from_secs(10));
@@ -1361,12 +1464,7 @@ mod tests {
             "nvidia-smi",
             "sleep 3\necho 'NVIDIA Slow, 50, 10, 100, 1000'",
         );
-        // The stand-in's own `sleep` still has to resolve.
-        let mut path = std::ffi::OsString::from(dir.path());
-        if let Some(inherited) = std::env::var_os("PATH") {
-            path.push(":");
-            path.push(inherited);
-        }
+        let path = path_with_stand_in(dir.path());
         let (stdout, stderr) = run_child(SLOW_FIRST_INNER, Some(&path));
         assert!(
             stdout.contains(CHILD_OK),
@@ -1408,6 +1506,83 @@ mod tests {
         println!("{CHILD_OK}");
     }
 
+    /// `PATH` for a child whose `nvidia-smi` is the stand-in in `dir`. The
+    /// stand-in's own `sleep` still has to resolve through the inherited one.
+    fn path_with_stand_in(dir: &std::path::Path) -> std::ffi::OsString {
+        let mut path = std::ffi::OsString::from(dir);
+        if let Some(inherited) = std::env::var_os("PATH") {
+            path.push(":");
+            path.push(inherited);
+        }
+        path
+    }
+
+    /// Printed by the wrapper child when an AMD or Intel card answered, so
+    /// the Nvidia arm, the only one that reads the end clock, never ran.
+    const NVIDIA_ARM_NOT_REACHED: &str = "gpu-test-child-nvidia-arm-not-reached";
+
+    const WRAPPER_END_CLOCK_INNER: &str =
+        "gpu::tests::the_public_wrapper_counts_the_backoff_from_the_end_of_the_call_inner";
+
+    /// **`read_gpu_with_cache` itself** counts a backoff from when the failed
+    /// call returned. The seam tests above cannot see a wrapper that hands
+    /// the composition its start instant as the end clock (#1643 review).
+    /// Pinned in a re-exec'd child whose `nvidia-smi` is a stand-in that
+    /// fails after 1 s, so the call's start and end are a second apart.
+    ///
+    /// The wrapper probes the real `/sys/class/drm` first. Where an AMD or
+    /// Intel card answers, the Nvidia arm never runs (in production either),
+    /// and this passes without checking anything, saying so on stderr. A
+    /// host with no DRM card or only an Nvidia one, and a build sandbox with
+    /// no `/sys`, reach the Nvidia arm.
+    #[test]
+    fn the_public_wrapper_counts_the_backoff_from_the_end_of_the_call() {
+        let dir = tempfile::tempdir().unwrap();
+        script(dir.path(), "nvidia-smi", "sleep 1\nexit 9");
+        let path = path_with_stand_in(dir.path());
+        let (stdout, stderr) = run_child(WRAPPER_END_CLOCK_INNER, Some(&path));
+        if stdout.contains(NVIDIA_ARM_NOT_REACHED) {
+            eprintln!("skipped: an AMD or Intel card answered first, so the Nvidia arm never ran");
+            return;
+        }
+        assert!(
+            stdout.contains(CHILD_OK),
+            "the child ran nothing\n{stdout}\n{stderr}"
+        );
+    }
+
+    /// The body of
+    /// [`the_public_wrapper_counts_the_backoff_from_the_end_of_the_call`]; a
+    /// no-op outside its child.
+    #[test]
+    fn the_public_wrapper_counts_the_backoff_from_the_end_of_the_call_inner() {
+        if !is_child(WRAPPER_END_CLOCK_INNER) {
+            return;
+        }
+        let before = Instant::now();
+        let (state, cache) = read_gpu_with_cache(GpuCache::default());
+        let after = Instant::now();
+        if state.is_some() {
+            println!("{NVIDIA_ARM_NOT_REACHED}");
+            return;
+        }
+        let (not_before, delay) = cache
+            .nvidia_backoff
+            .expect("the failing stand-in left no retry gate");
+        assert_eq!(delay, NVIDIA_BACKOFF_INITIAL);
+        assert!(
+            not_before >= before + Duration::from_secs(1) + NVIDIA_BACKOFF_INITIAL,
+            "the gate opens {:?} after the call started: it was counted from before \
+             the 1 s call returned",
+            not_before.saturating_duration_since(before)
+        );
+        assert!(
+            not_before <= after + NVIDIA_BACKOFF_INITIAL,
+            "the gate was counted from after the call returned"
+        );
+        println!("{CHILD_OK}");
+    }
+
     #[test]
     fn nvidia_unavailable_never_consults_cached_reading_or_forks() {
         let t0 = Instant::now();
@@ -1420,7 +1595,7 @@ mod tests {
             nvidia_backoff: None,
         };
         let called = Cell::new(false);
-        let (state, new_cache) = read_nvidia_with_cache_at(cache, t0, || {
+        let (state, new_cache) = read_nvidia_instantly(cache, t0, || {
             called.set(true);
             Err(NvidiaFailure::NotInstalled)
         });
@@ -1447,14 +1622,14 @@ mod tests {
     fn a_cache_hit_threads_the_cache_forward() {
         let fork_count = Cell::new(0u32);
         let t0 = Instant::now();
-        let (_, mut cache) = read_nvidia_with_cache_at(GpuCache::default(), t0, || {
+        let (_, mut cache) = read_nvidia_instantly(GpuCache::default(), t0, || {
             fork_count.set(fork_count.get() + 1);
             Ok(fake_reading("fake nvidia"))
         });
 
         for step in 1..=5u64 {
             let now = t0 + Duration::from_millis(step * 80); // up to 400ms, well under the 1.5s TTL
-            let (state, next) = read_nvidia_with_cache_at(cache, now, || {
+            let (state, next) = read_nvidia_instantly(cache, now, || {
                 fork_count.set(fork_count.get() + 1);
                 Ok(fake_reading("should not be forked"))
             });
@@ -1498,6 +1673,7 @@ mod tests {
                 fork_count.set(fork_count.get() + 1);
                 Ok(fake_reading("forked"))
             },
+            || t0 + Duration::from_millis(100),
         );
         assert_eq!(
             fork_count.get(),
@@ -1506,6 +1682,28 @@ mod tests {
         );
         assert_eq!(state.as_ref().map(|s| s.name.as_str()), Some("cached"));
         assert!(cache.nvidia_last.is_some());
+    }
+
+    /// The composed entry point hands the Nvidia arm the caller's end clock,
+    /// not its start instant, so a backoff counts from when the failed call
+    /// returned (#1643 review).
+    #[test]
+    fn composition_passes_the_end_clock_to_the_nvidia_arm() {
+        let t0 = Instant::now();
+        let ended = t0 + NVIDIA_SMI_FIRST_DEADLINE;
+        let (_, cache) = read_gpu_with_cache_at(
+            GpuCache::default(),
+            t0,
+            || None,
+            |_| None,
+            || Err(NvidiaFailure::Transient),
+            || ended,
+        );
+        assert_eq!(
+            cache.nvidia_backoff,
+            Some((ended + NVIDIA_BACKOFF_INITIAL, NVIDIA_BACKOFF_INITIAL)),
+            "the composed fn counted the backoff from the wrong instant"
+        );
     }
 
     /// Probe order AMD → Intel → Nvidia, and an AMD hit never even calls the
@@ -1523,6 +1721,7 @@ mod tests {
                 forked.set(true);
                 Err(NvidiaFailure::Transient)
             },
+            || t0,
         );
         assert_eq!(state.as_ref().map(|s| s.name.as_str()), Some("amd"));
         assert!(!forked.get(), "an AMD box must never fork nvidia-smi");
@@ -1562,7 +1761,7 @@ mod tests {
         // whole point of the seam `Sampler::reset` calls on a park/unpark
         // edge (a stale pre-close reading must never survive the park).
         let now = t0 + Duration::from_millis(50);
-        let (state, _) = read_nvidia_with_cache_at(cache, now, || {
+        let (state, _) = read_nvidia_instantly(cache, now, || {
             fork_count.set(fork_count.get() + 1);
             Ok(fake_reading("fresh"))
         });
@@ -2028,24 +2227,39 @@ mod tests {
     /// `nvidia-smi` child and the reaper thread.
     ///
     /// The failures are real. A soft `RLIMIT_NPROC` of 1 makes every
-    /// `fork`/`clone` fail with `EAGAIN` for any uid that already has a task
-    /// (the kernel counts the uid's tasks against the calling process's
-    /// limit). The limit belongs to one process, though, and lowering it in
-    /// this shared test binary would fail every sibling test that forks. So
-    /// it is lowered in a re-exec'd child that runs only the `_inner` test
-    /// below. Other processes of the same uid keep their own limits: more of
-    /// them only puts the uid further over 1, which changes nothing here.
+    /// `fork`/`clone` fail with `EAGAIN` for any uid that already has a task:
+    /// the kernel adds the task being created to the uid's count
+    /// (`copy_creds`) before it checks `count > limit` against the calling
+    /// process's limit. This child has at least two tasks of its own anyway
+    /// (its main thread and libtest's test thread). The limit belongs to one
+    /// process, though, and lowering it in this shared test binary would
+    /// fail every sibling test that forks. So it is lowered in a re-exec'd
+    /// child that runs only the `_inner` test below. Other processes of the
+    /// same uid keep their own limits: more of them only puts the uid
+    /// further over 1, which changes nothing here.
     ///
     /// The kernel exempts a task with `CAP_SYS_RESOURCE` or `CAP_SYS_ADMIN`
     /// in the initial user namespace (in practice: real root). There the
-    /// child finds it can still start a thread, says so, and this test
-    /// passes without checking anything, saying so on stderr. The nix build
-    /// sandbox runs tests as an unprivileged build user, so the limit binds
-    /// there.
+    /// child finds it can still start a thread and says so. Unset
+    /// `TROLLSHELL_REQUIRE_NPROC`, this test then passes without checking
+    /// anything; its `skipped:` line goes to stderr, which libtest discards
+    /// for a passing test unless run with `--nocapture`, so the skip is
+    /// silent. With `TROLLSHELL_REQUIRE_NPROC=1` it fails instead, on the
+    /// `TROLLSHELL_REQUIRE_GL`/`TROLLSHELL_REQUIRE_TZDATA` precedent.
+    /// `checks.workspace-tests` sets it: the nix build sandbox runs tests as
+    /// an unprivileged build user, so the limit binds there.
     #[test]
     fn spawn_failures_warn_once_per_streak_and_leak_nothing() {
         let (stdout, stderr) = run_child(SPAWN_FAILURE_INNER, None);
         if stdout.contains(NPROC_NOT_ENFORCED) {
+            let required =
+                std::env::var_os("TROLLSHELL_REQUIRE_NPROC").is_some_and(|want| want == "1");
+            assert!(
+                !required,
+                "TROLLSHELL_REQUIRE_NPROC=1, but RLIMIT_NPROC does not bind this uid (root, or \
+                 CAP_SYS_RESOURCE/CAP_SYS_ADMIN in the initial user namespace), so no spawn \
+                 could be made to fail"
+            );
             eprintln!(
                 "skipped: RLIMIT_NPROC does not bind this uid (root?), so no spawn can be \
                  made to fail"

@@ -754,6 +754,13 @@
                 # if it has one). `system-tests` carries its own copy.
                 export TZDIR="${pkgs.tzdata}/share/zoneinfo"
                 export TROLLSHELL_REQUIRE_TZDATA=1
+                # #1643, same switch shape: hytte-sensors' RLIMIT_NPROC
+                # spawn-failure test passes without checking anything where the
+                # limit does not bind (real root), and a passing test's
+                # `skipped:` line never reaches the log. The sandbox's build user
+                # is unprivileged, so the limit binds here and a skip can only
+                # mean the test went vacuous: fail it instead.
+                export TROLLSHELL_REQUIRE_NPROC=1
               '';
               # Leaf/terminal check: nothing consumes its target dir. Same
               # `doInstallCargoArtifacts = false` reasoning as `system-tests`

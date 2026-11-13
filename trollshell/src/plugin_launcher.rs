@@ -2502,6 +2502,17 @@ impl OwedLaunches {
         };
         let refused = err.is::<UnitExists>();
         let owes = (err.is::<StillStopping>() || refused) && enabled && stamped;
+        // A run-out on a unit stopped and still listed (SubState `dead` or
+        // `failed`: [`held_unit`]) has seen it held, as the look would: a
+        // start by hand before the look's next tick then stands (#1555
+        // review, LOW 3).
+        if owes
+            && err
+                .downcast_ref::<StillStopping>()
+                .is_some_and(|s| matches!(s.sub_state.as_str(), "dead" | "failed"))
+        {
+            state.held.insert(id.to_owned());
+        }
         if owes && state.launch.insert(id.to_owned()) {
             if refused {
                 tracing::info!(
@@ -3392,7 +3403,12 @@ fn stopping_unit<'a>(
 /// Plugin `id`'s unit in `units` if this launcher started it
 /// ([`is_stamped`]) and it is stopped but still listed: neither running nor
 /// still stopping ([`blocks_relaunch`]), so `inactive` or `failed`. A
-/// `--collect` unit is listed so only while a process is left in its cgroup,
+/// `--collect` unit is listed so only while a process is left in its cgroup
+/// (or while its own start job is still queued: a fresh launch is listed
+/// `inactive`/`dead` for about 1 to 15 ms before that job runs, which no
+/// reader sees, since every one runs under `CONVERGE_LOCK` and `systemd-run`
+/// without `--no-block` waits for the job; a future `--no-block` would make
+/// every start answer `StillStopping`),
 /// and systemd refuses a launch under its name until that process exits
 /// (#1644 review, MEDIUM 1, measured on systemd 260.5). systemd sends it no
 /// further signal, so no wait of the launcher's frees the name: the
@@ -11893,9 +11909,12 @@ mod tests {
                 .collect::<String>()
         };
         let wrapper = body("pub async fn set_enabled(id: &str, enabled: bool)");
-        assert!(
-            wrapper.contains("set_enabled_via(id,enabled,|on|systemd::set_plugin_enabled(id,on))"),
-            "{wrapper}"
+        // Exact, not `contains`: a stray real call in front of the hand-off
+        // would pass the latter (#1555 review, LOW 4, the review's R9).
+        assert_eq!(
+            wrapper,
+            "pubasyncfnset_enabled(id:&str,enabled:bool)->anyhow::Result<()>{\
+             set_enabled_via(id,enabled,|on|systemd::set_plugin_enabled(id,on)).await"
         );
         let via = body("async fn set_enabled_via<");
         assert!(
@@ -11910,6 +11929,113 @@ mod tests {
             !body("async fn set_enabled_in(").contains("systemd::"),
             "set_enabled_in reaches no user manager"
         );
+    }
+
+    /// **`launch()` hands its failure to [`launch_failed`]** (#1555 review,
+    /// LOW 1): the only thing that types a held name, and no test runs
+    /// `launch()` itself. A source scan.
+    ///
+    /// Falsified by `launch()` building its error inline again (the review's
+    /// R1, green in the hermetic and gated suites).
+    #[test]
+    fn launch_types_its_refusal() {
+        let src = include_str!("plugin_launcher.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests").expect("tests module")];
+        let start = prod.find("async fn launch(\n").expect("launch is defined");
+        let len = prod[start..].find("\n}\n").expect("its body ends");
+        let body: String = prod[start..start + len].split_whitespace().collect();
+        assert!(
+            body.contains(
+                "if!output.status.success(){letstderr=String::from_utf8_lossy(&output.stderr);\
+                 returnErr(launch_failed(id,output.status,stderr.trim()));}"
+            ),
+            "{body}"
+        );
+    }
+
+    /// **A start refused by a unit that was not waited on owes nothing**
+    /// (#1555 review, LOW 2): the direct-launch branch of [`start_via`]
+    /// settles with `stamped = false`, whatever the listing said.
+    ///
+    /// Falsified by that branch passing `true` (the review's R2).
+    #[tokio::test]
+    async fn a_start_refused_with_no_wait_owes_nothing() {
+        let on = spec("/bin/pet", true);
+        for listing in [
+            Some(vec![unit_for("pet", "active", &on)]),
+            Some(Vec::new()),
+            None,
+        ] {
+            let owed = OwedLaunches::new();
+            let shown = listing.clone();
+            let answer = start_via(
+                "pet",
+                || async { Some(declared(&[("pet", on.clone())])) },
+                move || async move { shown.ok_or_else(|| anyhow::anyhow!("no user manager")) },
+                |_| async { panic!("nothing is waited for") },
+                || async { panic!("nothing is stopped") },
+                |_, _| async { Err(refused()) },
+                || async { panic!("a declared plugin is never started from a unit file") },
+                &owed,
+            )
+            .await;
+            assert!(
+                answer.as_ref().is_err_and(anyhow::Error::is::<UnitExists>),
+                "{answer:?}"
+            );
+            assert!(
+                held(&owed).is_empty(),
+                "{listing:?}: owed {:?}",
+                held(&owed)
+            );
+        }
+    }
+
+    /// **A start by hand right after a held answer stands** (#1555 review,
+    /// LOW 3): a start or a Save that met a held unit owes the plugin and
+    /// records that the unit was seen held, so a `systemctl --user start`
+    /// before the look's next tick is not replaced ([`Owed::held`]).
+    ///
+    /// Falsified by [`OwedLaunches::settle`] not recording it.
+    #[tokio::test]
+    async fn a_hand_start_right_after_a_held_answer_stands() {
+        let on = spec("/bin/pet", true);
+        for via_save in [false, true] {
+            let owed = OwedLaunches::new();
+            if via_save {
+                let answer = restart_for_settings_via(
+                    "pet",
+                    || async { Some(declared(&[("pet", on.clone())])) },
+                    || async { Ok(vec![stamped_in("pet", "inactive", "dead")]) },
+                    |_, _, _| async { panic!("not running") },
+                    || async { panic!("switched on") },
+                    &owed,
+                )
+                .await;
+                assert_eq!(answer.expect("answers"), SettingsRestart::StillStopping);
+            } else {
+                let answer = start_via(
+                    "pet",
+                    || async { Some(declared(&[("pet", on.clone())])) },
+                    || async { Ok(vec![stamped_in("pet", "inactive", "dead")]) },
+                    |_| async { panic!("held") },
+                    || async { panic!("held") },
+                    |_, _| async { panic!("held") },
+                    || async { panic!("declared") },
+                    &owed,
+                )
+                .await;
+                assert!(answer.is_err_and(|e| e.is::<StillStopping>()));
+            }
+            assert_eq!(held(&owed), ["pet"], "rail");
+            // `systemctl --user start` of the held unit, before the next look.
+            let due = owed.take_stopped(&[stamped_in("pet", "active", "running")]);
+            assert!(
+                !due && owed.state().replace.is_empty(),
+                "save: {via_save}: the hand start is marked for a replace, whose stop meets the \
+                 stuck process and leaves the plugin down"
+            );
+        }
     }
 
     /// **A start whose returned unit runs out is owed its launch** (#1644

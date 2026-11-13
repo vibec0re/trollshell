@@ -2907,26 +2907,32 @@ const APPLYING: &str = "Saved. Asking the shell to apply it…";
 ///   it is switched on; one that is **on but not running** — it failed, or
 ///   exited, very likely for want of this very setting — would otherwise wait
 ///   for the next login, so the line says how to start it now (#1415 second
-///   review L7).
+///   review L7). That advice is wrong while the plugin's old unit still holds
+///   its name (a process left in it), since the switch cannot start it then,
+///   so the shell answers `still-stopping` in that state instead (#1555
+///   follow-up), and this line is not shown there.
 /// - `switched-off` (#1417 item 6) is a plugin the shell found running but
 ///   switched off (#1424): it was not restarted, and it reads the values when
 ///   it next starts. The shell stopped it if its launcher had started it, and
 ///   left a unit file of its own alone; the answer does not say which, so the
 ///   line claims neither. `enabled` does not enter into it: the shell read
 ///   the switch after any queued toggle, and the tab's poll may be older.
-/// - `still-stopping` (#1417 item 1) is a plugin whose unit did not stop
-///   within the shell's 12 s wait. The shell then relaunches nothing and
-///   starts nothing, so the plugin is down once its stuck process exits.
-///   Since #1555 bullet 6 the shell brings it back by itself: it watches the
-///   unit and, once it is gone, launches the plugin from what is declared
-///   then, if it is still switched on, a shell restarted meanwhile included.
-///   So the line says that, and asks for nothing: the "switch it off and on"
-///   it used to ask for is no longer needed, and a switch flipped on before
-///   the old unit is gone fails (at once, or after the shell's own 12 s
-///   wait), since systemd keeps the unit until its last process has exited.
-///   The line also says that the process may never exit (one stuck on a
-///   hung mount), since then nothing brings the plugin back, the shell or
-///   the switch (#1644 review, MEDIUM 1).
+/// - `still-stopping` (#1417 item 1) is a plugin whose old unit still holds
+///   its name because a process in it has not exited: its stop outlasted the
+///   shell's 12 s wait, or left a process behind, or (#1555 follow-up) it
+///   was not running and its stopped unit was already held so. The shell
+///   then relaunches nothing and starts nothing, so the plugin is down once
+///   its stuck process exits. Since #1555 bullet 6 the shell brings it back
+///   by itself: it watches the unit and, once it is gone, launches the
+///   plugin from what is declared then, if it is still switched on, a shell
+///   restarted meanwhile included. So the line says that, and asks for
+///   nothing: the "switch it off and on" it used to ask for is no longer
+///   needed, and a switch flipped on before the old unit is gone fails (at
+///   once, or after the shell's own 12 s wait), since systemd keeps the unit
+///   until its last process has exited. The line names no wait: the shell
+///   answers a held unit at once. It also says that the process may never
+///   exit (one stuck on a hung mount), since then nothing brings the plugin
+///   back, the shell or the switch (#1644 review, MEDIUM 1).
 fn restart_status(answer: &str, enabled: bool) -> &'static str {
     match answer {
         "relaunched" => "Saved, and the plugin restarted.",
@@ -2940,10 +2946,10 @@ fn restart_status(answer: &str, enabled: bool) -> &'static str {
              the next time it starts."
         }
         "still-stopping" => {
-            "Saved, but the running plugin did not stop within 12 s, so it was not restarted yet. \
-             The shell starts it with the new values by itself once the old process has exited, \
-             if it is still switched on then. Until then it stays down, and a process stuck on a \
-             hung mount may never exit."
+            "Saved, but the plugin's old process has not exited, so it was not restarted yet. The \
+             shell starts it with the new values by itself once the old process has exited, if it \
+             is still switched on then. Until then it stays down, and a process stuck on a hung \
+             mount may never exit."
         }
         "not-declared" => {
             "Saved, but this plugin runs from a unit file of its own, which does not read \
@@ -6103,10 +6109,14 @@ mod tests {
             // gone, so the line says so and no longer asks for the switch.
             // #1644 review, MEDIUM 1: "gone" is once the old process has
             // exited, which one stuck on a hung mount may never do, and the
-            // line does not promise otherwise.
+            // line does not promise otherwise. #1555 follow-up: the answer
+            // also comes for a plugin that was not running, whose old unit
+            // still held its name, so the line says what holds it, not that
+            // a running plugin did not stop.
             let still = super::restart_status("still-stopping", enabled);
             assert!(
-                still.contains("did not stop within 12 s")
+                still.contains("old process has not exited")
+                    && !still.contains("running plugin")
                     && still.contains("not restarted yet")
                     && still.contains("starts it with the new values by itself")
                     && still.contains("once the old process has exited")
@@ -6169,11 +6179,14 @@ mod tests {
         }
     }
 
-    /// #1417 item 1: the `still-stopping` line names the shell's own wait,
-    /// read out of `plugin_launcher.rs`'s `STOP_WAIT` on the source-pin
-    /// precedent above, so the two cannot drift apart unnoticed.
+    /// #1555 follow-up: the `still-stopping` line names **no** wait. It used
+    /// to name the shell's own (#1417 item 1), but the shell now answers it
+    /// at once for an old unit that is stopped but still held by a process,
+    /// and for a plugin that was not running at all, so "within 12 s" would
+    /// be false there. Read out of `plugin_launcher.rs`'s `STOP_WAIT` on the
+    /// source-pin precedent above.
     #[test]
-    fn the_still_stopping_line_names_the_shells_own_wait() {
+    fn the_still_stopping_line_names_no_wait() {
         let launcher = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../trollshell/src/plugin_launcher.rs"
@@ -6183,8 +6196,8 @@ mod tests {
         let secs = &launcher[from..from + launcher[from..].find(')').expect("closes")];
         let line = super::restart_status("still-stopping", true);
         assert!(
-            line.contains(&format!("within {secs} s")),
-            "the shell waits {secs} s: {line}"
+            !line.contains(&format!("{secs} s")),
+            "the shell does not always wait {secs} s: {line}"
         );
     }
 

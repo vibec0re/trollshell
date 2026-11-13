@@ -806,10 +806,11 @@ struct FoldQueues {
 ///    `subscribed()`: "the consumer has to tolerate that replay"). Each kind
 ///    of event does:
 ///    - `PropertiesChanged` (adapter, device, battery) carries absolute
-///      values, and a receiver delivers everything after its first delivered
-///      item until a marker. Every later change to the same property follows
-///      the replayed one on the same receiver, so the state ends at the
-///      newest value; an older one can show until that next item is applied.
+///      values. zbus hands a subscription every matching message it reads
+///      once that subscription's sender is registered, so every later change
+///      to the same property follows the replayed one on the same receiver,
+///      or a marker does. The state ends at the newest value; an older one
+///      can show until that next item is applied.
 ///    - `InterfacesAdded` never overwrites. A device or battery the map
 ///      already has is left as it is ([`Added::Known`]). A device it inserts is
 ///      subscribed with [`Reread::OnceSubscribed`] and read again once that

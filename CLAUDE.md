@@ -334,6 +334,8 @@ inline in `flake.nix` as one-liners.
 
   Since #1595, `checks.workspace-tests` and `system-tests` export `TZDIR` at nixpkgs' `tzdata` (`${pkgs.tzdata}/share/zoneinfo`) in their `preCheck`: the build sandbox has no system zoneinfo, so any test needing libical's builtin zones (`/freeassociation.sourceforge.net/<IANA>`) or a named zone through the real `Local` used to skip in CI and only run on a dev machine. Both also export `TROLLSHELL_REQUIRE_TZDATA=1`, the fail-instead-of-skip switch on the `TROLLSHELL_REQUIRE_GL` precedent: a tzdata-needing test's skip helper must check it and fail with a message naming `TZDIR` rather than skip. No such helper is on main yet (#1594 adds the hytte-ecal rows that need one), so today the switch is exported and documented but read by nothing.
 
+  Since #1643, `checks.workspace-tests` also exports `TROLLSHELL_REQUIRE_NPROC=1`, the same switch for `hytte-sensors`' `spawn_failures_warn_once_per_streak_and_leak_nothing` (`crates/hytte-sensors/src/gpu.rs`): it lowers `RLIMIT_NPROC` to 1 in a re-exec'd child to make `fork`/thread spawns fail with a real `EAGAIN`, and where the limit does not bind (real root, or `CAP_SYS_RESOURCE`/`CAP_SYS_ADMIN` in the initial user namespace) it would otherwise pass without checking anything, with its `skipped:` line swallowed by libtest's capture of a passing test. The sandbox's build user is unprivileged, so the limit binds there; `system-tests` runs the same test without the switch.
+
 Since #1231 the workflow (`.github/workflows/nix-flake-check.yml`) no longer
 runs those checks as one `nix flake check` on one runner. Five of them are
 each a full workspace compile (`packages.trollshell`'s release build off the bin-only

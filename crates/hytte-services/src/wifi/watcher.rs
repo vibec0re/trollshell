@@ -3,7 +3,7 @@
 
 use futures_signals::signal::Mutable;
 use futures_util::{Stream, StreamExt};
-use hytte_bus::{BusKind, SignalEvent, SignalItem, SignalSubscription};
+use hytte_bus::{BusKind, SignalItem, SignalSubscription};
 use std::collections::HashMap;
 use std::time::Duration;
 use zbus::zvariant::OwnedValue;
@@ -18,7 +18,7 @@ use super::parse::{
 };
 use super::types::{Adapter, PromptRequest, Station, WifiNetwork};
 use super::{AGENT_PATH, IwdPaths};
-use crate::handshake::Handshake;
+use crate::handshake::{Handshake, subscribe_then_snapshot};
 use crate::retry;
 
 // ── Subscriptions ─────────────────────────────────────────────────────────────
@@ -52,10 +52,11 @@ fn station_props_signal(station_path: &str) -> SignalSubscription {
         .start()
 }
 
-/// The streams [`pump_iwd_events`] reads. The first three are receivers taken
-/// for one discovery from subscriptions [`run_wifi_watcher`] holds for its
-/// whole life, all three read with their markers; the station's subscription
-/// is per discovery too, since its path comes from the snapshot.
+/// The streams [`pump_iwd_events`] reads, all four with their markers. The
+/// first three are receivers taken for one discovery from subscriptions
+/// [`run_wifi_watcher`] holds for its whole life. The station's subscription
+/// is made per discovery ([`open_station`]), since its path comes from the
+/// snapshot.
 struct IwdStreams<'a, O, E> {
     /// iwd's owner: [`name_owner_changed`].
     owner: &'a mut O,
@@ -390,6 +391,40 @@ where
     }
 }
 
+/// Open the station's own `PropertiesChanged` for one discovery pass, in the
+/// order that keeps a station change made after the snapshot from being lost
+/// (#1551), with every step injected so a test can record the order:
+///
+/// 1. The snapshot's view of the station and adapter (`apply_snapshot`).
+///    Pure, and older than anything below.
+/// 2. The subscription and its receiver (`subscribe`).
+/// 3. The wait for the bus to have its match rule ([`Handshake`], made inside
+///    [`subscribe_then_snapshot`] so it cannot be left out).
+/// 4. The station and its networks read again, live (`reread`). That read is
+///    sent after the rule is in place, so it supersedes step 1, and every
+///    change iwd makes after answering it reaches the receiver.
+///
+/// The station's path comes from the snapshot, so this subscription cannot be
+/// made before the snapshot the way [`open_discovery`]'s three are; the
+/// re-read is what closes the window instead. Until #1551's follow-up the
+/// subscription was made after the snapshot, never waited for, and nothing
+/// but the network list was read after it: a station change in between (a
+/// connect finishing, a scan ending) stayed off screen until the station
+/// changed again.
+async fn open_station<H, R, F>(
+    apply_snapshot: impl FnOnce(),
+    subscribe: impl FnOnce() -> (H, R),
+    reread: impl FnOnce() -> F,
+) -> (H, R)
+where
+    H: Handshake,
+    F: Future<Output = ()>,
+{
+    apply_snapshot();
+    let (opened, ()) = subscribe_then_snapshot(subscribe, reread).await;
+    opened
+}
+
 /// `paths` is the committed iwd backend's own path cache — passed in rather than
 /// reached for through a process-global, so that a backend switch retires this
 /// watcher's paths along with the watcher (#633; see [`IwdPaths`]).
@@ -419,6 +454,11 @@ where
 /// when the next pass asked: that pass's handshake answers for the dead rule,
 /// and its snapshot can predate the rebuilt one. The marker that rebuild
 /// sends is what says to snapshot again (#1645 review).
+///
+/// The station's own `PropertiesChanged` follows the same rules on the
+/// pass's own subscription ([`open_station`]): waited for, then the station
+/// read again live, and read with its markers, a marker on it sending the
+/// pump back to discovery too.
 ///
 /// The subscriptions live for the watcher's life, but each discovery takes
 /// **fresh receivers** from them: the owner's at the top of the pass, before
@@ -472,26 +512,35 @@ pub(super) async fn run_wifi_watcher(
             tokio::time::sleep(DISCOVERY_RETRY).await;
             continue 'discovery;
         };
+        let station_path_str = station_path.as_str().to_string();
 
-        // The station's own properties, subscribed as soon as the snapshot
-        // names the station, and so before the network read below. Its path
-        // is not known before the snapshot, so a station change between the
-        // snapshot and this line still waits for the station's next change.
-        let station_sub = station_props_signal(station_path.as_str());
-        let mut station_events = station_sub.events();
-
-        paths.set_station_path(station_path.as_str()).await;
-        let adapter_path = adapter_path_from_station(station_path.as_str());
+        paths.set_station_path(&station_path_str).await;
+        let adapter_path = adapter_path_from_station(&station_path_str);
         if !adapter_path.is_empty() {
             paths.set_adapter_path(&adapter_path).await;
         }
-        tracing::info!(path = station_path.as_str(), "wifi station found");
+        tracing::info!(path = station_path_str, "wifi station found");
 
-        refresh_adapter_from_managed(&managed, station_path.as_str(), &adapter_mutable);
-        refresh_station_from_managed(&managed, &station_path, &station_mutable);
-        refresh_networks(station_path.as_str(), &station_mutable, &networks_mutable).await;
+        // The station's own properties: the snapshot's view first, then the
+        // subscription, the wait for its rule, and a live re-read that
+        // supersedes the snapshot's view (#1551, see `open_station`).
+        let (station_sub, mut station_items) = open_station(
+            || {
+                refresh_adapter_from_managed(&managed, &station_path_str, &adapter_mutable);
+                refresh_station_from_managed(&managed, &station_path, &station_mutable);
+            },
+            || {
+                let sub = station_props_signal(&station_path_str);
+                let items = sub.items();
+                (sub, items)
+            },
+            || async {
+                refresh_station(&station_path_str, &station_mutable).await;
+                refresh_networks(&station_path_str, &station_mutable, &networks_mutable).await;
+            },
+        )
+        .await;
 
-        let station_path_str = station_path.as_str().to_string();
         // Returns when the station was removed or iwd changed hands — falls
         // through to re-discover (and re-register the agent) on the next
         // iteration of 'discovery.
@@ -500,7 +549,7 @@ pub(super) async fn run_wifi_watcher(
                 owner: &mut owner_items,
                 added: &mut added_items,
                 removed: &mut removed_items,
-                station: &mut station_events,
+                station: &mut station_items,
             },
             || register_iwd_agent(AGENT_PATH),
             &station_path_str,
@@ -519,14 +568,19 @@ pub(super) async fn run_wifi_watcher(
 /// Drive the iwd event loop. Returns when the watcher needs to restart
 /// discovery: the station was removed, iwd changed hands (see
 /// [`owner_reaction`]), or iwd's `InterfacesAdded`/`InterfacesRemoved`
-/// receiver reported a hole.
+/// receiver or the station's `PropertiesChanged` receiver reported a hole.
 ///
 /// A hole there (`Resubscribed` or `Lagged`) is handled as a hole in the
 /// owner's ([`IwdOwner::Hole`]): rediscover, keeping the state. An object
 /// change was missed, and the one the pump cannot rebuild from later signals
 /// is the station's own removal, so only a fresh snapshot settles it. That
 /// also re-registers the agent, which iwd answers with `AlreadyExists` if it
-/// still holds it.
+/// still holds it. A hole in the station's receiver alone could be repaired
+/// by re-reading the station, but rediscovering does that as well (the next
+/// pass makes a fresh station subscription, waits for it and re-reads the
+/// station, [`open_station`]), and keeps one rule for all four receivers. A
+/// `Resubscribed` there comes with a reconnect of our own bus connection, which
+/// hands the other three receivers a marker of their own anyway.
 ///
 /// It also registers our agent with iwd (`register`, [`register_iwd_agent`]
 /// in production, injected so a test can drive the pump without a bus), and
@@ -544,7 +598,7 @@ async fn pump_iwd_events<O, E, R, RF>(
     adapter_mutable: &Mutable<Option<Adapter>>,
 ) where
     O: Stream<Item = SignalItem> + Unpin,
-    E: Stream<Item = SignalEvent> + Unpin,
+    E: Stream<Item = SignalItem> + Unpin,
     R: Fn() -> RF,
     RF: Future<Output = Result<(), hytte_bus::BusError>>,
 {
@@ -552,7 +606,7 @@ async fn pump_iwd_events<O, E, R, RF>(
         owner: owner_items,
         added: added_items,
         removed: removed_items,
-        station: station_events,
+        station: station_items,
     } = streams;
 
     let mut registering = std::pin::pin!(register_agent_until_accepted(
@@ -589,9 +643,15 @@ async fn pump_iwd_events<O, E, R, RF>(
             () = &mut registering, if !registered && !iwd_gone => {
                 registered = true;
             }
-            Some(evt) = station_events.next(), if !iwd_gone => {
+            // A marker on the station's receiver: rediscover, keeping the
+            // state, as for the other three (see this function's doc).
+            Some(item) = station_items.next(), if !iwd_gone => {
+                let SignalItem::Event(evt) = &item else {
+                    tracing::info!(?item, "iwd station PropertiesChanged has a hole; rediscovering");
+                    return;
+                };
                 let should_refresh = handle_station_props_event(
-                    &evt, station_path_str, station_mutable, adapter_mutable,
+                    evt, station_path_str, station_mutable, adapter_mutable,
                 ).await;
                 if should_refresh {
                     refresh_networks(station_path_str, station_mutable, networks_mutable).await;
@@ -660,8 +720,8 @@ async fn handle_station_props_event(
 mod tests {
     use super::{
         Adapter, IWD_RECHECK, IwdOwner, IwdStreams, Mutable, OwnerReaction, Station,
-        iwd_owner_change, next_iwd_owner, open_discovery, owner_reaction, pump_iwd_events,
-        register_agent_until_accepted, wait_for_owner,
+        iwd_owner_change, next_iwd_owner, open_discovery, open_station, owner_reaction,
+        pump_iwd_events, register_agent_until_accepted, wait_for_owner,
     };
     use crate::handshake::Handshake;
     use crate::retry;
@@ -911,6 +971,52 @@ mod tests {
         );
     }
 
+    /// The station's subscription is waited for and the station read again
+    /// after it, and the snapshot's older view of the station is applied
+    /// before that read, never after it (#1551's follow-up). Until then the
+    /// subscription was made after the snapshot and never waited for, and a
+    /// station change in between waited for the station's next change.
+    ///
+    /// **Falsification:** drop the wait from `open_station` (or from
+    /// `subscribe_then_snapshot`) and "station rule installed" never reaches
+    /// the log; re-read before the wait, or apply the snapshot after the
+    /// re-read, and the order changes.
+    #[tokio::test]
+    async fn the_station_is_read_again_once_its_rule_is_installed() {
+        /// A subscription whose handshake is not ready until polled twice,
+        /// so a wait that is created but not awaited to the end is caught.
+        struct Recording<'a>(&'a RefCell<Vec<&'static str>>);
+        impl Handshake for Recording<'_> {
+            fn subscribed(&self) -> impl Future<Output = ()> {
+                let log = self.0;
+                async move {
+                    tokio::task::yield_now().await;
+                    log.borrow_mut().push("station rule installed");
+                }
+            }
+        }
+
+        let log = RefCell::new(Vec::new());
+        let (_subscription, ()) = open_station(
+            || log.borrow_mut().push("snapshot applied"),
+            || {
+                log.borrow_mut().push("station receiver");
+                (Recording(&log), ())
+            },
+            || async { log.borrow_mut().push("station re-read") },
+        )
+        .await;
+        assert_eq!(
+            log.into_inner(),
+            [
+                "snapshot applied",
+                "station receiver",
+                "station rule installed",
+                "station re-read",
+            ]
+        );
+    }
+
     /// A hole in iwd's `InterfacesAdded` or `InterfacesRemoved` receiver
     /// sends the pump back to discovery and keeps the state, as a hole in
     /// the owner's does (#1645 review). Those two used to be read with
@@ -919,30 +1025,41 @@ mod tests {
     /// marker was filtered out and the snapshot that predated the new rule
     /// was never taken again.
     ///
+    /// The station's `PropertiesChanged` receiver is held to the same rule
+    /// since #1551's follow-up: it used to be read with `events()` too, so a
+    /// station change lost behind a marker waited for the station's next one.
+    ///
     /// Every other stream is pending and the registration never answers, so
     /// nothing in the pump reaches a bus.
     ///
-    /// **Falsification:** `continue` on a marker in either arm instead of
-    /// returning (what `events()` amounted to) and the pump never ends;
-    /// clear the state on one and the kept-state assertion fails.
+    /// **Falsification:** `continue` on a marker in any of the three arms
+    /// instead of returning (what `events()` amounted to) and the pump never
+    /// ends; clear the state on one and the kept-state assertion fails.
     #[tokio::test(start_paused = true)]
     async fn a_hole_in_iwds_object_signals_rediscovers_and_keeps_the_state() {
         use futures_util::stream::{self, LocalBoxStream};
 
         for marker in [SignalItem::Resubscribed, SignalItem::Lagged { skipped: 3 }] {
-            for on in ["InterfacesAdded", "InterfacesRemoved"] {
+            for on in [
+                "InterfacesAdded",
+                "InterfacesRemoved",
+                "station PropertiesChanged",
+            ] {
                 let quiet =
                     || -> LocalBoxStream<'static, SignalItem> { stream::pending().boxed_local() };
-                let hole = stream::iter([marker.clone()])
-                    .chain(stream::pending())
-                    .boxed_local();
-                let mut owner = quiet();
-                let (mut added, mut removed) = if on == "InterfacesAdded" {
-                    (hole, quiet())
-                } else {
-                    (quiet(), hole)
+                let stream_for = |name: &str| {
+                    if name == on {
+                        stream::iter([marker.clone()])
+                            .chain(stream::pending())
+                            .boxed_local()
+                    } else {
+                        quiet()
+                    }
                 };
-                let mut station = stream::pending::<SignalEvent>();
+                let mut owner = quiet();
+                let mut added = stream_for("InterfacesAdded");
+                let mut removed = stream_for("InterfacesRemoved");
+                let mut station = stream_for("station PropertiesChanged");
                 let station_state = Mutable::new(Some(Station::default()));
                 let adapter_state = Mutable::new(Some(Adapter::default()));
 

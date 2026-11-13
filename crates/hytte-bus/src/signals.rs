@@ -219,9 +219,18 @@ impl SignalSubscription {
     /// emission the bus routes after the read was answered reaches that
     /// receiver, or is followed on it by a [`SignalItem::Resubscribed`] /
     /// [`SignalItem::Lagged`] marker. The receiver comes first because a
-    /// broadcast receiver sees only what is sent after it exists. An emission
-    /// made between the `AddMatch` and the read is delivered too, although it
-    /// is older than the state read: the consumer has to tolerate that replay.
+    /// broadcast receiver sees only what is sent after it exists.
+    ///
+    /// An emission made between the `AddMatch` and the read may or may not be
+    /// delivered. zbus adds this subscription's sender to the connection only
+    /// once the `AddMatch` reply has arrived, and the connection's socket
+    /// reader hands each message to the senders registered when it reads it,
+    /// so an emission the broker routes right behind that reply can be read
+    /// and dropped before the sender exists. The state read covers it either
+    /// way. A dropped emission reached this process before `subscribed()`
+    /// resolved, so the peer made it before the read was even sent, and the
+    /// read's answer already reflects it. A delivered one is older than the
+    /// read, and the consumer has to tolerate that replay.
     ///
     /// # Across a reconnect
     ///
@@ -229,7 +238,9 @@ impl SignalSubscription {
     /// match rule, not a latch. When the task sees its stream end or the
     /// connection's epoch advance, this goes back to pending until the
     /// replacement rule is installed on the new connection, and it can be
-    /// awaited again at any time; each call returns a fresh future. The
+    /// awaited again at any time; each call returns a fresh future that reads
+    /// the current state, so on a rule that is installed it resolves at once
+    /// rather than waiting for the next change. The
     /// [`SignalItem::Resubscribed`] marker for a rebuild is queued *before*
     /// the rebuild counts as subscribed, so a receiver taken earlier has the
     /// marker by the time this resolves again.
@@ -244,12 +255,24 @@ impl SignalSubscription {
     ///
     /// # Liveness
     ///
-    /// The future has no deadline. While the bus is unreachable it stays
-    /// pending, as the subscription task backs off and retries without one;
-    /// a state read would fail for as long. A destination with no owner does
-    /// not hold it up: the rule is installed against the name, not its owner.
-    /// It never resolves if every [`SignalSubscription`] handle is dropped
-    /// before the rule is installed.
+    /// The future has no deadline. It stays pending for as long as the
+    /// subscription cannot be established, because the task retries every
+    /// failure the same way, on the crate's backoff ramp (up to 30 s between
+    /// attempts) and with no deadline of its own. That covers two cases:
+    ///
+    /// - **The bus is unreachable.** A state read would fail for as long.
+    /// - **The bus is up but refuses this `AddMatch`**: past the broker's
+    ///   `max_match_rules_per_connection`, or by a bus or LSM policy. Here a
+    ///   state read would succeed. A caller that waits gets no snapshot at
+    ///   all until the rule lands, where without the wait it would have had
+    ///   one with no live updates. The journal says why only through the
+    ///   task's one `warn!` for the failed subscription.
+    ///
+    /// A destination with no owner does not hold it up: the rule is installed
+    /// against the name, not its owner. A future that outlives every
+    /// [`SignalSubscription`] handle before the rule is installed never
+    /// resolves: the task exits and the watch closes, and a closed watch is
+    /// not read as "subscribed".
     ///
     /// `+ use<>` for the reason [`Self::events`] carries it: the future owns
     /// its receiver and borrows nothing, so it can be a `select!` arm or be

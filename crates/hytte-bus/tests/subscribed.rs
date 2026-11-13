@@ -200,10 +200,72 @@ async fn subscribed_does_not_wait_for_the_destination_to_have_an_owner() {
     );
 }
 
+/// `subscribed()` reads the state, not the next change: on a rule that is
+/// already installed it resolves at once, however many times it is asked.
+/// The iwd watcher depends on this on every discovery pass after its first,
+/// where it awaits three rules that have been in place since the shell
+/// started.
+///
+/// **Falsification:** wait for the watch's next `changed()` in
+/// `wait_for_live` (or in `subscribed()` alone) instead of `wait_for`, and
+/// the second await never resolves. Every other test here awaits
+/// `subscribed()` only while it is pending, so they all stay green.
+#[tokio::test(flavor = "multi_thread")]
+async fn subscribed_resolves_again_on_an_installed_rule() {
+    let (conn, _guard) = ephemeral_bus().await;
+    let shared = SharedConnection::for_test_session(conn);
+    let sub = subscribe(&shared, "Ping");
+    within("the first subscribed()", sub.subscribed()).await;
+    for again in 0..3 {
+        assert!(
+            sub.subscribed().now_or_never().is_some(),
+            "subscribed() #{again} on an installed rule waited for a change instead of \
+             reading the state"
+        );
+    }
+}
+
+/// A `subscribed()` future that outlives every handle never reads as
+/// "subscribed" for a rule that was never installed: the handles go, the
+/// task exits, the watch closes, and the future stays pending.
+///
+/// Neither consumer can reach this today (both hold their handle across the
+/// await), but `subscribed()`'s doc promises it.
+///
+/// **Falsification:** resolve instead of `pending()` on the closed arm of
+/// `wait_for_live`.
+#[tokio::test(flavor = "multi_thread")]
+async fn subscribed_stays_pending_once_every_handle_is_gone() {
+    let (conn, _guard) = ephemeral_bus().await;
+    let shared = SharedConnection::for_test_session(conn);
+    // No connection from here on: the rule can never be installed.
+    shared.drop_connection_for_test().await;
+    let sub = subscribe(&shared, "Ping");
+    let done = sub
+        .task_done_receiver()
+        .await
+        .expect("the first take of the exit probe");
+    let wait = sub.subscribed();
+    drop(sub);
+    within("the subscription task to exit", done)
+        .await
+        .expect("the task reported its exit");
+    // The task's end of the watch drops as the task returns, right after it
+    // reported the exit, so a future that resolves on a closed watch does so
+    // well inside this window.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), wait)
+            .await
+            .is_err(),
+        "subscribed() resolved after every handle was dropped, with no rule installed"
+    );
+}
+
 /// "Subscribed" is about the current match rule, not a latch: once the task
 /// has seen its bus die, `subscribed()` is pending until the replacement
-/// rule is installed, and an emission made after it resolves again is
-/// delivered, behind the `Resubscribed` marker for the rebuild.
+/// rule is installed, and stays pending through the task's failed attempts
+/// to re-subscribe. An emission made after it resolves again is delivered,
+/// behind the `Resubscribed` marker for the rebuild.
 ///
 /// No supervisor runs here, on purpose. With nothing to reconnect it, the
 /// subscription stays down for as long as the test holds it there, so "the
@@ -214,7 +276,9 @@ async fn subscribed_does_not_wait_for_the_destination_to_have_an_owner() {
 /// **Falsification:** delete the `live.send_replace(false)` after the drain
 /// in `run_subscription` (never re-arm) and the wait for the task to notice
 /// times out. Were that wait removed too, `subscribed()` would answer for the
-/// dead rule and the emission below would be routed before the new one.
+/// dead rule and the emission below would be routed before the new one. Set
+/// the watch to `true` on the task's subscribe-error arm and the bounded
+/// wait below resolves on the first failed attempt.
 #[tokio::test(flavor = "multi_thread")]
 async fn after_the_bus_dies_subscribed_waits_for_the_replacement_rule() {
     let (conn_a, guard_a) = ephemeral_bus().await;
@@ -232,9 +296,19 @@ async fn after_the_bus_dies_subscribed_waits_for_the_replacement_rule() {
         sub.unsubscribed_for_test(),
     )
     .await;
+    // Pending, and staying pending through the task's failed attempts:
+    // nothing is installed, so its first retry (50 ms after it noticed) and
+    // the backed-off ones after it (250 ms, then 500 ms later) all fail. A
+    // single poll here would not do: it and the install below both fit
+    // inside that first 50 ms, so the task's first retry would find the new
+    // connection and never reach its error arm. A bounded negative: a
+    // runtime too slow to make one attempt in this window passes it
+    // vacuously, never spuriously.
     assert!(
-        sub.subscribed().now_or_never().is_none(),
-        "subscribed() must be pending while the subscription has no match rule"
+        tokio::time::timeout(Duration::from_secs(1), sub.subscribed())
+            .await
+            .is_err(),
+        "subscribed() resolved while every attempt to re-subscribe was failing"
     );
 
     let peer = peer(&guard_b.address).await;

@@ -1618,4 +1618,61 @@ mod system_tests {
             .expect("forwarder did not exit with its subscription")
             .expect("forwarder task panicked");
     }
+
+    /// `subscribe_then_snapshot` with a **real** subscription: the snapshot
+    /// is not asked for while the bus has no match rule, and is once it has.
+    /// The order test drives a recording double, so it cannot see the
+    /// production `impl Handshake for SignalSubscription` the watchers go
+    /// through (`listen` here, `open_discovery` in `wifi::watcher`, both the
+    /// same impl); this does (#1645 review).
+    ///
+    /// **Falsification:** return `std::future::ready(())` from that impl and
+    /// the snapshot is taken on the first poll.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_snapshot_waits_for_a_real_subscriptions_match_rule() {
+        use futures_util::FutureExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let guard = ephemeral_bus().await;
+        let conn = Builder::address(guard.address.as_str())
+            .expect("bus address")
+            .build()
+            .await
+            .expect("connect to ephemeral bus");
+        let shared = SharedConnection::for_test_system(conn.clone());
+        // No connection until the test installs one, so the rule cannot be
+        // installed before then.
+        shared.drop_connection_for_test().await;
+
+        let taken = AtomicBool::new(false);
+        let mut opened = std::pin::pin!(super::subscribe_then_snapshot(
+            || {
+                let sub = signals_with(&shared, "org.bluez")
+                    .at_path("/")
+                    .iface("org.freedesktop.DBus.ObjectManager")
+                    .signal("InterfacesAdded")
+                    .start();
+                let items = sub.items();
+                (sub, items)
+            },
+            || {
+                taken.store(true, Ordering::SeqCst);
+                async {}
+            },
+        ));
+        assert!(
+            opened.as_mut().now_or_never().is_none(),
+            "subscribe_then_snapshot finished with no match rule installed"
+        );
+        assert!(
+            !taken.load(Ordering::SeqCst),
+            "the snapshot was asked for before the bus had the match rule"
+        );
+
+        shared.install_fresh_connection_for_test(conn).await;
+        let ((_subscription, _items), ()) = tokio::time::timeout(DBUS_REPLY_BUDGET, opened)
+            .await
+            .expect("the helper never went on once the rule was installed");
+        assert!(taken.load(Ordering::SeqCst));
+    }
 }

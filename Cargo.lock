@@ -1389,6 +1389,7 @@ dependencies = [
  "hytte-plugin",
  "niri-ipc",
  "serde_json",
+ "socket2",
  "tempfile",
 ]
 

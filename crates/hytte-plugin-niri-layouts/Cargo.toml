@@ -45,6 +45,11 @@ niri-ipc.workspace = true
 # HIGH-1). `niri-ipc` already depends on it, so this adds no resolved package
 # and no `Cargo.lock` line.
 serde_json.workspace = true
+# The request connect: a send timeout armed before `connect(2)` bounds the
+# connect in the kernel (`EAGAIN` when niri's listen backlog stays full), so no
+# helper thread is needed (#1560). Already built into the binary through
+# tokio, so it adds no resolved package.
+socket2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -1538,11 +1538,13 @@ fn a_pending_approval_prompts_once_and_not_again_on_the_next_poll() {
 }
 
 /// The card asks with the **two-button** choice set, because "This session" and
-/// "Always" are not answers to a one-shot config merge — and because that
-/// variant is what makes an unanswered prompt send nothing.
+/// "Always" are not answers to a one-shot config merge. (What an unanswered
+/// prompt sends no longer depends on the card: since #1542 item 5 neither
+/// card sends anything on silence.)
 ///
 /// Falsification: pass `ConsentChoices::Grant` and this goes red; the overlay
-/// would then draw four buttons and deny the approval after 60 s of silence.
+/// would then draw four buttons, two of them naming standing grants the hive
+/// cannot honour.
 #[test]
 fn the_prompt_asks_for_the_approve_deny_card() {
     let (mut m, _rx) = model();

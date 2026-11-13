@@ -48,10 +48,11 @@ const ENV_TOKEN: &str = "HYTTE_INFOBROKER_TOKEN";
 /// How long [`call`] waits for the broker's one reply line before giving up.
 ///
 /// The longest a working broker legitimately takes is an `auth` parked on the
-/// human: the shell's card answers within 60 s, and the broker's own backstop
-/// ([`CONSENT_PARK_TIMEOUT`], 65 s) answers a card that never does. This is
-/// that backstop plus 15 s of slack, so a slow-but-alive broker always answers
-/// first. Without any bound (#1489 follow-up audit, L2) a wedged broker — one
+/// human. A click answers at once; a card nobody clicks closes after 60 s and
+/// sends nothing (#1542 item 5), so the broker's own park deadline
+/// ([`CONSENT_PARK_TIMEOUT`], 65 s) is what answers it, with a retryable
+/// refusal. This is that deadline plus 15 s of slack, so a slow-but-alive
+/// broker always answers first. Without any bound (#1489 follow-up audit, L2) a wedged broker — one
 /// that accepted the connection and then never wrote — hung the CLI, and with
 /// it the agent that shelled out to it, forever.
 const REPLY_TIMEOUT: Duration = CONSENT_PARK_TIMEOUT.saturating_add(Duration::from_secs(15));

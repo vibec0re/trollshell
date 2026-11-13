@@ -1018,7 +1018,8 @@ where
                     Step::Update(Input::AudioSpectrum(spectrum))
                 }
                 // #487 phase 1b: the human's answer to a `RequestConsent` this
-                // plugin raised (or `Deny` on the host's 60 s timeout).
+                // plugin raised. Only a click sends one: an unanswered card
+                // sends nothing (#1542 item 5).
                 Some(Ok(HostMsg::ConsentDecision {
                     request_id,
                     decision,

@@ -466,6 +466,10 @@ pub(super) mod fake {
         pub(in super::super) pair_reply: Mutex<Option<Result<(), BusError>>>,
         /// When set, `Pair` answers only once this is notified.
         pub(in super::super) pair_gate: Mutex<Option<Arc<Notify>>>,
+        /// What the next `Connect` answers; `None` answers `Ok`.
+        pub(in super::super) connect_reply: Mutex<Option<Result<(), BusError>>>,
+        /// When set, `Connect` answers only once this is notified.
+        pub(in super::super) connect_gate: Mutex<Option<Arc<Notify>>>,
         pub(in super::super) calls: Mutex<Vec<Call>>,
         /// bluetoothd's own `Trusted`, what a live read answers; `None` makes
         /// the read fail. A `SetTrusted` changes it, as bluetoothd's setter
@@ -487,6 +491,8 @@ pub(super) mod fake {
                 shown: Mutex::new(Some(Shown::default())),
                 pair_reply: Mutex::new(Some(Ok(()))),
                 pair_gate: Mutex::new(None),
+                connect_reply: Mutex::new(None),
+                connect_gate: Mutex::new(None),
                 calls: Mutex::new(Vec::new()),
                 live_trusted: Mutex::new(Some(false)),
                 trusted_reads: Mutex::new(Vec::new()),
@@ -587,7 +593,19 @@ pub(super) mod fake {
 
         fn connect<'a>(&'a self, _device: &'a str) -> BoxFuture<'a, Result<(), BusError>> {
             self.record(Call::Connect);
-            Box::pin(async { Ok(()) })
+            let reply = self
+                .connect_reply
+                .lock()
+                .expect("connect_reply")
+                .take()
+                .unwrap_or(Ok(()));
+            let gate = self.connect_gate.lock().expect("connect_gate").clone();
+            Box::pin(async move {
+                if let Some(gate) = gate {
+                    gate.notified().await;
+                }
+                reply
+            })
         }
 
         fn shown(&self, _device: &str) -> Option<Shown> {

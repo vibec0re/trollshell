@@ -908,7 +908,7 @@ mod tests {
     /// call a `wifi::`/`networkd::` command *before* the popdown, and
     /// `get_backend()` aborts the whole test binary with a non-unwinding panic
     /// when no service is registered. `bluetooth::set_trusted` is reachable
-    /// because `mark_busy` returns early on an absent `shared_state()`.
+    /// because `spawn_busy` marks nothing on an absent `shared_state()`.
     ///
     /// Falsified by replacing the `upgrade()` arm with a no-op: the popover
     /// stays visible after the click.

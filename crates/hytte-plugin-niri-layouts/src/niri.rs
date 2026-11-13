@@ -168,12 +168,21 @@ impl SocketTransport {
             }
         };
         let socket = Socket::new(Domain::UNIX, Type::STREAM, None).map_err(|e| unreachable(&e))?;
-        socket
-            .set_write_timeout(Some(kernel_timeout(self.remaining(deadline)?)))
-            .map_err(|e| unreachable(&e))?;
         let addr = SockAddr::unix(path).map_err(|e| unreachable(&e))?;
-        socket.connect(&addr).map_err(|e| unreachable(&e))?;
-        Ok(UnixStream::from(socket))
+        loop {
+            // Re-armed per attempt with only the time left: with a send
+            // timeout set, a signal or a stop/continue during the backlog wait
+            // ends `connect(2)` with `EINTR` even under `SA_RESTART`, and leaves
+            // the socket unconnected, so the same socket can simply dial again.
+            socket
+                .set_write_timeout(Some(kernel_timeout(self.remaining(deadline)?)))
+                .map_err(|e| unreachable(&e))?;
+            match socket.connect(&addr) {
+                Ok(()) => return Ok(UnixStream::from(socket)),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(unreachable(&e)),
+            }
+        }
     }
 
     fn describe(&self, e: &io::Error, what: &str) -> String {
@@ -826,14 +835,13 @@ mod tests {
     }
 
     /// A niri whose listen backlog is full (it stopped accepting) must not
-    /// park the connect: the send timeout armed before `connect(2)` ends it in
-    /// the kernel with `EAGAIN`, reported as the connect's own timeout. No
-    /// thread is involved on either side: the backlog is filled from the test
-    /// thread with non-blocking connects.
+    /// park the connect, and once the request has given up nothing may be
+    /// left parked in `connect(2)` — whatever that thread would be called.
     #[test]
     fn a_full_listen_backlog_times_out_the_connect() {
         use super::SocketTransport;
         use socket2::{Domain, SockAddr, Socket, Type};
+        use std::sync::mpsc;
         use std::time::{Duration, Instant};
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -857,11 +865,25 @@ mod tests {
             assert!(held.len() < 64, "the backlog never filled");
         }
 
-        let started = Instant::now();
-        let err = SocketTransport::with_timeout(Duration::from_millis(300))
-            .send_to(&path, &Request::Version)
-            .expect_err("no backlog slot, no reply");
-        let took = started.elapsed();
+        // The request runs on a watchdog worker, so an unbounded connect fails
+        // this test in 3 s instead of hanging the suite until CI's
+        // max-silent-time. Closing the listener wakes a parked connect
+        // (`ECONNREFUSED`), so the worker always ends.
+        let (done, outcome) = mpsc::channel();
+        let request_path = path.clone();
+        let worker = std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = SocketTransport::with_timeout(Duration::from_millis(300))
+                .send_to(&request_path, &Request::Version);
+            drop(done.send((result, started.elapsed())));
+        });
+        let Ok((result, took)) = outcome.recv_timeout(Duration::from_secs(3)) else {
+            drop((held, listener));
+            drop(worker.join());
+            panic!("the connect was not bounded by the deadline");
+        };
+        worker.join().expect("worker");
+        let err = result.expect_err("no backlog slot, no reply");
         // The connect's own timeout, not the read's: a connect that got a
         // slot would time out on the reply instead and prove nothing here.
         assert!(
@@ -873,14 +895,87 @@ mod tests {
             "returned early: {took:?}"
         );
         assert!(took < Duration::from_secs(2), "not bounded: {took:?}");
-        // The old path left a named helper thread parked behind a full
-        // backlog (`comm` keeps 15 bytes); there is none to find now.
-        let leftover = std::fs::read_dir("/proc/self/task")
-            .expect("task dir")
-            .filter_map(|t| std::fs::read_to_string(t.ok()?.path().join("comm")).ok())
-            .filter(|name| name.trim() == "niri-layouts-co")
-            .count();
-        assert_eq!(leftover, 0, "a connect helper thread is left behind");
+        // Name-independent, and scoped to this listener so a sibling test's
+        // own waiting connect cannot trip it: free the one slot and see
+        // whether anything still waiting on this listener takes it. A helper
+        // abandoned at the deadline would be parked in `connect(2)` right now
+        // and lands in the queue as soon as `accept` wakes it; a connect the
+        // kernel already ended leaves the queue empty.
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        drop(listener.accept().expect("the held client's slot"));
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(10));
+            match listener.accept() {
+                Ok(_) => panic!("a connect outlived the request it belonged to"),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("accept: {e}"),
+            }
+        }
+        drop((held, listener));
+    }
+
+    /// A stop/continue (SIGSTOP + SIGCONT, or a cgroup freeze) while the
+    /// connect waits for a backlog slot must not end the request early: with
+    /// `SO_SNDTIMEO` armed, `connect(2)` returns `EINTR` there even with no
+    /// signal handler (signal(7)), and is never restarted.
+    #[test]
+    fn a_stop_and_continue_during_the_backlog_wait_is_not_an_error() {
+        use super::SocketTransport;
+        use socket2::{Domain, SockAddr, Socket, Type};
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("niri.sock");
+        let addr = SockAddr::unix(&path).expect("addr");
+        let listener = Socket::new(Domain::UNIX, Type::STREAM, None).expect("socket");
+        listener.bind(&addr).expect("bind");
+        listener.listen(0).expect("listen");
+        let mut held = Vec::new();
+        loop {
+            let client = Socket::new(Domain::UNIX, Type::STREAM, None).expect("client");
+            client.set_nonblocking(true).expect("nonblocking");
+            match client.connect(&addr) {
+                Ok(()) => held.push(client),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("filling the backlog: {e}"),
+            }
+            assert!(held.len() < 64, "the backlog never filled");
+        }
+        let pid = std::process::id();
+        let mut nudger = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "sleep 0.15; kill -STOP {pid}; sleep 0.05; kill -CONT {pid}"
+            ))
+            .spawn()
+            .expect("sh");
+        let started = Instant::now();
+        // Watchdog worker, as in the full-backlog test: an unbounded connect
+        // fails this test in 5 s instead of hanging the whole binary.
+        let (done, outcome) = std::sync::mpsc::channel();
+        let request_path = path.clone();
+        let worker = std::thread::spawn(move || {
+            drop(
+                done.send(
+                    SocketTransport::with_timeout(Duration::from_millis(600))
+                        .send_to(&request_path, &Request::Version),
+                ),
+            );
+        });
+        let Ok(result) = outcome.recv_timeout(Duration::from_secs(5)) else {
+            drop((held, listener));
+            drop(worker.join());
+            nudger.wait().expect("sh");
+            panic!("the connect was not bounded by the deadline");
+        };
+        worker.join().expect("worker");
+        let err = result.expect_err("no backlog slot, no reply");
+        let took = started.elapsed();
+        nudger.wait().expect("sh");
+        assert!(err.contains("timed out"), "got {err:?}");
+        assert!(took >= Duration::from_millis(550), "ended early: {took:?}");
         drop((held, listener));
     }
 

@@ -360,7 +360,7 @@ async fn open_discovery<O, E, T, H, W, WF, D, DF>(
     take_owner: impl FnOnce() -> O,
     wait: W,
     take_iwd: impl FnOnce() -> (E, E),
-    subscriptions: &[&H],
+    subscriptions: [&H; 3],
     discover: D,
 ) -> Opened<O, E, T>
 where
@@ -451,7 +451,7 @@ pub(super) async fn run_wifi_watcher(
                 owner
             },
             || (added_sub.events(), removed_sub.events()),
-            &[&owner_sub, &added_sub, &removed_sub],
+            [&owner_sub, &added_sub, &removed_sub],
             discover_station,
         )
         .await;
@@ -844,7 +844,7 @@ mod tests {
                     log.borrow_mut().push("iwd receivers");
                     ((), ())
                 },
-                &subscriptions,
+                subscriptions,
                 || {
                     log.borrow_mut().push("snapshot");
                     async { Some(()) }

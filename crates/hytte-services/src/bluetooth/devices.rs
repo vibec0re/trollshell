@@ -841,10 +841,11 @@ struct FoldQueues {
 /// device messages.
 ///
 /// - **The owner comes first** so a `Lost` that is already queued wins over
-///   everything else that is. Every other arm can call `org.bluez` (a resync,
-///   a re-read), and a call to a name with no owner D-Bus-activates the
-///   bluetoothd the user just stopped. Unbiased, the handshake's resync beat
-///   a `Lost` queued while [`open_fold`] waited 14 times in 20.
+///   everything else that is. A resync and a device re-read are calls to
+///   `org.bluez` (and an applied `InterfacesAdded` leads to a re-read), and a
+///   call to a name with no owner D-Bus-activates the bluetoothd the user
+///   just stopped. Unbiased, the handshake's resync beat a `Lost` queued
+///   while [`open_fold`] waited in 14 rounds of 20 (#1647 review).
 /// - **Removal before addition**, for the mis-order above.
 /// - **The resync before the device messages**, because the device messages
 ///   are the one source that can come fast (every device's

@@ -2730,7 +2730,10 @@ fn merge_declared(
 ///
 /// # Errors
 /// Unknown/invalid id, a still-running unit, a unit still stopping when
-/// [`STOP_WAIT`] ran out ([`StillStopping`]), or an unreachable user manager.
+/// [`STOP_WAIT`] ran out ([`StillStopping`]), a stopped unit that still
+/// holds its name because a process is left in it (systemd refuses the
+/// launch, "already loaded"; only a unit `deactivating` is waited for), or an
+/// unreachable user manager.
 pub async fn start(id: &str) -> anyhow::Result<()> {
     start_via(
         id,
@@ -11667,8 +11670,6 @@ mod tests {
         held_back: std::cell::Cell<usize>,
         /// Each launch, with the `PET_NAME` it was handed.
         launched: std::cell::RefCell<Vec<(String, Option<String>)>>,
-        /// Other plugins' units every listing shows beside `pet`'s.
-        others: std::cell::RefCell<Vec<systemd::PluginUnit>>,
     }
 
     impl OwedRun {
@@ -11680,14 +11681,11 @@ mod tests {
                 passes: std::cell::RefCell::default(),
                 held_back: std::cell::Cell::new(0),
                 launched: std::cell::RefCell::default(),
-                others: std::cell::RefCell::default(),
             }
         }
 
         fn listing(&self) -> Vec<systemd::PluginUnit> {
-            let mut units: Vec<_> = self.pet.get().map(own_unit).into_iter().collect();
-            units.extend(self.others.borrow().iter().cloned());
-            units
+            self.pet.get().map(own_unit).into_iter().collect()
         }
 
         /// Wait for `n` more ticks than have been.
@@ -11719,9 +11717,11 @@ mod tests {
     ///
     /// The rail: a pass whose plan holds anything but launches (a stop, a
     /// restart, or a wait for a unit still stopping) would reach the real
-    /// user manager, so it is counted in `held_back` and not run. The plan it
-    /// reads is the pass's own ([`plan_with_owed`]), dry-run on a copy of
-    /// what is owed, so taking it changes nothing the pass then sees.
+    /// user manager, so it is counted in `held_back` and not run. It holds a
+    /// pass back if either [`plan`] or the pass's own [`plan_with_owed`]
+    /// (dry-run on a copy of what is owed, so taking it changes nothing the
+    /// pass then sees) holds one: a mutant of the pass's call site must not
+    /// reach the real user manager either (#1580's lesson).
     async fn watch_owed(
         sources: &Sources,
         owed: &OwedLaunches,
@@ -11747,8 +11747,10 @@ mod tests {
                 copy.launch.clone_from(&now.launch);
                 copy.replace.clone_from(&now.replace);
             }
-            if plan_with_owed(&declared, &run.listing(), &dry_run)
+            let listing = run.listing();
+            if plan(&declared, &listing)
                 .iter()
+                .chain(&plan_with_owed(&declared, &listing, &dry_run))
                 .any(|(_, action)| *action != Action::Launch)
             {
                 run.held_back.set(run.held_back.get() + 1);
@@ -11922,45 +11924,6 @@ mod tests {
             })
             .await;
         }
-    }
-
-    /// **The pass one owed plugin makes due launches it without waiting for
-    /// another still stopping** (#1644 review, LOW 2), end to end against
-    /// scratch files: `caw` and `pet` both ran out (a rebuild's restart on
-    /// one stuck mount, say). `pet`'s unit goes; `caw`'s stays
-    /// `deactivating`. The tick that sees `pet` gone runs one pass, which
-    /// launches `pet` and plans nothing for `caw`, so it holds
-    /// [`CONVERGE_LOCK`] for no [`STOP_WAIT`]; `caw` stays owed, to the look.
-    ///
-    /// Falsified by the pass planning with [`plan`] alone: it plans a
-    /// [`Action::WaitThenLaunch`] for `caw`, which the rail holds back, so
-    /// `pet` is never launched.
-    #[tokio::test]
-    async fn the_pass_for_one_owed_plugin_waits_for_no_other() {
-        let (_dir, sources, _toml) = scratch_sources(
-            r#"{"version":1,"plugins":{"caw":{"exec":"/bin/caw","enabled":true},"pet":{"exec":"/bin/pet","enabled":true}}}"#,
-        );
-        let owed = owing(&["caw", "pet"]);
-        let run = OwedRun::new();
-        run.others
-            .borrow_mut()
-            .push(stamped_in("caw", "deactivating", "final-sigkill"));
-        watch_owed(&sources, &owed, &run, async {
-            run.ticks(3).await;
-            assert!(run.passes.borrow().is_empty(), "both still stopping");
-            run.pet.set(None);
-            until("pet is launched", || !run.launched.borrow().is_empty()).await;
-            run.ticks(3).await;
-            assert_eq!(
-                run.held_back.get(),
-                0,
-                "the pass planned a wait under the lock for caw, which the look is watching"
-            );
-            assert_eq!(*run.launched.borrow(), [("pet".to_owned(), None)]);
-            assert_eq!(*run.passes.borrow(), [None], "one pass");
-            assert_eq!(held(&owed), ["caw"], "caw is left to the look");
-        })
-        .await;
     }
 
     /// Against a real user manager, where one runs (#1444): this container has

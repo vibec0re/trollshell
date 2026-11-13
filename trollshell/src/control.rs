@@ -242,8 +242,9 @@ impl ControlIface {
     ///
     /// # Errors
     /// Unknown/invalid id, a unit that is already running, a unit still
-    /// stopping when that wait ran out, or an unreachable user manager — see
-    /// [`plugin_launcher::start`].
+    /// stopping when that wait ran out, a stopped unit that still holds its
+    /// name because a process is left in it (refused at once), or an
+    /// unreachable user manager — see [`plugin_launcher::start`].
     async fn start_plugin(&self, id: String) -> zbus::fdo::Result<()> {
         plugin_launcher::start(&id)
             .await

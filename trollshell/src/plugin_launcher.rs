@@ -3054,9 +3054,21 @@ async fn stop_unit(id: &str) -> anyhow::Result<()> {
 /// persist into (neither `$XDG_STATE_HOME` nor `$HOME` set) or a failed write;
 /// on the legacy path, an invalid id or an unreachable user manager.
 pub async fn set_enabled(id: &str, enabled: bool) -> anyhow::Result<()> {
+    set_enabled_via(id, enabled, |on| systemd::set_plugin_enabled(id, on)).await
+}
+
+/// [`set_enabled`] with the legacy arm's `Enable/DisableUnitFiles` passed in
+/// (`unit_file`, handed the switch's value), so the one test that drives the
+/// environment wiring hands it a stand-in, and no mutant of the decision
+/// can send it to the real user manager (#1555 follow-up).
+async fn set_enabled_via<U, UF>(id: &str, enabled: bool, unit_file: U) -> anyhow::Result<()>
+where
+    U: FnOnce(bool) -> UF,
+    UF: Future<Output = anyhow::Result<()>>,
+{
     match set_enabled_in(&Sources::from_env(), id, enabled).await? {
         Kept::Overrides => Ok(()),
-        Kept::UnitFile => systemd::set_plugin_enabled(id, enabled).await,
+        Kept::UnitFile => unit_file(enabled).await,
     }
 }
 
@@ -3067,7 +3079,7 @@ enum Kept {
     /// nix declares.
     Overrides,
     /// Nowhere yet: the id is not declared, so it is a legacy static unit,
-    /// whose enablement is its unit file's. [`set_enabled`] persists it
+    /// whose enablement is its unit file's. [`set_enabled_via`] persists it
     /// there.
     UnitFile,
 }
@@ -3080,10 +3092,11 @@ enum Kept {
 /// lose one of the two, and a reconcile must not read the file between the
 /// two halves of either. The legacy arm's D-Bus call is the caller's, after
 /// the lock is released; it touches nothing a reconcile reads. It is not
-/// made here so that nothing a test calls with scratch [`Sources`] can reach
-/// the real user manager, whatever [`persist_decision`] answers (#1555
-/// follow-up): under a mutant of it that answers [`Persist::UnitFile`] for a
-/// declared id, a switch test used to `Enable/DisableUnitFiles` the real
+/// made here, nor anywhere a test reaches without a stand-in
+/// ([`set_enabled_via`]), so that no switch test can reach the real user
+/// manager whatever this decides (#1555 follow-up): under a mutant of
+/// [`persist_decision`] that answers [`Persist::UnitFile`] for a declared
+/// id, a switch test used to `Enable/DisableUnitFiles` the real
 /// `trollshell-plugin-<id>.service`.
 async fn set_enabled_in(sources: &Sources, id: &str, enabled: bool) -> anyhow::Result<Kept> {
     converge_locked(async {
@@ -6369,6 +6382,13 @@ mod tests {
     /// going through [`Sources::from_env`] (an override path of `None` makes
     /// `set_enabled` fail; a wrapper reading only the config half makes the
     /// switch vanish from `load_declared`).
+    ///
+    /// It drives [`set_enabled_via`], what `set_enabled` hands the real
+    /// unit-file call to (`an_undeclared_switch_is_left_to_its_unit_file`
+    /// pins that), with a stand-in for that call: a declared switch never
+    /// reaches it, and under a mutant that sends it there anyway this test
+    /// panics rather than `EnableUnitFiles` the real
+    /// `trollshell-plugin-timer.service` (#1555 follow-up).
     #[test]
     fn the_environment_wrappers_persist_under_the_state_home() {
         scratch_home(|home| {
@@ -6382,7 +6402,11 @@ mod tests {
                 .build()
                 .expect("runtime");
             rt.block_on(async {
-                set_enabled("timer", true).await.expect("persists");
+                set_enabled_via("timer", true, |_| async {
+                    panic!("a declared plugin's switch never reaches its unit file")
+                })
+                .await
+                .expect("persists");
                 assert_eq!(
                     read_overrides(Some(&toml)).enabled.get("timer"),
                     Some(&true),
@@ -10700,7 +10724,8 @@ mod tests {
         ("launch_at_startup", "reconcile_then_watch"),
         ("start", "start_via"),
         ("stop", "stop_via"),
-        ("set_enabled", "set_enabled_in"),
+        ("set_enabled", "set_enabled_via"),
+        ("set_enabled_via", "set_enabled_in"),
         ("restart_for_settings", "restart_for_settings_via"),
         ("relaunch_for_secret", "relaunch_for_secret_inner"),
         ("relaunch_for_secret_inner", "relaunch_for_secret_via"),
@@ -11837,16 +11862,17 @@ mod tests {
     /// **A switch for an undeclared id is left to its unit file, by the
     /// caller** (#1555 follow-up): [`set_enabled_in`] decides, writes the
     /// override file, and answers [`Kept::UnitFile`] for a legacy static
-    /// unit without reaching a user manager; [`set_enabled`] makes that
-    /// `Enable/DisableUnitFiles`. So no switch test, and no mutant of
-    /// [`persist_decision`] under one, reaches the real call for a
-    /// `trollshell-plugin-<id>.service`: a mutant answering
+    /// unit without reaching a user manager; [`set_enabled_via`] makes the
+    /// `Enable/DisableUnitFiles` it is handed, which [`set_enabled`] hands
+    /// the real one and the one test of the wrapper a stand-in. So no switch
+    /// test, and no mutant of the decision under one, reaches the real call
+    /// for a `trollshell-plugin-<id>.service`: a mutant answering
     /// [`Persist::UnitFile`] for a declared id now only leaves the override
     /// unwritten, which the persisting tests catch.
     ///
     /// Falsified by the legacy arm writing or answering
-    /// [`Kept::Overrides`], and by [`set_enabled`] dropping or misrouting
-    /// the unit-file call, or [`set_enabled_in`] making one (the scan).
+    /// [`Kept::Overrides`], and by the wrappers dropping or misrouting the
+    /// unit-file call, or [`set_enabled_in`] making one (the scan).
     #[tokio::test]
     async fn an_undeclared_switch_is_left_to_its_unit_file() {
         let (_dir, sources, toml) = scratch_sources(TWO_FREE);
@@ -11868,12 +11894,17 @@ mod tests {
         };
         let wrapper = body("pub async fn set_enabled(id: &str, enabled: bool)");
         assert!(
-            wrapper.contains(
+            wrapper.contains("set_enabled_via(id,enabled,|on|systemd::set_plugin_enabled(id,on))"),
+            "{wrapper}"
+        );
+        let via = body("async fn set_enabled_via<");
+        assert!(
+            via.contains(
                 "matchset_enabled_in(&Sources::from_env(),id,enabled).await?{\
                  Kept::Overrides=>Ok(()),\
-                 Kept::UnitFile=>systemd::set_plugin_enabled(id,enabled).await,}"
+                 Kept::UnitFile=>unit_file(enabled).await,}"
             ),
-            "{wrapper}"
+            "{via}"
         );
         assert!(
             !body("async fn set_enabled_in(").contains("systemd::"),

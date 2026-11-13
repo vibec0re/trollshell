@@ -5432,7 +5432,8 @@ color-scheme` → `'prefer-light'`), open the Settings drawer: the "Dark
 
 ## Bluetooth
 
-- [ ] **(#1491)** Pair and Connect get BlueZ's own deadline, the watcher
+- [ ] **(#1491)** Pair gets BlueZ's own deadline (Connect's own is #1551's,
+      below), the watcher
       notices a `bluetoothd` restart, and a late prompt wake cannot clear a
       newer prompt.
   1. Pair a keyboard or phone that asks for a PIN or a confirmation, and take
@@ -5452,6 +5453,23 @@ color-scheme` → `'prefer-light'`), open the Settings drawer: the "Dark
   6. Prompt race, if you can provoke it: start pairing, let the prompt time
      out on the remote side, then retry at once. The second prompt's banner
      stays up.
+
+- [ ] **(#1551)** A `Connect` that hangs frees its row after 45 s instead of
+      five minutes; `Pair` keeps its long deadline.
+  1. With a paired, disconnected device in the Bluetooth panel, freeze
+     bluetoothd: `sudo kill -STOP $(pidof bluetoothd)`. Tap the device's row.
+     It shows as busy (disabled).
+  2. About 45 s later the row is enabled again, with a "Couldn't connect: …
+     call timeout" toast. Before #1551 the row stayed disabled for five
+     minutes.
+  3. `sudo kill -CONT $(pidof bluetoothd)`. bluetoothd catches up, and the
+     row follows whatever it does with the queued `Connect`.
+  4. Pair a device that asks for a PIN or a confirmation, and take about
+     50 s to answer, longer than a `Connect` is now given. No toast; it
+     pairs, then shows as trusted and connected.
+  5. Tap a paired device that is switched off: the row comes back within a
+     few seconds with a "Couldn't connect" toast (bluetoothd's own page
+     timeout), as before.
 
 ## Night light
 

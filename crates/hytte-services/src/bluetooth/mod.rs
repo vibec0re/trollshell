@@ -54,27 +54,65 @@ use crate::retry;
 #[cfg(test)]
 const BLUEZ_AGENT_REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
 
-/// Deadline for `Device1.Pair` and `Device1.Connect`. It matches the deadline
-/// `BlueZ` puts on its own client's calls.
+/// Deadline for `Device1.Pair`. It matches the deadline `BlueZ` puts on its
+/// own client's calls.
 ///
-/// Both calls block for as long as bluetoothd works on them. `Pair` also blocks
-/// while the user reads a code or types a PIN on our agent's prompt, and
-/// bluetoothd allows that prompt a full minute on its own. `hytte_bus::call`'s
-/// default is 25 s, shorter than one prompt. With that default, a user still
-/// checking the code got a "Couldn't pair: call timeout" toast while bluetoothd
-/// went on pairing. The trust-and-connect follow-up in [`pair_device`] never
-/// ran. The row came back enabled, so a second tap got
-/// `org.bluez.Error.InProgress`.
+/// `Pair` blocks for as long as bluetoothd works on it, and that includes
+/// the time the user takes to read a code or type a PIN on our agent's
+/// prompt: bluetoothd allows that prompt a full minute on its own.
+/// `hytte_bus::call`'s default is 25 s, shorter than one prompt. With that
+/// default, a user still checking the code got a "Couldn't pair: call
+/// timeout" toast while bluetoothd went on pairing. The trust-and-connect
+/// follow-up in [`pair_device`] never ran. The row came back enabled, so a
+/// second tap got `org.bluez.Error.InProgress`.
 ///
 /// Five minutes is `METHOD_CALL_TIMEOUT` (300 s) in `BlueZ`'s
 /// `gdbus/client.c`. `bluetoothctl` puts that deadline on every method call
-/// it makes, `pair` and `connect` included. bluetoothd bounds both calls
-/// itself: each agent prompt by `REQUEST_TIMEOUT`, each connection attempt by
-/// the controller's and the kernel's own timeouts. So this deadline is a
-/// backstop for a bluetoothd that has stopped answering. A bluetoothd that
-/// exits does not reach it: the bus answers the pending call with `NoReply`
-/// as soon as the daemon disconnects.
+/// it makes, `pair` included. bluetoothd bounds a pairing itself: each agent
+/// prompt by `REQUEST_TIMEOUT`, and the kernel's pairing command by
+/// `BONDING_TIMEOUT` (2 min, `src/adapter.c`). So this deadline is a backstop
+/// for a bluetoothd that has stopped answering. A bluetoothd that exits does
+/// not reach it: the bus answers the pending call with `NoReply` as soon as
+/// the daemon disconnects.
+///
+/// `Connect` has a deadline of its own, [`CONNECT_CALL_TIMEOUT`]: it waits on
+/// no person.
 const PAIRING_CALL_TIMEOUT: Duration = Duration::from_mins(5);
+
+/// Deadline for `Device1.Connect`: a plain one from the row, and the one
+/// [`pair_device`] makes once its `Pair` has succeeded (#1551).
+///
+/// The device is busy, its row disabled, until this call ends. Until #1551
+/// `Connect` shared [`PAIRING_CALL_TIMEOUT`], so a `Connect` that hung held the
+/// row disabled for five minutes. Unlike `Pair`, `Connect` does not wait on
+/// the user: the shell offers it only for a paired device, which
+/// authenticates with its stored key, and bluetoothd refuses it while that
+/// device is pairing (`dev_connect`, `src/device.c`). It waits on the radio.
+///
+/// The longest bluetoothd waits on one connection attempt is the kernel's.
+/// bluetoothd connects each profile over an L2CAP socket and sets no send
+/// timeout on it (nothing in `btio/`, `src/` or `profiles/` sets
+/// `SO_SNDTIMEO`), so the socket keeps the kernel's default,
+/// `L2CAP_CONN_TIMEOUT`: 40 s (`include/net/bluetooth/l2cap.h`, set in
+/// `l2cap_sock_alloc`). `l2cap_chan_connect` hands it to the ACL or LE
+/// connection it starts and arms it as the channel's timer
+/// (`net/bluetooth/l2cap_core.c`). When it fires, the channel fails and
+/// bluetoothd answers the `Connect` (`device_profile_connected`,
+/// `src/device.c`). A device that is off or out of range fails much sooner,
+/// at the page timeout (5.12 s by default).
+///
+/// So 45 s: the kernel's 40 s and a margin for bluetoothd to turn that
+/// failure into its reply. By then bluetoothd has given up on the attempt
+/// itself, and the row is enabled again soon after.
+///
+/// It does not cover everything bluetoothd may still do. It connects a
+/// device's profiles one after another, and when one fails on a link that is
+/// up it goes on to the next, so profiles that each time out can keep it busy
+/// for a multiple of 40 s. The call ends at 45 s anyway. A profile that
+/// connects after that shows in the device's `Connected`, which the watcher
+/// follows, and a second tap while bluetoothd is still busy is answered
+/// `org.bluez.Error.InProgress`.
+const CONNECT_CALL_TIMEOUT: Duration = Duration::from_secs(45);
 
 // ── Cross-thread shared handle ────────────────────────────────────────────────
 //
@@ -110,7 +148,7 @@ pub(super) struct BluetoothShared {
     pub(super) pending_response: Arc<ReplySlot>,
     /// Most recent connect/pair/disconnect failure (#1171), or `None` before
     /// the first one. `Mutable::set` always notifies subscribers, even on an
-    /// unchanged value (see `mark_busy`'s doc below for the same invariant),
+    /// unchanged value (see `Busy::hold`'s comment for the same invariant),
     /// so a *second* identical failure is a fresh `set` rather than a
     /// swallowed no-op — but a subscriber only observes what is there when it
     /// next polls, so two failures inside one main-loop turn coalesce into one
@@ -432,7 +470,7 @@ pub fn pair_prompts() -> impl Signal<Item = Option<PairPrompt>> {
 /// worked example.
 ///
 /// Repeats are real: `Mutable::set` always notifies, even on an unchanged
-/// value (see `mark_busy`'s doc for the same invariant), so a second
+/// value (see `Busy::hold`'s comment for the same invariant), so a second
 /// identical failure is a fresh emission — though two inside one main-loop
 /// turn coalesce, since a polling subscriber only ever sees the latest.
 pub fn action_error() -> impl Signal<Item = Option<ActionError>> {
@@ -518,27 +556,82 @@ fn send_reply(id: u64, reply: AgentReply) {
     });
 }
 
-fn mark_busy(path: &str) {
-    let Some(shared) = shared_state() else {
-        return;
-    };
-    // Peek with a read lock first — `lock_mut()` always fires the
-    // signal on drop, even if the contents didn't change, so we only
-    // take a write lock when the value will actually flip.
-    if shared.device_actions.lock_ref().contains(path) {
-        return;
-    }
-    shared.device_actions.lock_mut().insert(path.to_string());
+/// One action's hold on a device's busy marker, its entry in
+/// `device_actions`: the device is busy from [`Busy::hold`] until this drops.
+///
+/// Dropping is what releases it, so every way an action ends does: its call
+/// answers, fails or runs out of time, or its task is dropped first (a panic
+/// in it, or the runtime shutting down). Until #1551 a `mark_idle` on the
+/// line after the call released it, which a dropped task never reached, and
+/// the row stayed disabled until bluetoothd next restarted.
+///
+/// Like that `mark_idle`, dropping clears the device's marker whoever set it.
+/// The row is disabled while it is busy, so a second action on the same
+/// device starts only after the first has ended, or after the watcher
+/// restarted (bluetoothd or its adapter gone, say) and cleared every marker.
+/// Only then can two actions on one device overlap, as they could before.
+#[must_use = "the device is idle again as soon as this drops"]
+struct Busy {
+    actions: Mutable<HashSet<String>>,
+    path: String,
 }
 
-fn mark_idle(path: &str) {
-    let Some(shared) = shared_state() else {
-        return;
-    };
-    if !shared.device_actions.lock_ref().contains(path) {
-        return;
+impl Busy {
+    /// Mark `path` busy in `actions` until the returned hold drops.
+    fn hold(actions: &Mutable<HashSet<String>>, path: &str) -> Self {
+        // Peek with a read lock first — `lock_mut()` always fires the
+        // signal on drop, even if the contents didn't change, so we only
+        // take a write lock when the value will actually flip.
+        if !actions.lock_ref().contains(path) {
+            actions.lock_mut().insert(path.to_owned());
+        }
+        Self {
+            actions: actions.clone(),
+            path: path.to_owned(),
+        }
     }
-    shared.device_actions.lock_mut().remove(path);
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        if self.actions.lock_ref().contains(&self.path) {
+            self.actions.lock_mut().remove(&self.path);
+        }
+    }
+}
+
+/// Run one device action, `work`, on the runtime, with `path` busy for as
+/// long as it runs ([`Busy`]). The device is marked busy before this returns,
+/// so its row is disabled before the task first runs.
+///
+/// Without the service's state there is no marker to set, and `work` runs
+/// unmarked.
+fn spawn_busy(path: &str, work: impl Future<Output = ()> + Send + 'static) {
+    let shared = shared_state();
+    spawn_busy_on(
+        runtime::handle(),
+        shared.as_ref().map(|shared| &shared.device_actions),
+        path,
+        work,
+    );
+}
+
+/// [`spawn_busy`] on `rt`, marking `path` in `actions`.
+fn spawn_busy_on(
+    rt: &tokio::runtime::Handle,
+    actions: Option<&Mutable<HashSet<String>>>,
+    path: &str,
+    work: impl Future<Output = ()> + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
+    let busy = actions.map(|actions| Busy::hold(actions, path));
+    rt.spawn(async move {
+        // Moved into the task, so it lives as long as the task does: it drops
+        // once `work` has finished, or with the task if the task is dropped
+        // first. Not naming it here would leave it in this function, which
+        // drops it before the task has run at all.
+        let _busy = busy;
+        work.await;
+    })
 }
 
 /// Fire-and-forget: set the `Powered` property on the adapter.
@@ -597,29 +690,27 @@ pub fn stop_discovery() {
     });
 }
 
-/// Fire-and-forget: call `Connect` on the given device path.
+/// Fire-and-forget: call `Connect` on the given device path. The device is
+/// busy until the call ends, at the latest after its 45 s deadline
+/// (`CONNECT_CALL_TIMEOUT`).
 pub fn connect_device(device_path: &str) {
     let path = device_path.to_string();
-    mark_busy(&path);
-    runtime::handle().spawn(async move {
+    spawn_busy(device_path, async move {
         if let Err(e) = do_device_call(&path, "Connect").await {
             tracing::warn!(error = %e, path, "bluetooth connect_device failed");
             report_action_error(format!("Couldn't connect: {e}"));
         }
-        mark_idle(&path);
     });
 }
 
 /// Fire-and-forget: call `Disconnect` on the given device path.
 pub fn disconnect_device(device_path: &str) {
     let path = device_path.to_string();
-    mark_busy(&path);
-    runtime::handle().spawn(async move {
+    spawn_busy(device_path, async move {
         if let Err(e) = do_device_call(&path, "Disconnect").await {
             tracing::warn!(error = %e, path, "bluetooth disconnect_device failed");
             report_action_error(format!("Couldn't disconnect: {e}"));
         }
-        mark_idle(&path);
     });
 }
 
@@ -645,10 +736,8 @@ pub fn pair_device(device_path: &str) {
         return;
     };
     let path = device_path.to_string();
-    mark_busy(&path);
-    runtime::handle().spawn(async move {
+    spawn_busy(device_path, async move {
         pair_from_shell(&shared, &trust::SystemBluez, &path).await;
-        mark_idle(&path);
     });
 }
 
@@ -742,12 +831,10 @@ fn is_already_exists(e: &hytte_bus::BusError) -> bool {
 /// Fire-and-forget: set the `Trusted` property on a device.
 pub fn set_trusted(device_path: &str, on: bool) {
     let path = device_path.to_string();
-    mark_busy(&path);
-    runtime::handle().spawn(async move {
+    spawn_busy(device_path, async move {
         if let Err(e) = do_set_device_bool(&path, "Trusted", on).await {
             tracing::warn!(error = %e, on, path, "bluetooth set_trusted failed");
         }
-        mark_idle(&path);
     });
 }
 
@@ -755,18 +842,15 @@ pub fn set_trusted(device_path: &str, on: bool) {
 /// (unpair). Equivalent to `bluetoothctl remove <addr>`.
 pub fn remove_device(device_path: &str) {
     let path = device_path.to_string();
-    mark_busy(&path);
-    runtime::handle().spawn(async move {
+    spawn_busy(device_path, async move {
         let adapter = get_adapter_path().await;
         if adapter.is_empty() {
             tracing::warn!("remove_device: no adapter path known");
-            mark_idle(&path);
             return;
         }
         if let Err(e) = do_remove_device(&adapter, &path).await {
             tracing::warn!(error = %e, path, "bluetooth remove_device failed");
         }
-        mark_idle(&path);
     });
 }
 
@@ -837,10 +921,15 @@ async fn do_device_call(device_path: &str, method: &str) -> Result<(), hytte_bus
 }
 
 /// The deadline a `Device1` method gets, or `None` for `hytte_bus::call`'s
-/// default. Only `Pair` and `Connect` take longer than that default. See
-/// [`PAIRING_CALL_TIMEOUT`].
+/// default (25 s). `Pair` waits on the user ([`PAIRING_CALL_TIMEOUT`]),
+/// `Connect` on the radio ([`CONNECT_CALL_TIMEOUT`]); both can take longer
+/// than that default.
 fn device_call_deadline(method: &str) -> Option<Duration> {
-    matches!(method, "Pair" | "Connect").then_some(PAIRING_CALL_TIMEOUT)
+    match method {
+        "Pair" => Some(PAIRING_CALL_TIMEOUT),
+        "Connect" => Some(CONNECT_CALL_TIMEOUT),
+        _ => None,
+    }
 }
 
 async fn do_remove_device(
@@ -866,35 +955,262 @@ async fn do_remove_device(
 mod tests {
     use super::{
         ActionError, BLUEZ_AGENT_REQUEST_TIMEOUT, PairOutcome, device_call_deadline, is_deadline,
-        pair_outcome, set_action_error,
+        pair_outcome, set_action_error, spawn_busy_on,
     };
+    use crate::bluetooth::trust::fake::{Call, FakeBus};
+    use crate::bluetooth::trust::{DeviceBus, Pairings, pair_then_trust};
     use futures_signals::signal::{Mutable, Signal};
     use hytte_bus::BusError;
-    use std::time::Instant;
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+    use tokio::sync::Notify;
+    use tokio::task::JoinHandle;
 
+    /// Each `Device1` call gets the deadline for what it waits on (#1551).
+    ///
     /// `Pair` blocks while the user answers our agent's prompt, and
     /// bluetoothd gives that prompt 60 s. A deadline shorter than that fires
     /// while pairing is still in progress: a false "Couldn't pair" toast, no
-    /// follow-up, and a re-enabled row that answers `InProgress`. `Connect`
-    /// has the same deadline, because it is also the second half of that
-    /// follow-up.
+    /// follow-up, and a re-enabled row that answers `InProgress`.
     ///
-    /// **Falsification:** make `device_call_deadline` return `None` for
-    /// `Pair` (the 25 s default) and this fails.
+    /// `Connect` waits on the radio, which the kernel gives up on after 40 s
+    /// per attempt. With `Pair`'s five minutes, a hung `Connect` held the row
+    /// disabled for five minutes. That includes the `Connect` that follows a
+    /// successful `Pair`: `SystemBluez::connect` is the same `Connect` call.
+    ///
+    /// The durations are literals, in the units of the sources they come
+    /// from, so a change to this crate's constants cannot move both sides of
+    /// the comparison at once.
+    ///
+    /// **Falsification:** give `Connect` `PAIRING_CALL_TIMEOUT` again (the
+    /// pre-#1551 rule) and the `Connect` rows fail; make `Pair` take the 25 s
+    /// default and the `Pair` rows fail.
     #[test]
-    fn pair_and_connect_outlast_an_agent_prompt() {
-        for method in ["Pair", "Connect"] {
-            let deadline = device_call_deadline(method);
-            assert!(
-                deadline.is_some_and(|d| d > BLUEZ_AGENT_REQUEST_TIMEOUT),
-                "{method} must wait out a whole agent prompt, got {deadline:?}"
-            );
-        }
+    fn each_device_call_gets_the_deadline_for_what_it_waits_on() {
+        let pair = device_call_deadline("Pair").expect("Pair has a deadline of its own");
+        // `METHOD_CALL_TIMEOUT` in BlueZ's `gdbus/client.c`, 300 s: what
+        // `bluetoothctl` puts on its own `pair`. (Minutes, because clippy
+        // insists on the largest whole unit.)
+        assert_eq!(pair, Duration::from_mins(5));
+        // `REQUEST_TIMEOUT` in BlueZ's `src/agent.c`, 60 s: one agent prompt.
+        assert_eq!(BLUEZ_AGENT_REQUEST_TIMEOUT, Duration::from_mins(1));
+        assert!(
+            pair > Duration::from_mins(1),
+            "Pair must wait out a whole agent prompt, got {pair:?}"
+        );
+
+        let connect = device_call_deadline("Connect").expect("Connect has a deadline of its own");
+        assert_eq!(connect, Duration::from_secs(45));
+        // `L2CAP_CONN_TIMEOUT` in the kernel's `include/net/bluetooth/l2cap.h`,
+        // 40 s: when bluetoothd's connection attempt gives up by itself.
+        assert!(
+            connect > Duration::from_secs(40),
+            "Connect must outlast the kernel's own connect timeout, got {connect:?}"
+        );
+        assert!(
+            connect < pair,
+            "a hung Connect must free its row long before a pairing would"
+        );
+
         assert_eq!(
             device_call_deadline("Disconnect"),
             None,
             "a call that waits on nobody keeps the bus default"
         );
+    }
+
+    const DEVICE: &str = "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF";
+
+    fn is_busy(actions: &Mutable<HashSet<String>>) -> bool {
+        actions.lock_ref().contains(DEVICE)
+    }
+
+    /// Let every task that is ready run.
+    async fn settle() {
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// What a connect's call answered, once it has.
+    type Answer = Arc<Mutex<Option<Result<(), BusError>>>>;
+
+    /// A connect the way `connect_device` runs one: the `Connect` call as
+    /// the work of `spawn_busy_on`, in `actions`. The call's answer is kept
+    /// for the test.
+    fn spawn_connect(
+        actions: &Mutable<HashSet<String>>,
+        bus: &Arc<FakeBus>,
+    ) -> (JoinHandle<()>, Answer) {
+        let answer: Answer = Arc::new(Mutex::new(None));
+        let task = spawn_busy_on(
+            &tokio::runtime::Handle::current(),
+            Some(actions),
+            DEVICE,
+            {
+                let bus = bus.clone();
+                let answer = answer.clone();
+                async move {
+                    let reply = bus.connect(DEVICE).await;
+                    *answer.lock().expect("answer") = Some(reply);
+                }
+            },
+        );
+        (task, answer)
+    }
+
+    /// A connect holds its device busy from the moment it is started, before
+    /// its task has run, for as long as `Connect` is unanswered, and releases
+    /// it once `Connect` succeeds (#1551).
+    ///
+    /// **Falsification:** drop the `let _busy = busy;` that moves the hold
+    /// into the task (it then drops when `spawn_busy_on` returns) and the
+    /// device is idle while `Connect` runs; empty `Busy`'s `drop` and it is
+    /// never released.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_connect_holds_its_device_busy_until_it_answers() {
+        let actions = Mutable::new(HashSet::new());
+        let bus = FakeBus::new();
+        let gate = Arc::new(Notify::new());
+        *bus.connect_gate.lock().expect("connect_gate") = Some(gate.clone());
+        let bus = Arc::new(bus);
+
+        let (task, answer) = spawn_connect(&actions, &bus);
+        assert!(is_busy(&actions), "busy before the task has run");
+        settle().await;
+        assert_eq!(bus.calls(), vec![Call::Connect]);
+        assert!(is_busy(&actions), "busy while Connect is unanswered");
+
+        gate.notify_one();
+        task.await.expect("the connect task");
+        assert!(matches!(*answer.lock().expect("answer"), Some(Ok(()))));
+        assert!(!is_busy(&actions), "idle once Connect has succeeded");
+    }
+
+    /// A connect that fails, whether bluetoothd answered with an error or
+    /// the call's own deadline ran out, releases its device (#1551).
+    ///
+    /// **Falsification:** empty `Busy`'s `drop` and both rows stay busy.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_connect_that_fails_or_runs_out_of_time_releases_its_device() {
+        for (reply, deadline) in [
+            (
+                BusError::Permanent {
+                    reason: "Page Timeout".to_owned(),
+                    dbus_name: Some("org.bluez.Error.Failed".to_owned()),
+                },
+                false,
+            ),
+            (
+                BusError::Timeout {
+                    reason: "call timeout".to_owned(),
+                },
+                true,
+            ),
+        ] {
+            let actions = Mutable::new(HashSet::new());
+            let bus = FakeBus::new();
+            *bus.connect_reply.lock().expect("connect_reply") = Some(Err(reply));
+            let bus = Arc::new(bus);
+
+            let (task, answer) = spawn_connect(&actions, &bus);
+            task.await.expect("the connect task");
+            let answered = answer.lock().expect("answer").take();
+            assert!(
+                answered.as_ref().is_some_and(|reply| reply
+                    .as_ref()
+                    .is_err_and(|e| e.is_timeout() == deadline)),
+                "the work saw the failure it was scripted with, got {answered:?}"
+            );
+            assert!(
+                !is_busy(&actions),
+                "idle after a failed Connect (deadline: {deadline})"
+            );
+        }
+    }
+
+    /// A connect whose task ends before `Connect` answers releases its
+    /// device: a task that is aborted, and one that panics (#1551). Until
+    /// then the marker was released by a line after the call, which neither
+    /// reaches, and the row stayed disabled until bluetoothd next restarted.
+    ///
+    /// **Falsification:** empty `Busy`'s `drop`, or release the marker on
+    /// the line after `work.await` instead of through the hold, and both
+    /// stay busy.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_connect_whose_task_ends_early_releases_its_device() {
+        let actions = Mutable::new(HashSet::new());
+        let bus = FakeBus::new();
+        // Never notified: this `Connect` never answers.
+        *bus.connect_gate.lock().expect("connect_gate") = Some(Arc::new(Notify::new()));
+        let bus = Arc::new(bus);
+        let (task, answer) = spawn_connect(&actions, &bus);
+        settle().await;
+        assert!(is_busy(&actions), "busy while Connect is unanswered");
+        task.abort();
+        let ended = task.await.expect_err("the task was aborted");
+        assert!(ended.is_cancelled(), "{ended:?}");
+        assert!(answer.lock().expect("answer").is_none(), "never answered");
+        assert!(!is_busy(&actions), "idle once the task is dropped");
+
+        let actions = Mutable::new(HashSet::new());
+        let task = spawn_busy_on(
+            &tokio::runtime::Handle::current(),
+            Some(&actions),
+            DEVICE,
+            async { panic!("a bug in the action") },
+        );
+        let ended = task.await.expect_err("the task panicked");
+        assert!(ended.is_panic(), "{ended:?}");
+        assert!(!is_busy(&actions), "idle after a panic in the action");
+    }
+
+    /// The `Connect` a pairing makes once `Pair` has succeeded keeps the
+    /// device busy until it answers, and no longer (#1551).
+    ///
+    /// **Falsification:** empty `Busy`'s `drop` and the device stays busy
+    /// after the pairing's `Connect` has answered.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pairing_holds_its_device_busy_through_its_connect() {
+        let actions = Mutable::new(HashSet::new());
+        let bus = FakeBus::new();
+        let gate = Arc::new(Notify::new());
+        *bus.connect_gate.lock().expect("connect_gate") = Some(gate.clone());
+        let bus = Arc::new(bus);
+        let task = spawn_busy_on(&tokio::runtime::Handle::current(), Some(&actions), DEVICE, {
+            let bus = bus.clone();
+            async move {
+                let outcome = pair_then_trust(&*bus, &Pairings::default(), DEVICE).await;
+                assert!(matches!(outcome, PairOutcome::Paired), "{outcome:?}");
+            }
+        });
+        settle().await;
+        assert_eq!(
+            bus.calls(),
+            vec![Call::Pair, Call::SetTrusted(true), Call::Connect]
+        );
+        assert!(is_busy(&actions), "busy while the pairing's Connect runs");
+
+        gate.notify_one();
+        task.await.expect("the pairing task");
+        assert!(!is_busy(&actions), "idle once that Connect has answered");
+    }
+
+    /// Without the service's state there is no marker, and the action runs
+    /// anyway, as the device calls always have. The panel's Trust-button test
+    /// relies on this.
+    #[tokio::test(flavor = "current_thread")]
+    async fn without_the_service_an_action_runs_unmarked() {
+        let bus = Arc::new(FakeBus::new());
+        let task = spawn_busy_on(&tokio::runtime::Handle::current(), None, DEVICE, {
+            let bus = bus.clone();
+            async move {
+                let _ = bus.connect(DEVICE).await;
+            }
+        });
+        task.await.expect("the connect task");
+        assert_eq!(bus.calls(), vec![Call::Connect]);
     }
 
     fn method_error(name: &str) -> BusError {

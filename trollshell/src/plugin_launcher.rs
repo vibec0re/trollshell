@@ -3529,7 +3529,8 @@ impl std::fmt::Display for StillStopping {
         write!(
             f,
             "plugin {}'s unit was still stopping after {} s (SubState {}), so it was not \
-             relaunched; it starts with the new spec the next time it is started",
+             relaunched; a switched-on plugin whose unit the shell started is launched with \
+             the new spec once that unit has stopped, and any other the next time it is started",
             self.id,
             STOP_WAIT.as_secs(),
             self.sub_state
@@ -10725,10 +10726,9 @@ mod tests {
             assert!(held(&owed).is_empty(), "{active}/{sub}: no longer owed");
         }
         let owed = owing(&["a", "b", "c"]);
-        assert!(owed.take_stopped(&[
-            unit("b", "deactivating", false),
-            unit("c", "active", false),
-        ]));
+        assert!(
+            owed.take_stopped(&[unit("b", "deactivating", false), unit("c", "active", false),])
+        );
         assert_eq!(held(&owed), ["b"], "each id on its own unit's row");
     }
 
@@ -10759,7 +10759,10 @@ mod tests {
             "still stopping"
         );
         assert_eq!(held(&owed), ["pet"]);
-        assert!(observe_owed(&owed, || async { Ok(Vec::new()) }).await, "gone");
+        assert!(
+            observe_owed(&owed, || async { Ok(Vec::new()) }).await,
+            "gone"
+        );
         assert!(held(&owed).is_empty());
     }
 
@@ -10789,7 +10792,8 @@ mod tests {
     /// a plugin switched off, and by owing anything but a run-out.
     #[tokio::test(start_paused = true)]
     async fn a_start_that_runs_out_owes_a_launch_for_a_switched_on_plugins_own_unit() {
-        let still_stopping = |answer: anyhow::Result<()>| ran_out_ids(&[("pet", answer)]) == ["pet"];
+        let still_stopping =
+            |answer: anyhow::Result<()>| ran_out_ids(&[("pet", answer)]) == ["pet"];
         let manager = Manager::new(&[("pet", None)]);
         manager.stopped_elsewhere("pet");
         assert!(still_stopping(start_against(&manager).await));
@@ -10804,12 +10808,16 @@ mod tests {
 
         let manager = Manager::new(&[("pet", None)]);
         manager.stopped_elsewhere("pet");
-        assert!(still_stopping(start_against_switched(&manager, false).await));
+        assert!(still_stopping(
+            start_against_switched(&manager, false).await
+        ));
         assert!(manager.owed_ids().is_empty(), "nor a plugin switched off");
 
         let manager = Manager::new(&[("pet", Some(Duration::from_secs(2)))]);
         manager.stopped_elsewhere("pet");
-        start_against(&manager).await.expect("launched once it is gone");
+        start_against(&manager)
+            .await
+            .expect("launched once it is gone");
         assert!(manager.owed_ids().is_empty(), "a start that went through");
     }
 
@@ -10916,15 +10924,21 @@ mod tests {
     #[tokio::test]
     async fn a_save_that_answers_still_stopping_owes_the_plugin_its_launch() {
         let owed = OwedLaunches::new();
-        let answer = save_running_out(vec![unit_for("pet", "active", &spec("/bin/pet", true))], &owed)
-            .await
-            .expect("an answer");
+        let answer = save_running_out(
+            vec![unit_for("pet", "active", &spec("/bin/pet", true))],
+            &owed,
+        )
+        .await
+        .expect("an answer");
         assert_eq!(answer, SettingsRestart::StillStopping);
         assert_eq!(held(&owed), ["pet"]);
 
         let owed = OwedLaunches::new();
         let answer = save_running_out(vec![unit("pet", "active", false)], &owed).await;
-        assert!(held(&owed).is_empty(), "{answer:?}: an unstamped unit is not owed");
+        assert!(
+            held(&owed).is_empty(),
+            "{answer:?}: an unstamped unit is not owed"
+        );
 
         let owed = OwedLaunches::new();
         let on = spec("/bin/pet", true);
@@ -11246,8 +11260,7 @@ mod tests {
             assert_eq!(held(&owed), ["pet"]);
 
             run.pet.set(None);
-            until("pet is launched", || !run.launched.borrow().is_empty())
-                .await;
+            until("pet is launched", || !run.launched.borrow().is_empty()).await;
             let listed = run.listed.get();
             run.ticks(3).await;
             assert_eq!(
@@ -11293,12 +11306,14 @@ mod tests {
                 run.ticks(3).await;
                 assert!(run.passes.borrow().is_empty(), "{meanwhile}");
                 run.pet.set(None);
-                until("the pass", || !run.passes.borrow().is_empty())
-                    .await;
+                until("the pass", || !run.passes.borrow().is_empty()).await;
                 let listed = run.listed.get();
                 run.ticks(3).await;
                 assert_eq!(*run.passes.borrow(), [None], "{meanwhile}: one pass");
-                assert!(run.launched.borrow().is_empty(), "{meanwhile}: nothing launched");
+                assert!(
+                    run.launched.borrow().is_empty(),
+                    "{meanwhile}: nothing launched"
+                );
                 assert!(held(&owed).is_empty(), "{meanwhile}: no longer owed");
                 assert_eq!(run.listed.get(), listed, "{meanwhile}");
                 assert_eq!(run.held_back.get(), 0, "{meanwhile}");
@@ -11656,6 +11671,77 @@ mod tests {
                     .any(|u| u.id == "pet" && u.active_state == "active"),
                 "running again, from the start: {units:?}"
             );
+        }
+
+        /// **A real unit still stopping keeps its launch owed until systemd
+        /// takes a launch under its name** (#1555 bullet 6): the premise the
+        /// watch's look rests on, on systemd itself. The stand-in is stopped
+        /// and still `deactivating` ([`stopping_stand_in`]); `pet` is owed a
+        /// launch, and [`observe_owed`] looks at real listings until it
+        /// answers that a pass is due. Every look that listed the unit
+        /// `deactivating` kept the id and made nothing due, so no pass would
+        /// have planned a wait for it; the look that made a pass due let the
+        /// id go, and a `systemd-run` under the name straight after it is
+        /// accepted, which is what the pass's launch needs.
+        ///
+        /// Driven by what each listing shows, never by the stand-in's clock.
+        /// The unit is `ts1555-owed-<pid>-pet.service`, never named like a
+        /// plugin's. A guard SIGKILLs, stops and resets it however the test
+        /// ends.
+        #[tokio::test]
+        async fn a_real_unit_still_stopping_keeps_its_launch_owed_until_it_is_gone() {
+            let prefix = format!("ts1555-owed-{}", std::process::id());
+            let unit = format!("{prefix}-pet.service");
+            let _cleanup = Cleanup(vec![unit.clone()]);
+            if stopping_stand_in(&prefix, "pet").await.is_none() {
+                return;
+            }
+            let owed = owing(&["pet"]);
+            // What each look's listing showed of `pet`.
+            let shown = std::cell::RefCell::new(Vec::new());
+            let began = std::time::Instant::now();
+            loop {
+                let due = observe_owed(&owed, || async {
+                    let units = list_prefixed(&prefix).await?;
+                    shown.borrow_mut().push(
+                        units
+                            .iter()
+                            .find(|u| u.id == "pet")
+                            .map(|u| u.active_state.clone()),
+                    );
+                    Ok(units)
+                })
+                .await;
+                let last = shown.borrow().last().cloned().expect("it listed");
+                if last.as_deref() == Some("deactivating") {
+                    assert!(!due, "no pass while the unit is still stopping");
+                    assert_eq!(held(&owed), ["pet"], "still owed");
+                } else {
+                    assert!(due, "a pass is due once the unit is {last:?}");
+                    assert!(held(&owed).is_empty(), "no longer owed");
+                    break;
+                }
+                assert!(
+                    began.elapsed() < Duration::from_secs(20),
+                    "{unit} never stopped: {:?}",
+                    shown.borrow()
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let shown = shown.into_inner();
+            eprintln!(
+                "{unit}: {} looks over {:?}, the last showing {:?}",
+                shown.len(),
+                began.elapsed(),
+                shown.last()
+            );
+            assert!(
+                shown.len() > 1,
+                "rail: at least one look saw it still stopping: {shown:?}"
+            );
+            launch_stubborn(&unit, STOPPING_TAKES)
+                .await
+                .expect("systemd takes a launch under the name once the look says it is gone");
         }
 
         /// **A reconcile's launch onto a real unit still stopping waits in

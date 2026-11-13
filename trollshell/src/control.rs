@@ -230,6 +230,10 @@ impl ControlIface {
     /// A declared plugin whose unit is still stopping (`deactivating`, e.g. a
     /// `StopPlugin` a moment ago) is launched once the unit is gone, so the
     /// answer can take up to the launcher's 12 s stop wait (#1417 follow-up).
+    /// If the unit is still stopping when that wait runs out, the call fails,
+    /// but a plugin switched on whose unit the launcher started is launched
+    /// by the launcher once the unit is gone (#1555 bullet 6), as after a
+    /// [`restart_plugin`](Self::restart_plugin) answering `still-stopping`.
     ///
     /// # Errors
     /// Unknown/invalid id, a unit that is already running, a unit still
@@ -423,8 +427,11 @@ impl ControlIface {
     /// - `"still-stopping"` — declared, running and switched on, but its unit,
     ///   which the launcher started, did not stop within 12 s (#1417 item 1):
     ///   nothing was relaunched and nothing started the old unit again, so the
-    ///   plugin is down once its stuck process exits, and the values apply
-    ///   when it is next started.
+    ///   plugin is down once its stuck process exits. The launcher then owes
+    ///   it a launch (#1555 bullet 6): its `plugins.json` watch looks at the
+    ///   unit on every tick and, once it is gone, runs one ordinary reconcile,
+    ///   which launches the plugin with the values saved by then if it is
+    ///   still declared and switched on. Nobody has to start it by hand.
     ///
     /// The tab sends this after **every** Save, whatever its own last poll
     /// said: the answer is decided here, after any restart already under way,

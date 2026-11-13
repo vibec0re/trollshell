@@ -2916,11 +2916,13 @@ const APPLYING: &str = "Saved. Asking the shell to apply it…";
 ///   the switch after any queued toggle, and the tab's poll may be older.
 /// - `still-stopping` (#1417 item 1) is a plugin whose unit did not stop
 ///   within the shell's 12 s wait. The shell then relaunches nothing and
-///   starts nothing, so the plugin is down once its stuck process exits, and
-///   nothing brings it back on its own. It is switched on (the shell only
-///   restarts a switched-on plugin), so the line says how to start it, as
-///   `not-running`'s does, and when: a switch flipped before the old unit is
-///   gone would be refused.
+///   starts nothing, so the plugin is down once its stuck process exits.
+///   Since #1555 bullet 6 the shell brings it back by itself: it watches the
+///   unit and, once it is gone, launches the plugin from what is declared
+///   then, if it is still switched on. So the line says that, and asks for
+///   nothing: the "switch it off and on" it used to ask for is no longer
+///   needed, and a switch flipped before the old unit is gone would only
+///   wait for it as well.
 fn restart_status(answer: &str, enabled: bool) -> &'static str {
     match answer {
         "relaunched" => "Saved, and the plugin restarted.",
@@ -2934,9 +2936,9 @@ fn restart_status(answer: &str, enabled: bool) -> &'static str {
              the next time it starts."
         }
         "still-stopping" => {
-            "Saved, but the running plugin did not stop within 12 s, so it was not restarted. It \
-             reads the new values the next time it starts: once it has stopped, switch it off and \
-             on to start it now."
+            "Saved, but the running plugin did not stop within 12 s, so it was not restarted yet. \
+             The shell starts it with the new values by itself once the old process has stopped, \
+             if it is still switched on then."
         }
         "not-declared" => {
             "Saved, but this plugin runs from a unit file of its own, which does not read \
@@ -2946,11 +2948,14 @@ fn restart_status(answer: &str, enabled: bool) -> &'static str {
     }
 }
 
-/// Whether [`restart_status`]'s line for `answer` asks the user to act, so
-/// the form shows it in the style its other "Saved, but …" lines already use
-/// (`set_status`'s `error`) rather than as a quiet success (#1445 review,
-/// N1). Only `still-stopping` does: the plugin is about to be down, and
-/// nothing brings it back until someone switches it off and on.
+/// Whether [`restart_status`]'s line for `answer` says the Save has not taken
+/// effect, so the form shows it in the style its other "Saved, but …" lines
+/// already use (`set_status`'s `error`) rather than as a quiet success (#1445
+/// review, N1). Only `still-stopping` does: the plugin is about to be down
+/// and the new values are not running yet. The shell starts it by itself once
+/// the old unit is gone (#1555 bullet 6), so the line no longer asks the user
+/// to act, but until then it is not the "restarted" a quiet line would read
+/// as.
 fn restart_status_warns(answer: &str) -> bool {
     answer == "still-stopping"
 }
@@ -6088,13 +6093,17 @@ mod tests {
                  values the next time it starts."
             );
             // #1417 item 1: the old unit did not stop in time, so the shell
-            // relaunched nothing and started nothing. Never "restarted", and
-            // it says how to start the plugin once it is down.
+            // relaunched nothing and started nothing. Never "restarted".
+            // #1555 bullet 6: the shell launches it once the old unit is
+            // gone, so the line says so and no longer asks for the switch.
             let still = super::restart_status("still-stopping", enabled);
             assert!(
                 still.contains("did not stop within 12 s")
-                    && still.contains("not restarted")
-                    && still.contains("switch it off and on")
+                    && still.contains("not restarted yet")
+                    && still.contains("starts it with the new values by itself")
+                    && still.contains("once the old process has stopped")
+                    && still.contains("still switched on")
+                    && !still.contains("switch it off and on")
                     && !still.contains("plugin restarted"),
                 "{still}"
             );
@@ -6169,8 +6178,9 @@ mod tests {
         );
     }
 
-    /// #1445 review, N1: the `still-stopping` line asks the user to act, so
-    /// it is shown like the form's other "Saved, but …" lines, and every
+    /// #1445 review, N1: the `still-stopping` line says the Save has not
+    /// taken effect yet (the shell starts the plugin by itself later, #1555
+    /// bullet 6), so it is shown like the form's other "Saved, but …" lines, and every
     /// other answer's line stays a quiet one. The Save's handler shows each
     /// answer's line in the style this picks.
     ///

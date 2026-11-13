@@ -18,6 +18,7 @@ use super::parse::{
 };
 use super::types::{Adapter, PromptRequest, Station, WifiNetwork};
 use super::{AGENT_PATH, IwdPaths};
+use crate::handshake::Handshake;
 use crate::retry;
 
 // ── Subscriptions ─────────────────────────────────────────────────────────────
@@ -344,15 +345,26 @@ struct Opened<O, E, T> {
 ///    first pass is the one call the backend probe may rely on to start iwd.
 /// 3. Fresh iwd receivers (`take_iwd`), after the wait and before the
 ///    snapshot, so every change made while the snapshot is taken is queued.
-/// 4. The snapshot (`discover`).
-async fn open_discovery<O, E, T, W, WF, D, DF>(
+/// 4. The wait for the bus to have every subscription's match rule
+///    (`subscriptions`, `hytte-bus`'s handshake), after the receivers exist
+///    and before the snapshot is asked for. A subscription installs its rule
+///    from a spawned task, so on the watcher's first pass the snapshot could
+///    otherwise be answered before the bus routed anything here. On a later
+///    pass the rules are long in place and this costs nothing; after a
+///    reconnect of our own bus connection it waits for the rebuilt rules.
+///    The wait is made here, on the subscriptions themselves, so the caller
+///    cannot leave it out.
+/// 5. The snapshot (`discover`).
+async fn open_discovery<O, E, T, H, W, WF, D, DF>(
     first: &mut bool,
     take_owner: impl FnOnce() -> O,
     wait: W,
     take_iwd: impl FnOnce() -> (E, E),
+    subscriptions: &[&H],
     discover: D,
 ) -> Opened<O, E, T>
 where
+    H: Handshake,
     W: FnOnce(O) -> WF,
     WF: Future<Output = O>,
     D: FnOnce() -> DF,
@@ -363,6 +375,9 @@ where
         owner = wait(owner).await;
     }
     let (added, removed) = take_iwd();
+    for subscription in subscriptions {
+        subscription.subscribed().await;
+    }
     let snapshot = discover().await;
     Opened {
         owner,
@@ -383,6 +398,14 @@ where
 /// restarted iwd had no agent. Now an owner change made while a snapshot is
 /// taken is queued for the pump that follows it, and a pump reads it after
 /// the snapshot.
+///
+/// "Before its first snapshot" holds on the bus, not only in this function's
+/// order: [`open_discovery`] waits for the bus to have all three match rules
+/// (`hytte-bus`'s handshake) before it asks for a snapshot. That wait has no
+/// deadline. A subscription to `net.connman.iwd` does not need iwd to be
+/// running, so it does not hold up the first discovery, the one that may
+/// start iwd; with the system bus itself down the watcher waits here, where
+/// discovery would have failed and retried.
 ///
 /// The subscriptions live for the watcher's life, but each discovery takes
 /// **fresh receivers** from them: the owner's at the top of the pass, before
@@ -428,6 +451,7 @@ pub(super) async fn run_wifi_watcher(
                 owner
             },
             || (added_sub.events(), removed_sub.events()),
+            &[&owner_sub, &added_sub, &removed_sub],
             discover_station,
         )
         .await;
@@ -601,6 +625,7 @@ mod tests {
         IWD_RECHECK, IwdOwner, OwnerReaction, iwd_owner_change, next_iwd_owner, open_discovery,
         owner_reaction, register_agent_until_accepted, wait_for_owner,
     };
+    use crate::handshake::Handshake;
     use crate::retry;
     use futures_util::StreamExt;
     use hytte_bus::{BusError, SignalEvent, SignalItem};
@@ -777,14 +802,35 @@ mod tests {
 
     /// A discovery pass opens in #1551's order: the owner receiver, then the
     /// wait for iwd (every pass but the watcher's first), then iwd's
-    /// receivers, then the snapshot (#1573 review).
+    /// receivers, then the wait for every subscription's match rule, then
+    /// the snapshot (#1573 review).
     ///
     /// **Falsification:** wait on the first pass too, skip the wait on a
     /// later one, take iwd's receivers before the wait, or take the snapshot
-    /// before them, and the recorded order changes.
+    /// before them, and the recorded order changes. So does dropping the
+    /// `subscribed().await` loop from `open_discovery`, awaiting only some of
+    /// the subscriptions, or moving the loop below the snapshot.
     #[tokio::test]
     async fn a_discovery_pass_opens_in_order_and_waits_except_the_first() {
+        /// A subscription whose handshake is not ready until polled twice,
+        /// so a wait that is created but not awaited to the end is caught.
+        struct Recording<'a>(&'a RefCell<Vec<&'static str>>, &'static str);
+        impl Handshake for Recording<'_> {
+            fn subscribed(&self) -> impl Future<Output = ()> {
+                let Self(log, name) = *self;
+                async move {
+                    tokio::task::yield_now().await;
+                    log.borrow_mut().push(name);
+                }
+            }
+        }
+
         let log = RefCell::new(Vec::new());
+        let subscriptions = [
+            &Recording(&log, "owner rule installed"),
+            &Recording(&log, "added rule installed"),
+            &Recording(&log, "removed rule installed"),
+        ];
         let mut first = true;
         for _ in 0..2 {
             let opened = open_discovery(
@@ -798,6 +844,7 @@ mod tests {
                     log.borrow_mut().push("iwd receivers");
                     ((), ())
                 },
+                &subscriptions,
                 || {
                     log.borrow_mut().push("snapshot");
                     async { Some(()) }
@@ -811,10 +858,16 @@ mod tests {
             [
                 "owner receiver",
                 "iwd receivers",
+                "owner rule installed",
+                "added rule installed",
+                "removed rule installed",
                 "snapshot",
                 "owner receiver",
                 "wait for iwd",
                 "iwd receivers",
+                "owner rule installed",
+                "added rule installed",
+                "removed rule installed",
                 "snapshot",
             ]
         );

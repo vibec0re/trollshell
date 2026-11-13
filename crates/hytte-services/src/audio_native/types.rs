@@ -79,6 +79,18 @@ pub(super) struct NodeProxy {
 /// bind only the one named `default`. Like `NodeProxy`, both must stay
 /// alive together — dropping either ends property events.
 pub(super) struct MetadataProxy {
+    /// The **registry global id** this proxy was bound to — what the
+    /// registry's `global_remove` names when the object goes away.
+    ///
+    /// Kept because nothing on the proxy carries it: `Proxy::id()` is
+    /// `pw_proxy_get_id`, the proxy's *client-local* id, a separate number
+    /// space. Comparing that against a removed global's id (which the removal
+    /// path used to do) missed the real removal on a `WirePlumber` restart,
+    /// and matched whatever unrelated global — a link, a node, a short-lived
+    /// client such as a keybind's `wpctl` — happened to carry the same number,
+    /// clearing both defaults and dropping this listener for the rest of the
+    /// session while the `default` metadata was still alive.
+    pub(super) global_id: u32,
     #[allow(dead_code)]
     pub(super) proxy: pw::metadata::Metadata,
     #[allow(dead_code)]
@@ -126,9 +138,14 @@ pub(super) struct AudioState {
     /// Populated lazily when the registry walker first sees a Metadata
     /// global with `metadata.name = "default"`.
     pub(super) metadata_default: Option<MetadataProxy>,
+    /// Default picks made while `metadata_default` was `None`, written out
+    /// when it binds.
+    pub(super) pending_defaults: PendingDefaults,
     /// `default.audio.sink` value — the `node.name` of the current default
-    /// sink. Compared against each Sink's name in `emit_snapshots` to
-    /// flip `is_default`. `None` until the first property event fires.
+    /// sink, as the session manager resolved it ([`DefaultKind`]'s effective
+    /// key; a pick is written to the configured one). Compared against each
+    /// Sink's name in `emit_snapshots` to flip `is_default`. `None` until the
+    /// first property event fires.
     pub(super) default_sink_name: Option<String>,
     /// Same as `default_sink_name` for the default source.
     pub(super) default_source_name: Option<String>,
@@ -161,6 +178,7 @@ impl AudioState {
             nodes: HashMap::new(),
             proxies: HashMap::new(),
             metadata_default: None,
+            pending_defaults: PendingDefaults::default(),
             default_sink_name: None,
             default_source_name: None,
             links: HashMap::new(),
@@ -187,22 +205,28 @@ impl AudioState {
 // `Set*` prefix on every variant is intentional — this is a command enum.
 #[allow(clippy::enum_variant_names)]
 pub(super) enum Command {
-    /// Set channelVolumes on a sink, identified by `node.name`. The new
-    /// linear gain is replicated across every channel currently in the
-    /// cache so a stereo sink stays stereo. If the cache is empty (no
-    /// Props event received yet) the command is dropped — we'd otherwise
+    /// Set channelVolumes on a sink, identified by `node.name`. `linear` is
+    /// the overall level — the channel average every surface shows — and each
+    /// channel currently in the cache is scaled to it
+    /// (`pod::scaled_channel_volumes`), so the sink keeps both its channel
+    /// count and its balance. It used to write `linear` to every channel,
+    /// which kept a stereo sink two channels wide but flattened L = 1.0,
+    /// R = 0.5 to 0.80/0.80 on the first scroll notch. If the cache is empty
+    /// (no Props event received yet) the command is dropped — we'd otherwise
     /// publish a mono channelVolumes array and clobber the sink's layout.
     SetSinkVolume {
         name: String,
         linear: f64,
     },
-    /// Set channelVolumes on a source (microphone, line-in).
+    /// Set channelVolumes on a source (microphone, line-in), scaled the same
+    /// way as [`Command::SetSinkVolume`].
     SetSourceVolume {
         name: String,
         linear: f64,
     },
     /// Set channelVolumes on a playback stream, identified by pipewire
-    /// global id (streams have no stable `node.name`).
+    /// global id (streams have no stable `node.name`), scaled the same way as
+    /// [`Command::SetSinkVolume`].
     SetStreamVolume {
         id: u32,
         linear: f64,
@@ -220,11 +244,15 @@ pub(super) enum Command {
         id: u32,
         mute: bool,
     },
-    /// Write `default.audio.sink` on the `default` Metadata. Phase 4 wires
-    /// this — for Phase 3 the dispatcher logs and drops the command.
+    /// Make a sink the user's default: written to the `default` Metadata as
+    /// [`DefaultKind::Sink`]'s **configured** key, the one the session manager
+    /// reads a user's choice from — see [`DefaultKind`] for why that is not
+    /// the key the default is read back from.
     SetDefaultSink {
         name: String,
     },
+    /// [`Command::SetDefaultSink`] for a source, on [`DefaultKind::Source`]'s
+    /// configured key.
     SetDefaultSource {
         name: String,
     },
@@ -237,6 +265,108 @@ pub(super) enum Command {
     SetSpectrumActive {
         active: bool,
     },
+}
+
+/// Which default a `default` Metadata key is about, and the **two** keys each
+/// one has.
+///
+/// The session manager keeps a pair per kind, and they are not
+/// interchangeable:
+///
+/// * the **configured** key (`default.configured.audio.sink`) is the user's
+///   choice. It is what `wpctl set-default` and `pactl set-default-sink`
+///   write, what `WirePlumber` persists across restarts and logins
+///   (`default-nodes/state-default-nodes.lua` stores only these), and the
+///   only keys whose change triggers a re-evaluation (`default-nodes/rescan.lua`'s
+///   `metadata-changed` interest names nothing else);
+/// * the **effective** key (`default.audio.sink`) is the session manager's
+///   *answer*: on every rescan `default-nodes/apply-default-node.lua` writes it
+///   from the node `default-nodes/find-selected-default-node.lua` picked,
+///   which is the configured one whenever that node is present.
+///
+/// So a pick is written to the configured key and the default is read back off
+/// the effective one. Writing the effective key directly — what this backend
+/// did until it was found — does flip the default for a moment (the linking
+/// scripts follow the effective key), and the next rescan then writes the old
+/// choice back over it: a device plugged or unplugged, a Bluetooth sink
+/// connecting, a headphone jack's `Route` change. It also never reached the
+/// state file, so it did not survive a `WirePlumber` restart or a re-login.
+/// Checked against `WirePlumber` 0.5.14 (the installed scripts) and 0.5.15
+/// (this flake's nixpkgs pin).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DefaultKind {
+    Sink,
+    Source,
+}
+
+impl DefaultKind {
+    /// The key a user's pick is **written** to.
+    pub(super) const fn configured_key(self) -> &'static str {
+        match self {
+            Self::Sink => "default.configured.audio.sink",
+            Self::Source => "default.configured.audio.source",
+        }
+    }
+
+    /// The key the session manager's resolved default is **read** from.
+    pub(super) const fn effective_key(self) -> &'static str {
+        match self {
+            Self::Sink => "default.audio.sink",
+            Self::Source => "default.audio.source",
+        }
+    }
+
+    /// The kind whose [`effective_key`](Self::effective_key) is `key`, if any —
+    /// the metadata listener's filter. A configured key answers `None`: the
+    /// user's choice is not the default until the session manager says so.
+    pub(super) fn from_effective_key(key: &str) -> Option<Self> {
+        [Self::Sink, Self::Source]
+            .into_iter()
+            .find(|kind| kind.effective_key() == key)
+    }
+}
+
+/// Default picks that arrived while no `default` Metadata was bound, held
+/// until one is: at most one per [`DefaultKind`], the **last** one, because a
+/// later pick supersedes an earlier one exactly as it would have on the wire.
+///
+/// Before this a pick in that window was logged and dropped. Nothing promises
+/// the window stays shut — the registry walk is not documented to deliver the
+/// metadata global before the sink nodes, a `WirePlumber` restart leaves none
+/// bound for a moment, and a failed bind leaves none at all — and the one
+/// caller that acts on its own, `bluetooth_audio`'s reactor switching to a
+/// Bluetooth sink, records the switch as done (`last_observed_bt_default`) the
+/// moment it sends it and never retries, so a dropped write there was lost for
+/// the whole Bluetooth episode. Now the write lands as soon as the metadata
+/// binds, on the configured key like any other.
+///
+/// It lives in the session's [`AudioState`], so a mainloop restart drops it
+/// along with the rest of the session's view of the graph.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct PendingDefaults {
+    sink: Option<String>,
+    source: Option<String>,
+}
+
+impl PendingDefaults {
+    /// Hold `name` as the pick for `kind`, replacing an earlier one.
+    pub(super) fn park(&mut self, kind: DefaultKind, name: String) {
+        *match kind {
+            DefaultKind::Sink => &mut self.sink,
+            DefaultKind::Source => &mut self.source,
+        } = Some(name);
+    }
+
+    /// Take every held pick, sink first, leaving nothing held.
+    pub(super) fn drain(&mut self) -> Vec<(DefaultKind, String)> {
+        [
+            (DefaultKind::Sink, self.sink.take()),
+            (DefaultKind::Source, self.source.take()),
+        ]
+        .into_iter()
+        .filter_map(|(kind, name)| name.map(|name| (kind, name)))
+        .collect()
+    }
 }
 
 /// What a [`Command::SetSpectrumActive`] should actually do, given the requested

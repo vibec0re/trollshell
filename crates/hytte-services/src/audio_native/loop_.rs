@@ -22,11 +22,14 @@ use super::super::pipewire::{
     AudioSpectrum, PipewireHandles, PlaybackStream, RecordStream, Sink, Source, Volume,
 };
 use super::graph::{resolve_link_dest, resolve_link_source};
-use super::pod::{avg_volume, build_props_pod, decode_props, parse_default_name, pick_app_name};
+use super::pod::{
+    avg_volume, build_props_pod, decode_props, parse_default_name, pick_app_name,
+    scaled_channel_volumes,
+};
 use super::spectrum::SpectrumUserData;
 use super::types::{
-    AudioRole, AudioState, Command, LinkEdge, MetadataProxy, NodeEntry, NodeProxy, SpectrumAction,
-    SpectrumCapture, StateRef, clone_handles,
+    AudioRole, AudioState, Command, DefaultKind, LinkEdge, MetadataProxy, NodeEntry, NodeProxy,
+    SpectrumAction, SpectrumCapture, StateRef, clone_handles,
 };
 use crate::retry;
 
@@ -462,7 +465,19 @@ pub(super) fn run_once(
                             Rc::clone(&state_add),
                         ) {
                             Ok(proxy) => {
-                                state_add.borrow_mut().metadata_default = Some(proxy);
+                                let mut guard = state_add.borrow_mut();
+                                let s = &mut *guard;
+                                // Picks made while nothing was bound land now.
+                                let pending = s.pending_defaults.drain();
+                                let meta = s.metadata_default.insert(proxy);
+                                for (kind, name) in pending {
+                                    tracing::debug!(
+                                        key = kind.configured_key(),
+                                        name = %name,
+                                        "audio_native: writing a default parked before the metadata bound",
+                                    );
+                                    set_configured_default(meta, kind, &name);
+                                }
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -529,12 +544,14 @@ pub(super) fn run_once(
             }
             // If the default Metadata global went away (pipewire-pulse or
             // wireplumber restart), drop our cached proxy so the next
-            // re-add rebinds cleanly. We don't know the id of the metadata
-            // global without tracking it; compare by checking whether
-            // the proxy's upcast id matches. Cheaper to clear on any
-            // removal that hits a Metadata-shaped slot.
-            if let Some(meta) = s.metadata_default.as_ref()
-                && pw::proxy::ProxyT::upcast_ref(&meta.proxy).id() == id
+            // re-add rebinds cleanly. Compared against the global id the
+            // proxy was bound to, which `MetadataProxy` records for exactly
+            // this — the proxy's own `id()` is a client-local number, so
+            // comparing that missed the real removal and matched unrelated
+            // globals that happened to share it (see `global_id`'s doc).
+            if s.metadata_default
+                .as_ref()
+                .is_some_and(|meta| meta.global_id == id)
             {
                 tracing::debug!(id, "audio_native: - default metadata");
                 s.metadata_default = None;
@@ -609,10 +626,14 @@ fn bind_node_for_params(
 }
 
 /// Bind the `default` Metadata global and start listening for property
-/// changes on `default.audio.sink` and `default.audio.source`. Other keys
+/// changes on `default.audio.sink` and `default.audio.source` — the
+/// **effective** keys ([`DefaultKind::effective_key`]). Other keys
 /// (file-chooser default folder, screen-share preferences, etc.) also
 /// live on this object; we filter inside the callback to leave those
-/// untouched.
+/// untouched. That includes the `default.configured.audio.*` pair
+/// [`write_default`] writes: the user's choice is not the default until the
+/// session manager has resolved it, which arrives as a change to the
+/// effective key a moment later.
 fn bind_default_metadata(
     registry: &pw::registry::RegistryRc,
     id: u32,
@@ -641,30 +662,26 @@ fn bind_default_metadata(
                 }
                 return 0;
             };
-            match key {
-                "default.audio.sink" => {
-                    let new_name = value.and_then(parse_default_name);
-                    let mut s = state.borrow_mut();
-                    if s.default_sink_name != new_name {
-                        s.default_sink_name = new_name;
-                        emit_snapshots(&mut s);
-                    }
-                }
-                "default.audio.source" => {
-                    let new_name = value.and_then(parse_default_name);
-                    let mut s = state.borrow_mut();
-                    if s.default_source_name != new_name {
-                        s.default_source_name = new_name;
-                        emit_snapshots(&mut s);
-                    }
-                }
-                _ => {} // ignore unrelated metadata keys
+            // Ignore unrelated metadata keys — the configured pair among them.
+            let Some(kind) = DefaultKind::from_effective_key(key) else {
+                return 0;
+            };
+            let new_name = value.and_then(parse_default_name);
+            let mut s = state.borrow_mut();
+            let slot = match kind {
+                DefaultKind::Sink => &mut s.default_sink_name,
+                DefaultKind::Source => &mut s.default_source_name,
+            };
+            if *slot != new_name {
+                *slot = new_name;
+                emit_snapshots(&mut s);
             }
             0
         })
         .register();
 
     Ok(MetadataProxy {
+        global_id: id,
         proxy: metadata,
         listener,
     })
@@ -694,10 +711,10 @@ fn handle_command(cmd: Command, state: &StateRef, core: &pw::core::CoreRc) {
             apply_mute_by_id(state, id, mute);
         }
         Command::SetDefaultSink { name } => {
-            write_default(state, "default.audio.sink", &name);
+            write_default(state, DefaultKind::Sink, &name);
         }
         Command::SetDefaultSource { name } => {
-            write_default(state, "default.audio.source", &name);
+            write_default(state, DefaultKind::Source, &name);
         }
         Command::SetSpectrumActive { active } => {
             set_spectrum_active(state, core, active);
@@ -788,12 +805,13 @@ fn activate_spectrum(stream: &pw::stream::StreamRc) {
 }
 
 /// Resolve a node by `node.name` and target role, then call the closure
-/// with its pipewire id and current channel count. The closure builds the
-/// appropriate Props pod and calls `set_param`. Returns silently if the
-/// node isn't in the cache yet (e.g. a stale name from a UI race).
+/// with its proxy and its cached per-channel gains (empty until the first
+/// `Props` event). The closure builds the appropriate Props pod and calls
+/// `set_param`. Returns silently if the node isn't in the cache yet (e.g. a
+/// stale name from a UI race).
 fn with_named_node<F>(state: &StateRef, name: &str, role: AudioRole, f: F)
 where
-    F: FnOnce(&pw::node::Node, usize),
+    F: FnOnce(&pw::node::Node, &[f32]),
 {
     let s = state.borrow();
     let Some((id, entry)) = s
@@ -804,84 +822,123 @@ where
         tracing::debug!(name, ?role, "audio_native: target node not in cache");
         return;
     };
-    let channels = entry.channel_volumes.len();
     let Some(proxy) = s.proxies.get(id) else {
         tracing::debug!(name, ?role, "audio_native: target node has no proxy");
         return;
     };
-    f(&proxy.proxy, channels);
+    f(&proxy.proxy, &entry.channel_volumes);
 }
 
 fn with_id_node<F>(state: &StateRef, id: u32, f: F)
 where
-    F: FnOnce(&pw::node::Node, usize),
+    F: FnOnce(&pw::node::Node, &[f32]),
 {
     let s = state.borrow();
     let Some(entry) = s.nodes.get(&id) else {
         tracing::debug!(id, "audio_native: target stream not in cache");
         return;
     };
-    let channels = entry.channel_volumes.len();
     let Some(proxy) = s.proxies.get(&id) else {
         tracing::debug!(id, "audio_native: target stream has no proxy");
         return;
     };
-    f(&proxy.proxy, channels);
+    f(&proxy.proxy, &entry.channel_volumes);
 }
 
 fn apply_volume_by_name(state: &StateRef, name: &str, role: AudioRole, linear: f64) {
-    with_named_node(state, name, role, |node, channels| {
-        send_volume(node, channels, linear);
+    with_named_node(state, name, role, |node, gains| {
+        send_volume(node, gains, linear);
     });
 }
 
 fn apply_volume_by_id(state: &StateRef, id: u32, linear: f64) {
-    with_id_node(state, id, |node, channels| {
-        send_volume(node, channels, linear);
+    with_id_node(state, id, |node, gains| {
+        send_volume(node, gains, linear);
     });
 }
 
 fn apply_mute_by_name(state: &StateRef, name: &str, role: AudioRole, mute: bool) {
-    with_named_node(state, name, role, |node, _channels| send_mute(node, mute));
+    with_named_node(state, name, role, |node, _gains| send_mute(node, mute));
 }
 
 fn apply_mute_by_id(state: &StateRef, id: u32, mute: bool) {
-    with_id_node(state, id, |node, _channels| send_mute(node, mute));
+    with_id_node(state, id, |node, _gains| send_mute(node, mute));
 }
 
-/// Write `default.audio.{sink,source}` to the `default` Metadata. The C
-/// API expects the value as `Spa:String:JSON` formatted as
-/// `{"name":"<node.name>"}`. Subject 0 targets "any" (global) scope —
-/// matches what `wpctl set-default` does. Silently no-ops if the
-/// `default` metadata hasn't been seen yet (e.g. the loop hasn't
-/// reached the metadata global yet on startup).
-fn write_default(state: &StateRef, key: &str, name: &str) {
-    let s = state.borrow();
-    let Some(meta) = s.metadata_default.as_ref() else {
-        tracing::warn!(
-            key,
+/// Write a user's default pick to the `default` Metadata, on the kind's
+/// **configured** key (`default.configured.audio.{sink,source}`) — the one the
+/// session manager reads a choice from and persists, not the effective key it
+/// answers on; [`DefaultKind`] has the `WirePlumber` scripts that make the
+/// difference matter.
+///
+/// If no `default` metadata is bound yet (the loop hasn't reached that global,
+/// or `WirePlumber` is restarting) the pick is **parked** in
+/// [`PendingDefaults`] and written by the registry walker the moment one
+/// binds. It used to be logged and dropped, which `bluetooth_audio`'s reactor
+/// in particular cannot recover from: it marks its switch done when it sends
+/// it, and never sends it again.
+///
+/// [`PendingDefaults`]: super::types::PendingDefaults
+fn write_default(state: &StateRef, kind: DefaultKind, name: &str) {
+    let mut guard = state.borrow_mut();
+    let s = &mut *guard;
+    if let Some(meta) = s.metadata_default.as_ref() {
+        set_configured_default(meta, kind, name);
+    } else {
+        tracing::debug!(
+            key = kind.configured_key(),
             name,
-            "audio_native: write_default before default metadata bound",
+            "audio_native: default picked before the default metadata bound; parked until it does",
         );
-        return;
-    };
-    let value = serde_json::json!({ "name": name }).to_string();
-    meta.proxy
-        .set_property(0, key, Some("Spa:String:JSON"), Some(&value));
+        s.pending_defaults.park(kind, name.to_owned());
+    }
+}
+
+/// Write `name` to `kind`'s configured key on the bound `default` metadata:
+/// [`default_value_json`] as [`DEFAULT_VALUE_TYPE`] on subject 0 — the key,
+/// type, subject and JSON object `wpctl set-default` writes
+/// (`module-default-nodes-api.c`'s `set_default_configured_node_name`, which
+/// `printf`s `{ "name": "%s" }`; only the whitespace differs).
+fn set_configured_default(meta: &MetadataProxy, kind: DefaultKind, name: &str) {
+    let value = default_value_json(name);
+    meta.proxy.set_property(
+        0,
+        kind.configured_key(),
+        Some(DEFAULT_VALUE_TYPE),
+        Some(&value),
+    );
+}
+
+/// The SPA type a default-node value is tagged with. `module-default-nodes-api.c`
+/// parses a default key's value only when it carries this type (a `g_strcmp0`
+/// on it guards both the effective and the configured arm).
+const DEFAULT_VALUE_TYPE: &str = "Spa:String:JSON";
+
+/// The JSON a default-node key carries: `{"name":"<node.name>"}`, the shape
+/// [`parse_default_name`] reads back off the effective key. Built with
+/// `serde_json` rather than `format!` so a `node.name` with a quote or a
+/// backslash in it stays one valid JSON string.
+fn default_value_json(name: &str) -> String {
+    serde_json::json!({ "name": name }).to_string()
 }
 
 /// Build a `SPA_TYPE_OBJECT_Props` pod carrying just `SPA_PROP_channelVolumes`
-/// (one float per channel, all set to `linear`) and dispatch it via
-/// `node.set_param`. If `channels == 0` the cache hasn't seen a Props event
-/// yet — silently skip rather than publishing a mono array that would
-/// clobber a stereo sink's layout.
-// `linear` gain is in [0,1]; f32 is PipeWire's channelVolumes element type.
-fn send_volume(node: &pw::node::Node, channels: usize, linear: f64) {
-    if channels == 0 {
-        tracing::debug!("audio_native: skip set_volume — channel count unknown");
+/// and dispatch it via `node.set_param`. `linear` is the overall level the
+/// surfaces show — the channel average — and each of the node's cached `gains`
+/// is scaled to it by [`scaled_channel_volumes`], so a sink's balance survives
+/// a volume step instead of being flattened to one value on every channel. If
+/// `gains` is empty the cache hasn't seen a Props event yet — silently skip
+/// rather than publishing a mono array that would clobber a stereo sink's
+/// layout; a non-finite `linear` is skipped too.
+fn send_volume(node: &pw::node::Node, gains: &[f32], linear: f64) {
+    let Some(channel_volumes) = scaled_channel_volumes(gains, linear) else {
+        tracing::debug!(
+            channels = gains.len(),
+            linear,
+            "audio_native: skip set_volume — channel layout unknown or level not finite"
+        );
         return;
-    }
-    let channel_volumes: Vec<f32> = vec![crate::cast::f64_to_f32_gain(linear); channels];
+    };
     let pod = build_props_pod(Some(channel_volumes), None);
     let Some(pod) = pod else {
         tracing::warn!("audio_native: failed to build volume pod");
@@ -1147,8 +1204,9 @@ pub(super) fn send_command(cmd: Command) {
 #[cfg(test)]
 mod tests {
     use super::{
-        COMMAND_TX, Command, PW_INIT, SessionEnd, initial_slot, pw, reconnect_after,
-        run_sessions_with, send_command, session_receiver, supervise_sessions,
+        COMMAND_TX, Command, DEFAULT_VALUE_TYPE, PW_INIT, SessionEnd, default_value_json,
+        initial_slot, parse_default_name, pw, reconnect_after, run_sessions_with, send_command,
+        session_receiver, supervise_sessions,
     };
     use crate::retry;
     use hytte_reactive::test_lock::TEST_LOCK;
@@ -1158,6 +1216,26 @@ mod tests {
     use std::sync::{Arc, Mutex, PoisonError};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    /// The value a default pick writes is the one the reader takes back off the
+    /// effective key — `{"name": …}` tagged `Spa:String:JSON`, what `wpctl
+    /// set-default` writes — and a `node.name` with JSON metacharacters in it
+    /// survives as one string rather than as broken JSON the session manager
+    /// would drop.
+    #[test]
+    fn a_default_value_round_trips_through_the_reader() {
+        assert_eq!(DEFAULT_VALUE_TYPE, "Spa:String:JSON");
+        for name in [
+            "alsa_output.pci-0000_00_1f.3.analog-stereo",
+            "bluez_output.AC_C5_8B_11_22_33.1",
+            r#"a "quoted" \ name"#,
+        ] {
+            assert_eq!(
+                parse_default_name(&default_value_json(name)).as_deref(),
+                Some(name),
+            );
+        }
+    }
 
     /// #1170's item 3: a core error — the `Ok(())`-shaped exit — must be paced
     /// exactly like a failed connect. Before this, the quit arm returned

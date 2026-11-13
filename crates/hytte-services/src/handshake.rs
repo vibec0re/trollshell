@@ -9,12 +9,14 @@
 //! recording stand-in and read the order back.
 //!
 //! [`subscribe_then_snapshot`] serves every site where the read comes after
-//! one wait: `bluetooth`'s `listen` (its owner subscription, then the
-//! snapshot), its `event_loop` (every subscription the fold reads, then one
-//! resync), its `wait_for_bluez` (the owner subscription, then
-//! `NameHasOwner`), and `wifi`'s station (the station's `PropertiesChanged`,
-//! then the station re-read). `open_discovery` has an extra step between the
-//! receivers and the wait, so it orders its own.
+//! one wait and nothing else may go on meanwhile: `bluetooth`'s `listen` (its
+//! owner subscription, then the snapshot), its `event_loop` (the fold's three
+//! top-level subscriptions, then one resync), and its `wait_for_bluez` (the
+//! owner subscription, then `NameHasOwner`). `wifi`'s `open_discovery` has an
+//! extra step between the receivers and the wait, so it orders its own. The
+//! iwd station's subscription is waited for by `wifi`'s event pump, as one of
+//! its arms, so the network read and the agent registration do not wait on it
+//! (#1647 review).
 
 use hytte_bus::SignalSubscription;
 

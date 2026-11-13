@@ -456,26 +456,11 @@ enum DeviceMsg {
         body: zbus::Message,
     },
     /// The device's subscription has its match rule: read the device again
-    /// ([`Reread::OnceSubscribed`], [`reread_device`]).
+    /// ([`FoldBus::subscribe_device`], [`reread_device`]).
     Reread {
         /// The device's object path.
         path: String,
     },
-}
-
-/// Whether a device's subscription asks [`fold`] to read the device again
-/// once the bus has its match rule (#1551).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Reread {
-    /// No. The subscription is one of [`open_fold`]'s: the fold waits for its
-    /// rule before its first resync, and that resync reads the device after
-    /// the rule is in place.
-    No,
-    /// Yes. The subscription is made after the device's state was read (its
-    /// `InterfacesAdded`, or a resync that found it), and nothing else waits
-    /// for its rule, so a change in between would be lost. The re-read is
-    /// sent after the rule is in place.
-    OnceSubscribed,
 }
 
 /// Depth of the queue carrying "re-sync, please" wakes to [`fold`].
@@ -545,11 +530,23 @@ where
 trait FoldBus {
     /// One device's `PropertiesChanged` subscription. Dropping it tears the
     /// subscription down ([`subscribe_device_props`]).
-    type DeviceSub: Handshake;
+    type DeviceSub;
 
     /// Subscribe to one device's `PropertiesChanged`, its forwarder feeding
-    /// [`fold`]'s queues.
-    fn subscribe_device(&self, path: &str, reread: Reread) -> Self::DeviceSub;
+    /// [`fold`]'s queues, and have the forwarder ask [`fold`] to read the
+    /// device again once the bus has the rule ([`DeviceMsg::Reread`], #1551).
+    ///
+    /// Every device subscription asks for that re-read, because every one is
+    /// made after its device's state was read: a device that appears is
+    /// subscribed off its `InterfacesAdded`, and a device a resync finds,
+    /// [`listen`]'s snapshot devices among them, off that resync's answer.
+    /// Nothing waits for the device's rule before reading it, so a change
+    /// made in between would be lost; the re-read is sent once the rule is in
+    /// place, so it covers that change and every later one reaches the
+    /// forwarder. Not waiting is deliberate (#1647 review): a rule the bus
+    /// refuses then costs only its own device's live updates, as before
+    /// #1551, rather than holding up the whole fold.
+    fn subscribe_device(&self, path: &str) -> Self::DeviceSub;
 
     /// bluez's `GetManagedObjects`.
     fn managed_objects(&self) -> impl Future<Output = Result<ManagedObjects, BusError>>;
@@ -572,8 +569,8 @@ struct SystemBluez {
 impl FoldBus for SystemBluez {
     type DeviceSub = SignalSubscription;
 
-    fn subscribe_device(&self, path: &str, reread: Reread) -> SignalSubscription {
-        subscribe_device_props(path, self.props_tx.clone(), self.resync_tx.clone(), reread)
+    fn subscribe_device(&self, path: &str) -> SignalSubscription {
+        subscribe_device_props(path, self.props_tx.clone(), self.resync_tx.clone())
     }
 
     fn managed_objects(&self) -> impl Future<Output = Result<ManagedObjects, BusError>> {
@@ -591,58 +588,63 @@ impl FoldBus for SystemBluez {
 
 // ── Opening the fold ──────────────────────────────────────────────────────────
 
-/// Every subscription [`fold`] reads besides the owner's, made together and
-/// waited for together ([`open_fold`]).
-struct FoldSubscriptions<H, D> {
+/// The three top-level subscriptions [`fold`] reads besides the owner's, made
+/// together and waited for together ([`open_fold`]).
+///
+/// No device's subscription is among them (#1647 review). The first resync,
+/// which [`open_fold`] arms, subscribes every device it finds, and each of
+/// those reads its device again once its own rule is in place
+/// ([`FoldBus::subscribe_device`]). Until the review the snapshot's devices
+/// were subscribed here and waited for with the rest, so a single device rule
+/// the bus refused (one rule per known device, against a per-connection
+/// limit) kept the whole fold from starting, owner stream included.
+struct FoldSubscriptions<H> {
     /// `InterfacesAdded` on bluez's root object.
     added: H,
     /// `InterfacesRemoved` on bluez's root object.
     removed: H,
     /// `PropertiesChanged` on the adapter.
     adapter: H,
-    /// `PropertiesChanged` on every device in [`listen`]'s snapshot.
-    devices: HashMap<String, D>,
 }
 
-impl<H: Handshake, D: Handshake> Handshake for FoldSubscriptions<H, D> {
+impl<H: Handshake> Handshake for FoldSubscriptions<H> {
     /// Resolves once the bus has every one of these rules.
     async fn subscribed(&self) {
         for sub in [&self.added, &self.removed, &self.adapter] {
             sub.subscribed().await;
         }
-        for sub in self.devices.values() {
-            sub.subscribed().await;
-        }
     }
 }
 
-/// Subscribe everything [`fold`] reads (`subscribe`, which takes the
-/// receivers too), wait for the bus to have every one of those rules, then
-/// arm one resync (#1551).
+/// Subscribe the three top-level signals [`fold`] reads (`subscribe`, which
+/// takes the receivers too), wait for the bus to have their rules, then arm
+/// one resync (#1551).
 ///
 /// These subscriptions are made after [`listen`]'s snapshot, because the
-/// adapter's and the devices' paths come from it, so an emission between that
-/// snapshot and their rules would be lost. They used to be made there and
-/// never waited for, on purpose: replaying an `InterfacesAdded` older than the
-/// snapshot would have applied an older device's properties over the
-/// snapshot's. Now the window is closed by reading again after the rules are
-/// in place, and the fold tolerates that replay instead (see [`fold`]'s
-/// "Ordering"). The cost is a second `GetManagedObjects` per [`listen`].
+/// adapter's path comes from it, so an emission between that snapshot and
+/// their rules would be lost. They used to be made there and never waited
+/// for, on purpose: replaying an `InterfacesAdded` older than the snapshot
+/// would have applied an older device's properties over the snapshot's. Now
+/// the window is closed by reading again after the rules are in place, and
+/// the fold tolerates that replay instead (see [`fold`]'s "Ordering"). The
+/// cost is a second `GetManagedObjects` per [`listen`], and, since that
+/// resync is what subscribes the snapshot's devices, one `GetAll` per known
+/// device once its rule is in place.
 ///
 /// The wait is made inside [`subscribe_then_snapshot`], on what `subscribe`
 /// returned, and the resync is armed here rather than by the caller, so
 /// neither can be left out or moved ahead of the other. It has no deadline:
 /// with the bus down it waits for it, and a bus that refuses one of these
-/// `AddMatch`es keeps the fold from starting, with the `listen` snapshot on
-/// screen and that subscription's one `warn!` in the journal (`hytte-bus`'s
-/// `subscribed()`, "Liveness").
-async fn open_fold<H, D, R>(
-    subscribe: impl FnOnce() -> (FoldSubscriptions<H, D>, R),
+/// three `AddMatch`es keeps the fold from starting, with the `listen`
+/// snapshot on screen and that subscription's one `warn!` in the journal
+/// (`hytte-bus`'s `subscribed()`, "Liveness"). A refused **device** rule does
+/// not: no device's subscription is waited for here.
+async fn open_fold<H, R>(
+    subscribe: impl FnOnce() -> (FoldSubscriptions<H>, R),
     resync: &ResyncWake,
-) -> (FoldSubscriptions<H, D>, R)
+) -> (FoldSubscriptions<H>, R)
 where
     H: Handshake,
-    D: Handshake,
 {
     let (opened, ()) = subscribe_then_snapshot(subscribe, || async {
         arm_resync(resync, "every fold subscription installed");
@@ -681,8 +683,9 @@ fn bluetooth_marker_or_event(
     }
 }
 
-/// Subscribe to everything the watch folds, wait for every rule, arm one
-/// resync ([`open_fold`]), then [`fold`] until the watch ends.
+/// Subscribe to the three top-level signals the watch folds, wait for their
+/// rules, arm one resync ([`open_fold`]), then [`fold`] until the watch ends.
+/// That resync subscribes every device it finds ([`resync`]).
 ///
 /// `owner_items` is the `NameOwnerChanged` stream [`listen`] subscribed to
 /// before its snapshot, so an owner change made while that snapshot was
@@ -706,21 +709,13 @@ where
         props_tx,
         resync_tx: resync_tx.clone(),
     };
-    let known: Vec<String> = state.devices_map.lock().await.keys().cloned().collect();
 
-    let (mut subscriptions, (added, removed, adapter)) = open_fold(
+    let (subscriptions, (added, removed, adapter)) = open_fold(
         || {
             let subscriptions = FoldSubscriptions {
                 added: object_manager_signal("InterfacesAdded"),
                 removed: object_manager_signal("InterfacesRemoved"),
                 adapter: props_changed_signal(adapter_path),
-                devices: known
-                    .into_iter()
-                    .map(|path| {
-                        let sub = bus.subscribe_device(&path, Reread::No);
-                        (path, sub)
-                    })
-                    .collect(),
             };
             let receivers = (
                 subscriptions.added.items(),
@@ -732,7 +727,6 @@ where
         &resync_tx,
     )
     .await;
-    let device_subs = std::mem::take(&mut subscriptions.devices);
 
     let end = fold(
         state,
@@ -749,7 +743,9 @@ where
             resync_tx,
             resync_rx,
         },
-        device_subs,
+        // No device is subscribed yet: the resync `open_fold` armed
+        // subscribes every one it finds.
+        HashMap::new(),
     )
     .await;
     // The three streams end when their last handle goes, so the handles have
@@ -785,11 +781,14 @@ struct FoldQueues {
 ///
 /// # Ordering (#1551)
 ///
-/// [`open_fold`] arms one resync once every subscription's rule is in place:
-/// a `GetManagedObjects` sent after the rules, so every change bluez makes
+/// [`open_fold`] arms one resync once the three top-level rules are in place:
+/// a `GetManagedObjects` sent after those rules, so every change bluez makes
 /// after answering it reaches a receiver here, or a marker follows it there,
-/// which resyncs again. What the fold relies on, for that resync and every
-/// other read:
+/// which resyncs again. Device rules are covered device by device: that
+/// resync subscribes every device it finds, and each device's subscription
+/// asks for a re-read of its device once its own rule is in place
+/// ([`FoldBus::subscribe_device`]). What the fold relies on, for those reads
+/// and every other:
 ///
 /// 1. **A read is never older than what it overwrites.** Every read the fold
 ///    makes (a [`resync`], a device's [`reread_device`]) is sent from inside
@@ -813,10 +812,10 @@ struct FoldQueues {
 ///      can show until that next item is applied.
 ///    - `InterfacesAdded` never overwrites. A device or battery the map
 ///      already has is left as it is ([`Added::Known`]). A device it inserts is
-///      subscribed with [`Reread::OnceSubscribed`] and read again once that
-///      rule is in place, which drops it if bluez no longer has it. So a
-///      replayed add can neither roll a device back to the properties it was
-///      announced with, nor keep a device removed before the read.
+///      subscribed and read again once that rule is in place, which drops it
+///      if bluez no longer has it. So a replayed add can neither roll a device
+///      back to the properties it was announced with, nor keep a device
+///      removed before the read.
 ///    - `InterfacesRemoved` of a device the map does not have changes
 ///      nothing.
 /// 3. **Nothing is held twice.** The map and the subscriptions are keyed by
@@ -829,11 +828,37 @@ struct FoldQueues {
 /// succession can be applied the other way round (the add first, kept as
 /// [`Added::Known`], then the removal) and be missing until the next resync
 /// or its next `InterfacesAdded`. That predates #1551 and is not changed by
-/// it.
+/// it. The arm order below narrows it: a removal already queued is taken
+/// before an add, so the mis-order needs the add to come out of its receiver
+/// before the removal has reached its own. The other mis-order, an add taken
+/// after its own object's removal, the add's re-read heals by dropping the
+/// device.
 ///
-/// A device subscribed later than [`open_fold`] (one that appears, or one a
-/// resync finds) is covered by its own re-read, for the reason
-/// [`Reread::OnceSubscribed`] gives.
+/// # Arm order (#1647 review)
+///
+/// The loop is `biased`: each turn it takes the first ready arm in this
+/// order, owner, `InterfacesRemoved`, `InterfacesAdded`, adapter, resync,
+/// device messages.
+///
+/// - **The owner comes first** so a `Lost` that is already queued wins over
+///   everything else that is. Every other arm can call `org.bluez` (a resync,
+///   a re-read), and a call to a name with no owner D-Bus-activates the
+///   bluetoothd the user just stopped. Unbiased, the handshake's resync beat
+///   a `Lost` queued while [`open_fold`] waited 14 times in 20.
+/// - **Removal before addition**, for the mis-order above.
+/// - **The resync before the device messages**, because the device messages
+///   are the one source that can come fast (every device's
+///   `PropertiesChanged` during discovery: RSSI, advertising data). At the
+///   bottom they can delay nothing above them.
+///
+/// Bias cannot starve an arm unless the arms above it stay ready on every
+/// turn. Each turn takes one item and does a bounded piece of work; the four
+/// signal arms are low-rate bus signals whose receivers are bounded (an
+/// overrun becomes one `Lagged` marker, which only arms the resync); the
+/// resync queue is drained whole on each turn and refilled only by markers,
+/// a new owner and a re-announced adapter. So an arm waits for the backlog
+/// queued above it, not for a stream, and the only stream that could keep
+/// the arms above it busy is at the bottom.
 async fn fold<B, O, S>(
     state: &State,
     adapter_path: &str,
@@ -861,11 +886,23 @@ where
 
     loop {
         tokio::select! {
+            // See "Arm order" above: the order of these arms is load-bearing.
+            biased;
+
             item = owner_items.next() => {
                 let Some(item) = item else { break; };
                 if let Some(end) = on_owner_item(item, &resync_tx) {
                     tracing::info!("bluetoothd exited (org.bluez has no owner)");
                     return Ok(end);
+                }
+            }
+
+            item = ifaces_removed_items.next() => {
+                let Some(item) = item else { break; };
+                let evt = bluetooth_marker_or_event(item, "InterfacesRemoved", &resync_tx);
+                let Some(evt) = evt else { continue; };
+                if handle_ifaces_removed(state, adapter_path, &evt.body, &mut device_subs).await {
+                    return Err(anyhow::anyhow!("adapter removed"));
                 }
             }
 
@@ -883,20 +920,19 @@ where
                 ).await;
             }
 
-            item = ifaces_removed_items.next() => {
-                let Some(item) = item else { break; };
-                let evt = bluetooth_marker_or_event(item, "InterfacesRemoved", &resync_tx);
-                let Some(evt) = evt else { continue; };
-                if handle_ifaces_removed(state, adapter_path, &evt.body, &mut device_subs).await {
-                    return Err(anyhow::anyhow!("adapter removed"));
-                }
-            }
-
             item = adapter_props_items.next() => {
                 let Some(item) = item else { break; };
                 let evt = bluetooth_marker_or_event(item, "adapter PropertiesChanged", &resync_tx);
                 let Some(evt) = evt else { continue; };
                 handle_adapter_props_changed(state, adapter_path, &evt.body);
+            }
+
+            // One `GetManagedObjects` per burst of markers, however many
+            // subscriptions noticed the same hole. See `ResyncWake`.
+            Some(()) = resync_rx.recv() => {
+                drain_and_resync(&mut resync_rx, || {
+                    resync(state, adapter_path, bus, &mut device_subs)
+                }).await?;
             }
 
             Some(msg) = props_rx.recv() => {
@@ -908,14 +944,6 @@ where
                         reread_device(state, &path, bus, &mut device_subs).await;
                     }
                 }
-            }
-
-            // One `GetManagedObjects` per burst of markers, however many
-            // subscriptions noticed the same hole. See `ResyncWake`.
-            Some(()) = resync_rx.recv() => {
-                drain_and_resync(&mut resync_rx, || {
-                    resync(state, adapter_path, bus, &mut device_subs)
-                }).await?;
             }
         }
     }
@@ -932,8 +960,10 @@ where
 /// is gone for good — `GetManagedObjects` is the only source broad enough to
 /// repair whichever one it was. Reconciles the adapter, replaces the device
 /// map wholesale (batteries included), and diffs the per-device subscription
-/// set against it, subscribing a device it finds with
-/// [`Reread::OnceSubscribed`]. Mirrors [`handle_ifaces_removed`]'s "adapter
+/// set against it, subscribing a device it finds
+/// ([`FoldBus::subscribe_device`], which reads it again once its rule is in
+/// place). The first resync of a watch is the one that subscribes
+/// [`listen`]'s snapshot devices. Mirrors [`handle_ifaces_removed`]'s "adapter
 /// removed" branch when the adapter itself is gone: same cleanup, same `Err`
 /// to force a full reconnect.
 ///
@@ -979,7 +1009,7 @@ async fn resync<B: FoldBus>(
     device_subs.retain(|path, _| new_map.contains_key(path));
     for path in new_map.keys() {
         if !device_subs.contains_key(path) {
-            let sub = bus.subscribe_device(path, Reread::OnceSubscribed);
+            let sub = bus.subscribe_device(path);
             device_subs.insert(path.clone(), sub);
         }
     }
@@ -1008,35 +1038,31 @@ async fn resync<B: FoldBus>(
 /// `items()` is `+ use<>` and owns only its `broadcast::Receiver`, so handing
 /// the forwarder the *stream* instead of a handle makes the map's handle the
 /// last one, and `Drop` means what its doc says. The same holds for
-/// `subscribed()`, which a [`Reread::OnceSubscribed`] forwarder is handed too
-/// ([`forward_device`]).
+/// `subscribed()`, which the forwarder is handed too ([`forward_device`]).
 fn subscribe_device_props(
     device_path: &str,
     tx: tokio::sync::mpsc::UnboundedSender<DeviceMsg>,
     resync_tx: ResyncWake,
-    reread: Reread,
 ) -> SignalSubscription {
     forward_device(
         props_changed_signal(device_path),
         device_path,
         tx,
         resync_tx,
-        reread,
     )
 }
 
 /// Wire one device subscription to the fold: spawn its forwarder on the
-/// subscription's items and, for [`Reread::OnceSubscribed`], on its
-/// handshake, so the forwarder asks for the re-read once the rule is in
-/// place. Returns the handle, still the only one.
+/// subscription's items and on its handshake, so the forwarder asks for the
+/// device's re-read once the rule is in place
+/// ([`FoldBus::subscribe_device`]). Returns the handle, still the only one.
 fn forward_device(
     sub: SignalSubscription,
     path: &str,
     tx: tokio::sync::mpsc::UnboundedSender<DeviceMsg>,
     resync_tx: ResyncWake,
-    reread: Reread,
 ) -> SignalSubscription {
-    let installed = (reread == Reread::OnceSubscribed).then(|| sub.subscribed());
+    let installed = Some(sub.subscribed());
     // Detached deliberately: the forwarder's shutdown is its stream ending,
     // which is what dropping `sub` causes. The handle is returned only so a
     // test can await that.
@@ -1061,8 +1087,10 @@ fn forward_device(
 /// The stream's item type is also the guard on the `items()`/`events()` choice
 /// this fold depends on: `events()` yields `SignalEvent`, which does not fit.
 ///
-/// `installed`, when given, is the subscription's handshake: once it resolves
-/// the forwarder sends one [`DeviceMsg::Reread`] ([`Reread::OnceSubscribed`]).
+/// `installed` is the subscription's handshake ([`forward_device`] always
+/// hands it one; `None` is for tests of the forwarder's other duties): once
+/// it resolves the forwarder sends one [`DeviceMsg::Reread`]
+/// ([`FoldBus::subscribe_device`]).
 /// Where that lands among the device's own emissions does not matter: the
 /// read is sent when the fold reaches it, after whatever came before it, and
 /// whatever comes after is newer or a replay the fold tolerates ([`fold`]'s
@@ -1128,8 +1156,8 @@ where
 #[derive(Debug, PartialEq, Eq)]
 enum Added {
     /// A device the map did not have, inserted from the signal's properties.
-    /// It needs a subscription that reads it again once its rule is in place
-    /// ([`Reread::OnceSubscribed`]).
+    /// It needs a subscription, which reads it again once its rule is in
+    /// place ([`FoldBus::subscribe_device`]).
     Inserted,
     /// A device the map already has, or a battery it already knows. Nothing
     /// was overwritten (#1551): the signal is either a replay older than the
@@ -1205,10 +1233,11 @@ async fn handle_ifaces_added<B: FoldBus>(
 
     let added = apply_added(state, adapter_path, p, &ifaces).await;
     // A device the map holds gets a subscription if it has none: always for
-    // one just inserted, and for a known one as a backstop. It is read again
-    // once that subscription's rule is in place.
+    // one just inserted, and for a known one as a backstop (a `listen`
+    // snapshot device the first resync has not subscribed yet). It is read
+    // again once that subscription's rule is in place.
     if matches!(added, Added::Inserted | Added::Known) && !device_subs.contains_key(p) {
-        let sub = bus.subscribe_device(p, Reread::OnceSubscribed);
+        let sub = bus.subscribe_device(p);
         device_subs.insert(p.to_string(), sub);
     }
 }
@@ -1333,9 +1362,8 @@ fn device_is_gone(error: &BusError) -> bool {
     )
 }
 
-/// Read one device again and fold the answer in: what a
-/// [`Reread::OnceSubscribed`] subscription asks for once its rule is in place
-/// (#1551).
+/// Read one device again and fold the answer in: what a device's subscription
+/// asks for once its rule is in place ([`FoldBus::subscribe_device`], #1551).
 ///
 /// A device the map no longer has is not read: it was removed since the
 /// forwarder asked, and a call to `org.bluez` for nothing is a call that can
@@ -1387,19 +1415,28 @@ async fn reread_device<B: FoldBus>(
 /// built the way a snapshot builds one; the battery is kept from the map
 /// unless bluez answered for it. `Gone` drops the device. A device the map no
 /// longer has stays gone: the read never resurrects one.
+///
+/// The list is published only when the entry changed (#1647 review). Most
+/// re-reads find what the map already has: a device the first resync
+/// subscribed was read by that resync a moment earlier, and a device a scan
+/// finds has usually not changed since its `InterfacesAdded`. Publishing
+/// those anyway re-rendered the panel's list a second time per device.
 async fn apply_reread(state: &State, path: &str, read: DeviceRead) -> bool {
     let mut map = state.devices_map.lock().await;
-    let Some(known_battery) = map.get(path).map(|dev| dev.battery) else {
+    let Some(known) = map.get(path) else {
         return false;
     };
-    let dropped = match read {
+    let (dropped, changed) = match read {
         DeviceRead::Found { device, battery } => {
             let mut dev = device_from(path, &device, battery.as_ref());
             if battery.is_none() {
-                dev.battery = known_battery;
+                dev.battery = known.battery;
             }
-            map.insert(path.to_string(), dev);
-            false
+            let changed = !same_device(known, &dev);
+            if changed {
+                map.insert(path.to_string(), dev);
+            }
+            (false, changed)
         }
         DeviceRead::Gone => {
             tracing::debug!(
@@ -1407,12 +1444,38 @@ async fn apply_reread(state: &State, path: &str, read: DeviceRead) -> bool {
                 "bluetooth: a re-read device is not there any more; dropping it"
             );
             map.remove(path);
-            true
+            (true, true)
         }
     };
     drop(map);
-    state.publish_devices().await;
+    if changed {
+        state.publish_devices().await;
+    }
     dropped
+}
+
+/// Whether two entries are the same, field for field ([`Device`] derives no
+/// `PartialEq`). The fields are destructured without `..`, so a field added
+/// to [`Device`] does not compile here until it is compared too.
+fn same_device(a: &Device, b: &Device) -> bool {
+    let Device {
+        path,
+        address,
+        alias,
+        icon,
+        paired,
+        connected,
+        trusted,
+        battery,
+    } = a;
+    *path == b.path
+        && *address == b.address
+        && *alias == b.alias
+        && *icon == b.icon
+        && *paired == b.paired
+        && *connected == b.connected
+        && *trusted == b.trusted
+        && *battery == b.battery
 }
 
 fn handle_adapter_props_changed(state: &State, adapter_path: &str, msg: &zbus::Message) {
@@ -1458,7 +1521,7 @@ mod tests {
     use hytte_bus::SignalEvent;
     use std::cell::{Cell, RefCell};
 
-    /// A forwarder that never asks for a re-read ([`Reread::No`]).
+    /// A forwarder handed no handshake, so it never asks for a re-read.
     const NO_REREAD: Option<std::future::Ready<()>> = None;
 
     /// A subscription whose handshake is not ready until polled twice, so a
@@ -1482,15 +1545,16 @@ mod tests {
         }
     }
 
-    /// `event_loop`'s subscriptions are made after `listen`'s snapshot, so
-    /// the fold waits for the bus to have **every** one of their rules (the
-    /// three top-level ones and one per known device) and only then arms
-    /// one resync, which reads everything again (#1551). Until then they
-    /// were never waited for and nothing was read again, and an emission
-    /// between the snapshot and the rules was lost.
+    /// `event_loop`'s three top-level subscriptions are made after
+    /// `listen`'s snapshot, so the fold waits for the bus to have every one
+    /// of their rules and only then arms one resync, which reads everything
+    /// again (#1551). Until then they were never waited for and nothing was
+    /// read again, and an emission between the snapshot and the rules was
+    /// lost. No device rule is waited for (#1647 review): that resync
+    /// subscribes the devices, and each reads its own device again.
     ///
     /// **Falsification:** drop the wait (from `open_fold` or
-    /// `subscribe_then_snapshot`), or either loop in `FoldSubscriptions`'
+    /// `subscribe_then_snapshot`), or the loop in `FoldSubscriptions`'
     /// `subscribed`, and rules go missing from the log; arm the resync
     /// before the wait and a rule lands with the wake already armed; arm it
     /// twice, or not at all, and the wake count is wrong.
@@ -1511,10 +1575,6 @@ mod tests {
                     added: rule("InterfacesAdded"),
                     removed: rule("InterfacesRemoved"),
                     adapter: rule("adapter PropertiesChanged"),
-                    devices: HashMap::from([
-                        ("/org/bluez/hci0/dev_A".to_owned(), rule("device A")),
-                        ("/org/bluez/hci0/dev_B".to_owned(), rule("device B")),
-                    ]),
                 };
                 (subscriptions, ())
             },
@@ -1532,8 +1592,6 @@ mod tests {
                 ("InterfacesAdded", false),
                 ("InterfacesRemoved", false),
                 ("adapter PropertiesChanged", false),
-                ("device A", false),
-                ("device B", false),
             ],
             "every rule, each before the resync was armed"
         );
@@ -1705,31 +1763,34 @@ mod tests {
         }
     }
 
-    /// A per-device subscription with no bus behind it, and whether it was
-    /// made to ask for a re-read.
-    struct FakeSub(Reread);
+    /// A per-device subscription with no bus behind it, naming its device.
+    struct FakeSub(String);
 
-    impl Handshake for FakeSub {
-        fn subscribed(&self) -> impl Future<Output = ()> {
-            std::future::ready(())
-        }
-    }
+    /// What bluez holds, by path.
+    type HeldMap = RefCell<HashMap<&'static str, Held>>;
+
+    /// A change bluez makes while a read is in flight ([`FakeBluez::during_read`]).
+    type DuringRead = Box<dyn FnOnce(&HeldMap)>;
 
     /// A [`FoldBus`] with no bus: bluez's objects are `held`, reads are
     /// answered from them, and every subscription and read is recorded.
     #[derive(Default)]
     struct FakeBluez {
-        held: RefCell<HashMap<&'static str, Held>>,
+        held: HeldMap,
         /// `subscribe_device` calls, in order.
-        subscriptions: RefCell<Vec<(String, Reread)>>,
+        subscriptions: RefCell<Vec<String>>,
+        /// `GetManagedObjects` calls.
+        managed_reads: Cell<u32>,
         /// `GetAll` calls, in order.
         reads: RefCell<Vec<(String, &'static str)>>,
-        /// When set, every `Reread::OnceSubscribed` subscription asks for its
-        /// re-read at once, as its forwarder does once the rule is in place.
+        /// When set, every subscription asks for its re-read at once, as its
+        /// forwarder does once the rule is in place.
         rules_land: Option<tokio::sync::mpsc::UnboundedSender<DeviceMsg>>,
         /// Run once, while the fold's `GetManagedObjects` is in flight: after
-        /// bluez has taken its answer, before the fold has applied it.
-        during_read: RefCell<Option<Box<dyn FnOnce()>>>,
+        /// bluez has taken its answer, before the fold has applied it. Handed
+        /// what bluez holds, so a change it makes there (bluez's state first,
+        /// then its signal, as bluez does) is what a later read answers.
+        during_read: RefCell<Option<DuringRead>>,
     }
 
     impl FakeBluez {
@@ -1744,19 +1805,18 @@ mod tests {
     impl FoldBus for FakeBluez {
         type DeviceSub = FakeSub;
 
-        fn subscribe_device(&self, path: &str, reread: Reread) -> FakeSub {
-            self.subscriptions
-                .borrow_mut()
-                .push((path.to_owned(), reread));
-            if let (Some(tx), Reread::OnceSubscribed) = (&self.rules_land, reread) {
+        fn subscribe_device(&self, path: &str) -> FakeSub {
+            self.subscriptions.borrow_mut().push(path.to_owned());
+            if let Some(tx) = &self.rules_land {
                 let _ = tx.send(DeviceMsg::Reread {
                     path: path.to_owned(),
                 });
             }
-            FakeSub(reread)
+            FakeSub(path.to_owned())
         }
 
         fn managed_objects(&self) -> impl Future<Output = Result<ManagedObjects, BusError>> {
+            self.managed_reads.set(self.managed_reads.get() + 1);
             let mut managed: ManagedObjects = HashMap::from([(
                 zbus::zvariant::OwnedObjectPath::try_from(ADAPTER).expect("path"),
                 HashMap::from([("org.bluez.Adapter1".to_owned(), HashMap::new())]),
@@ -1768,7 +1828,7 @@ mod tests {
                 );
             }
             if let Some(during_read) = self.during_read.borrow_mut().take() {
-                during_read();
+                during_read(&self.held);
             }
             std::future::ready(Ok(managed))
         }
@@ -1864,7 +1924,7 @@ mod tests {
         assert_eq!(subs.len(), 1);
         assert_eq!(
             *bus.subscriptions.borrow(),
-            [(HEADPHONES.to_owned(), Reread::OnceSubscribed)],
+            [HEADPHONES],
             "the resync subscribed the device; the replays subscribed nothing"
         );
     }
@@ -1918,9 +1978,9 @@ mod tests {
     /// once its rule is in place, and bluez answering that it is not there
     /// drops it, subscription included (#1551).
     ///
-    /// **Falsification:** subscribe an added device without a re-read, keep
-    /// a device the re-read says is gone, or stop counting `UnknownObject`
-    /// as gone, and the device stays.
+    /// **Falsification:** leave an added device unsubscribed, keep a device
+    /// the re-read says is gone, or stop counting `UnknownObject` as gone,
+    /// and the device or its subscription stays.
     #[tokio::test]
     async fn a_replayed_add_cannot_keep_a_removed_device() {
         let bus = FakeBluez::default();
@@ -1957,8 +2017,8 @@ mod tests {
         .await;
         assert_eq!(
             *bus.subscriptions.borrow(),
-            [(GONE.to_owned(), Reread::OnceSubscribed)],
-            "a device the map did not have is read again once subscribed"
+            [GONE],
+            "a device the map did not have is subscribed, and so read again"
         );
 
         // Its forwarder's re-read, once the rule is in place.
@@ -2085,6 +2145,51 @@ mod tests {
         assert_eq!(published(&state), [row("Headphones", true, Some(40))]);
     }
 
+    /// A re-read that finds the device as the map has it publishes nothing,
+    /// and one that finds it changed publishes the change (#1647 review,
+    /// LOW 4). Every device a resync subscribes is read again moments after
+    /// that resync read it, and publishing an unchanged list re-rendered the
+    /// panel's list once more per device.
+    ///
+    /// **Falsification:** publish on every `Found` (the #1647 head) and the
+    /// unchanged re-read overwrites the marker list below.
+    #[tokio::test]
+    async fn a_re_read_publishes_only_a_change() {
+        let bus = FakeBluez::holding(&[(
+            PHONE,
+            Held {
+                alias: "Phone",
+                connected: false,
+                battery: None,
+            },
+        )]);
+        let state = state();
+        let mut subs: HashMap<String, FakeSub> = HashMap::new();
+        state.devices_map.lock().await.insert(
+            PHONE.to_owned(),
+            device_from(PHONE, &device_props("Phone", false), None),
+        );
+        // A marker in the published list: a publish replaces it.
+        let marker = || vec![device("/marker", "not published since", false, false)];
+        state.devices.set(marker());
+
+        reread_device(&state, PHONE, &bus, &mut subs).await;
+        assert_eq!(bus.reads.borrow().len(), 1, "the round trip is still made");
+        assert_eq!(
+            published(&state),
+            [row("not published since", false, None)],
+            "nothing changed, so nothing was published"
+        );
+
+        bus.held
+            .borrow_mut()
+            .get_mut(PHONE)
+            .expect("held")
+            .connected = true;
+        reread_device(&state, PHONE, &bus, &mut subs).await;
+        assert_eq!(published(&state), [row("Phone", true, None)]);
+    }
+
     /// What counts as "the device is not there": the three answers bluez
     /// gives for one (and the generic one), and nothing that only says the
     /// call failed.
@@ -2113,10 +2218,12 @@ mod tests {
 
     /// A resync replaces the map with what bluez holds, drops the
     /// subscription of a device it no longer has, and subscribes a device
-    /// it finds with a re-read, since nothing waits for that rule.
+    /// it finds (which reads it again once its rule is in place). That is
+    /// also how `listen`'s snapshot devices get their subscriptions: the
+    /// first resync finds them with none.
     ///
-    /// **Falsification:** subscribe a device the resync finds without a
-    /// re-read, or keep a device it does not find.
+    /// **Falsification:** leave a device the resync finds unsubscribed, or
+    /// keep a device it does not find.
     #[tokio::test]
     async fn a_resync_subscribes_what_it_finds_with_a_re_read() {
         let bus = FakeBluez::holding(&[(
@@ -2132,7 +2239,7 @@ mod tests {
             GONE.to_owned(),
             device_from(GONE, &device_props("Gone", false), None),
         );
-        let mut subs = HashMap::from([(GONE.to_owned(), FakeSub(Reread::No))]);
+        let mut subs = HashMap::from([(GONE.to_owned(), FakeSub(GONE.to_owned()))]);
 
         resync(&state, ADAPTER, &bus, &mut subs)
             .await
@@ -2141,31 +2248,27 @@ mod tests {
         assert_eq!(published(&state), [row("Phone", false, None)]);
         assert_eq!(
             subs.iter()
-                .map(|(path, sub)| (path.as_str(), sub.0))
+                .map(|(path, sub)| (path.as_str(), sub.0.as_str()))
                 .collect::<Vec<_>>(),
-            [(PHONE, Reread::OnceSubscribed)]
+            [(PHONE, PHONE)]
         );
-        assert_eq!(
-            *bus.subscriptions.borrow(),
-            [(PHONE.to_owned(), Reread::OnceSubscribed)]
-        );
+        assert_eq!(*bus.subscriptions.borrow(), [PHONE]);
     }
 
     /// The fold end to end, on the handshake's resync and the replays that
-    /// can follow it (#1551). The resync is the only thing queued when the
-    /// loop starts. While its read is in flight bluez changes a device's
-    /// name (newer than the answer), and two adds older than the answer
-    /// come out of their receiver after it, which is what a replay is: one
-    /// for a device the answer has, one for a device bluez removed before
-    /// it. The read replaces `listen`'s older snapshot, the newer change
-    /// lands on top of it, neither replay rolls a device back or keeps one
-    /// bluez no longer has, and the device the read found is read again
-    /// once subscribed. Whatever order the loop picks its later arms in,
-    /// the end state is the same.
+    /// can follow it (#1551). The fold starts as `event_loop` starts it: the
+    /// resync queued and no device subscribed. While the resync's read is in
+    /// flight bluez changes a device's name (newer than the answer), and two
+    /// adds older than the answer come out of their receiver after it, which
+    /// is what a replay is: one for a device the answer has, one for a
+    /// device bluez removed before it. The read replaces `listen`'s older
+    /// snapshot and subscribes both devices it found, the newer change lands
+    /// on top of it, neither replay rolls a device back or keeps one bluez no
+    /// longer has, and every subscribed device is read again.
     ///
-    /// **Falsification:** let a replayed add overwrite a device the map has,
-    /// ignore `DeviceMsg::Reread` in the loop, or let a resync keep the
-    /// map's entries over its read, and the published list is wrong.
+    /// **Falsification:** ignore `DeviceMsg::Reread` in the loop, or leave
+    /// `listen`'s snapshot devices unsubscribed, and the published list or
+    /// the subscriptions are wrong.
     #[tokio::test(start_paused = true)]
     async fn the_fold_settles_on_bluezs_state_after_its_resync() {
         let (props_tx, props_rx) = tokio::sync::mpsc::unbounded_channel::<DeviceMsg>();
@@ -2194,7 +2297,8 @@ mod tests {
         // A clone, so `added_tx` itself keeps the stream open past the
         // replays: a stream that ends ends the fold.
         let replayed = added_tx.clone();
-        *bus.during_read.borrow_mut() = Some(Box::new(move || {
+        *bus.during_read.borrow_mut() = Some(Box::new(move |held: &HeldMap| {
+            held.borrow_mut().get_mut(HEADPHONES).expect("held").alias = "Headphones (2)";
             let newer = HashMap::from([("Alias".to_owned(), make_owned_value("Headphones (2)"))]);
             let _ = renamed.send(DeviceMsg::Props {
                 path: HEADPHONES.to_owned(),
@@ -2220,7 +2324,6 @@ mod tests {
             HEADPHONES.to_owned(),
             device_from(HEADPHONES, &device_props("dev_AA", false), None),
         );
-        let subs = HashMap::from([(HEADPHONES.to_owned(), FakeSub(Reread::No))]);
 
         // What `open_fold` leaves queued once every rule is in place.
         arm_resync(&resync_tx, "the handshake");
@@ -2247,7 +2350,8 @@ mod tests {
                     resync_tx,
                     resync_rx,
                 },
-                subs,
+                // `event_loop` subscribes no device before the resync.
+                HashMap::new(),
             ),
         )
         .await;
@@ -2258,14 +2362,184 @@ mod tests {
             published(&state),
             [row("Headphones (2)", true, None), row("Phone", false, None)]
         );
+        let mut subscribed = bus.subscriptions.borrow().clone();
+        subscribed.sort();
         assert_eq!(
-            *bus.subscriptions.borrow(),
-            [
-                (PHONE.to_owned(), Reread::OnceSubscribed),
-                (GONE.to_owned(), Reread::OnceSubscribed),
-            ],
-            "the device the read found, and the one the replay brought in"
+            subscribed,
+            [HEADPHONES, PHONE, GONE],
+            "the two devices the read found, and the one the replay brought in"
         );
+        assert_eq!(bus.managed_reads.get(), 1, "one resync");
+    }
+
+    /// A device bluez removed and added back, whose removal and add are both
+    /// queued, ends up in the map: the removal is taken first. Taken the other
+    /// way round the add is `Known` (a no-op) and the removal drops a device
+    /// bluez has (#1647 review, the fold's "Arm order").
+    ///
+    /// **Falsification:** put the `InterfacesAdded` arm above the
+    /// `InterfacesRemoved` one and the device is gone; drop `biased;` and it
+    /// is gone in about half the rounds.
+    #[tokio::test(start_paused = true)]
+    async fn a_device_removed_and_added_back_stays() {
+        for round in 0..32 {
+            let (props_tx, props_rx) = tokio::sync::mpsc::unbounded_channel::<DeviceMsg>();
+            let (resync_tx, resync_rx) = tokio::sync::mpsc::channel::<()>(RESYNC_WAKE_QUEUE);
+            let phone = Held {
+                alias: "Phone",
+                connected: false,
+                battery: None,
+            };
+            let mut bus = FakeBluez::holding(&[(PHONE, phone.clone())]);
+            bus.rules_land = Some(props_tx);
+            let state = state();
+            state.devices_map.lock().await.insert(
+                PHONE.to_owned(),
+                device_from(PHONE, &device_props("Phone", false), None),
+            );
+            let event = |body| {
+                futures_util::stream::iter([SignalItem::Event(SignalEvent {
+                    body,
+                    sender: None,
+                    timestamp: std::time::SystemTime::now(),
+                })])
+                .chain(futures_util::stream::pending())
+                .boxed()
+            };
+
+            let settled = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                fold(
+                    &state,
+                    ADAPTER,
+                    &bus,
+                    FoldStreams {
+                        owner: futures_util::stream::pending::<SignalItem>().boxed(),
+                        added: event(interfaces_added(PHONE, &interfaces(&phone))),
+                        removed: event(interfaces_removed(PHONE, &["org.bluez.Device1"])),
+                        adapter: futures_util::stream::pending::<SignalItem>().boxed(),
+                    },
+                    FoldQueues {
+                        props_rx,
+                        resync_tx,
+                        resync_rx,
+                    },
+                    HashMap::from([(PHONE.to_owned(), FakeSub(PHONE.to_owned()))]),
+                ),
+            )
+            .await;
+            assert!(settled.is_err(), "the fold runs until the watch ends");
+            assert_eq!(
+                published(&state),
+                [row("Phone", false, None)],
+                "round {round}: the device bluez has must stay"
+            );
+        }
+    }
+
+    /// bluetoothd leaving while reads are queued behind it: its `Lost` is
+    /// taken before any of them, so the fold ends without calling `org.bluez`
+    /// again. On a system bus a call to that name with no owner D-Bus-activates
+    /// the bluetoothd that was just stopped (#1647 review, LOW 3: the
+    /// handshake's resync beat a queued `Lost` 14 times in 20 there, against a
+    /// real broker). Here a resync, a device re-read and an `InterfacesAdded`
+    /// for a new device are all queued with the `Lost`.
+    ///
+    /// **Falsification:** drop `biased;` from the fold's `select!`, or move
+    /// the owner arm down, and some of the rounds call bluez.
+    #[tokio::test(start_paused = true)]
+    async fn a_queued_lost_ends_the_fold_before_any_queued_read() {
+        let lost = || {
+            let body = zbus::Message::signal(
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "NameOwnerChanged",
+            )
+            .expect("signal builder")
+            .build(&("org.bluez", ":1.4", ""))
+            .expect("build NameOwnerChanged");
+            futures_util::stream::iter([SignalItem::Event(SignalEvent {
+                body,
+                sender: None,
+                timestamp: std::time::SystemTime::now(),
+            })])
+            .chain(futures_util::stream::pending())
+            .boxed()
+        };
+        for round in 0..32 {
+            let (props_tx, props_rx) = tokio::sync::mpsc::unbounded_channel::<DeviceMsg>();
+            let (resync_tx, resync_rx) = tokio::sync::mpsc::channel::<()>(RESYNC_WAKE_QUEUE);
+            let bus = FakeBluez::holding(&[(
+                PHONE,
+                Held {
+                    alias: "Phone",
+                    connected: false,
+                    battery: None,
+                },
+            )]);
+            let state = state();
+            state.devices_map.lock().await.insert(
+                PHONE.to_owned(),
+                device_from(PHONE, &device_props("Phone", false), None),
+            );
+            arm_resync(&resync_tx, "the handshake");
+            props_tx
+                .send(DeviceMsg::Reread {
+                    path: PHONE.to_owned(),
+                })
+                .expect("the fold's queue");
+            let added = futures_util::stream::iter([SignalItem::Event(SignalEvent {
+                body: interfaces_added(
+                    HEADPHONES,
+                    &interfaces(&Held {
+                        alias: "Headphones",
+                        connected: false,
+                        battery: None,
+                    }),
+                ),
+                sender: None,
+                timestamp: std::time::SystemTime::now(),
+            })])
+            .chain(futures_util::stream::pending())
+            .boxed();
+
+            let ended = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                fold(
+                    &state,
+                    ADAPTER,
+                    &bus,
+                    FoldStreams {
+                        owner: lost(),
+                        added,
+                        removed: futures_util::stream::pending::<SignalItem>().boxed(),
+                        adapter: futures_util::stream::pending::<SignalItem>().boxed(),
+                    },
+                    FoldQueues {
+                        props_rx,
+                        resync_tx,
+                        resync_rx,
+                    },
+                    HashMap::from([(PHONE.to_owned(), FakeSub(PHONE.to_owned()))]),
+                ),
+            )
+            .await
+            .expect("a Lost ends the fold");
+            assert_eq!(
+                ended.expect("no error"),
+                ListenEnd::DaemonExited,
+                "round {round}"
+            );
+            assert_eq!(bus.managed_reads.get(), 0, "round {round}: a resync ran");
+            assert!(
+                bus.reads.borrow().is_empty(),
+                "round {round}: a device was read"
+            );
+            assert!(
+                bus.subscriptions.borrow().is_empty(),
+                "round {round}: an add was applied"
+            );
+        }
     }
 
     // ── #1201: bluetooth_marker_or_event routes markers to a resync ─────────
@@ -2852,7 +3126,7 @@ mod tests {
 //   cargo test -p hytte-services --features system-tests --lib bluetooth
 #[cfg(all(test, feature = "system-tests"))]
 mod system_tests {
-    use super::{DeviceMsg, RESYNC_WAKE_QUEUE, Reread, forward_device, spawn_device_forwarder};
+    use super::{DeviceMsg, RESYNC_WAKE_QUEUE, forward_device, spawn_device_forwarder};
 
     use hytte_bus::signals_with;
     use hytte_bus::test_support::SharedConnection;
@@ -2990,8 +3264,8 @@ mod system_tests {
 
         let (props_tx, _props_rx) = tokio::sync::mpsc::unbounded_channel::<DeviceMsg>();
         let (resync_tx, _resync_rx) = tokio::sync::mpsc::channel::<()>(RESYNC_WAKE_QUEUE);
-        // With its handshake too, as a `Reread::OnceSubscribed` forwarder
-        // has it: holding that future must not keep the subscription up.
+        // With its handshake too, as `forward_device` hands every forwarder
+        // one: holding that future must not keep the subscription up.
         let forwarder = spawn_device_forwarder(
             "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF".to_string(),
             sub.items(),
@@ -3080,9 +3354,9 @@ mod system_tests {
         assert!(taken.load(Ordering::SeqCst));
     }
 
-    /// `forward_device` with a **real** subscription: a
-    /// `Reread::OnceSubscribed` forwarder asks for its re-read once the bus
-    /// has the device's match rule, and not while it has none (#1551). The
+    /// `forward_device` with a **real** subscription: the forwarder asks for
+    /// its re-read once the bus has the device's match rule, and not while
+    /// it has none (#1551). The
     /// hermetic forwarder test hands it a stand-in handshake, so it cannot
     /// see that `forward_device` wires the subscription's own `subscribed()`
     /// in; this does.
@@ -3115,7 +3389,6 @@ mod system_tests {
             PATH,
             props_tx,
             resync_tx,
-            Reread::OnceSubscribed,
         );
 
         // A bounded negative: with no connection the rule cannot be
@@ -3140,3 +3413,10 @@ mod system_tests {
         drop(sub);
     }
 }
+
+// The production `listen` → `event_loop` → `fold`, through the process-global
+// system connection, against a real `dbus-daemon` and a scripted `org.bluez`,
+// in a re-exec'd child (#1647 review R1–R3). A child module, not a file under
+// `tests/`, because `listen` is private.
+#[cfg(all(test, feature = "system-tests"))]
+mod real_bus;

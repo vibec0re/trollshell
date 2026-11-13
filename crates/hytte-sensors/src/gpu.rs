@@ -212,7 +212,9 @@ fn read_intel_gpu(rc6_prev: Option<(u64, Instant)>) -> Option<(GpuState, Option<
     None
 }
 
-/// How long one `nvidia-smi` invocation may run before it is killed.
+/// How long one `nvidia-smi` invocation may run before it is killed, once
+/// one has answered in this process (until then it is
+/// [`NVIDIA_SMI_FIRST_DEADLINE`]).
 ///
 /// `nvidia-smi` talks to the kernel driver, and a wedged driver (a GPU that
 /// fell off the bus, a hung suspend/resume) leaves it in uninterruptible
@@ -223,13 +225,44 @@ fn read_intel_gpu(rc6_prev: Option<(u64, Instant)>) -> Option<(GpuState, Option<
 /// and still only two ticks of a 1 Hz sampler.
 pub const NVIDIA_SMI_DEADLINE: Duration = Duration::from_secs(2);
 
+/// How long `nvidia-smi` may run while none has answered yet in this process
+/// (#1561). After the first reading, [`NVIDIA_SMI_DEADLINE`] applies.
+///
+/// On a host without persistence mode, the first `nvidia-smi` brings the
+/// driver up from cold, which can take longer than 2 s. With only
+/// [`NVIDIA_SMI_DEADLINE`], that call was killed every time, so the GPU row
+/// never appeared on a host where it used to be slow but work. 10 s lets a
+/// slow first call finish.
+///
+/// The cost: until the first reading, each attempt can block its caller this
+/// long. On a driver that never answers, every attempt does (one per retry
+/// backoff, [`NVIDIA_BACKOFF_INITIAL`] up to [`NVIDIA_BACKOFF_MAX`]). A call
+/// that runs out this deadline is killed and reaped like any other.
+pub const NVIDIA_SMI_FIRST_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Set once any `nvidia-smi` call in this process has returned a reading,
+/// and never cleared. [`nvidia_smi_deadline`] reads it.
+static NVIDIA_SMI_ANSWERED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The deadline for the next `nvidia-smi` call: [`NVIDIA_SMI_FIRST_DEADLINE`]
+/// until one has answered in this process, [`NVIDIA_SMI_DEADLINE`] after.
+fn nvidia_smi_deadline(answered_before: bool) -> Duration {
+    if answered_before {
+        NVIDIA_SMI_DEADLINE
+    } else {
+        NVIDIA_SMI_FIRST_DEADLINE
+    }
+}
+
 /// First retry delay after a transient `nvidia-smi` failure (timeout,
 /// non-zero exit, unparseable output). Doubles per consecutive failure up to
 /// [`NVIDIA_BACKOFF_MAX`], and resets on the first success.
 pub const NVIDIA_BACKOFF_INITIAL: Duration = Duration::from_secs(5);
 
 /// Ceiling of the `nvidia-smi` retry backoff: a GPU that stays broken costs
-/// one fork (and at worst one [`NVIDIA_SMI_DEADLINE`] of blocking) per five
+/// one fork (and at worst one [`NVIDIA_SMI_DEADLINE`] of blocking, or one
+/// [`NVIDIA_SMI_FIRST_DEADLINE`] while none has answered yet) per five
 /// minutes, not one per tick.
 pub const NVIDIA_BACKOFF_MAX: Duration = Duration::from_mins(5);
 
@@ -283,8 +316,8 @@ fn parse_nvidia_csv(s: &str) -> Option<GpuState> {
 /// - [`GpuCache::forget_readings`] clears that backoff, and
 ///   `hytte-plugin-stats` calls it (`Sampler::reset`) when its sidebar
 ///   reopens after a while. So with a wedged driver, each such reopen can add
-///   one more child (one [`NVIDIA_SMI_DEADLINE`] fork each), and the cap is
-///   what bounds that path.
+///   one more child (one fork each, killed at [`NVIDIA_SMI_FIRST_DEADLINE`]
+///   when none has ever answered), and the cap is what bounds that path.
 ///
 /// Past the cap a further child is dropped un-waited (a zombie until the
 /// process exits, the pre-reaper behaviour) so the list, and the memory
@@ -468,7 +501,27 @@ fn query_nvidia_smi(program: &str, deadline: Duration) -> Result<GpuState, Nvidi
 }
 
 fn read_nvidia_gpu() -> Result<GpuState, NvidiaFailure> {
-    query_nvidia_smi("nvidia-smi", NVIDIA_SMI_DEADLINE)
+    query_nvidia_smi_tracked("nvidia-smi", &NVIDIA_SMI_ANSWERED, nvidia_smi_deadline)
+}
+
+/// One [`query_nvidia_smi`] call whose deadline is `deadline_for(answered)`,
+/// and which sets `answered` when it returns a reading.
+///
+/// Only a reading sets it. A failed spawn, a timeout, a non-zero exit or
+/// output that does not parse all leave it as it was, and nothing clears it.
+/// `deadline_for` is [`nvidia_smi_deadline`] in production; a test passes a
+/// short one so a timeout does not cost it the full first-call deadline.
+fn query_nvidia_smi_tracked(
+    program: &str,
+    answered: &std::sync::atomic::AtomicBool,
+    deadline_for: impl FnOnce(bool) -> Duration,
+) -> Result<GpuState, NvidiaFailure> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let result = query_nvidia_smi(program, deadline_for(answered.load(Relaxed)));
+    if result.is_ok() {
+        answered.store(true, Relaxed);
+    }
+    result
 }
 
 /// How long a successful Nvidia reading stays valid before
@@ -1143,6 +1196,218 @@ mod tests {
         );
     }
 
+    // ── the first-call deadline (#1561 bullet 2) ─────────────────────────────
+
+    /// The two values are the maintainer's decision on #1561, so they are
+    /// pinned as literals rather than through the constants.
+    #[test]
+    fn the_deadline_is_generous_until_nvidia_smi_first_answers() {
+        assert_eq!(nvidia_smi_deadline(false), Duration::from_secs(10));
+        assert_eq!(nvidia_smi_deadline(true), Duration::from_secs(2));
+    }
+
+    /// One [`query_nvidia_smi_tracked`] call with a fixed `deadline`.
+    /// Returns its result and the flag value its deadline was chosen from.
+    fn tracked(
+        program: &str,
+        answered: &std::sync::atomic::AtomicBool,
+        deadline: Duration,
+    ) -> (Result<GpuState, NvidiaFailure>, bool) {
+        let mut asked = None;
+        let got = query_nvidia_smi_tracked(program, answered, |before| {
+            asked = Some(before);
+            deadline
+        });
+        (got, asked.expect("the call never chose a deadline"))
+    }
+
+    /// Only a reading counts as "has answered": a failed spawn, a program
+    /// that ran but failed, one that printed garbage and one that ran out
+    /// its deadline all leave the flag down. And once it is up, a later
+    /// failure does not bring it back down. Each call's deadline is chosen
+    /// from the flag as it stood before the call.
+    #[test]
+    fn only_a_reading_marks_nvidia_smi_as_answered() {
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-nvidia-smi");
+        let missing = missing.to_str().unwrap();
+        // Written by this process, but never executed: no write fd can race
+        // an exec of it (see `script`).
+        let not_executable = dir.path().join("not-executable");
+        std::fs::write(
+            &not_executable,
+            "#!/bin/sh\necho 'NVIDIA Test, 1, 2, 3, 4'\n",
+        )
+        .unwrap();
+        let not_executable = not_executable.to_str().unwrap();
+        let fails = script(dir.path(), "fails", "exit 9");
+        let garbage = script(dir.path(), "garbage", "echo 'not a csv line'");
+        let hangs = script(dir.path(), "hangs", "exec sleep 30");
+        let answers = script(
+            dir.path(),
+            "answers",
+            "echo 'NVIDIA Test, 55, 40, 1024, 8192'",
+        );
+        let quick = Duration::from_secs(5);
+        let short = Duration::from_millis(200);
+
+        let answered = AtomicBool::new(false);
+        let cases = [
+            (
+                missing,
+                quick,
+                NvidiaFailure::NotInstalled,
+                "a program that is not there",
+            ),
+            (
+                not_executable,
+                quick,
+                NvidiaFailure::Transient,
+                "a failed spawn",
+            ),
+            (
+                fails.as_str(),
+                quick,
+                NvidiaFailure::Transient,
+                "a non-zero exit",
+            ),
+            (
+                garbage.as_str(),
+                quick,
+                NvidiaFailure::Transient,
+                "output that does not parse",
+            ),
+            (hangs.as_str(), short, NvidiaFailure::Transient, "a timeout"),
+        ];
+        for (program, deadline, want, what) in cases {
+            let (got, asked) = tracked(program, &answered, deadline);
+            assert_eq!(got.err(), Some(want), "{what}");
+            assert!(
+                !asked,
+                "{what}: the deadline was chosen as if one had answered"
+            );
+            assert!(
+                !answered.load(Relaxed),
+                "{what} marked nvidia-smi as answered"
+            );
+        }
+
+        let (got, asked) = tracked(&answers, &answered, quick);
+        assert_eq!(got.expect("a reading").name, "NVIDIA Test");
+        assert!(
+            !asked,
+            "the first reading's deadline was chosen as if one had answered"
+        );
+        assert!(
+            answered.load(Relaxed),
+            "a reading did not mark nvidia-smi as answered"
+        );
+
+        for (program, deadline, want, what) in cases {
+            let (got, asked) = tracked(program, &answered, deadline);
+            assert_eq!(got.err(), Some(want), "{what}, after a reading");
+            assert!(asked, "{what}: the deadline forgot the earlier reading");
+            assert!(answered.load(Relaxed), "{what} cleared the answered flag");
+        }
+    }
+
+    /// Marks a re-exec'd child of one of this module's tests. Its value is
+    /// the full path of the one `_inner` test that child runs; unset in an
+    /// ordinary run, where every `_inner` test returns at once.
+    const GPU_CHILD: &str = "HYTTE_SENSORS_GPU_TEST_CHILD";
+
+    /// Printed by a child only after every assertion passed, so a stale
+    /// `--exact` filter that runs nothing cannot pass for a success.
+    const CHILD_OK: &str = "gpu-test-child-reached-the-end";
+
+    /// True in the re-exec'd child that runs `inner`.
+    fn is_child(inner: &str) -> bool {
+        std::env::var_os(GPU_CHILD).is_some_and(|v| v == inner)
+    }
+
+    /// Re-exec this test binary to run just `inner`, with `PATH` replaced by
+    /// `path` when given. Asserts that the child passed and returns its
+    /// stdout and stderr.
+    fn run_child(inner: &str, path: Option<&std::ffi::OsStr>) -> (String, String) {
+        let mut child =
+            std::process::Command::new(std::env::current_exe().expect("this test binary"));
+        child
+            .args(["--exact", "--nocapture", "--test-threads=1", inner])
+            .env(GPU_CHILD, inner);
+        if let Some(path) = path {
+            child.env("PATH", path);
+        }
+        let out = child.output().expect("re-exec this test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "the child failed\n{stdout}\n{stderr}");
+        (stdout, stderr)
+    }
+
+    const SLOW_FIRST_INNER: &str =
+        "gpu::tests::the_real_reader_waits_for_a_slow_first_answer_only_inner";
+
+    /// **`read_nvidia_gpu` itself** gives `nvidia-smi` the long deadline
+    /// until it first answers, and the short one after. Pinned in a
+    /// re-exec'd child, which has its own process-wide flag and a `PATH`
+    /// whose `nvidia-smi` is a stand-in that takes 3 s to answer: between
+    /// [`NVIDIA_SMI_DEADLINE`] and [`NVIDIA_SMI_FIRST_DEADLINE`].
+    #[test]
+    fn the_real_reader_waits_for_a_slow_first_answer_only() {
+        let dir = tempfile::tempdir().unwrap();
+        script(
+            dir.path(),
+            "nvidia-smi",
+            "sleep 3\necho 'NVIDIA Slow, 50, 10, 100, 1000'",
+        );
+        // The stand-in's own `sleep` still has to resolve.
+        let mut path = std::ffi::OsString::from(dir.path());
+        if let Some(inherited) = std::env::var_os("PATH") {
+            path.push(":");
+            path.push(inherited);
+        }
+        let (stdout, stderr) = run_child(SLOW_FIRST_INNER, Some(&path));
+        assert!(
+            stdout.contains(CHILD_OK),
+            "the child ran nothing\n{stdout}\n{stderr}"
+        );
+    }
+
+    /// The body of [`the_real_reader_waits_for_a_slow_first_answer_only`]; a
+    /// no-op outside its child.
+    #[test]
+    fn the_real_reader_waits_for_a_slow_first_answer_only_inner() {
+        if !is_child(SLOW_FIRST_INNER) {
+            return;
+        }
+        let started = Instant::now();
+        let first = read_nvidia_gpu();
+        let took = started.elapsed();
+        assert_eq!(
+            first.expect("the slow first call was killed").name,
+            "NVIDIA Slow"
+        );
+        assert!(
+            took > NVIDIA_SMI_DEADLINE,
+            "the stand-in answered in {took:?}, so this proved nothing"
+        );
+
+        let started = Instant::now();
+        let second = read_nvidia_gpu();
+        let took = started.elapsed();
+        assert_eq!(
+            second.err(),
+            Some(NvidiaFailure::Transient),
+            "the slow call after a reading was not killed"
+        );
+        assert!(
+            took < Duration::from_secs(3),
+            "the call after a reading ran {took:?}: it did not get the short deadline"
+        );
+        println!("{CHILD_OK}");
+    }
+
     #[test]
     fn nvidia_unavailable_never_consults_cached_reading_or_forks() {
         let t0 = Instant::now();
@@ -1714,5 +1979,193 @@ mod tests {
         assert!(woke < 5, "an idle reaper woke {woke} times in 2 s");
         drop(tx);
         reaper.join().unwrap();
+    }
+
+    // ── spawn failures, induced with RLIMIT_NPROC (#1561) ────────────────────
+
+    /// Every `WARN` event's message. A re-exec'd child installs it as its
+    /// global default: the child runs one test, so nothing else logs there.
+    struct Warnings(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for Warnings {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            let mut message = String::new();
+            event.record(
+                &mut |field: &tracing::field::Field, value: &dyn std::fmt::Debug| {
+                    if field.name() == "message" {
+                        message = format!("{value:?}");
+                    }
+                },
+            );
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(message);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Printed by the spawn-failure child when `RLIMIT_NPROC` does not bind
+    /// this uid, so no spawn can be made to fail.
+    const NPROC_NOT_ENFORCED: &str = "gpu-test-child-rlimit-nproc-does-not-bind";
+
+    const SPAWN_FAILURE_INNER: &str =
+        "gpu::tests::spawn_failures_warn_once_per_streak_and_leak_nothing_inner";
+
+    /// What a failed spawn does, for both spawns on the GPU path: the
+    /// `nvidia-smi` child and the reaper thread.
+    ///
+    /// The failures are real. A soft `RLIMIT_NPROC` of 1 makes every
+    /// `fork`/`clone` fail with `EAGAIN` for any uid that already has a task
+    /// (the kernel counts the uid's tasks against the calling process's
+    /// limit). The limit belongs to one process, though, and lowering it in
+    /// this shared test binary would fail every sibling test that forks. So
+    /// it is lowered in a re-exec'd child that runs only the `_inner` test
+    /// below. Other processes of the same uid keep their own limits: more of
+    /// them only puts the uid further over 1, which changes nothing here.
+    ///
+    /// The kernel exempts a task with `CAP_SYS_RESOURCE` or `CAP_SYS_ADMIN`
+    /// in the initial user namespace (in practice: real root). There the
+    /// child finds it can still start a thread, says so, and this test
+    /// passes without checking anything, saying so on stderr. The nix build
+    /// sandbox runs tests as an unprivileged build user, so the limit binds
+    /// there.
+    #[test]
+    fn spawn_failures_warn_once_per_streak_and_leak_nothing() {
+        let (stdout, stderr) = run_child(SPAWN_FAILURE_INNER, None);
+        if stdout.contains(NPROC_NOT_ENFORCED) {
+            eprintln!(
+                "skipped: RLIMIT_NPROC does not bind this uid (root?), so no spawn can be \
+                 made to fail"
+            );
+            return;
+        }
+        assert!(
+            stdout.contains(CHILD_OK),
+            "the child ran nothing\n{stdout}\n{stderr}"
+        );
+    }
+
+    /// The body of [`spawn_failures_warn_once_per_streak_and_leak_nothing`];
+    /// a no-op outside its child, which is the only process that ever
+    /// lowers its `RLIMIT_NPROC`.
+    #[test]
+    fn spawn_failures_warn_once_per_streak_and_leak_nothing_inner() {
+        use nix::sys::resource::{Resource, getrlimit, setrlimit};
+        if !is_child(SPAWN_FAILURE_INNER) {
+            return;
+        }
+        let warnings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        tracing::subscriber::set_global_default(Warnings(std::sync::Arc::clone(&warnings)))
+            .expect("the child's only subscriber");
+        let warned = || warnings.lock().unwrap().clone();
+
+        // Everything this test forks, it forks before the limit goes down.
+        let dir = tempfile::tempdir().unwrap();
+        let smi = script(dir.path(), "smi", "echo 'NVIDIA Test, 55, 40, 1024, 8192'");
+        let killed = || {
+            let mut c = sleeper();
+            let pid = c.id();
+            c.kill().unwrap();
+            wait_zombie(pid);
+            (c, pid)
+        };
+        let (first, first_pid) = killed();
+        let (second, second_pid) = killed();
+        let (after, after_pid) = killed();
+        let (again, again_pid) = killed();
+
+        let (soft, hard) = getrlimit(Resource::RLIMIT_NPROC).unwrap();
+        let lower = || setrlimit(Resource::RLIMIT_NPROC, 1, hard).expect("lower RLIMIT_NPROC");
+        let restore =
+            || setrlimit(Resource::RLIMIT_NPROC, soft, hard).expect("restore RLIMIT_NPROC");
+
+        lower();
+        if let Ok(probe) = std::thread::Builder::new().spawn(|| {}) {
+            restore();
+            probe.join().unwrap();
+            println!("{NPROC_NOT_ENFORCED}");
+            return;
+        }
+
+        // 1. `nvidia-smi` cannot be spawned: a transient failure (retried
+        // with backoff), no panic, no child, so nothing for the reaper and
+        // no reaper started.
+        assert_eq!(
+            query_nvidia_smi(&smi, Duration::from_secs(5)).err(),
+            Some(NvidiaFailure::Transient),
+            "a failed nvidia-smi spawn"
+        );
+        assert!(
+            REAPER.lock().unwrap().is_none(),
+            "a failed nvidia-smi spawn started a reaper"
+        );
+        assert_eq!(
+            warned(),
+            Vec::<String>::new(),
+            "a failed nvidia-smi spawn warned"
+        );
+
+        // 2. The reaper thread cannot start, for two kills in a row: one
+        // warning for the streak, no inbox kept, and both children dropped
+        // un-waited (the documented cost: zombies until the process exits).
+        reap_later(first);
+        reap_later(second);
+        restore();
+        let lines = warned();
+        assert_eq!(lines.len(), 1, "want one warning per streak: {lines:?}");
+        assert!(
+            lines[0].contains("could not start the nvidia-smi reaper"),
+            "{lines:?}"
+        );
+        assert!(
+            REAPER.lock().unwrap().is_none(),
+            "a failed reaper spawn left an inbox behind"
+        );
+        std::thread::sleep(REAPER_POLL * 3);
+        assert!(
+            is_zombie(first_pid) && is_zombie(second_pid),
+            "a child whose reaper could not start was waited on after all"
+        );
+
+        // 3. The next kill once threads can start: a reaper starts and
+        // reaps it, with no further warning.
+        reap_later(after);
+        assert!(
+            wait_reaped(after_pid, Duration::from_secs(5)),
+            "no reaper was started once spawning worked again"
+        );
+        assert!(
+            REAPER.lock().unwrap().is_some(),
+            "the new inbox was not kept"
+        );
+        assert_eq!(warned().len(), 1, "a working spawn warned");
+
+        // 4. That success ended the streak, so the next failure warns again.
+        // (A dead inbox forces the respawn: the live reaper would take it.)
+        let (dead_tx, dead_rx) = std::sync::mpsc::channel();
+        drop(dead_rx);
+        *REAPER.lock().unwrap() = Some(dead_tx);
+        lower();
+        reap_later(again);
+        restore();
+        assert_eq!(warned().len(), 2, "a second streak did not warn");
+        assert!(
+            is_zombie(again_pid),
+            "the second streak's child was waited on"
+        );
+        println!("{CHILD_OK}");
     }
 }

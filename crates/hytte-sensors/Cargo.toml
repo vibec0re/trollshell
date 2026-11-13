@@ -30,6 +30,11 @@ nix = { workspace = true, features = ["feature"] }
 tracing.workspace = true
 
 [dev-dependencies]
+# Tests only: `gpu.rs`'s spawn-failure test lowers `RLIMIT_NPROC` with
+# `nix::sys::resource::setrlimit` in a re-exec'd child (#1561). The
+# "resource" feature of the `nix` above, so no new resolved package, and the
+# shipped build does not get it.
+nix = { workspace = true, features = ["feature", "resource"] }
 # `cpufreq.rs` and `hwmon.rs` build fixture sysfs directories to exercise the
 # fast/slow-path chip resolution without touching the real `/sys`.
 tempfile.workspace = true

@@ -2039,7 +2039,10 @@ mod tests {
             drop(command);
         };
         let (pumped, ()) = futures_util::future::join(pump, drive).await;
-        assert!(pumped.is_err(), "a lost iwd is waited for, not rediscovered");
+        assert!(
+            pumped.is_err(),
+            "a lost iwd is waited for, not rediscovered"
+        );
         assert!(
             calls.borrow().is_empty(),
             "iwd was called after its Lost was read: {:?}",

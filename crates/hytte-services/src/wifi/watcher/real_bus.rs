@@ -2462,14 +2462,17 @@ async fn w8_the_commands_paths_follow_the_panel() {
     let (shown_tx, mut shown) = tokio::sync::mpsc::unbounded_channel();
     let observer = tokio::spawn({
         let paths = watcher.paths.clone();
-        watcher.station.signal_ref(Option::is_some).for_each(move |some| {
-            let (paths, shown_tx) = (paths.clone(), shown_tx.clone());
-            async move {
-                if some {
-                    let _ = shown_tx.send(paths.station_path().await);
+        watcher
+            .station
+            .signal_ref(Option::is_some)
+            .for_each(move |some| {
+                let (paths, shown_tx) = (paths.clone(), shown_tx.clone());
+                async move {
+                    if some {
+                        let _ = shown_tx.send(paths.station_path().await);
+                    }
                 }
-            }
-        })
+            })
     });
     w7_step(&watcher, &fake, "connected", |w| {
         w.station.lock_ref().is_some() && w7_count(&fake.calls, "GetAll", ADAPTER) > 0
@@ -2477,7 +2480,12 @@ async fn w8_the_commands_paths_follow_the_panel() {
     .await;
     let first = tokio::time::timeout(Duration::from_secs(5), shown.recv()).await;
     observer.abort();
-    let mut read = vec![first.ok().flatten().unwrap_or_else(|| "no station".to_owned())];
+    let mut read = vec![
+        first
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "no station".to_owned()),
+    ];
     while let Ok(path) = shown.try_recv() {
         read.push(path);
     }

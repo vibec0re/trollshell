@@ -640,38 +640,32 @@ mod tests {
     /// last row loses `HOME`.
     #[test]
     fn a_delta_keeps_the_ssid_only_on_the_same_network() {
-        let rows: [(
-            &str,
-            Vec<(&str, OwnedValue)>,
-            &[&str],
-            Option<&str>,
-            Option<&str>,
-        ); 5] = [
+        let rows = [
             (
                 "another network",
                 vec![("ConnectedNetwork", object_path(WORK))],
-                &[],
+                Vec::new(),
                 Some(WORK),
                 None,
             ),
             (
                 "the same network again",
                 vec![("ConnectedNetwork", object_path(HOME))],
-                &[],
+                Vec::new(),
                 Some(HOME),
                 Some("home"),
             ),
             (
                 "a roam on the same network",
                 vec![("State", owned("roaming"))],
-                &[],
+                Vec::new(),
                 Some(HOME),
                 Some("home"),
             ),
             (
                 "a scan",
                 vec![("Scanning", owned(true))],
-                &[],
+                Vec::new(),
                 Some(HOME),
                 Some("home"),
             ),
@@ -680,7 +674,7 @@ mod tests {
                  only beside `ConnectedNetwork`, but only the latter clears \
                  the network",
                 Vec::new(),
-                &["ConnectedAccessPoint"],
+                vec!["ConnectedAccessPoint"],
                 Some(HOME),
                 Some("home"),
             ),
@@ -692,7 +686,7 @@ mod tests {
                 Some(HOME),
                 Some("home"),
             )));
-            let (changed, invalidated) = delta(changed, invalidated);
+            let (changed, invalidated) = delta(changed, &invalidated);
             apply_station_props_delta(&changed, &invalidated, &published);
             let st = published.get_cloned().expect("a station");
             assert_eq!(st.connected_network.as_deref(), network, "{case}");

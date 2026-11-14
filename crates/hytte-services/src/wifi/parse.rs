@@ -94,13 +94,30 @@ pub(super) fn station_removed_from_event(msg: &zbus::Message, station_path: &str
 
 // ── Delta application ─────────────────────────────────────────────────────────
 
-/// Apply a `PropertiesChanged` delta for `net.connman.iwd.Station`.
+/// Apply a `PropertiesChanged` delta for `net.connman.iwd.Station`: the
+/// signal's changed dict, then its invalidated list.
+///
+/// iwd reports a disconnect's `ConnectedNetwork` in the **invalidated** list,
+/// not as a changed value (#1654): `station_reset_connection_state` marks it
+/// changed once the network is gone (iwd 3.12 `src/station.c:1988-1991`), its
+/// getter then answers nothing (`station_property_get_connected_network`,
+/// `:4709-4722`), and ell lists a property whose getter answers nothing as
+/// invalidated (`ell/dbus-service.c:985-994`). Reading only the dict kept the
+/// old network after a disconnect.
+///
+/// The SSID follows [`with_kept_ssid`]'s rule, the one discovery uses: kept
+/// while the station stays on the same network, blank otherwise until the
+/// network read the caller makes next names the new one.
 pub(super) fn apply_station_props_delta(
     changed: &HashMap<String, OwnedValue>,
+    invalidated: &[String],
     station_mutable: &Mutable<Option<Station>>,
 ) {
     let mut guard = station_mutable.lock_mut();
-    let Some(st) = guard.as_mut() else { return };
+    let Some(previous) = guard.as_ref() else {
+        return;
+    };
+    let mut st = previous.clone();
 
     for (key, value) in changed {
         match key.as_str() {
@@ -126,9 +143,21 @@ pub(super) fn apply_station_props_delta(
             _ => {}
         }
     }
+    // `ConnectedNetwork` is the only property read here that iwd can
+    // invalidate. Its `State` and `Scanning` getters always answer
+    // (`src/station.c:4742-4796`), so ell never lists them.
+    if invalidated.iter().any(|key| key == "ConnectedNetwork") {
+        st.connected_network = None;
+    }
+
+    let next = with_kept_ssid(Some(previous), st);
+    *guard = Some(next);
 }
 
-/// Apply a `PropertiesChanged` delta for `net.connman.iwd.Adapter`.
+/// Apply a `PropertiesChanged` delta for `net.connman.iwd.Adapter`. It reads
+/// the changed dict only: the adapter's `Powered` and `Name` getters always
+/// answer (iwd 3.12 `src/wiphy.c:2522-2533`, `:2594-2617`), so iwd never
+/// invalidates either.
 pub(super) fn apply_adapter_props_delta(
     changed: &HashMap<String, OwnedValue>,
     adapter_mutable: &Mutable<Option<Adapter>>,
@@ -178,6 +207,13 @@ pub(super) fn refresh_adapter_from_managed(
 /// SSID of the station already published when both are on the same network
 /// (#1551).
 ///
+/// It is the one rule for every station read: the discovery snapshot
+/// ([`refresh_station_from_managed`]), the live re-read
+/// ([`super::client::refresh_station`]) and a `PropertiesChanged` delta
+/// ([`apply_station_props_delta`]). Until #1654 the last two kept the SSID
+/// whatever the network, so a network change named the network just left
+/// until the network list was read.
+///
 /// A parsed station has no SSID. iwd's `Station` names only its
 /// `ConnectedNetwork`, and the name comes with the network list read after
 /// the snapshot ([`super::client::refresh_networks`]), one round trip per
@@ -190,8 +226,9 @@ pub(super) fn refresh_adapter_from_managed(
 /// The SSID is kept only when all of these hold:
 ///
 /// - A station was published. The pump clears it when it sees iwd leave, a
-///   new iwd take the name or the station removed, so no SSID crosses
-///   those.
+///   new iwd take the name or the station removed, and a discovery pass
+///   clears it when it finds iwd without an owner or without a station
+///   (#1654), so no SSID crosses those.
 /// - Both are the same station object (the same path). Under iwd's own path
 ///   scheme this decides nothing the next condition does not: a network's
 ///   path extends its station's, so the same `ConnectedNetwork` already
@@ -345,7 +382,7 @@ mod tests {
             OwnedValue::try_from(zbus::zvariant::Value::from(true)).unwrap(),
         );
         // Must not panic; the unrecognised state falls back to Disconnected.
-        apply_station_props_delta(&changed, &station);
+        apply_station_props_delta(&changed, &[], &station);
         assert_eq!(
             station.lock_ref().as_ref().unwrap().state,
             StationState::Disconnected,
@@ -525,6 +562,121 @@ mod tests {
         );
         let st = station_mutable.get_cloned().expect("a station");
         assert_eq!(st.connected_ssid, None, "nothing was published to keep");
+    }
+
+    fn owned<'a>(x: impl Into<zbus::zvariant::Value<'a>>) -> OwnedValue {
+        x.into().try_to_owned().expect("an owned value")
+    }
+
+    fn object_path(p: &str) -> OwnedValue {
+        owned(zbus::zvariant::ObjectPath::try_from(p).expect("an object path"))
+    }
+
+    /// A `PropertiesChanged` delta's changed dict and invalidated list, as
+    /// the watcher decodes them from iwd's `(s, a{sv}, as)`.
+    fn delta(
+        changed: Vec<(&str, OwnedValue)>,
+        invalidated: &[&str],
+    ) -> (HashMap<String, OwnedValue>, Vec<String>) {
+        (
+            changed
+                .into_iter()
+                .map(|(k, x)| (k.to_owned(), x))
+                .collect(),
+            invalidated.iter().map(|&k| k.to_owned()).collect(),
+        )
+    }
+
+    /// iwd's disconnect: `State` changed to `disconnected`, and
+    /// `ConnectedNetwork` (with `ConnectedAccessPoint`) in the invalidated
+    /// list, because its getter answers nothing once the network is gone
+    /// (#1654). The station loses its network and its SSID, so the panel
+    /// stops marking the old network "Connected". The same holds when the
+    /// invalidation arrives in a signal of its own, with nothing changed.
+    ///
+    /// **Falsification:** ignore the invalidated list and the network stays
+    /// `HOME` in both rows.
+    #[test]
+    fn an_invalidated_connected_network_clears_the_network_and_its_ssid() {
+        let rows = [
+            (
+                "with the state change",
+                delta(
+                    vec![("State", owned("disconnected"))],
+                    &["ConnectedNetwork", "ConnectedAccessPoint"],
+                ),
+                StationState::Disconnected,
+            ),
+            (
+                "alone",
+                delta(Vec::new(), &["ConnectedNetwork", "ConnectedAccessPoint"]),
+                StationState::Connected,
+            ),
+        ];
+        for (case, (changed, invalidated), state) in rows {
+            let published = Mutable::new(Some(station(
+                STATION,
+                StationState::Connected,
+                Some(HOME),
+                Some("home"),
+            )));
+            apply_station_props_delta(&changed, &invalidated, &published);
+            let st = published.get_cloned().expect("a station");
+            assert_eq!(st.connected_network, None, "{case}");
+            assert_eq!(st.connected_ssid, None, "{case}");
+            assert_eq!(st.state, state, "{case}");
+        }
+    }
+
+    /// A delta that moves the station to another network blanks the SSID
+    /// until the network read names the new one, and a delta that keeps it
+    /// on the same network keeps the SSID: [`with_kept_ssid`]'s rule (#1654).
+    /// Until then a network change kept the old network's name.
+    ///
+    /// **Falsification:** keep the published SSID whatever the network (the
+    /// pre-#1654 field update) and the first row names "home" for `WORK`;
+    /// blank it on every delta and the other rows lose it.
+    #[test]
+    fn a_delta_keeps_the_ssid_only_on_the_same_network() {
+        let rows = [
+            (
+                "another network",
+                vec![("ConnectedNetwork", object_path(WORK))],
+                Some(WORK),
+                None,
+            ),
+            (
+                "the same network again",
+                vec![("ConnectedNetwork", object_path(HOME))],
+                Some(HOME),
+                Some("home"),
+            ),
+            (
+                "a roam on the same network",
+                vec![("State", owned("roaming"))],
+                Some(HOME),
+                Some("home"),
+            ),
+            (
+                "a scan",
+                vec![("Scanning", owned(true))],
+                Some(HOME),
+                Some("home"),
+            ),
+        ];
+        for (case, changed, network, ssid) in rows {
+            let published = Mutable::new(Some(station(
+                STATION,
+                StationState::Connected,
+                Some(HOME),
+                Some("home"),
+            )));
+            let (changed, invalidated) = delta(changed, &[]);
+            apply_station_props_delta(&changed, &invalidated, &published);
+            let st = published.get_cloned().expect("a station");
+            assert_eq!(st.connected_network.as_deref(), network, "{case}");
+            assert_eq!(st.connected_ssid.as_deref(), ssid, "{case}");
+        }
     }
 
     #[test]

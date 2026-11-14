@@ -1472,16 +1472,14 @@ async fn w7_step(watcher: &Watcher, fake: &W7Fake, step: &str, done: impl Fn(&Wa
     }
 }
 
+/// Every value the watcher's adapter took, in order ([`w7_watch_adapter`]).
+type W7Seen = Arc<Mutex<Vec<Option<Adapter>>>>;
+
 /// Record every value the watcher's adapter takes, as the panel's signal
 /// sees it, from now until the returned task is aborted: a `None` there is
 /// the card reading "No adapter" and its power switch going insensitive,
 /// however briefly. A wait on the end state cannot see that.
-fn w7_watch_adapter(
-    watcher: &Watcher,
-) -> (
-    Arc<Mutex<Vec<Option<Adapter>>>>,
-    tokio::task::JoinHandle<()>,
-) {
+fn w7_watch_adapter(watcher: &Watcher) -> (W7Seen, tokio::task::JoinHandle<()>) {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let mut values = watcher.adapter.signal_cloned().to_stream();
     let record = seen.clone();

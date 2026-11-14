@@ -303,14 +303,10 @@ pub(super) fn adapter_in(
             let parent = adapter_path_from_station(station);
             adapters.find(|(path, _)| *path == parent)?
         }
-        None => {
-            let adapters: Vec<_> = adapters.collect();
-            adapters
-                .iter()
-                .find(|(path, _)| Some(*path) == kept)
-                .or_else(|| adapters.iter().min_by(|(a, _), (b, _)| a.cmp(b)))
-                .copied()?
-        }
+        None => adapters
+            .clone()
+            .find(|(path, _)| Some(*path) == kept)
+            .or_else(|| adapters.min_by(|(a, _), (b, _)| a.cmp(b)))?,
     };
     Some(adapter_from_props(path, props))
 }
@@ -889,6 +885,15 @@ mod tests {
     /// between runs of the process.
     #[test]
     fn the_adapter_a_snapshot_publishes() {
+        /// A case, the snapshot, the published adapter's path, and the
+        /// station's and adapter's paths the snapshot must publish.
+        type Row<'a> = (
+            &'a str,
+            ManagedObjects,
+            Option<&'a str>,
+            Option<&'a str>,
+            Option<&'a str>,
+        );
         let station = || {
             object(
                 &["net.connman.iwd.Device", "net.connman.iwd.Station"],
@@ -905,13 +910,6 @@ mod tests {
             }
             managed
         };
-        type Row<'a> = (
-            &'a str,
-            ManagedObjects,
-            Option<&'a str>,
-            Option<&'a str>,
-            Option<&'a str>,
-        );
         let rows: [Row<'_>; 8] = [
             (
                 "the station's own adapter",

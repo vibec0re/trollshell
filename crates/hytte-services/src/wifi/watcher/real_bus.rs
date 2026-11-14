@@ -2503,6 +2503,35 @@ async fn w8_an_iwd_that_leaves_inside_a_hole_takes_the_paths_too() {
     println!("{CHILD_OK} {}", test_name(TEST));
 }
 
+/// W6's station removed inside a hole: no pump sees it go, and the next
+/// pass, whose snapshot has the adapter and no station, clears the station's
+/// path and keeps the adapter's (#1659).
+///
+/// **Falsification:** hand that pass's station-side clear other paths than
+/// the watcher's and the station's path stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn w8_a_station_removed_inside_a_hole_takes_its_path() {
+    const TEST: &str = "w8_a_station_removed_inside_a_hole_takes_its_path";
+    let Some(address) = in_child(TEST) else {
+        return run_in_child(TEST, None).await;
+    };
+    let (watcher, fake) = w6_start(&address, W6Hole::StationRemoved, None).await;
+    let settled = wait_for(&watcher, |w| {
+        w.station.lock_ref().is_none() && w.adapter.lock_ref().is_some()
+    })
+    .await;
+    if let Err(state) = settled {
+        panic!("the station is gone and its adapter is not; the panel has {state}");
+    }
+    assert_eq!(
+        w8_paths(&watcher).await,
+        (String::new(), ADAPTER.to_owned())
+    );
+    watcher.task.abort();
+    fake.abort();
+    println!("{CHILD_OK} {}", test_name(TEST));
+}
+
 /// The adapter of [`W8_STATION`].
 const W8_ADAPTER: &str = "/net/connman/iwd/1";
 /// The station W8's iwd starts with. Its path sorts after [`STATION`]'s.

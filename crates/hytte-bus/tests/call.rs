@@ -543,3 +543,73 @@ async fn no_auto_start_holds_on_the_retry_after_a_reconnect() {
         }
     }
 }
+
+/// The transient tail runs outside the deadline (#1658): a call whose
+/// connection dies under it is reported `Transient` and clears that connection
+/// even when the lock the tail needs is only free after the deadline has
+/// passed. Cancelling the tail instead would turn the `Transient` (which
+/// `RetryPolicy::Once` retries) into a `Timeout` (which nothing retries) and
+/// leave the dead connection cached with the supervisor never woken, which is
+/// `with_conn_within`'s own stated reason for keeping it outside.
+///
+/// No supervisor loop runs: `supervisor_notify_for_test` observes the wake, so
+/// a cleared connection cannot send a reconnect to `$DBUS_SESSION_BUS_ADDRESS`.
+///
+/// **Falsification:** move `settle` inside `with_conn_within`'s `timeout` and
+/// the call answers `Timeout` with the dead connection still installed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transport_error_is_settled_even_once_the_deadline_has_passed() {
+    const BUDGET: Duration = Duration::from_millis(500);
+
+    let (conn, guard) = ephemeral_bus().await;
+    let arrived = Arc::new(AtomicUsize::new(0));
+    let peer = serve_stall(&guard.address, Some(arrived.clone())).await;
+    let shared = SharedConnection::for_test_session(conn);
+    let woken = shared.supervisor_notify_for_test();
+
+    let call = tokio::spawn({
+        let shared = shared.clone();
+        async move {
+            call_with(&shared, STALL)
+                .at_path(STALL_PATH)
+                .iface(STALL)
+                .method("Ping")
+                .timeout(BUDGET)
+                .retry(RetryPolicy::Never)
+                .send::<u32>()
+                .await
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while arrived.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline, "the call never reached the peer");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // The call has its connection and is waiting for a reply. Take the pool's
+    // lock, then kill the broker: the call's transport error arrives at once,
+    // and its tail queues for the lock until well past the call's deadline.
+    let held = shared.hold_lock_for_test().await;
+    drop(peer);
+    drop(guard);
+    tokio::time::sleep(BUDGET * 3).await;
+    drop(held);
+
+    let err = tokio::time::timeout(Duration::from_secs(10), call)
+        .await
+        .expect("the call must answer once the lock is free")
+        .expect("the call task panicked")
+        .expect_err("a call whose broker died cannot have answered");
+    assert!(
+        err.is_transient() && !err.is_timeout(),
+        "a transport error that arrived inside the deadline is Transient however long \
+         its tail waited for the lock, got {err:?}"
+    );
+    assert!(
+        !shared.is_connected_for_test().await,
+        "the call's tail must clear the dead connection"
+    );
+    tokio::time::timeout(Duration::from_secs(1), woken.notified())
+        .await
+        .expect("the call's tail must wake the supervisor");
+}

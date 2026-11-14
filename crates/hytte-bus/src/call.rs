@@ -553,6 +553,46 @@ mod tests {
         assert_eq!(started.elapsed(), Duration::from_millis(60));
     }
 
+    /// The wedge itself, rather than a lock the test holds for the whole call:
+    /// a `call()` that queued for the pool's lock and is then never polled
+    /// again is handed the lock on release (tokio's mutex is fair), and keeps
+    /// it. A second call behind it runs out its own deadline (#1658). This is
+    /// the premise `with_conn_within`'s docs rest on, exercised through two
+    /// real `call()`s; `hold_lock_for_test` only provides the initial
+    /// contention.
+    ///
+    /// **Falsification:** put `do_call`'s deadline back around the method
+    /// call alone and the second call waits for the lock until [`NEVER`].
+    #[tokio::test(start_paused = true)]
+    async fn a_call_behind_an_unpolled_waiter_times_out_at_its_own_deadline() {
+        let shared = SharedConnection::unconnected_for_test(BusKind::Session);
+        let held = shared.hold_lock_for_test().await;
+        let mut first = std::pin::pin!(ping(&shared, RetryPolicy::Never));
+        tokio::select! {
+            biased;
+            _ = &mut first => panic!("the lock is held: the first call cannot have answered"),
+            () = std::future::ready(()) => {}
+        }
+        // The first call is queued. Releasing hands it the lock; nothing
+        // polls it again until the second call has answered.
+        drop(held);
+
+        let started = Instant::now();
+        let err = ping(&shared, RetryPolicy::Once)
+            .await
+            .expect_err("a call behind a wedged lock cannot have answered");
+        assert!(
+            err.is_timeout() && !err.is_transient(),
+            "a call behind an unpolled waiter is BusError::Timeout, got {err:?}"
+        );
+        assert_eq!(started.elapsed(), Duration::from_millis(100));
+
+        // Polled at last, the first call takes the lock it was handed.
+        first
+            .await
+            .expect_err("a pool with no connection cannot answer");
+    }
+
     /// The only failure class `Backoff` retries.
     fn transient() -> BusError {
         BusError::Transient {

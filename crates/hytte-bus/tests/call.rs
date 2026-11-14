@@ -265,7 +265,8 @@ async fn calls_in_flight_across_a_broker_restart_answer_promptly() {
 /// `Permanent` recognisable only by its `reason` string. Three things it must
 /// keep from that: the call is not retried (the peer may still carry it out,
 /// so the default `RetryPolicy::Once` must not issue it twice), it is not a
-/// lost connection (the epoch stays put), and it reads as it always did.
+/// lost connection (the connection stays installed and the epoch stays put),
+/// and it reads as it always did.
 ///
 /// **Falsification:** put `do_call`'s elapsed timer back on
 /// `zbus::Error::Failure("call timeout")` and the first assertion fails with
@@ -320,6 +321,14 @@ async fn a_call_past_its_deadline_is_a_timeout() {
         shared.epoch(),
         epoch,
         "a deadline must not force a reconnect"
+    );
+    // The epoch moves only once the supervisor has reconnected, which goes
+    // through `$DBUS_SESSION_BUS_ADDRESS`: nothing there in the nix sandbox,
+    // the host's bus on a dev box. Whether the connection is still installed
+    // is the deterministic half.
+    assert!(
+        shared.is_connected_for_test().await,
+        "a deadline must not clear the connection"
     );
 }
 
@@ -396,6 +405,11 @@ async fn time_spent_getting_the_connection_counts_against_the_deadline() {
         shared.epoch(),
         epoch,
         "a deadline must not force a reconnect"
+    );
+    // The deterministic half, as in `a_call_past_its_deadline_is_a_timeout`.
+    assert!(
+        shared.is_connected_for_test().await,
+        "a deadline must not clear the connection"
     );
 }
 

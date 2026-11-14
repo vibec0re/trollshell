@@ -880,16 +880,17 @@ where
 /// Each re-read is awaited inside its arm, so no event is applied while it is
 /// in flight and it never overwrites a newer one; an older event applied
 /// after it is an absolute value followed by every later change on the same
-/// receiver. Every call stops being polled once iwd is gone, like every other
-/// arm that would call iwd.
+/// receiver. Every call stops once iwd is gone: the re-reads' arms are no
+/// longer polled, and the registration is dropped.
 ///
-/// The loop is `biased`, owner first, so an iwd exit that is already queued
-/// wins over every queued arm that would call iwd: unbiased, a pass that
-/// started with a `Lost` queued could send `RegisterAgent` or a re-read
-/// first, and a call to iwd's name with no owner D-Bus-activates the iwd that
-/// was just stopped. The other arms cannot starve: each but the one-shot
-/// calls is a bus signal taking one bounded step per item, with a bounded
-/// receiver whose overrun is a marker that ends the pass.
+/// The loop is `biased`, owner first, and [`beside_registration`] polls it
+/// before the registration, so an iwd exit that is already queued wins over
+/// every call to iwd: otherwise a pass that started with a `Lost` queued
+/// could send `RegisterAgent` or a re-read first, and a call to iwd's name
+/// with no owner D-Bus-activates the iwd that was just stopped. The other
+/// arms cannot starve: each but the one-shot re-reads is a bus signal taking
+/// one bounded step per item, with a bounded receiver whose overrun is a
+/// marker that ends the pass.
 async fn pump_iwd_events<O, E, H, R, RF, S, SF, A, AF>(
     streams: IwdStreams<'_, O, E, H>,
     calls: IwdCalls<R, S, A>,
@@ -955,15 +956,17 @@ impl Published<'_> {
 ///
 /// It used to be one of the loop's arms, so it was not polled while another
 /// arm's handler awaited a call of its own (a re-read, a network read), and a
-/// zbus call holds its connection's resources between polls. The socket's
-/// write half is a `tokio::sync::Mutex` (zbus 5.14 with `tokio`,
-/// `abstractions/async_lock.rs`), which is fair: it hands the lock to the
+/// call in flight holds its connection's resources between polls. The locks
+/// on the way to the socket are `tokio::sync::Mutex`es (`hytte-bus`'s
+/// `with_conn`, and zbus 5.14's write half under its `tokio` feature,
+/// `abstractions/async_lock.rs`), which are fair: they hand the lock to the
 /// first queued waiter whether or not that waiter is polled. A
-/// `RegisterAgent` queued behind another writer was handed the lock while its
-/// arm sat unpolled, and the handler's own call then waited behind it until
-/// its 25 s deadline. The adapter's subscription (#1656) added writes at the
-/// pump's start, and #1656's W1 runs measured it at 3 of 40 until this. A
-/// pending call's receiver on the connection's method-return queue (8 deep,
+/// `RegisterAgent` queued behind another caller could be handed a lock while
+/// its arm sat unpolled, and the handler's own call then waited behind it
+/// until its 25 s deadline: #1656's W1 failed 3 of 40 runs that way, with
+/// neither call ever written, once the adapter's subscription put more
+/// traffic on the connection at the pump's start. A pending call's receiver
+/// on the connection's method-return queue (8 deep, zbus
 /// `connection/mod.rs`) is the same hazard for every reply on the
 /// connection, which is why a registration that iwd's exit leaves pending is
 /// dropped rather than kept.

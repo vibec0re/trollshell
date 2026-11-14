@@ -194,8 +194,13 @@ impl BusProxy {
     /// rebuild or clear it, and keep it until the returned value is dropped.
     /// Every [`call`](Self::call) then waits to read the cache, which is what
     /// its deadline is bounded against since #1658.
+    ///
+    /// Compiled only for this crate's own tests (`cfg(test)` or the
+    /// `system-tests` feature): a production holder of this proxy could
+    /// otherwise park every call on it and the watcher's rebuild.
     #[doc(hidden)]
     #[must_use = "the lock is released as soon as this is dropped"]
+    #[cfg(any(test, feature = "system-tests"))]
     pub async fn hold_cache_for_test(&self) -> impl Sized {
         self.inner.cached.write().await
     }

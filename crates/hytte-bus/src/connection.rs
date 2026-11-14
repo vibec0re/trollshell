@@ -534,6 +534,7 @@ pub mod test_support {
         /// (#1658).
         #[doc(hidden)]
         #[must_use]
+        #[cfg(any(test, feature = "system-tests"))]
         pub fn unconnected_for_test(kind: BusKind) -> Self {
             Self {
                 kind,
@@ -551,8 +552,14 @@ pub mod test_support {
         /// the connection, as it would behind a waiter that was handed the
         /// lock and is never polled again — the wedge a `call()`'s deadline
         /// is bounded against since #1658.
+        ///
+        /// Compiled only for this crate's own tests (`cfg(test)` or the
+        /// `system-tests` feature), as is [`Self::unconnected_for_test`]:
+        /// anything holding a [`pooled`] singleton could otherwise wedge every
+        /// primitive on that bus, the supervisor included.
         #[doc(hidden)]
         #[must_use = "the lock is released as soon as this is dropped"]
+        #[cfg(any(test, feature = "system-tests"))]
         pub async fn hold_lock_for_test(&self) -> impl Send + 'static {
             Arc::clone(&self.inner).lock_owned().await
         }

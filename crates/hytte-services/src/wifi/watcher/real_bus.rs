@@ -79,14 +79,51 @@ impl Drop for Broker {
     }
 }
 
+/// Set on a child to the file its broker's `net.connman.iwd` activation
+/// appends a line to ([`activations`]).
+const ACTIVATIONS_ENV: &str = "HYTTE_IWD_REAL_BUS_ACTIVATIONS";
+
+/// The file a broker's `net.connman.iwd` activation appends to, in its
+/// tempdir.
+fn activations_file(tmp: &TempDir) -> std::path::PathBuf {
+    tmp.path().join("activations")
+}
+
+/// In a child: how many times its broker has started `net.connman.iwd` so
+/// far. Zero on a broker that cannot ([`run_in_activating_child`]).
+fn activations() -> usize {
+    let file = std::env::var(ACTIVATIONS_ENV).expect("the activation file's path");
+    std::fs::read_to_string(file).map_or(0, |s| s.lines().count())
+}
+
 /// A fresh `dbus-daemon`, refusing match rules past `match_limit` per
-/// connection when given.
-async fn broker(match_limit: Option<u32>) -> Broker {
+/// connection when given. With `activatable`, `net.connman.iwd` gets an
+/// activation file whose `Exec` appends a line to [`activations_file`] and
+/// exits 1, `bluetooth::devices`' `real_bus` shape (#1651): a start the bus
+/// counts, and one that fails, so the name stays unowned. The broker answers
+/// the call that caused it once that process has exited, so the line is
+/// written by the time the call's answer is in.
+async fn broker(match_limit: Option<u32>, activatable: bool) -> Broker {
     let tmp = TempDir::new().expect("a tempdir for dbus-daemon");
     let address = format!("unix:path={}", tmp.path().join("bus").display());
     let limit = match_limit.map_or_else(String::new, |n| {
         format!(r#"<limit name="max_match_rules_per_connection">{n}</limit>"#)
     });
+    let servicedir = if activatable {
+        let services = tmp.path().join("services");
+        std::fs::create_dir(&services).expect("create the service directory");
+        std::fs::write(
+            services.join("net.connman.iwd.service"),
+            format!(
+                "[D-BUS Service]\nName=net.connman.iwd\nExec=/bin/sh -c \"echo activated >> {}; exit 1\"\n",
+                activations_file(&tmp).display()
+            ),
+        )
+        .expect("write the net.connman.iwd activation file");
+        format!("<servicedir>{}</servicedir>", services.display())
+    } else {
+        String::new()
+    };
     let config = tmp.path().join("bus.conf");
     std::fs::write(
         &config,
@@ -99,6 +136,7 @@ async fn broker(match_limit: Option<u32>) -> Broker {
   <listen>{address}</listen>
   <auth>EXTERNAL</auth>
   {limit}
+  {servicedir}
   <policy context="default">
     <allow send_destination="*" eavesdrop="true"/>
     <allow eavesdrop="true"/>
@@ -149,14 +187,24 @@ fn in_child(test: &str) -> Option<String> {
 
 /// Run `test` in a re-exec'd child whose system bus is a fresh broker.
 async fn run_in_child(test: &str, match_limit: Option<u32>) {
+    run_in(test, broker(match_limit, false).await).await;
+}
+
+/// [`run_in_child`], on a broker that can start `net.connman.iwd` and counts
+/// each start ([`activations`]).
+async fn run_in_activating_child(test: &str) {
+    run_in(test, broker(None, true).await).await;
+}
+
+async fn run_in(test: &str, bus: Broker) {
     let name = test_name(test);
-    let bus = broker(match_limit).await;
     let no_session = format!("unix:path={}", bus.tmp.path().join("no-session").display());
     let out = tokio::time::timeout(
         CHILD_BUDGET,
         Command::new(std::env::current_exe().expect("this test binary's path"))
             .args(["--exact", "--nocapture", "--test-threads=1", &name])
             .env(CHILD_ENV, &name)
+            .env(ACTIVATIONS_ENV, activations_file(&bus.tmp))
             .env("DBUS_SYSTEM_BUS_ADDRESS", &bus.address)
             .env("DBUS_SESSION_BUS_ADDRESS", &no_session)
             .kill_on_drop(true)
@@ -1594,5 +1642,47 @@ async fn w7_a_snapshot_with_no_station_publishes_its_adapter_itself() {
 
     watcher.task.abort();
     fake.task.abort();
+    println!("{CHILD_OK} {}", test_name(TEST));
+}
+
+/// The adapter's re-read, sent to `net.connman.iwd` with no owner on a bus
+/// that could start it, is refused by the bus and starts nothing, and the
+/// adapter it was reading stays published (#1656; #1551, #1652). The watcher
+/// sends that read on its own, after a rule lands or a signal does not
+/// decode, and iwd may have exited in between. The positive control is a
+/// plain call to the same name: the broker counts its start, so a zero above
+/// is a zero.
+///
+/// **Falsification:** drop `no_auto_start()` from `refresh_adapter` and the
+/// re-read starts iwd.
+#[tokio::test(flavor = "multi_thread")]
+async fn w7_the_adapter_reread_never_starts_iwd() {
+    const TEST: &str = "w7_the_adapter_reread_never_starts_iwd";
+    if in_child(TEST).is_none() {
+        return run_in_activating_child(TEST).await;
+    }
+    let off = Adapter {
+        path: ADAPTER.to_owned(),
+        powered: false,
+        name: "phy0".to_owned(),
+    };
+    let adapter = Mutable::new(Some(off.clone()));
+
+    let before = activations();
+    crate::wifi::client::refresh_adapter(ADAPTER, &adapter).await;
+    assert_eq!(activations(), before, "the adapter's re-read started iwd");
+    assert_eq!(
+        adapter.get_cloned(),
+        Some(off),
+        "a refused re-read changed the adapter"
+    );
+
+    let answer = crate::wifi::client::get_managed_objects().await;
+    assert_eq!(
+        activations(),
+        before + 1,
+        "the broker did not count a plain call's start ({:?})",
+        answer.err()
+    );
     println!("{CHILD_OK} {}", test_name(TEST));
 }

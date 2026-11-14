@@ -1,7 +1,8 @@
 //! The production `run_wifi_watcher`, through the process-global system
 //! connection, against a real `dbus-daemon` and a scripted `net.connman.iwd`
 //! (#1647 review: W1 and W2, and W3 for the network read a re-read can add;
-//! #1654: W5 for a disconnect, W6 for an iwd or station gone inside a hole).
+//! #1654: W5 for a disconnect, W6 for an iwd or station gone inside a hole;
+//! #1656: W7 for the adapter powered off and on again).
 //!
 //! Each test re-execs this test binary with `DBUS_SYSTEM_BUS_ADDRESS` set to
 //! a fresh broker, for the reason and in the shape `bluetooth::devices`'
@@ -15,7 +16,7 @@
 //! cargo test -p hytte-services --features system-tests --lib wifi::watcher::real_bus
 //! ```
 
-use super::{Adapter, IwdPaths, Station, StationState, run_wifi_watcher};
+use super::{Adapter, IwdPaths, Station, StationState, WifiNetwork, run_wifi_watcher};
 use futures_signals::signal::{Mutable, SignalExt};
 use futures_util::StreamExt;
 use std::collections::HashMap;
@@ -210,19 +211,21 @@ struct Hold {
     release: tokio::sync::oneshot::Receiver<()>,
 }
 
+/// The adapter's `net.connman.iwd.Adapter` properties.
+fn adapter_props(powered: bool) -> Props {
+    HashMap::from([
+        ("Powered".to_owned(), v(powered)),
+        ("Name".to_owned(), v("phy0")),
+    ])
+}
+
 /// iwd's `GetManagedObjects` answer: the adapter, and the station with
 /// `station`'s properties.
 fn managed_objects(station: &Props) -> HashMap<OwnedObjectPath, Ifaces> {
     HashMap::from([
         (
             OwnedObjectPath::try_from(ADAPTER).expect("a path"),
-            HashMap::from([(
-                "net.connman.iwd.Adapter".to_owned(),
-                HashMap::from([
-                    ("Powered".to_owned(), v(true)),
-                    ("Name".to_owned(), v("phy0")),
-                ]),
-            )]),
+            HashMap::from([("net.connman.iwd.Adapter".to_owned(), adapter_props(true))]),
         ),
         (
             OwnedObjectPath::try_from(STATION).expect("a path"),
@@ -318,6 +321,9 @@ async fn fake_iwd(address: &str, script: Script) -> (zbus::Connection, Arc<Mutex
                             .await;
                     }
                 }
+                "GetAll" if at == ADAPTER => {
+                    let _ = task_conn.reply(&hdr, &adapter_props(true)).await;
+                }
                 "GetAll" => {
                     let name = networks
                         .iter()
@@ -371,26 +377,33 @@ fn state_change(state: &str) -> Props {
     HashMap::from([("State".to_owned(), v(state.to_owned()))])
 }
 
-/// The watcher's station and adapter, and the task running it.
+/// The watcher's station, networks and adapter, the paths it hands the
+/// commands, and the task running it.
 struct Watcher {
     station: Mutable<Option<Station>>,
+    networks: Mutable<Vec<WifiNetwork>>,
     adapter: Mutable<Option<Adapter>>,
+    paths: IwdPaths,
     task: tokio::task::JoinHandle<()>,
 }
 
 fn spawn_watcher() -> Watcher {
     let station = Mutable::new(None);
+    let networks = Mutable::new(Vec::new());
     let adapter = Mutable::new(None);
+    let paths = IwdPaths::default();
     let task = tokio::spawn(run_wifi_watcher(
         station.clone(),
-        Mutable::new(Vec::new()),
+        networks.clone(),
         Mutable::new(None),
         adapter.clone(),
-        IwdPaths::default(),
+        paths.clone(),
     ));
     Watcher {
         station,
+        networks,
         adapter,
+        paths,
         task,
     }
 }
@@ -936,6 +949,9 @@ async fn w6_fake(fake: W6Fake) {
             "GetAll" if at == STATION => {
                 let _ = conn.reply(&hdr, &clone_props(&station)).await;
             }
+            "GetAll" if at == ADAPTER => {
+                let _ = conn.reply(&hdr, &adapter_props(true)).await;
+            }
             "GetAll" => {
                 let props: Props = HashMap::from([
                     ("Name".to_owned(), v("home".to_owned())),
@@ -1054,25 +1070,56 @@ async fn w6_an_iwd_that_leaves_inside_a_hole_is_cleared() {
 }
 
 /// iwd removes its station inside the hole that ends a pass, and keeps its
-/// name. The next pass's snapshot has no station, and it must clear the
-/// station and adapter before it retries (#1654). It used to retry with
-/// both on the panel.
+/// name and its adapter. The next pass's snapshot has the adapter and no
+/// station: it must clear the station and its networks (#1654), and publish
+/// the snapshot's adapter rather than clear it (#1656). Before #1654 it
+/// retried with the station on the panel; from #1654 to #1656 it cleared the
+/// adapter too, which is what took the power switch away with the radio off.
 ///
-/// **Falsification:** do not clear on a snapshot with no station and the
-/// panel keeps both.
+/// **Falsification:** do not clear the station's side on a snapshot with no
+/// station and the panel keeps the station; clear the adapter there too (the
+/// #1654 clear) and the adapter is gone.
 #[tokio::test(flavor = "multi_thread")]
-async fn w6_a_station_removed_inside_a_hole_is_cleared() {
-    const TEST: &str = "w6_a_station_removed_inside_a_hole_is_cleared";
+async fn w6_a_station_removed_inside_a_hole_clears_the_station_and_keeps_the_adapter() {
+    const TEST: &str =
+        "w6_a_station_removed_inside_a_hole_clears_the_station_and_keeps_the_adapter";
     let Some(address) = in_child(TEST) else {
         return run_in_child(TEST, None).await;
     };
     let (watcher, fake) = w6_start(&address, W6Hole::StationRemoved, None).await;
-    if let Err(kept) = w6_wait_cleared(&watcher).await {
-        panic!("the station is gone and the panel kept {kept:?}");
+    let settled = wait_for(&watcher, |w| {
+        w.station.lock_ref().is_none()
+            && w.networks.lock_ref().is_empty()
+            && w.adapter.lock_ref().as_ref().map(|a| a.path.as_str()) == Some(ADAPTER)
+    })
+    .await;
+    if let Err(state) = settled {
+        panic!("the station is gone and its adapter is not; the panel has {state}");
     }
     watcher.task.abort();
     fake.abort();
     println!("{CHILD_OK} {}", test_name(TEST));
+}
+
+/// Wait until `done` holds for the watcher's published state; that state if
+/// it never does.
+async fn wait_for(watcher: &Watcher, done: impl Fn(&Watcher) -> bool) -> Result<(), String> {
+    tokio::time::timeout(BUDGET, async {
+        // Polled, as `wait_calls` is: each state waited for here is one the
+        // test holds still until the next step.
+        while !done(watcher) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        format!(
+            "station {:?}, {} network(s), adapter {:?}",
+            watcher.station.get_cloned(),
+            watcher.networks.lock_ref().len(),
+            watcher.adapter.get_cloned()
+        )
+    })
 }
 
 /// A pass whose snapshot fails learns nothing about iwd, so it keeps what
@@ -1110,5 +1157,390 @@ async fn w6_a_failed_snapshot_keeps_the_station() {
     assert!(adapter.is_some(), "a failed snapshot dropped the adapter");
     watcher.task.abort();
     fake.abort();
+    println!("{CHILD_OK} {}", test_name(TEST));
+}
+
+// ── W7: the adapter powered off and on again ────────────────────────────────
+
+/// W7's iwd: the adapter's power, and whether its station exists. The fake
+/// answers every call from it, and the steps below change it before they
+/// emit, as iwd does.
+#[derive(Clone, Copy)]
+struct W7State {
+    powered: bool,
+    station: bool,
+}
+
+/// W7's station: connected on [`HOME_NET`] ("home").
+fn w7_station_props() -> Props {
+    let mut station = station_props("connected");
+    station.insert("ConnectedNetwork".to_owned(), path(HOME_NET));
+    station
+}
+
+/// iwd's tree for `state`: the adapter always, at [`ADAPTER`]; the netdev's
+/// `Device` always, at [`STATION`]; its `Station` only while it exists. That
+/// is what iwd 3.12 keeps with the adapter powered off: the adapter's object
+/// goes only with the wiphy (`src/wiphy.c:2478-2490`) and the `Device` only
+/// with the netdev (`src/device.c:362-364`), while the netdev going down
+/// removes the `Station` (`src/station.c:5941-5945`).
+fn w7_tree(state: W7State) -> HashMap<OwnedObjectPath, Ifaces> {
+    let mut netdev = HashMap::from([(
+        "net.connman.iwd.Device".to_owned(),
+        HashMap::from([
+            ("Name".to_owned(), v("wlan0")),
+            ("Powered".to_owned(), v(state.station)),
+        ]),
+    )]);
+    if state.station {
+        netdev.insert("net.connman.iwd.Station".to_owned(), w7_station_props());
+    }
+    HashMap::from([
+        (
+            OwnedObjectPath::try_from(ADAPTER).expect("a path"),
+            HashMap::from([(
+                "net.connman.iwd.Adapter".to_owned(),
+                adapter_props(state.powered),
+            )]),
+        ),
+        (OwnedObjectPath::try_from(STATION).expect("a path"), netdev),
+    ])
+}
+
+/// Emit a `PropertiesChanged` for `iface` at `at`.
+async fn w7_properties_changed(conn: &zbus::Connection, at: &str, iface: &str, changed: Props) {
+    let none: &[&str] = &[];
+    conn.emit_signal(
+        None::<zbus::names::BusName<'_>>,
+        at,
+        "org.freedesktop.DBus.Properties",
+        "PropertiesChanged",
+        &(iface, changed, none),
+    )
+    .await
+    .expect("emit PropertiesChanged");
+}
+
+/// The netdev going down: the `Station` interface removed, then the
+/// `Device`'s `Powered` false at the same path (`src/device.c:371-375`).
+async fn w7_remove_station(conn: &zbus::Connection, state: &Mutex<W7State>) {
+    state.lock().expect("state").station = false;
+    let station = OwnedObjectPath::try_from(STATION).expect("a path");
+    conn.emit_signal(
+        None::<zbus::names::BusName<'_>>,
+        "/",
+        "org.freedesktop.DBus.ObjectManager",
+        "InterfacesRemoved",
+        &(station, vec!["net.connman.iwd.Station".to_owned()]),
+    )
+    .await
+    .expect("emit InterfacesRemoved");
+    let device = HashMap::from([("Powered".to_owned(), v(false))]);
+    w7_properties_changed(conn, STATION, "net.connman.iwd.Device", device).await;
+}
+
+/// The rfkill state changing: the adapter's `Powered` at the adapter's own
+/// path (`wiphy_rfkill_cb`, `src/wiphy.c:2492-2520`).
+async fn w7_set_powered(conn: &zbus::Connection, state: &Mutex<W7State>, on: bool) {
+    state.lock().expect("state").powered = on;
+    let adapter = HashMap::from([("Powered".to_owned(), v(on))]);
+    w7_properties_changed(conn, ADAPTER, "net.connman.iwd.Adapter", adapter).await;
+}
+
+/// The netdev coming up: the `Device`'s `Powered` true, then the `Station`
+/// added (`src/station.c:5936-5939`).
+async fn w7_add_station(conn: &zbus::Connection, state: &Mutex<W7State>) {
+    state.lock().expect("state").station = true;
+    let device = HashMap::from([("Powered".to_owned(), v(true))]);
+    w7_properties_changed(conn, STATION, "net.connman.iwd.Device", device).await;
+    let station = OwnedObjectPath::try_from(STATION).expect("a path");
+    let ifaces: HashMap<String, Props> =
+        HashMap::from([("net.connman.iwd.Station".to_owned(), w7_station_props())]);
+    conn.emit_signal(
+        None::<zbus::names::BusName<'_>>,
+        "/",
+        "org.freedesktop.DBus.ObjectManager",
+        "InterfacesAdded",
+        &(station, ifaces),
+    )
+    .await
+    .expect("emit InterfacesAdded");
+}
+
+/// W7's scripted iwd. It answers from `state`, and records each call as
+/// `"<member> <path>"` **after** its reply is sent, so a test that sees a
+/// read recorded knows a signal it emits now reaches the watcher after that
+/// read's answer. A `Set` of the adapter's `Powered` to true powers the
+/// radio on as iwd does: the adapter's `Powered`, then the station.
+async fn w7_fake(
+    conn: zbus::Connection,
+    mut stream: zbus::MessageStream,
+    state: Arc<Mutex<W7State>>,
+    calls: Arc<Mutex<Vec<String>>>,
+) {
+    let unknown = "org.freedesktop.DBus.Error.UnknownObject";
+    while let Some(Ok(msg)) = stream.next().await {
+        if msg.message_type() != zbus::message::Type::MethodCall {
+            continue;
+        }
+        let hdr = msg.header();
+        let at = hdr.path().map(ToString::to_string).unwrap_or_default();
+        let member = hdr.member().map(ToString::to_string).unwrap_or_default();
+        let now = *state.lock().expect("state");
+        let mut power_on = false;
+        match member.as_str() {
+            "GetManagedObjects" => {
+                let _ = conn.reply(&hdr, &w7_tree(now)).await;
+            }
+            "GetAll" if at == ADAPTER => {
+                let _ = conn.reply(&hdr, &adapter_props(now.powered)).await;
+            }
+            "GetAll" | "GetOrderedNetworks" if at == STATION && !now.station => {
+                let _ = conn.reply_error(&hdr, unknown, &"no station").await;
+            }
+            "GetAll" if at == STATION => {
+                let _ = conn.reply(&hdr, &w7_station_props()).await;
+            }
+            "GetAll" => {
+                let props: Props = HashMap::from([
+                    ("Name".to_owned(), v("home".to_owned())),
+                    ("Type".to_owned(), v("psk")),
+                ]);
+                let _ = conn.reply(&hdr, &props).await;
+            }
+            "GetOrderedNetworks" => {
+                let ordered: Vec<(OwnedObjectPath, i16)> =
+                    vec![(OwnedObjectPath::try_from(HOME_NET).expect("a path"), -5000)];
+                let _ = conn.reply(&hdr, &ordered).await;
+            }
+            "RegisterAgent" => {
+                let _ = conn.reply(&hdr, &()).await;
+            }
+            "Set" if at == ADAPTER => {
+                let (iface, name, value) = msg
+                    .body()
+                    .deserialize::<(String, String, OwnedValue)>()
+                    .expect("Set's (s, s, v)");
+                assert_eq!(
+                    (iface.as_str(), name.as_str()),
+                    ("net.connman.iwd.Adapter", "Powered")
+                );
+                power_on = bool::try_from(value).expect("a bool");
+                let _ = conn.reply(&hdr, &()).await;
+            }
+            _ => {
+                let _ = conn
+                    .reply_error(&hdr, "org.freedesktop.DBus.Error.UnknownMethod", &"no")
+                    .await;
+            }
+        }
+        calls.lock().expect("calls").push(format!("{member} {at}"));
+        if power_on {
+            w7_set_powered(&conn, &state, true).await;
+            w7_add_station(&conn, &state).await;
+        }
+    }
+}
+
+/// W7's scripted iwd, running: its connection (dropping it is iwd leaving),
+/// its state, the calls it answered, and its task.
+struct W7Fake {
+    conn: zbus::Connection,
+    state: Arc<Mutex<W7State>>,
+    calls: Arc<Mutex<Vec<String>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// Start W7's iwd in `state`, then the watcher.
+async fn w7_start(address: &str, state: W7State) -> (W7Fake, Watcher) {
+    let conn = zbus::connection::Builder::address(address)
+        .expect("the broker's address")
+        .build()
+        .await
+        .expect("the scripted iwd connects");
+    let state = Arc::new(Mutex::new(state));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let stream = zbus::MessageStream::from(&conn);
+    let task = tokio::spawn(w7_fake(conn.clone(), stream, state.clone(), calls.clone()));
+    conn.request_name("net.connman.iwd")
+        .await
+        .expect("own net.connman.iwd");
+    let fake = W7Fake {
+        conn,
+        state,
+        calls,
+        task,
+    };
+    (fake, spawn_watcher())
+}
+
+/// How many times the scripted iwd was called with `member` at `at`.
+fn w7_count(calls: &Mutex<Vec<String>>, member: &str, at: &str) -> usize {
+    let call = format!("{member} {at}");
+    calls
+        .lock()
+        .expect("calls")
+        .iter()
+        .filter(|c| **c == call)
+        .count()
+}
+
+/// The adapter is published at its own path with `powered`.
+fn adapter_is(watcher: &Watcher, powered: bool) -> bool {
+    watcher
+        .adapter
+        .lock_ref()
+        .as_ref()
+        .map(|a| (a.path.as_str(), a.powered))
+        == Some((ADAPTER, powered))
+}
+
+/// Wait for one W7 step's state, or fail naming the step.
+async fn w7_step(watcher: &Watcher, fake: &W7Fake, step: &str, done: impl Fn(&Watcher) -> bool) {
+    if let Err(state) = wait_for(watcher, done).await {
+        panic!(
+            "{step}: the panel has {state}. Calls: {:?}",
+            fake.calls.lock().expect("calls")
+        );
+    }
+}
+
+/// The radio switched off and on again, as iwd does it (#1656). Powering
+/// off: the station's interface removed, then the adapter's `Powered` false
+/// at the adapter's path. The panel must keep the adapter, show it off with
+/// no station and no networks, and follow `Powered` back on; then iwd adds
+/// the station again and the panel must show it. Until #1656 the station's
+/// removal cleared the adapter, nothing read the adapter's path, and a pass
+/// with no station published no adapter: the card read "No adapter" and the
+/// power switch went insensitive.
+///
+/// Each change is emitted once the watcher has read both objects again
+/// after their rules landed, and `Powered` only after the panel shows the
+/// station gone, so only the adapter's live subscription can carry it.
+///
+/// **Falsification:** clear the adapter on the station's removal and the
+/// second step fails; drop the adapter's subscription, or ignore its delta,
+/// and the third does; do not rediscover on the station's return and the
+/// last does.
+#[tokio::test(flavor = "multi_thread")]
+async fn w7_the_radio_switched_off_and_on_keeps_the_adapter() {
+    const TEST: &str = "w7_the_radio_switched_off_and_on_keeps_the_adapter";
+    let Some(address) = in_child(TEST) else {
+        return run_in_child(TEST, None).await;
+    };
+    let on = W7State {
+        powered: true,
+        station: true,
+    };
+    let (fake, watcher) = w7_start(&address, on).await;
+
+    w7_step(&watcher, &fake, "connected", |w| {
+        w.station.lock_ref().is_some()
+            && !w.networks.lock_ref().is_empty()
+            && adapter_is(w, true)
+            && w7_count(&fake.calls, "GetAll", STATION) > 0
+            && w7_count(&fake.calls, "GetAll", ADAPTER) > 0
+    })
+    .await;
+
+    w7_remove_station(&fake.conn, &fake.state).await;
+    w7_step(&watcher, &fake, "the station removed", |w| {
+        w.station.lock_ref().is_none() && w.networks.lock_ref().is_empty() && adapter_is(w, true)
+    })
+    .await;
+
+    w7_set_powered(&fake.conn, &fake.state, false).await;
+    w7_step(&watcher, &fake, "powered off", |w| {
+        w.station.lock_ref().is_none() && w.networks.lock_ref().is_empty() && adapter_is(w, false)
+    })
+    .await;
+
+    w7_set_powered(&fake.conn, &fake.state, true).await;
+    w7_step(&watcher, &fake, "powered on", |w| {
+        w.station.lock_ref().is_none() && adapter_is(w, true)
+    })
+    .await;
+
+    w7_add_station(&fake.conn, &fake.state).await;
+    w7_step(&watcher, &fake, "the station back", |w| {
+        w.station.lock_ref().as_ref().map(|st| st.path.as_str()) == Some(STATION)
+            && !w.networks.lock_ref().is_empty()
+            && adapter_is(w, true)
+    })
+    .await;
+
+    watcher.task.abort();
+    fake.task.abort();
+    println!("{CHILD_OK} {}", test_name(TEST));
+}
+
+/// The shell starts with the radio already off: iwd's tree has the adapter,
+/// powered off, and no station (#1656). The panel must show the adapter off,
+/// so the card reads "Disabled" and the power switch is live, and the
+/// watcher must not poll for the station: one snapshot, however long the
+/// radio stays off. Then the power switch's own call, addressed through the
+/// path the watcher hands the commands, must reach the adapter while no
+/// station exists, and the station iwd brings up must reach the panel.
+///
+/// The switch's call is `set_powered`'s iwd arm without the registry
+/// lookup: [`IwdPaths::adapter_path`], then `do_set_powered`.
+///
+/// **Falsification:** publish no adapter from a snapshot with no station
+/// (the pre-#1656 discovery) and the first step fails; retry the snapshot on
+/// a timer and the snapshot count does; set the commands' adapter path from
+/// the station's (there is none) and the path assertion does.
+#[tokio::test(flavor = "multi_thread")]
+async fn w7_a_radio_off_at_start_is_published_and_switched_on() {
+    const TEST: &str = "w7_a_radio_off_at_start_is_published_and_switched_on";
+    let Some(address) = in_child(TEST) else {
+        return run_in_child(TEST, None).await;
+    };
+    let off = W7State {
+        powered: false,
+        station: false,
+    };
+    let (fake, watcher) = w7_start(&address, off).await;
+
+    w7_step(&watcher, &fake, "off at start", |w| {
+        w.station.lock_ref().is_none()
+            && adapter_is(w, false)
+            && w7_count(&fake.calls, "GetAll", ADAPTER) > 0
+    })
+    .await;
+
+    // A bounded negative: longer than the pre-#1656 no-station retry.
+    tokio::time::sleep(super::DISCOVERY_RETRY + Duration::from_secs(1)).await;
+    assert_eq!(
+        w7_count(&fake.calls, "GetManagedObjects", "/"),
+        1,
+        "the watcher polled a radio that is off. Calls: {:?}",
+        fake.calls.lock().expect("calls")
+    );
+    assert!(
+        adapter_is(&watcher, false),
+        "the adapter moved: {:?}",
+        watcher.adapter.get_cloned()
+    );
+
+    let adapter_path = watcher.paths.adapter_path().await;
+    assert_eq!(
+        adapter_path, ADAPTER,
+        "the power switch has no adapter to address"
+    );
+    crate::wifi::do_set_powered(&adapter_path, true)
+        .await
+        .expect("the adapter takes Powered");
+
+    w7_step(&watcher, &fake, "switched on", |w| {
+        w.station.lock_ref().as_ref().map(|st| st.path.as_str()) == Some(STATION)
+            && !w.networks.lock_ref().is_empty()
+            && adapter_is(w, true)
+    })
+    .await;
+    // Recorded before the fake powered on, so in by now.
+    assert_eq!(w7_count(&fake.calls, "Set", ADAPTER), 1);
+
+    watcher.task.abort();
+    fake.task.abort();
     println!("{CHILD_OK} {}", test_name(TEST));
 }

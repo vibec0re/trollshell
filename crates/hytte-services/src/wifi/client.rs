@@ -6,8 +6,11 @@ use hytte_bus::BusKind;
 use std::collections::HashMap;
 use zbus::zvariant::OwnedValue;
 
-use super::parse::{ManagedObjects, parse_state, prop_bool, prop_str, with_kept_ssid};
-use super::types::{Station, WifiNetwork};
+use super::parse::{
+    Discovered, IWD_ADAPTER_IFACE, ManagedObjects, adapter_from_props, discovered, parse_state,
+    prop_bool, prop_str, with_kept_ssid,
+};
+use super::types::{Adapter, Station, WifiNetwork};
 
 // ── ObjectManager ─────────────────────────────────────────────────────────────
 
@@ -285,9 +288,11 @@ pub(super) fn is_already_registered(e: &hytte_bus::BusError) -> bool {
 
 // ── Discovery ─────────────────────────────────────────────────────────────────
 
-/// Read iwd's object tree and find its `Station`. `Ok(None)` when iwd
-/// answered and has no station, an error when iwd did not answer. The
-/// watcher clears what it published on the first and keeps it on the second
+/// Read iwd's object tree and find its `Station` and its `Adapter`
+/// ([`super::parse::discovered`]). An answer with no station still names the
+/// adapter, which is what an adapter that is powered off looks like (#1656).
+/// An error when iwd did not answer. The watcher publishes what an answer
+/// holds and clears what it lacks; on an error it keeps what it published
 /// (#1654).
 ///
 /// This **calls `net.connman.iwd`**, and iwd is D-Bus-activatable
@@ -297,22 +302,50 @@ pub(super) fn is_already_registered(e: &hytte_bus::BusError) -> bool {
 /// paces a retry itself. This used to sleep 5 s and return, and the watcher
 /// called it again, so an iwd that was stopped cleanly (its station removed,
 /// its name released) was restarted by the next attempt.
-pub(super) async fn discover_station()
--> Result<Option<(ManagedObjects, zbus::zvariant::OwnedObjectPath)>, hytte_bus::BusError> {
+pub(super) async fn discover_station() -> Result<Discovered, hytte_bus::BusError> {
     let managed = get_managed_objects().await.inspect_err(|e| {
         tracing::debug!(error = %e, "iwd GetManagedObjects failed (iwd not running?)");
     })?;
+    let found = discovered(managed);
+    if found.station.is_none() {
+        tracing::debug!(
+            adapter = ?found.adapter,
+            "iwd has no Station object (adapter powered off, or none)"
+        );
+    }
+    Ok(found)
+}
 
-    let Some(station_path) = managed.iter().find_map(|(path, ifaces)| {
-        ifaces
-            .contains_key("net.connman.iwd.Station")
-            .then(|| path.clone())
-    }) else {
-        tracing::debug!("iwd has no Station object yet");
-        return Ok(None);
-    };
-
-    Ok(Some((managed, station_path)))
+/// Read the adapter at `adapter_path` again, live, and publish it when it
+/// differs from what is published (#1656). The watcher sends this once the
+/// bus has the adapter's `PropertiesChanged` rule, the station re-read's
+/// discipline (#1551), and when an adapter signal does not decode.
+///
+/// Sent with `no_auto_start()`: the watcher sends it on its own, and a call
+/// to an iwd that has just exited must not D-Bus-activate it (#1551, #1652).
+/// The bus then answers `NameHasNoOwner`, which says nothing about the
+/// adapter: the state is kept, and iwd's `NameOwnerChanged` clears it.
+pub(super) async fn refresh_adapter(
+    adapter_path: &str,
+    adapter_mutable: &Mutable<Option<Adapter>>,
+) {
+    let props: HashMap<String, OwnedValue> =
+        match hytte_bus::call(BusKind::System, "net.connman.iwd")
+            .at_path(adapter_path.to_string())
+            .iface("org.freedesktop.DBus.Properties")
+            .method("GetAll")
+            .no_auto_start()
+            .args((IWD_ADAPTER_IFACE,))
+            .send::<HashMap<String, OwnedValue>>()
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::debug!(error = %e, path = adapter_path, "wifi: adapter GetAll failed");
+                return;
+            }
+        };
+    adapter_mutable.set_neq(Some(adapter_from_props(adapter_path, &props)));
 }
 
 /// Ask the bus whether anyone owns iwd's name. The bus answers this itself,

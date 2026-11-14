@@ -27,7 +27,10 @@ pub struct Station {
 }
 
 /// Snapshot of the iwd Adapter (`net.connman.iwd.Adapter`).
-#[derive(Clone, Debug, Default)]
+///
+/// `PartialEq` so the iwd watcher can republish it with `set_neq`: a
+/// discovery pass or a re-read that finds the adapter as it was wakes nothing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Adapter {
     /// D-Bus object path, e.g. `"/net/connman/iwd/0"`.
     pub path: String,

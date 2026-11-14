@@ -2165,6 +2165,71 @@ mod tests {
         }
     }
 
+    /// An adapter signal the pump cannot decode makes it read the adapter
+    /// again, rather than leave `Powered` at whatever it was (#1656). The
+    /// adapter's rule is refused here, so the read is the signal's and not
+    /// the handshake's.
+    ///
+    /// **Falsification:** ignore `apply_adapter_event`'s answer at the call
+    /// site and nothing is read.
+    #[tokio::test(start_paused = true)]
+    async fn an_adapter_signal_that_does_not_decode_reads_the_adapter_again() {
+        let log = RefCell::new(Vec::new());
+        let garbled = SignalItem::Event(event(
+            zbus::Message::signal(
+                ADAPTER,
+                "org.freedesktop.DBus.Properties",
+                "PropertiesChanged",
+            )
+            .expect("signal builder")
+            .build(&(7_u32,))
+            .expect("build"),
+        ));
+        let quiet = || futures_util::stream::pending::<SignalItem>().boxed_local();
+        let (mut owner, mut added, mut removed) = (quiet(), quiet(), quiet());
+        let mut adapter_items = futures_util::stream::iter([garbled])
+            .chain(futures_util::stream::pending())
+            .boxed_local();
+        let adapter = Mutable::new(Some(powered_off_adapter()));
+        let (station_state, networks, prompts) = (
+            Mutable::new(None),
+            Mutable::new(Vec::new()),
+            Mutable::new(None),
+        );
+
+        let pumped = tokio::time::timeout(
+            Duration::from_mins(1),
+            pump_iwd_events(
+                IwdStreams {
+                    owner: &mut owner,
+                    added: &mut added,
+                    removed: &mut removed,
+                    station: None,
+                    adapter: Some(PropsWatch {
+                        path: ADAPTER,
+                        items: &mut adapter_items,
+                        rule: &Refused,
+                    }),
+                },
+                IwdCalls {
+                    register: std::future::pending::<Result<(), BusError>>,
+                    reread_station: std::future::pending::<()>,
+                    reread_adapter: || {
+                        log.borrow_mut().push("adapter re-read");
+                        std::future::ready(())
+                    },
+                },
+                &station_state,
+                &networks,
+                &prompts,
+                &adapter,
+            ),
+        )
+        .await;
+        assert!(pumped.is_err(), "nothing here ends the pass");
+        assert_eq!(log.into_inner(), ["adapter re-read"]);
+    }
+
     /// The pump's streams for the station-removal tests: the owner quiet,
     /// the rest fed by the test.
     struct Fed {

@@ -819,6 +819,14 @@ async fn pump_iwd_events<O, E, H, R, RF, S, SF>(
     }
 }
 
+/// The `(interface, changed, invalidated)` body of a `PropertiesChanged`
+/// signal, or `None` if it does not decode as one.
+fn decode_properties_changed(
+    msg: &zbus::Message,
+) -> Option<(String, HashMap<String, OwnedValue>, Vec<String>)> {
+    msg.body().deserialize().ok()
+}
+
 /// Decode `PropertiesChanged` body. Applies the delta directly for known
 /// interfaces (Station/Adapter) to avoid a full `GetAll` round-trip, and
 /// signals whether the caller should refresh the network list.
@@ -828,11 +836,7 @@ async fn handle_station_props_event(
     station_mutable: &Mutable<Option<Station>>,
     adapter_mutable: &Mutable<Option<Adapter>>,
 ) -> bool {
-    let Ok((iface, changed, invalidated)) =
-        evt.body
-            .body()
-            .deserialize::<(String, HashMap<String, OwnedValue>, Vec<String>)>()
-    else {
+    let Some((iface, changed, invalidated)) = decode_properties_changed(&evt.body) else {
         // Can't decode — full refresh to be safe.
         refresh_station(station_path_str, station_mutable).await;
         return true;
@@ -856,8 +860,9 @@ async fn handle_station_props_event(
 mod tests {
     use super::{
         Adapter, IWD_RECHECK, IwdCalls, IwdOwner, IwdStreams, Mutable, OwnerReaction, Station,
-        StationState, handle_station_props_event, iwd_owner_change, next_iwd_owner, open_discovery,
-        owner_reaction, pump_iwd_events, register_agent_until_accepted, wait_for_owner,
+        StationState, decode_properties_changed, handle_station_props_event, iwd_owner_change,
+        next_iwd_owner, open_discovery, owner_reaction, pump_iwd_events,
+        register_agent_until_accepted, wait_for_owner,
     };
     use crate::handshake::Handshake;
     use crate::retry;
@@ -1456,15 +1461,10 @@ mod tests {
         .build(&("net.connman.iwd.Station", changed, invalidated))
         .expect("build PropertiesChanged");
         // The handler falls back to a live `GetAll` on a body it cannot
-        // decode, which would reach the host's system bus: refuse that here.
+        // decode, which would reach the host's system bus: refuse that here,
+        // through the handler's own decode.
         assert!(
-            body.body()
-                .deserialize::<(
-                    String,
-                    HashMap<String, zbus::zvariant::OwnedValue>,
-                    Vec<String>
-                )>()
-                .is_ok(),
+            decode_properties_changed(&body).is_some(),
             "the handler must decode this body without a bus"
         );
         SignalEvent {

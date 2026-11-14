@@ -174,7 +174,64 @@ pub(super) fn refresh_adapter_from_managed(
     }
 }
 
-/// Refresh the Station mutable from the managed-objects map (called once on discovery).
+/// The station to publish for a freshly parsed one: `parsed`, keeping the
+/// SSID of the station already published when both are on the same network
+/// (#1551).
+///
+/// A parsed station has no SSID. iwd's `Station` names only its
+/// `ConnectedNetwork`, and the name comes with the network list read after
+/// the snapshot ([`super::client::refresh_networks`]), one round trip per
+/// network. The watcher rediscovers on every hole in its subscriptions and
+/// keeps its state meanwhile, so each rediscovery used to publish a connected
+/// station with no SSID, and the Wi-Fi card read "Connected" until the list
+/// was read. The network read still decides the SSID when it lands; this
+/// only bridges the round trips before it.
+///
+/// The SSID is kept only when all of these hold:
+///
+/// - A station was published. The pump clears it when it sees iwd leave, a
+///   new iwd take the name or the station removed, so no SSID crosses
+///   those.
+/// - Both are the same station object (the same path). Under iwd's own path
+///   scheme this decides nothing the next condition does not: a network's
+///   path extends its station's, so the same `ConnectedNetwork` already
+///   means the same station. It is kept as a cheap guard against a path that
+///   does not follow that scheme, and no fixture iwd could produce reaches it
+///   on its own, so no test pins it.
+/// - `parsed` names a `ConnectedNetwork`, and it is the one `previous`
+///   named. iwd builds a network's path from the station's path, the SSID in
+///   hex and the security (`iwd_network_get_path`, iwd 3.12
+///   `src/station.c:435`), so one path is one SSID. That also covers an iwd
+///   that restarts between two passes, before the next pass takes its owner
+///   receiver: that owner change is sent before the receiver exists, so
+///   nothing reads it. The next pass's wait for iwd asks the bus whether the
+///   name has an owner and returns at once on yes ([`super::watcher`]'s
+///   `wait_for_owner`), reading nothing. So nothing clears the state, and a
+///   path the new iwd shares with the old one names the same network.
+/// - `parsed` is not `disconnected`.
+///
+/// Anything else publishes no SSID until the network read: a blank for a
+/// few round trips rather than another network's name.
+pub(super) fn with_kept_ssid(previous: Option<&Station>, parsed: Station) -> Station {
+    let kept = previous.and_then(|previous| {
+        let same_network = matches!(
+            (&previous.connected_network, &parsed.connected_network),
+            (Some(was), Some(is)) if was == is
+        );
+        (previous.path == parsed.path && same_network && parsed.state != StationState::Disconnected)
+            .then(|| previous.connected_ssid.clone())
+            .flatten()
+    });
+    Station {
+        connected_ssid: kept,
+        ..parsed
+    }
+}
+
+/// Refresh the Station mutable from the managed-objects map (called once on
+/// discovery). The SSID the published station had is kept when the station
+/// is still on the same network ([`with_kept_ssid`]); the network read that
+/// follows sets it either way.
 pub(super) fn refresh_station_from_managed(
     managed: &ManagedObjects,
     station_path: &zbus::zvariant::OwnedObjectPath,
@@ -199,13 +256,16 @@ pub(super) fn refresh_station_from_managed(
         .map(|p| p.as_str().to_string())
         .filter(|p| !p.is_empty() && p != "/");
 
-    station_mutable.set(Some(Station {
+    let parsed = Station {
         path: path_str.to_string(),
         state: parse_state(&state_str),
         scanning,
         connected_network,
-        connected_ssid: None, // filled after network list is read
-    }));
+        connected_ssid: None, // kept by `with_kept_ssid` below; the network read sets it
+    };
+    let mut published = station_mutable.lock_mut();
+    let next = with_kept_ssid(published.as_ref(), parsed);
+    *published = Some(next);
 }
 
 #[cfg(test)]
@@ -290,6 +350,181 @@ mod tests {
             station.lock_ref().as_ref().unwrap().state,
             StationState::Disconnected,
         );
+    }
+
+    const STATION: &str = "/net/connman/iwd/0/4";
+    /// iwd's paths for "home" and "work" on `STATION`, both `psk`.
+    const HOME: &str = "/net/connman/iwd/0/4/686f6d65_psk";
+    const WORK: &str = "/net/connman/iwd/0/4/776f726b_psk";
+
+    fn station(
+        path: &str,
+        state: StationState,
+        network: Option<&str>,
+        ssid: Option<&str>,
+    ) -> Station {
+        Station {
+            path: path.to_owned(),
+            state,
+            scanning: false,
+            connected_network: network.map(str::to_owned),
+            connected_ssid: ssid.map(str::to_owned),
+        }
+    }
+
+    /// A rediscovered station on the network the published one was on keeps
+    /// its SSID, in every state that has a `ConnectedNetwork`, rather than
+    /// going blank until the network list is read (#1551).
+    ///
+    /// **Falsification:** return `parsed` unchanged (the pre-fix
+    /// `connected_ssid: None`) and every row is blank.
+    #[test]
+    fn a_rediscovered_station_on_the_same_network_keeps_its_ssid() {
+        let previous = station(STATION, StationState::Connected, Some(HOME), Some("home"));
+        for state in [
+            StationState::Connected,
+            StationState::Roaming,
+            StationState::Connecting,
+            StationState::Disconnecting,
+        ] {
+            let parsed = station(STATION, state, Some(HOME), None);
+            let next = with_kept_ssid(Some(&previous), parsed);
+            assert_eq!(next.connected_ssid.as_deref(), Some("home"), "{state:?}");
+            assert_eq!(next.state, state, "the parsed state is published");
+            assert_eq!(next.connected_network.as_deref(), Some(HOME));
+        }
+    }
+
+    /// Every case where the published SSID may not be this network's name
+    /// publishes none. A blank for a few round trips is better than the
+    /// wrong network's name.
+    ///
+    /// **Falsification:** drop any one of `with_kept_ssid`'s network
+    /// conditions (the `Some` on both sides of the network match, the
+    /// `disconnected` check) and its row keeps "home". Dropping the station
+    /// path check keeps every row blank: each row uses a path iwd could
+    /// build, and there the network path already carries the station's.
+    #[test]
+    fn the_ssid_is_not_kept_when_it_may_name_another_network() {
+        let home = station(STATION, StationState::Connected, Some(HOME), Some("home"));
+        let rows: [(&str, Option<Station>, Station); 6] = [
+            (
+                "nothing published: iwd left or changed hands, or the station \
+                 was removed, and the watcher cleared it",
+                None,
+                station(STATION, StationState::Connected, Some(HOME), None),
+            ),
+            (
+                "the station is no longer connected",
+                Some(home.clone()),
+                station(STATION, StationState::Disconnected, None, None),
+            ),
+            (
+                "the station says disconnected but still names the network",
+                Some(home.clone()),
+                station(STATION, StationState::Disconnected, Some(HOME), None),
+            ),
+            (
+                "the station is on another network",
+                Some(home.clone()),
+                station(STATION, StationState::Connected, Some(WORK), None),
+            ),
+            (
+                "another station on a network of the same name, as after the \
+                 adapter went and came back: iwd puts the network under the \
+                 new station's path, so it is not the same network",
+                Some(home),
+                station(
+                    "/net/connman/iwd/1/5",
+                    StationState::Connected,
+                    Some("/net/connman/iwd/1/5/686f6d65_psk"),
+                    None,
+                ),
+            ),
+            (
+                "neither names a network, so they are not on the same one",
+                Some(station(
+                    STATION,
+                    StationState::Connected,
+                    None,
+                    Some("home"),
+                )),
+                station(STATION, StationState::Connected, None, None),
+            ),
+        ];
+        for (case, previous, parsed) in rows {
+            let next = with_kept_ssid(previous.as_ref(), parsed);
+            assert_eq!(next.connected_ssid, None, "{case}");
+        }
+    }
+
+    /// iwd's `GetManagedObjects` answer with the station in `state` on
+    /// `network`.
+    fn managed_with_station(state: &str, network: Option<&str>) -> ManagedObjects {
+        let owned = |x: zbus::zvariant::Value<'_>| x.try_to_owned().expect("an owned value");
+        let mut props = HashMap::from([
+            ("State".to_owned(), owned(state.into())),
+            ("Scanning".to_owned(), owned(false.into())),
+        ]);
+        if let Some(network) = network {
+            let path = zbus::zvariant::ObjectPath::try_from(network).expect("an object path");
+            props.insert("ConnectedNetwork".to_owned(), owned(path.into()));
+        }
+        HashMap::from([(
+            zbus::zvariant::OwnedObjectPath::try_from(STATION).expect("an object path"),
+            HashMap::from([("net.connman.iwd.Station".to_owned(), props)]),
+        )])
+    }
+
+    /// The discovery read keeps the SSID the station already had when the
+    /// snapshot puts it on the same network, and publishes none when it is
+    /// on another one or nothing was published (#1551). This is the read
+    /// the watcher makes on every rediscovery, so it is what puts
+    /// `with_kept_ssid` on screen.
+    ///
+    /// **Falsification:** publish the parsed station without
+    /// `with_kept_ssid`, or pass it `None` for the published station, and
+    /// the first assertion fails.
+    #[test]
+    fn rediscovery_keeps_the_published_ssid_on_the_same_network() {
+        let path = zbus::zvariant::OwnedObjectPath::try_from(STATION).expect("an object path");
+        let published = || {
+            Mutable::new(Some(station(
+                STATION,
+                StationState::Connected,
+                Some(HOME),
+                Some("home"),
+            )))
+        };
+
+        let station_mutable = published();
+        refresh_station_from_managed(
+            &managed_with_station("connected", Some(HOME)),
+            &path,
+            &station_mutable,
+        );
+        let st = station_mutable.get_cloned().expect("a station");
+        assert_eq!(st.connected_ssid.as_deref(), Some("home"));
+        assert_eq!(st.connected_network.as_deref(), Some(HOME));
+
+        let station_mutable = published();
+        refresh_station_from_managed(
+            &managed_with_station("connected", Some(WORK)),
+            &path,
+            &station_mutable,
+        );
+        let st = station_mutable.get_cloned().expect("a station");
+        assert_eq!(st.connected_network.as_deref(), Some(WORK));
+        assert_eq!(st.connected_ssid, None, "\"home\" is not WORK's name");
+
+        let station_mutable = Mutable::new(None);
+        refresh_station_from_managed(
+            &managed_with_station("connected", Some(HOME)),
+            &path,
+            &station_mutable,
+        );
+        let st = station_mutable.get_cloned().expect("a station");
+        assert_eq!(st.connected_ssid, None, "nothing was published to keep");
     }
 
     #[test]

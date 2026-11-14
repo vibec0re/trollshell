@@ -536,3 +536,139 @@ async fn w3_a_re_read_that_finds_a_change_reads_the_networks() {
     watcher.task.abort();
     println!("{CHILD_OK} {}", test_name(TEST));
 }
+
+// ── W4: the SSID crosses the pass boundary ──────────────────────────────────
+
+/// The network W4's station stays on.
+const W4_HOME: &str = "/net/connman/iwd/0/4/686f6d65_psk";
+
+/// More `InterfacesAdded` than hytte-bus's broadcast holds (64), so the
+/// pump's receiver for them reports `Lagged`.
+const W4_BURST: usize = 200;
+
+/// Emit [`W4_BURST`] `InterfacesAdded` without reading a call in between, so
+/// a pump waiting on this fake's reply cannot drain them.
+async fn w4_burst(conn: &zbus::Connection) {
+    let added = OwnedObjectPath::try_from("/net/connman/iwd/0/4/6e6577_psk").expect("a path");
+    for _ in 0..W4_BURST {
+        let ifaces: HashMap<String, Props> = HashMap::new();
+        let _ = conn
+            .emit_signal(
+                None::<zbus::names::BusName<'_>>,
+                "/",
+                "org.freedesktop.DBus.ObjectManager",
+                "InterfacesAdded",
+                &(added.clone(), ifaces),
+            )
+            .await;
+    }
+}
+
+/// W4's scripted iwd: connected on [`W4_HOME`] ("home") throughout. It
+/// answers the first `RegisterAgent` with a burst ([`w4_burst`]), and it holds
+/// the first `GetOrderedNetworks` after the second snapshot: it sends `held`,
+/// then answers once `release` fires. `stream` is made before the fake owns
+/// iwd's name, so no call can arrive before it.
+async fn w4_fake(
+    conn: zbus::Connection,
+    mut stream: zbus::MessageStream,
+    held: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+) {
+    let mut station = station_props("connected");
+    station.insert("ConnectedNetwork".to_owned(), path(W4_HOME));
+    let mut snapshots = 0_u32;
+    let mut burst_sent = false;
+    let mut to_hold = Some((held, release));
+    while let Some(Ok(msg)) = stream.next().await {
+        if msg.message_type() != zbus::message::Type::MethodCall {
+            continue;
+        }
+        let hdr = msg.header();
+        let at = hdr.path().map(ToString::to_string).unwrap_or_default();
+        let member = hdr.member().map(ToString::to_string).unwrap_or_default();
+        match member.as_str() {
+            "GetManagedObjects" => {
+                snapshots += 1;
+                let _ = conn.reply(&hdr, &managed_objects(&station)).await;
+            }
+            "GetAll" if at == STATION => {
+                let _ = conn.reply(&hdr, &clone_props(&station)).await;
+            }
+            "GetAll" => {
+                let props: Props = HashMap::from([
+                    ("Name".to_owned(), v("home".to_owned())),
+                    ("Type".to_owned(), v("psk")),
+                ]);
+                let _ = conn.reply(&hdr, &props).await;
+            }
+            "GetOrderedNetworks" => {
+                if snapshots == 2
+                    && let Some((held, release)) = to_hold.take()
+                {
+                    let _ = held.send(());
+                    let _ = release.await;
+                }
+                let ordered: Vec<(OwnedObjectPath, i16)> =
+                    vec![(OwnedObjectPath::try_from(W4_HOME).expect("a path"), -5000)];
+                let _ = conn.reply(&hdr, &ordered).await;
+            }
+            "RegisterAgent" => {
+                let _ = conn.reply(&hdr, &()).await;
+                if !std::mem::replace(&mut burst_sent, true) {
+                    w4_burst(&conn).await;
+                }
+            }
+            _ => {
+                let _ = conn
+                    .reply_error(&hdr, "org.freedesktop.DBus.Error.UnknownMethod", &"no")
+                    .await;
+            }
+        }
+    }
+}
+
+/// The station stays on "home" while a hole sends the watcher back to
+/// discovery. The second pass's snapshot names the same network, so the
+/// station that pass publishes keeps "home" while its own network read is
+/// still out (#1551). The hole is a `Lagged` on the `InterfacesAdded`
+/// receiver ([`w4_burst`]), sent while the pump waits on the fake's reply.
+///
+/// **Falsification:** clear the station anywhere between the pump's return
+/// and `refresh_station_from_managed`, or publish the parsed station without
+/// `with_kept_ssid`, and the held read sees no SSID.
+#[tokio::test(flavor = "multi_thread")]
+async fn w4_a_rediscovery_keeps_the_ssid_while_its_network_read_is_out() {
+    const TEST: &str = "w4_a_rediscovery_keeps_the_ssid_while_its_network_read_is_out";
+    let Some(address) = in_child(TEST) else {
+        return run_in_child(TEST, None).await;
+    };
+    let conn = zbus::connection::Builder::address(address.as_str())
+        .expect("the broker's address")
+        .build()
+        .await
+        .expect("the scripted iwd connects");
+    let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let stream = zbus::MessageStream::from(&conn);
+    let fake = tokio::spawn(w4_fake(conn.clone(), stream, held_tx, release_rx));
+    conn.request_name("net.connman.iwd")
+        .await
+        .expect("own net.connman.iwd");
+    let watcher = spawn_watcher();
+
+    tokio::time::timeout(BUDGET, held_rx)
+        .await
+        .expect("a second pass read the networks: the burst made a hole")
+        .expect("the fake held that read");
+    let st = watcher.station.get_cloned();
+    let _ = release_tx.send(());
+    assert_eq!(
+        st.as_ref().and_then(|st| st.connected_ssid.as_deref()),
+        Some("home"),
+        "the second pass published {st:?} before its network read"
+    );
+    watcher.task.abort();
+    fake.abort();
+    println!("{CHILD_OK} {}", test_name(TEST));
+}

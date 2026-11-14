@@ -347,9 +347,15 @@ impl Service for BluetoothService {
             let path_store = path_store.clone();
             async move {
                 let mut backoff = retry::ReconnectBackoff::new();
+                // The shell's first watch sends its snapshot plain, which
+                // starts a bluetoothd that is not running, as it always has.
+                // Every later one follows a `wait_for_bluez` that saw an
+                // owner, and asks without starting one (#1651 review).
+                let mut snapshot = devices::Snapshot::MayStart;
                 loop {
                     let started = std::time::Instant::now();
-                    let outcome = listen(&adapter_mutable, &devices_mutable, &path_store).await;
+                    let outcome =
+                        listen(&adapter_mutable, &devices_mutable, &path_store, snapshot).await;
                     let delay = backoff.delay_after_run(started.elapsed());
                     match outcome {
                         Ok(ListenEnd::StreamClosed) => {
@@ -381,15 +387,17 @@ impl Service for BluetoothService {
                     // Also reset the adapter path store so the next listen()
                     // call starts fresh.
                     set_adapter_path_local("").await;
-                    // Reconnect only to a bluetoothd that is running. The
-                    // next listen() calls org.bluez, and that call would
-                    // D-Bus-activate a stopped one. This applies to every
-                    // exit, not only `DaemonExited`: a dying bluetoothd can
-                    // remove its adapter just before it lets go of the name.
-                    // With bluetoothd up, this returns after one round trip
-                    // to the bus.
-                    wait_for_bluez().await;
-                    tokio::time::sleep(delay).await;
+                    // Back off, then reconnect only to a bluetoothd that is
+                    // running. The next listen() calls org.bluez, and a plain
+                    // call would D-Bus-activate a stopped one. This applies
+                    // to every exit, not only `DaemonExited`: a dying
+                    // bluetoothd can remove its adapter just before it lets
+                    // go of the name. The backoff comes first, so the owner
+                    // `wait_for_bluez` sees is milliseconds old when the
+                    // snapshot goes out (#1651 review); with bluetoothd up,
+                    // that wait is one round trip to the bus.
+                    wait_for_bluez(delay).await;
+                    snapshot = devices::Snapshot::NoAutoStart;
                 }
             }
         });

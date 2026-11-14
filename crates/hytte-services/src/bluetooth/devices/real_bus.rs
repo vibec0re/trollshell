@@ -1,6 +1,7 @@
 //! The production `listen` → `event_loop` → `fold` → `SystemBluez`, through
 //! the process-global system connection, against a real `dbus-daemon` and a
-//! scripted `org.bluez` (#1647 review, R1–R3).
+//! scripted `org.bluez` (#1647 review, R1–R3, and from its second round R4d;
+//! #1651 review, R5 with each top-level rule refused in turn, and R6).
 //!
 //! # Why each test runs in a re-exec'd child
 //!
@@ -17,7 +18,11 @@
 //! parent's broker, and its session bus is a socket path nothing listens on.
 //! The broker is configured as a session bus (no policy beyond "allow"), so
 //! the scripted `org.bluez` can own its name without root. A test that
-//! needs the broker to refuse match rules sets its per-connection limit.
+//! needs the broker to refuse match rules sets its per-connection limit
+//! ([`BrokerConfig`]). A test that needs to see whether anything starts
+//! bluetoothd gives the broker an `org.bluez` activation file that counts
+//! its starts ([`activations`]): what a real system bus does with a call to
+//! `org.bluez` that has no owner.
 //!
 //! The scripted bluez answers calls off a raw `zbus` connection's
 //! `MessageStream` with `reply`, `reply_error` and `emit_signal`, so the
@@ -31,7 +36,7 @@
 //! cargo test -p hytte-services --features system-tests --lib bluetooth::devices::real_bus
 //! ```
 
-use super::{Device, ListenEnd, listen};
+use super::{Device, FoldBus, ListenEnd, Snapshot, listen};
 use futures_signals::signal::{Mutable, SignalExt};
 use futures_util::StreamExt;
 use std::collections::HashMap;
@@ -45,6 +50,10 @@ use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
 /// Set on a child to the test it is to run.
 const CHILD_ENV: &str = "HYTTE_BLUEZ_REAL_BUS_CHILD";
+
+/// Set on a child to the file its broker's `org.bluez` activation appends a
+/// line to ([`activations`]).
+const ACTIVATIONS_ENV: &str = "HYTTE_BLUEZ_REAL_BUS_ACTIVATIONS";
 
 /// Printed by a child that got to the end of its test, so the parent can
 /// tell a pass from a filter that matched nothing.
@@ -101,14 +110,46 @@ impl Drop for Broker {
     }
 }
 
-/// A fresh `dbus-daemon`, refusing match rules past `match_limit` per
-/// connection when given.
-async fn broker(match_limit: Option<u32>) -> Broker {
+/// How [`run_in_child`] sets up the child's broker.
+#[derive(Clone, Copy, Default)]
+struct BrokerConfig {
+    /// Refuse match rules past this many per connection.
+    match_limit: Option<u32>,
+    /// Give `org.bluez` an activation file whose `Exec` appends a line to the
+    /// child's [`activations`] file and exits 1: a start the bus counts, and
+    /// one that fails, so the name stays unowned. The broker answers the call
+    /// that caused it only once that process has exited, so the line is
+    /// written by the time the call's answer is in.
+    activatable: bool,
+}
+
+/// The file a broker's `org.bluez` activation appends to, in its tempdir.
+fn activations_file(tmp: &TempDir) -> std::path::PathBuf {
+    tmp.path().join("activations")
+}
+
+/// A fresh `dbus-daemon`, set up as `config` says.
+async fn broker(config: BrokerConfig) -> Broker {
     let tmp = TempDir::new().expect("a tempdir for dbus-daemon");
     let address = format!("unix:path={}", tmp.path().join("bus").display());
-    let limit = match_limit.map_or_else(String::new, |n| {
+    let limit = config.match_limit.map_or_else(String::new, |n| {
         format!(r#"<limit name="max_match_rules_per_connection">{n}</limit>"#)
     });
+    let servicedir = if config.activatable {
+        let services = tmp.path().join("services");
+        std::fs::create_dir(&services).expect("create the service directory");
+        std::fs::write(
+            services.join("org.bluez.service"),
+            format!(
+                "[D-BUS Service]\nName=org.bluez\nExec=/bin/sh -c \"echo activated >> {}; exit 1\"\n",
+                activations_file(&tmp).display()
+            ),
+        )
+        .expect("write the org.bluez activation file");
+        format!("<servicedir>{}</servicedir>", services.display())
+    } else {
+        String::new()
+    };
     let config = tmp.path().join("bus.conf");
     std::fs::write(
         &config,
@@ -121,6 +162,7 @@ async fn broker(match_limit: Option<u32>) -> Broker {
   <listen>{address}</listen>
   <auth>EXTERNAL</auth>
   {limit}
+  {servicedir}
   <policy context="default">
     <allow send_destination="*" eavesdrop="true"/>
     <allow eavesdrop="true"/>
@@ -137,7 +179,10 @@ async fn broker(match_limit: Option<u32>) -> Broker {
         .arg("--print-address=1")
         .arg("--nofork")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        // Nothing reads it, and a pipe nobody reads blocks the broker once
+        // it is full: an activating broker writes about 250 B per
+        // activation, so some 130 would wedge it (#1651 review).
+        .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()
         .expect("spawn dbus-daemon (package `dbus`)");
@@ -170,15 +215,16 @@ fn in_child(test: &str) -> Option<String> {
 }
 
 /// Run `test` in a re-exec'd child whose system bus is a fresh broker.
-async fn run_in_child(test: &str, match_limit: Option<u32>) {
+async fn run_in_child(test: &str, config: BrokerConfig) {
     let name = test_name(test);
-    let bus = broker(match_limit).await;
+    let bus = broker(config).await;
     let no_session = format!("unix:path={}", bus.tmp.path().join("no-session").display());
     let out = tokio::time::timeout(
         CHILD_BUDGET,
         Command::new(std::env::current_exe().expect("this test binary's path"))
             .args(["--exact", "--nocapture", "--test-threads=1", &name])
             .env(CHILD_ENV, &name)
+            .env(ACTIVATIONS_ENV, activations_file(&bus.tmp))
             .env("DBUS_SYSTEM_BUS_ADDRESS", &bus.address)
             .env("DBUS_SESSION_BUS_ADDRESS", &no_session)
             .kill_on_drop(true)
@@ -196,6 +242,13 @@ async fn run_in_child(test: &str, match_limit: Option<u32>) {
     );
 }
 
+/// In a child: how many times its broker has started `org.bluez` so far
+/// ([`BrokerConfig::activatable`]).
+fn activations() -> usize {
+    let file = std::env::var(ACTIVATIONS_ENV).expect("the activation file's path");
+    std::fs::read_to_string(file).map_or(0, |s| s.lines().count())
+}
+
 // ── A scripted org.bluez ────────────────────────────────────────────────────
 
 /// What the scripted bluez holds and has been asked.
@@ -209,6 +262,10 @@ struct FakeState {
     managed_served: u32,
     /// `GetAll` calls answered, as `(path, interface)`.
     get_all: Vec<(String, String)>,
+    /// Give up `org.bluez` right after answering the `GetAll` that brings
+    /// `get_all` to this length, and clear this: bluetoothd answering what
+    /// it has queued and then exiting.
+    leave_after_get_all: Option<usize>,
 }
 
 struct FakeBluez {
@@ -259,10 +316,14 @@ async fn fake_bluez(address: &str, objects: HashMap<String, Ifaces>) -> FakeBlue
                 }
                 ("org.freedesktop.DBus.Properties", "GetAll") => {
                     let wanted: String = msg.body().deserialize().unwrap_or_default();
-                    let answer = {
+                    let (answer, leave) = {
                         let mut st = task_state.lock().expect("fake state");
                         st.get_all.push((path.clone(), wanted.clone()));
-                        if let Some(error) = st.errors.get(&path) {
+                        let leave = st.leave_after_get_all == Some(st.get_all.len());
+                        if leave {
+                            st.leave_after_get_all = None;
+                        }
+                        let answer = if let Some(error) = st.errors.get(&path) {
                             Err((*error, "scripted".to_owned()))
                         } else {
                             match st.objects.get(&path) {
@@ -278,12 +339,16 @@ async fn fake_bluez(address: &str, objects: HashMap<String, Ifaces>) -> FakeBlue
                                     format!("No such interface '{wanted}'"),
                                 )),
                             }
-                        }
+                        };
+                        (answer, leave)
                     };
                     let _ = match answer {
                         Ok(props) => task_conn.reply(&hdr, &props).await,
                         Err((name, detail)) => task_conn.reply_error(&hdr, name, &detail).await,
                     };
+                    if leave {
+                        let _ = task_conn.release_name("org.bluez").await;
+                    }
                 }
                 _ => {
                     let _ = task_conn
@@ -475,7 +540,8 @@ async fn wait_published(devices: &Mutable<Vec<Device>>, len: usize) {
     .expect("listen published its snapshot");
 }
 
-/// Run the production `listen` on its own task.
+/// Run the production `listen` on its own task, as the shell's first watch
+/// (its snapshot sent plain; R6 is the one test of a later watch's).
 fn spawn_listen(
     adapter: &Mutable<Option<super::Adapter>>,
     devices: &Mutable<Vec<Device>>,
@@ -483,7 +549,7 @@ fn spawn_listen(
     let (adapter, devices) = (adapter.clone(), devices.clone());
     tokio::spawn(async move {
         let store = Arc::new(tokio::sync::RwLock::new(String::new()));
-        listen(&adapter, &devices, &store).await
+        listen(&adapter, &devices, &store, Snapshot::MayStart).await
     })
 }
 
@@ -508,8 +574,8 @@ fn spawn_listen(
 ///
 /// **Falsification:** hand `forward_device`'s forwarder no handshake (no
 /// device is ever re-read), make `SystemBluez::get_all` ignore its
-/// interface, count every error as gone, hand `open_fold` another channel's
-/// wake (no resync), or subscribe a device's `PropertiesChanged` at
+/// interface, count every error as gone, hand `arm_once_subscribed` another
+/// channel's wake (no resync), or subscribe a device's `PropertiesChanged` at
 /// `/org/bluez`, and this fails.
 #[tokio::test(flavor = "multi_thread")]
 async fn r1_the_fold_settles_on_bluez_through_the_production_bus() {
@@ -519,7 +585,7 @@ async fn r1_the_fold_settles_on_bluez_through_the_production_bus() {
     const GHOST: &str = "/org/bluez/hci0/dev_33_33_33_33_33_33";
     const SLOW: &str = "/org/bluez/hci0/dev_44_44_44_44_44_44";
     let Some(address) = in_child(TEST) else {
-        return run_in_child(TEST, None).await;
+        return run_in_child(TEST, BrokerConfig::default()).await;
     };
 
     let fake = fake_bluez(
@@ -623,7 +689,14 @@ async fn r1_the_fold_settles_on_bluez_through_the_production_bus() {
 async fn r2_a_refused_device_rule_does_not_hold_up_the_fold() {
     const TEST: &str = "r2_a_refused_device_rule_does_not_hold_up_the_fold";
     let Some(address) = in_child(TEST) else {
-        return run_in_child(TEST, Some(16)).await;
+        return run_in_child(
+            TEST,
+            BrokerConfig {
+                match_limit: Some(16),
+                ..BrokerConfig::default()
+            },
+        )
+        .await;
     };
     let fake = fake_bluez(&address, adapter_with_devices(24)).await;
     let adapter_m = Mutable::new(None);
@@ -650,25 +723,32 @@ async fn r2_a_refused_device_rule_does_not_hold_up_the_fold() {
 
 // ── R3: the handshake's resync and a queued `Lost` ──────────────────────────
 
-/// bluetoothd leaving while `open_fold` waits for its rules: when the fold
-/// starts, the owner's `Lost` and the handshake's resync are both queued.
-/// The `Lost` must win, every time: the resync is a call to `org.bluez`,
-/// which on a real system bus D-Bus-activates the bluetoothd the user just
-/// stopped (here, with no `.service` file, the broker answers
-/// `ServiceUnknown` and `listen` ends with an error instead of
-/// `DaemonExited`). #1647 review R3: 14 of 20 rounds lost it unbiased.
+/// bluetoothd leaving while the fold's rules are being installed: the
+/// owner's `Lost` and the handshake's resync can both be queued when the
+/// fold next turns. The `Lost` must win, every time: the resync is a call to
+/// `org.bluez`, which, sent plain, D-Bus-activates the bluetoothd the user
+/// just stopped on a real system bus. Here the resync is refused instead
+/// (it is sent `no_auto_start()`, so the broker answers `NameHasNoOwner`)
+/// and `listen` ends with that error instead of `DaemonExited`. #1647
+/// review R3: 14 of 20 rounds lost it unbiased.
 ///
 /// Probabilistic by nature: each round is one draw of a race, which is why
 /// there are twenty.
 ///
-/// **Falsification:** drop `biased;` from the fold's `select!` and most
-/// rounds call `org.bluez` with no owner.
+/// **Falsification:** arm the resync in `event_loop` without waiting for the
+/// rules and most rounds send it after bluez has gone (18 of 20, #1651
+/// review). Dropping `biased;` from the fold's `select!` no longer shows
+/// here (20 of 20 green, #1651 review): with the wait beside the fold, the
+/// resync is armed only after the rules' round trips, by when the `Lost` has
+/// been read. The bias is pinned by the hermetic
+/// `a_queued_lost_ends_the_fold_before_any_queued_read` and
+/// `a_device_removed_and_added_back_stays`.
 #[tokio::test(flavor = "multi_thread")]
 async fn r3_a_queued_lost_wins_over_the_handshakes_resync() {
     const TEST: &str = "r3_a_queued_lost_wins_over_the_handshakes_resync";
     const ROUNDS: u32 = 20;
     let Some(address) = in_child(TEST) else {
-        return run_in_child(TEST, None).await;
+        return run_in_child(TEST, BrokerConfig::default()).await;
     };
     let fake = fake_bluez(&address, adapter_with_devices(4)).await;
     fake.conn
@@ -705,6 +785,501 @@ async fn r3_a_queued_lost_wins_over_the_handshakes_resync() {
         lost.is_empty(),
         "{}/{ROUNDS} watches called org.bluez after it had no owner: {lost:?}",
         lost.len()
+    );
+    println!("{CHILD_OK} {}", test_name(TEST));
+}
+
+// ── R4d: bluetoothd answers a re-read and exits ─────────────────────────────
+
+/// bluetoothd answering a device re-read and then exiting, while more
+/// re-reads are queued behind it, is not started again (#1647 second
+/// review, R4d; #1551).
+///
+/// Each `listen` re-reads every device its handshake's resync subscribes,
+/// back to back. When bluetoothd answers one and exits, the answer reaches
+/// the fold before the `NameOwnerChanged` does, so the fold's bias cannot
+/// help: the next queued re-read goes out to an `org.bluez` with no owner.
+/// Sent plain, that call D-Bus-activates bluetoothd, which the review
+/// measured in 78 of 120 rounds. The fold's reads are sent `no_auto_start()`
+/// so the bus refuses them instead; the `Lost` then ends every watch.
+///
+/// The broker counts every start of `org.bluez`
+/// ([`BrokerConfig::activatable`]). Each round, the scripted bluez owns the
+/// name, holds 20 devices and gives the name up right after answering its
+/// third `GetAll`. The last step is the positive control: a plain call to
+/// `org.bluez` with no owner, which the count has to see.
+///
+/// Probabilistic by nature: each round is one draw of a race, which is why
+/// there are thirty.
+///
+/// **Falsification:** send the device re-reads plain (drop `no_auto_start()`
+/// from `get_all_props`) and rounds start bluetoothd.
+#[tokio::test(flavor = "multi_thread")]
+async fn r4d_bluetoothd_exiting_after_a_re_read_is_not_started_again() {
+    const TEST: &str = "r4d_bluetoothd_exiting_after_a_re_read_is_not_started_again";
+    const ROUNDS: usize = 30;
+    const LEAVE_AFTER: usize = 3;
+    let Some(address) = in_child(TEST) else {
+        return run_in_child(
+            TEST,
+            BrokerConfig {
+                activatable: true,
+                ..BrokerConfig::default()
+            },
+        )
+        .await;
+    };
+    let fake = fake_bluez(&address, adapter_with_devices(20)).await;
+    fake.conn
+        .release_name("org.bluez")
+        .await
+        .expect("release org.bluez");
+
+    let mut started = Vec::new();
+    let mut ends = Vec::new();
+    for round in 0..ROUNDS {
+        let before = activations();
+        {
+            let mut st = fake.state.lock().expect("fake state");
+            st.leave_after_get_all = Some(st.get_all.len() + LEAVE_AFTER);
+        }
+        fake.conn
+            .request_name("org.bluez")
+            .await
+            .expect("own org.bluez");
+        let watch = spawn_listen(&Mutable::new(None), &Mutable::new(Vec::new()));
+        // Every call the watch made has its answer by the time it ends, and
+        // a call that started bluetoothd is answered only once that start
+        // has finished: no wait is needed for the count.
+        let ended = tokio::time::timeout(BUDGET, watch)
+            .await
+            .expect("the watch ended")
+            .expect("listen did not panic");
+        assert!(
+            fake.state
+                .lock()
+                .expect("fake state")
+                .leave_after_get_all
+                .is_none(),
+            "round {round}: bluez never answered {LEAVE_AFTER} re-reads, so it never left"
+        );
+        let after = activations();
+        if after > before {
+            started.push(format!(
+                "round {round}: {} start(s), {ended:?}",
+                after - before
+            ));
+        }
+        if !matches!(ended, Ok(ListenEnd::DaemonExited)) {
+            ends.push(format!("round {round}: {ended:?}"));
+        }
+    }
+    assert!(
+        started.is_empty(),
+        "{}/{ROUNDS} watches started bluetoothd after it left: {started:?}",
+        started.len()
+    );
+    assert!(
+        ends.is_empty(),
+        "{}/{ROUNDS} watches did not end on bluetoothd's exit: {ends:?}",
+        ends.len()
+    );
+
+    // The control: the shell's first snapshot, sent plain, to `org.bluez`
+    // with no owner. The count sees it, so a zero above is a zero.
+    let before = activations();
+    let answer = super::get_managed_objects(Snapshot::MayStart).await;
+    assert_eq!(
+        activations(),
+        before + 1,
+        "the broker did not count a plain call's start ({:?})",
+        answer.err()
+    );
+    println!("{CHILD_OK} {}", test_name(TEST));
+}
+
+/// Each read the fold makes, sent through the production `SystemBluez` to an
+/// `org.bluez` with no owner, is refused by the bus and starts nothing
+/// (#1551). R4d reaches the re-read by a race; this reaches every read, the
+/// resync's `GetManagedObjects` and a device's `GetAll` of `Device1` and of
+/// `Battery1` (the battery's since the #1651 review), every time. The
+/// refusal is also what `device_is_gone` is handed in that case, so it is
+/// checked there with the broker's own error: a device whose re-read meets
+/// it is kept.
+///
+/// The positive control is `listen`'s own snapshot, sent plain: the broker
+/// counts its start.
+///
+/// **Falsification:** drop `no_auto_start()` from either read
+/// (`SystemBluez::managed_objects`, `get_all_props`), or from
+/// `get_all_props` for `Battery1` only, and that call starts bluetoothd;
+/// count `NameHasNoOwner` as gone and the device read fails the
+/// `device_is_gone` check.
+#[tokio::test(flavor = "multi_thread")]
+async fn r4_the_folds_reads_never_start_bluetoothd() {
+    const TEST: &str = "r4_the_folds_reads_never_start_bluetoothd";
+    const DEVICE: &str = "/org/bluez/hci0/dev_11_11_11_11_11_11";
+    if in_child(TEST).is_none() {
+        return run_in_child(
+            TEST,
+            BrokerConfig {
+                activatable: true,
+                ..BrokerConfig::default()
+            },
+        )
+        .await;
+    }
+    let (props_tx, _props_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (resync_tx, _resync_rx) = tokio::sync::mpsc::channel(super::RESYNC_WAKE_QUEUE);
+    let bus = super::SystemBluez {
+        props_tx,
+        resync_tx,
+    };
+
+    let no_owner = |error: Option<&hytte_bus::BusError>| {
+        matches!(
+            error,
+            Some(hytte_bus::BusError::Permanent { dbus_name: Some(name), .. })
+                if name == "org.freedesktop.DBus.Error.NameHasNoOwner"
+        )
+    };
+
+    let resync = bus.managed_objects().await.err();
+    assert_eq!(
+        activations(),
+        0,
+        "the resync's read started bluetoothd ({resync:?})"
+    );
+    assert!(no_owner(resync.as_ref()), "the resync's read: {resync:?}");
+
+    let reread = bus.get_all(DEVICE, "org.bluez.Device1").await.err();
+    assert_eq!(
+        activations(),
+        0,
+        "a device's re-read started bluetoothd ({reread:?})"
+    );
+    assert!(no_owner(reread.as_ref()), "the re-read: {reread:?}");
+    assert!(
+        reread.as_ref().is_some_and(|e| !super::device_is_gone(e)),
+        "the bus refusing a re-read for want of an owner was read as the device gone: {reread:?}"
+    );
+
+    let battery = bus.get_all(DEVICE, "org.bluez.Battery1").await.err();
+    assert_eq!(
+        activations(),
+        0,
+        "a battery re-read started bluetoothd ({battery:?})"
+    );
+    assert!(
+        no_owner(battery.as_ref()),
+        "the battery re-read: {battery:?}"
+    );
+
+    let before = activations();
+    let answer = super::get_managed_objects(Snapshot::MayStart).await;
+    assert_eq!(
+        activations(),
+        before + 1,
+        "the broker did not count a plain call's start ({:?})",
+        answer.err()
+    );
+    println!("{CHILD_OK} {}", test_name(TEST));
+}
+
+// ── R5: each top-level rule refused in turn, while bluetoothd stays up ──────
+
+/// Emit with `emit` until the published state satisfies `seen`: a probe that
+/// a rule is installed and delivering to the fold. A single emission can be
+/// lost while the rule is still on its way, hence the repeat.
+async fn until_seen<E, F>(what: &str, emit: E, seen: impl Fn() -> bool)
+where
+    E: Fn() -> F,
+    F: std::future::Future<Output = ()>,
+{
+    let probed = tokio::time::timeout(BUDGET, async {
+        while !seen() {
+            emit().await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(probed.is_ok(), "{what} never reached the fold");
+}
+
+/// A system bus that refuses one of the fold's three top-level `AddMatch`es
+/// (#1647 second review, R5; #1651 review):
+///
+/// - the fold runs meanwhile: the two rules that did land deliver to it;
+/// - the handshake's resync waits for the refused rule, and only for it;
+/// - past `FOLD_RULES_DEADLINE` that resync goes out without it, so the
+///   snapshot's devices are subscribed after all;
+/// - bluetoothd exiting ends the watch.
+///
+/// The refused rule is chosen. The two that must land are installed first on
+/// the shell's own connection, with the builders `event_loop` uses: zbus
+/// counts identical match rules per connection, so `event_loop`'s copies
+/// need no `AddMatch`, and the one left to ask for is `refused`, the
+/// connection's fifth rule (the two held, their shared
+/// `NameOwnerChanged(arg0=org.bluez)`, `listen`'s owner rule), which a limit
+/// of 4 refuses. bluetoothd stays up until the end.
+///
+/// Until the #1651 review R5 released `org.bluez` as soon as `listen`
+/// published, before the fold's `AddMatch`es reached the broker
+/// (dbus-monitor showed no rule refused): the watch ended on the `Lost` with
+/// the handshake still pending, so its premise check held whether or not a
+/// rule was refused, and it could not see a resync armed without one rule.
+///
+/// **Falsification:** arm the resync in `event_loop` without waiting for any
+/// one of the three rules (at the call site or in `FoldSubscriptions`'
+/// `subscribed`) and that rule's variant sees a second `GetManagedObjects`
+/// within the second it is given; drop `arm_once_subscribed`'s deadline and
+/// no variant ever sees one; await the wait before the fold (the #1647 head)
+/// and no probe reaches it.
+async fn r5_with_refused(test: &'static str, refused: &'static str) {
+    let Some(address) = in_child(test) else {
+        return run_in_child(
+            test,
+            BrokerConfig {
+                match_limit: Some(4),
+                ..BrokerConfig::default()
+            },
+        )
+        .await;
+    };
+    let fake = fake_bluez(&address, adapter_with_devices(4)).await;
+    let _ = super::bluez_has_owner().await; // a warm connection
+    let held = hold_every_rule_but(refused).await;
+    let adapter_m = Mutable::new(None);
+    let devices_m = Mutable::new(Vec::new());
+    let watch = spawn_listen(&adapter_m, &devices_m);
+    wait_published(&devices_m, 4).await;
+    probe_every_rule_but(refused, &fake, &adapter_m, &devices_m).await;
+
+    // Every rule but `refused` delivers. A resync armed without it would be
+    // served within milliseconds; give it a second, well inside the
+    // deadline.
+    let mut answered = fake.answered.clone();
+    let resynced = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if fake.state.lock().expect("fake state").managed_served >= 2 {
+                return;
+            }
+            answered
+                .changed()
+                .await
+                .expect("the scripted bluez is alive");
+        }
+    })
+    .await;
+    assert!(
+        resynced.is_err(),
+        "{refused} refused, yet the handshake's resync ran: the fold did not wait for that rule"
+    );
+
+    // Past the deadline it goes out without that rule.
+    fake.wait_for("the overdue resync, past FOLD_RULES_DEADLINE", |st| {
+        st.managed_served >= 2
+    })
+    .await;
+
+    fake.conn
+        .release_name("org.bluez")
+        .await
+        .expect("release org.bluez");
+    let ended = tokio::time::timeout(BUDGET, watch).await;
+    assert!(
+        matches!(ended, Ok(Ok(Ok(ListenEnd::DaemonExited)))),
+        "{refused} refused: the watch did not end on bluetoothd's exit ({ended:?})"
+    );
+    drop(held);
+    println!("{CHILD_OK} {}", test_name(test));
+}
+
+/// Install every top-level rule of the fold's but `refused` on the shell's
+/// own connection, with the builders `event_loop` uses, and hold them.
+async fn hold_every_rule_but(refused: &str) -> Vec<hytte_bus::SignalSubscription> {
+    let mut held = Vec::new();
+    for rule in ["InterfacesAdded", "InterfacesRemoved", "adapter"] {
+        if rule == refused {
+            continue;
+        }
+        let sub = if rule == "adapter" {
+            super::props_changed_signal(ADAPTER)
+        } else {
+            super::object_manager_signal(rule)
+        };
+        tokio::time::timeout(BUDGET, sub.subscribed())
+            .await
+            .expect("a rule that must land landed");
+        held.push(sub);
+    }
+    held
+}
+
+/// Show that every top-level rule but `refused` delivers to the fold: one
+/// emission of each, repeated until it shows in what the fold publishes.
+async fn probe_every_rule_but(
+    refused: &str,
+    fake: &FakeBluez,
+    adapter_m: &Mutable<Option<super::Adapter>>,
+    devices_m: &Mutable<Vec<Device>>,
+) {
+    const NEW: &str = "/org/bluez/hci0/dev_20_00_00_00_00_00";
+    const GONE: &str = "/org/bluez/hci0/dev_10_00_00_00_00_00";
+    let fk = fake;
+    let new_device = device("20:00:00:00:00:00", "New", false, None);
+    let new_device = &new_device;
+
+    for rule in ["InterfacesAdded", "InterfacesRemoved", "adapter"] {
+        match rule {
+            r if r == refused => {}
+            "adapter" => {
+                until_seen(
+                    "the adapter's PropertiesChanged",
+                    move || async move {
+                        let invalidated: Vec<String> = Vec::new();
+                        let _ = fk
+                            .conn
+                            .emit_signal(
+                                None::<zbus::names::BusName<'_>>,
+                                ADAPTER,
+                                "org.freedesktop.DBus.Properties",
+                                "PropertiesChanged",
+                                &(
+                                    "org.bluez.Adapter1",
+                                    HashMap::from([("Powered".to_owned(), v(false))]),
+                                    invalidated,
+                                ),
+                            )
+                            .await;
+                    },
+                    || {
+                        adapter_m
+                            .get_cloned()
+                            .is_some_and(|a: super::Adapter| !a.powered)
+                    },
+                )
+                .await;
+            }
+            "InterfacesAdded" => {
+                until_seen(
+                    "an InterfacesAdded",
+                    move || fk.emit_added(NEW, new_device),
+                    || devices_m.get_cloned().iter().any(|d| d.path == NEW),
+                )
+                .await;
+            }
+            _ => {
+                until_seen(
+                    "an InterfacesRemoved",
+                    move || async move {
+                        let path = zbus::zvariant::ObjectPath::try_from(GONE).expect("a path");
+                        let _ = fk
+                            .conn
+                            .emit_signal(
+                                None::<zbus::names::BusName<'_>>,
+                                "/",
+                                "org.freedesktop.DBus.ObjectManager",
+                                "InterfacesRemoved",
+                                &(path, vec!["org.bluez.Device1"]),
+                            )
+                            .await;
+                    },
+                    || !devices_m.get_cloned().iter().any(|d| d.path == GONE),
+                )
+                .await;
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn r5_refused_interfaces_added() {
+    r5_with_refused("r5_refused_interfaces_added", "InterfacesAdded").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn r5_refused_interfaces_removed() {
+    r5_with_refused("r5_refused_interfaces_removed", "InterfacesRemoved").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn r5_refused_adapter_properties() {
+    r5_with_refused("r5_refused_adapter_properties", "adapter").await;
+}
+
+// ── R6: bluetoothd stopped between the wait and the next snapshot ───────────
+
+/// A watch after the shell's first sends its snapshot without starting
+/// bluetoothd (#1651 review). bluetoothd stopped after `wait_for_bluez` saw
+/// its owner, before the next `listen`'s `GetManagedObjects`, stays stopped,
+/// and the watch ends `DaemonExited`, which sends the supervised loop back to
+/// `wait_for_bluez`. Nothing is published.
+///
+/// The positive control is the shell's first watch, whose snapshot is sent
+/// plain: the broker counts its start, so the zero before it is a zero.
+///
+/// **Falsification:** send `Snapshot::NoAutoStart` plain
+/// (`get_managed_objects`) and bluetoothd is started; read its refusal as
+/// any other failure (drop `listen`'s no-owner arm) and the watch ends with
+/// an error instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn r6_a_later_watchs_snapshot_never_starts_bluetoothd() {
+    const TEST: &str = "r6_a_later_watchs_snapshot_never_starts_bluetoothd";
+    let Some(address) = in_child(TEST) else {
+        return run_in_child(
+            TEST,
+            BrokerConfig {
+                activatable: true,
+                ..BrokerConfig::default()
+            },
+        )
+        .await;
+    };
+    let fake = fake_bluez(&address, adapter_with_devices(4)).await;
+    tokio::time::timeout(BUDGET, super::wait_for_bluez(Duration::ZERO))
+        .await
+        .expect("the wait saw bluez's owner");
+    // bluetoothd is stopped right after.
+    fake.conn
+        .release_name("org.bluez")
+        .await
+        .expect("release org.bluez");
+
+    let adapter_m = Mutable::new(None);
+    let devices_m = Mutable::new(Vec::new());
+    let store = Arc::new(tokio::sync::RwLock::new(String::new()));
+    let later = tokio::time::timeout(
+        BUDGET,
+        listen(&adapter_m, &devices_m, &store, Snapshot::NoAutoStart),
+    )
+    .await
+    .expect("the later watch ended");
+    assert_eq!(
+        activations(),
+        0,
+        "a later watch's snapshot started bluetoothd ({later:?})"
+    );
+    assert!(
+        matches!(later, Ok(ListenEnd::DaemonExited)),
+        "a later watch's refused snapshot did not read as bluetoothd gone: {later:?}"
+    );
+    assert!(
+        adapter_m.get_cloned().is_none() && devices_m.get_cloned().is_empty(),
+        "a watch with no snapshot published something"
+    );
+
+    // The control: the shell's first watch starts it.
+    let first = tokio::time::timeout(
+        BUDGET,
+        listen(&adapter_m, &devices_m, &store, Snapshot::MayStart),
+    )
+    .await
+    .expect("the first watch ended");
+    assert_eq!(
+        activations(),
+        1,
+        "the control: the first watch's plain snapshot starts bluetoothd ({first:?})"
     );
     println!("{CHILD_OK} {}", test_name(TEST));
 }

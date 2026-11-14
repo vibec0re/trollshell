@@ -1217,7 +1217,16 @@ async fn w6_a_failed_snapshot_keeps_the_station() {
 struct W7State {
     powered: bool,
     station: bool,
+    /// A second adapter, powered off and with no netdev, at
+    /// [`SPARE_ADAPTER`].
+    spare: bool,
 }
+
+/// [`W7State::spare`]'s adapter. Its path sorts before [`ADAPTER`]'s, so a
+/// snapshot with no station that took the lowest path would publish it. No
+/// path iwd gives an adapter can do that (it numbers wiphys from 0); the
+/// watcher reads any object carrying `net.connman.iwd.Adapter` as one.
+const SPARE_ADAPTER: &str = "/net/connman/0";
 
 /// W7's station: connected on [`HOME_NET`] ("home").
 fn w7_station_props() -> Props {
@@ -1243,7 +1252,7 @@ fn w7_tree(state: W7State) -> HashMap<OwnedObjectPath, Ifaces> {
     if state.station {
         netdev.insert("net.connman.iwd.Station".to_owned(), w7_station_props());
     }
-    HashMap::from([
+    let mut tree = HashMap::from([
         (
             OwnedObjectPath::try_from(ADAPTER).expect("a path"),
             HashMap::from([(
@@ -1252,7 +1261,14 @@ fn w7_tree(state: W7State) -> HashMap<OwnedObjectPath, Ifaces> {
             )]),
         ),
         (OwnedObjectPath::try_from(STATION).expect("a path"), netdev),
-    ])
+    ]);
+    if state.spare {
+        tree.insert(
+            OwnedObjectPath::try_from(SPARE_ADAPTER).expect("a path"),
+            HashMap::from([("net.connman.iwd.Adapter".to_owned(), adapter_props(false))]),
+        );
+    }
+    tree
 }
 
 /// Emit a `PropertiesChanged` for `iface` at `at`.
@@ -1342,6 +1358,9 @@ async fn w7_fake(
             }
             "GetAll" if at == ADAPTER => {
                 let _ = conn.reply(&hdr, &adapter_props(now.powered)).await;
+            }
+            "GetAll" if at == SPARE_ADAPTER && now.spare => {
+                let _ = conn.reply(&hdr, &adapter_props(false)).await;
             }
             "GetAll" | "GetOrderedNetworks" if at == STATION && !now.station => {
                 let _ = conn.reply_error(&hdr, unknown, &"no station").await;
@@ -1453,6 +1472,27 @@ async fn w7_step(watcher: &Watcher, fake: &W7Fake, step: &str, done: impl Fn(&Wa
     }
 }
 
+/// Record every value the watcher's adapter takes, as the panel's signal
+/// sees it, from now until the returned task is aborted: a `None` there is
+/// the card reading "No adapter" and its power switch going insensitive,
+/// however briefly. A wait on the end state cannot see that.
+fn w7_watch_adapter(
+    watcher: &Watcher,
+) -> (
+    Arc<Mutex<Vec<Option<Adapter>>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut values = watcher.adapter.signal_cloned().to_stream();
+    let record = seen.clone();
+    let task = tokio::spawn(async move {
+        while let Some(value) = values.next().await {
+            record.lock().expect("seen").push(value);
+        }
+    });
+    (seen, task)
+}
+
 /// The radio switched off and on again, as iwd does it (#1656). Powering
 /// off: the station's interface removed, then the adapter's `Powered` false
 /// at the adapter's path. The panel must keep the adapter, show it off with
@@ -1462,14 +1502,17 @@ async fn w7_step(watcher: &Watcher, fake: &W7Fake, step: &str, done: impl Fn(&Wa
 /// with no station published no adapter: the card read "No adapter" and the
 /// power switch went insensitive.
 ///
-/// Each change is emitted once the watcher has read both objects again
-/// after their rules landed, and `Powered` only after the panel shows the
-/// station gone, so only the adapter's live subscription can carry it.
+/// The station's removal ends the pass (#1657 review), and `Powered` false
+/// is emitted while the pump pauses, so the next snapshot carries it. The
+/// radio coming back on is emitted once the panel shows it off, i.e. after
+/// that snapshot, so only the adapter's subscription can carry it: a pass
+/// with no station takes no other. The adapter is watched across all of it
+/// ([`w7_watch_adapter`]) and must never leave the panel.
 ///
 /// **Falsification:** clear the adapter on the station's removal and the
-/// second step fails; drop the adapter's subscription, or ignore its delta,
-/// and the third does; do not rediscover on the station's return and the
-/// last does.
+/// watch sees it gone (the end states all hold, a snapshot later); drop the
+/// adapter's subscription, or ignore its delta, and the fourth step fails;
+/// do not rediscover on the station's return and the last does.
 #[tokio::test(flavor = "multi_thread")]
 async fn w7_the_radio_switched_off_and_on_keeps_the_adapter() {
     const TEST: &str = "w7_the_radio_switched_off_and_on_keeps_the_adapter";
@@ -1479,6 +1522,7 @@ async fn w7_the_radio_switched_off_and_on_keeps_the_adapter() {
     let on = W7State {
         powered: true,
         station: true,
+        spare: false,
     };
     let (fake, watcher) = w7_start(&address, on).await;
 
@@ -1490,6 +1534,7 @@ async fn w7_the_radio_switched_off_and_on_keeps_the_adapter() {
             && w7_count(&fake.calls, "GetAll", ADAPTER) > 0
     })
     .await;
+    let (seen, watch) = w7_watch_adapter(&watcher);
 
     w7_remove_station(&fake.conn, &fake.state).await;
     w7_step(&watcher, &fake, "the station removed", |w| {
@@ -1517,6 +1562,13 @@ async fn w7_the_radio_switched_off_and_on_keeps_the_adapter() {
     })
     .await;
 
+    watch.abort();
+    let seen = seen.lock().expect("seen");
+    assert!(
+        seen.iter()
+            .all(|a| a.as_ref().is_some_and(|a| a.path == ADAPTER)),
+        "the adapter left the panel on the way: {seen:?}"
+    );
     watcher.task.abort();
     fake.task.abort();
     println!("{CHILD_OK} {}", test_name(TEST));
@@ -1546,6 +1598,7 @@ async fn w7_a_radio_off_at_start_is_published_and_switched_on() {
     let off = W7State {
         powered: false,
         station: false,
+        spare: false,
     };
     let (fake, watcher) = w7_start(&address, off).await;
 
@@ -1616,6 +1669,7 @@ async fn w7_a_snapshot_with_no_station_publishes_its_adapter_itself() {
     let off = W7State {
         powered: false,
         station: false,
+        spare: false,
     };
     let (fake, watcher) = w7_start(&address, off).await;
 
@@ -1684,5 +1738,352 @@ async fn w7_the_adapter_reread_never_starts_iwd() {
         "the broker did not count a plain call's start ({:?})",
         answer.err()
     );
+    println!("{CHILD_OK} {}", test_name(TEST));
+}
+
+/// The agent registration, sent to `net.connman.iwd` with no owner on a bus
+/// that could start it, starts nothing, and the bus answers it with what
+/// `is_no_owner` reads as iwd gone, which ends the registration (#1657
+/// review). The pump polls the registration beside its events, so a retry
+/// can go out while a handler awaits with iwd's `Lost` queued unread. The
+/// positive control is the same plain call
+/// `w7_the_adapter_reread_never_starts_iwd` uses.
+///
+/// **Falsification:** drop `no_auto_start()` from `register_iwd_agent` and
+/// the registration starts iwd.
+#[tokio::test(flavor = "multi_thread")]
+async fn w7_the_registration_never_starts_iwd() {
+    const TEST: &str = "w7_the_registration_never_starts_iwd";
+    if in_child(TEST).is_none() {
+        return run_in_activating_child(TEST).await;
+    }
+    let before = activations();
+    let refused = crate::wifi::client::register_iwd_agent(crate::wifi::AGENT_PATH).await;
+    assert_eq!(activations(), before, "the registration started iwd");
+    assert!(
+        matches!(&refused, Err(e) if crate::wifi::client::is_no_owner(e)),
+        "the bus did not answer that nobody owns iwd's name: {refused:?}"
+    );
+
+    let answer = crate::wifi::client::get_managed_objects().await;
+    assert_eq!(
+        activations(),
+        before + 1,
+        "the broker did not count a plain call's start ({:?})",
+        answer.err()
+    );
+    println!("{CHILD_OK} {}", test_name(TEST));
+}
+
+// ── #1657 review: a station flap, the agent across passes, LOW 1 and 3 ──────
+
+/// iwd takes the station down and brings it straight back up (a netdev
+/// flap). Its `InterfacesRemoved` and `InterfacesAdded` reach the pump on
+/// two receivers fed by two subscription tasks, so the pump can see the add
+/// first (`bluetooth::devices`' fold doc names the same mis-order). Here the
+/// scripted iwd emits them in that order, with its station present
+/// throughout, as the pump would see the flap reordered. The panel must end
+/// with the station iwd has (#1657 review).
+///
+/// **Falsification:** keep the pass running without the station on its
+/// removal (this PR's first head) and the panel waits for an add it has
+/// already read.
+#[tokio::test(flavor = "multi_thread")]
+async fn w7_a_station_flap_seen_reordered_keeps_the_station() {
+    const TEST: &str = "w7_a_station_flap_seen_reordered_keeps_the_station";
+    let Some(address) = in_child(TEST) else {
+        return run_in_child(TEST, None).await;
+    };
+    let on = W7State {
+        powered: true,
+        station: true,
+        spare: false,
+    };
+    let (fake, watcher) = w7_start(&address, on).await;
+    w7_step(&watcher, &fake, "connected", |w| {
+        w.station.lock_ref().is_some()
+            && !w.networks.lock_ref().is_empty()
+            && adapter_is(w, true)
+            && w7_count(&fake.calls, "GetAll", STATION) > 0
+            && w7_count(&fake.calls, "GetAll", ADAPTER) > 0
+    })
+    .await;
+
+    // Let the pass's own re-reads (and the network read a changed station
+    // adds) land, so the count below moves only for the add.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let snapshots = w7_count(&fake.calls, "GetManagedObjects", "/");
+    // The add, seen first: the pump reads the networks for it.
+    let reads = w7_count(&fake.calls, "GetOrderedNetworks", STATION);
+    let station = OwnedObjectPath::try_from(STATION).expect("a path");
+    let ifaces: HashMap<String, Props> =
+        HashMap::from([("net.connman.iwd.Station".to_owned(), w7_station_props())]);
+    fake.conn
+        .emit_signal(
+            None::<zbus::names::BusName<'_>>,
+            "/",
+            "org.freedesktop.DBus.ObjectManager",
+            "InterfacesAdded",
+            &(station.clone(), ifaces),
+        )
+        .await
+        .expect("emit InterfacesAdded");
+    w7_step(&watcher, &fake, "the add read", |_| {
+        w7_count(&fake.calls, "GetOrderedNetworks", STATION) > reads
+    })
+    .await;
+    assert_eq!(
+        w7_count(&fake.calls, "GetManagedObjects", "/"),
+        snapshots,
+        "the add was not read by the pass that has the station"
+    );
+
+    // The removal, seen second. iwd's station is up.
+    fake.conn
+        .emit_signal(
+            None::<zbus::names::BusName<'_>>,
+            "/",
+            "org.freedesktop.DBus.ObjectManager",
+            "InterfacesRemoved",
+            &(station, vec!["net.connman.iwd.Station".to_owned()]),
+        )
+        .await
+        .expect("emit InterfacesRemoved");
+    w7_step(&watcher, &fake, "the removal applied", |w| {
+        w.station.lock_ref().is_none()
+    })
+    .await;
+
+    w7_step(&watcher, &fake, "iwd has its station", |w| {
+        w.station.lock_ref().as_ref().map(|st| st.path.as_str()) == Some(STATION)
+            && !w.networks.lock_ref().is_empty()
+    })
+    .await;
+
+    watcher.task.abort();
+    fake.task.abort();
+    println!("{CHILD_OK} {}", test_name(TEST));
+}
+
+/// A radio off at start registers no agent while there is no station, and
+/// the pass that finds the station registers it (#1657 review). Nothing in
+/// the suite counted `RegisterAgent` across passes.
+///
+/// **Falsification:** register only on a pass that follows a pass with a
+/// station and the second step never sees `RegisterAgent`.
+#[tokio::test(flavor = "multi_thread")]
+async fn w7_the_station_pass_registers_after_a_radio_off_start() {
+    const TEST: &str = "w7_the_station_pass_registers_after_a_radio_off_start";
+    let Some(address) = in_child(TEST) else {
+        return run_in_child(TEST, None).await;
+    };
+    let off = W7State {
+        powered: false,
+        station: false,
+        spare: false,
+    };
+    let (fake, watcher) = w7_start(&address, off).await;
+    w7_step(&watcher, &fake, "off at start", |w| {
+        adapter_is(w, false) && w7_count(&fake.calls, "GetAll", ADAPTER) > 0
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        w7_count(&fake.calls, "RegisterAgent", "/net/connman/iwd"),
+        0,
+        "registered with no station"
+    );
+    crate::wifi::do_set_powered(ADAPTER, true)
+        .await
+        .expect("the adapter takes Powered");
+    w7_step(&watcher, &fake, "registered once the station is up", |w| {
+        w.station.lock_ref().is_some()
+            && w7_count(&fake.calls, "RegisterAgent", "/net/connman/iwd") == 1
+    })
+    .await;
+    watcher.task.abort();
+    fake.task.abort();
+    println!("{CHILD_OK} {}", test_name(TEST));
+}
+
+/// iwd leaves and a new iwd takes its name; the new one must get the agent
+/// (#1551's reason for re-registering on `Appeared`; #1657 review).
+///
+/// **Falsification:** register only on the watcher's first pass with a
+/// station and the second iwd never sees `RegisterAgent`; clear only the
+/// station's side on iwd's `Lost` and the second step never sees the
+/// adapter go.
+#[tokio::test(flavor = "multi_thread")]
+async fn w7_a_new_iwd_gets_the_agent() {
+    const TEST: &str = "w7_a_new_iwd_gets_the_agent";
+    let Some(address) = in_child(TEST) else {
+        return run_in_child(TEST, None).await;
+    };
+    let on = W7State {
+        powered: true,
+        station: true,
+        spare: false,
+    };
+    let (fake, watcher) = w7_start(&address, on).await;
+    w7_step(&watcher, &fake, "registered with the first iwd", |w| {
+        w.station.lock_ref().is_some()
+            && w7_count(&fake.calls, "RegisterAgent", "/net/connman/iwd") == 1
+    })
+    .await;
+    fake.conn
+        .release_name("net.connman.iwd")
+        .await
+        .expect("release iwd's name");
+    w7_step(&watcher, &fake, "the first iwd gone", |w| {
+        w.station.lock_ref().is_none() && w.adapter.lock_ref().is_none()
+    })
+    .await;
+    fake.task.abort();
+
+    let conn = zbus::connection::Builder::address(address.as_str())
+        .expect("the broker's address")
+        .build()
+        .await
+        .expect("the second iwd connects");
+    let state = Arc::new(Mutex::new(on));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let stream = zbus::MessageStream::from(&conn);
+    let task = tokio::spawn(w7_fake(conn.clone(), stream, state.clone(), calls.clone()));
+    conn.request_name("net.connman.iwd")
+        .await
+        .expect("the second iwd owns the name");
+    let second = W7Fake {
+        conn,
+        state,
+        calls,
+        task,
+    };
+    w7_step(&watcher, &second, "registered with the second iwd", |w| {
+        w.station.lock_ref().is_some()
+            && w7_count(&second.calls, "RegisterAgent", "/net/connman/iwd") == 1
+    })
+    .await;
+    watcher.task.abort();
+    second.task.abort();
+    println!("{CHILD_OK} {}", test_name(TEST));
+}
+
+/// The radio switched off on a bus that refuses the adapter's `AddMatch`
+/// (and the station's: the limit at 4 of
+/// `w7_a_snapshot_with_no_station_publishes_its_adapter_itself`). With no
+/// rule there is no live `Powered` and no re-read, so the snapshot that
+/// follows the station's removal is what must show the radio off, and the
+/// one that follows its return what must show it on (#1657 review, LOW 3:
+/// while a pass went on without the station, the card kept the radio on).
+/// The rfkill's `Powered` is emitted first, unheard, then the netdev goes
+/// down, as iwd may order them.
+///
+/// The premise is checked too: the adapter is never read again.
+///
+/// **Falsification:** keep the pass running on the station's removal and
+/// the panel keeps the radio on.
+#[tokio::test(flavor = "multi_thread")]
+async fn w7_with_the_adapters_rule_refused_a_power_off_still_reads_off() {
+    const TEST: &str = "w7_with_the_adapters_rule_refused_a_power_off_still_reads_off";
+    let Some(address) = in_child(TEST) else {
+        return run_in_child(TEST, Some(4)).await;
+    };
+    let on = W7State {
+        powered: true,
+        station: true,
+        spare: false,
+    };
+    let (fake, watcher) = w7_start(&address, on).await;
+    w7_step(&watcher, &fake, "connected", |w| {
+        w.station.lock_ref().is_some() && !w.networks.lock_ref().is_empty() && adapter_is(w, true)
+    })
+    .await;
+
+    w7_set_powered(&fake.conn, &fake.state, false).await;
+    w7_remove_station(&fake.conn, &fake.state).await;
+    w7_step(&watcher, &fake, "switched off", |w| {
+        w.station.lock_ref().is_none() && w.networks.lock_ref().is_empty() && adapter_is(w, false)
+    })
+    .await;
+
+    crate::wifi::do_set_powered(ADAPTER, true)
+        .await
+        .expect("the adapter takes Powered");
+    w7_step(&watcher, &fake, "switched on", |w| {
+        w.station.lock_ref().as_ref().map(|st| st.path.as_str()) == Some(STATION)
+            && adapter_is(w, true)
+    })
+    .await;
+    assert_eq!(
+        w7_count(&fake.calls, "GetAll", ADAPTER),
+        0,
+        "the adapter was read again, so its rule was installed: this limit no longer \
+         refuses it"
+    );
+
+    watcher.task.abort();
+    fake.task.abort();
+    println!("{CHILD_OK} {}", test_name(TEST));
+}
+
+/// Two adapters, and the one carrying the station is switched off (#1657
+/// review, LOW 1). The snapshot after the station's removal has no station,
+/// and the other adapter's path sorts first ([`SPARE_ADAPTER`]): the panel
+/// must keep the adapter it showed, so its switch turns back on the radio it
+/// turned off, not the spare. `Powered` false is emitted once the panel shows
+/// the station gone, while the pump pauses, so only that snapshot can carry
+/// it.
+///
+/// **Falsification:** without a station, take the lowest path whatever is
+/// published (ignore `kept` in `adapter_in`, or pass `None` for it at the
+/// watcher's call site), or clear the adapter on the station's removal, and
+/// the panel switches to the spare.
+#[tokio::test(flavor = "multi_thread")]
+async fn w7_with_two_adapters_the_switch_keeps_the_one_it_turned_off() {
+    const TEST: &str = "w7_with_two_adapters_the_switch_keeps_the_one_it_turned_off";
+    let Some(address) = in_child(TEST) else {
+        return run_in_child(TEST, None).await;
+    };
+    let on = W7State {
+        powered: true,
+        station: true,
+        spare: true,
+    };
+    let (fake, watcher) = w7_start(&address, on).await;
+    w7_step(&watcher, &fake, "connected", |w| {
+        w.station.lock_ref().is_some()
+            && !w.networks.lock_ref().is_empty()
+            && adapter_is(w, true)
+            && w7_count(&fake.calls, "GetAll", ADAPTER) > 0
+    })
+    .await;
+
+    w7_remove_station(&fake.conn, &fake.state).await;
+    w7_step(&watcher, &fake, "the station removed", |w| {
+        w.station.lock_ref().is_none()
+    })
+    .await;
+    w7_set_powered(&fake.conn, &fake.state, false).await;
+    w7_step(&watcher, &fake, "switched off", |w| {
+        w.station.lock_ref().is_none() && adapter_is(w, false)
+    })
+    .await;
+
+    let adapter_path = watcher.paths.adapter_path().await;
+    assert_eq!(
+        adapter_path, ADAPTER,
+        "the switch addresses another adapter"
+    );
+    crate::wifi::do_set_powered(&adapter_path, true)
+        .await
+        .expect("the adapter takes Powered");
+    w7_step(&watcher, &fake, "switched on", |w| {
+        w.station.lock_ref().as_ref().map(|st| st.path.as_str()) == Some(STATION)
+            && adapter_is(w, true)
+    })
+    .await;
+
+    watcher.task.abort();
+    fake.task.abort();
     println!("{CHILD_OK} {}", test_name(TEST));
 }

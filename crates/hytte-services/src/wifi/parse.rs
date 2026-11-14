@@ -246,9 +246,11 @@ pub(super) struct Discovered {
 }
 
 /// Read a `GetManagedObjects` answer into what the watcher publishes.
-pub(super) fn discovered(managed: ManagedObjects) -> Discovered {
+/// `kept` is the path of the adapter the watcher publishes now, if any
+/// ([`adapter_in`]).
+pub(super) fn discovered(managed: ManagedObjects, kept: Option<&str>) -> Discovered {
     let station = station_in(&managed);
-    let adapter = adapter_in(&managed, station.as_ref().map(|p| p.as_str()));
+    let adapter = adapter_in(&managed, station.as_ref().map(|p| p.as_str()), kept);
     Discovered {
         managed,
         station,
@@ -271,15 +273,26 @@ pub(super) fn station_in(managed: &ManagedObjects) -> Option<zbus::zvariant::Own
 /// - **With a station**: the adapter at the station's parent path
 ///   ([`adapter_path_from_station`]), the rule discovery has always used, or
 ///   none if that object has no `net.connman.iwd.Adapter`.
-/// - **Without one**: the object carrying `net.connman.iwd.Adapter` with the
-///   lowest path (byte order), so a machine with more than one adapter
-///   publishes the same one on every pass. Until #1656 a snapshot with no
-///   station published no adapter at all. iwd keeps the adapter's object while
-///   the adapter is powered off (it removes it only with the wiphy,
+/// - **Without one**: `kept`, the adapter the watcher publishes now, while
+///   the snapshot still has a `net.connman.iwd.Adapter` at its path (#1657
+///   review). Switching the radio off removes the station, and the pass that
+///   follows has none: with two adapters it must go on publishing the one
+///   the panel's switch just turned off, so the switch turns that one back
+///   on. Otherwise the object carrying `net.connman.iwd.Adapter` with the
+///   lowest path (byte order), so the choice does not move from pass to pass.
+///   That fallback is a guess on a machine with two adapters and no station:
+///   a shell that starts with both off, or a pass after iwd left (which
+///   clears the adapter), publishes the lowest. Until #1656 a snapshot with
+///   no station published no adapter at all. iwd keeps the adapter's object
+///   while the adapter is powered off (it removes it only with the wiphy,
 ///   `wiphy_destroy`, iwd 3.12 `src/wiphy.c:2478-2490`), but not the station,
 ///   so the panel read "No adapter" and its power switch went insensitive:
 ///   Wi-Fi could be switched off from the panel and never on again.
-pub(super) fn adapter_in(managed: &ManagedObjects, station: Option<&str>) -> Option<Adapter> {
+pub(super) fn adapter_in(
+    managed: &ManagedObjects,
+    station: Option<&str>,
+    kept: Option<&str>,
+) -> Option<Adapter> {
     let mut adapters = managed.iter().filter_map(|(path, ifaces)| {
         ifaces
             .get(IWD_ADAPTER_IFACE)
@@ -290,7 +303,14 @@ pub(super) fn adapter_in(managed: &ManagedObjects, station: Option<&str>) -> Opt
             let parent = adapter_path_from_station(station);
             adapters.find(|(path, _)| *path == parent)?
         }
-        None => adapters.min_by(|(a, _), (b, _)| a.cmp(b))?,
+        None => {
+            let adapters: Vec<_> = adapters.collect();
+            adapters
+                .iter()
+                .find(|(path, _)| Some(*path) == kept)
+                .or_else(|| adapters.iter().min_by(|(a, _), (b, _)| a.cmp(b)))
+                .copied()?
+        }
     };
     Some(adapter_from_props(path, props))
 }
@@ -843,7 +863,7 @@ mod tests {
     /// discovery) and the first assertion fails.
     #[test]
     fn a_snapshot_with_an_adapter_and_no_station_publishes_the_adapter() {
-        let found = discovered(powered_off_tree());
+        let found = discovered(powered_off_tree(), None);
         assert_eq!(
             found.adapter,
             Some(Adapter {
@@ -857,12 +877,16 @@ mod tests {
 
     /// Which adapter a snapshot publishes. With a station, the station's
     /// parent, as discovery always took it, even when another adapter sorts
-    /// first. Without one, the lowest path, so a pass with two adapters
-    /// publishes the same one every time. With none, none (#1656).
+    /// first or another is published. Without one, the adapter already
+    /// published while the snapshot still has it (#1657 review), else the
+    /// lowest path. With none, none (#1656).
     ///
     /// **Falsification:** pick the lowest path with a station too and the
-    /// second row names `/net/connman/iwd/0`; pick by map order without a
-    /// station and the third row varies between runs of the process.
+    /// second row names `/net/connman/iwd/0`; prefer the published adapter
+    /// with a station too and the third row does; ignore the published one
+    /// without a station and the fifth row names `/net/connman/iwd/0`; pick
+    /// by map order without a station and the fourth or sixth row varies
+    /// between runs of the process.
     #[test]
     fn the_adapter_a_snapshot_publishes() {
         let station = || {
@@ -871,46 +895,87 @@ mod tests {
                 &[("State", owned("connected"))],
             )
         };
-        let rows: [(&str, ManagedObjects, Option<&str>, Option<&str>); 5] = [
+        let two = |phy1_station: bool| {
+            let mut managed = HashMap::from([
+                (opath("/net/connman/iwd/0"), adapter_object(false, "phy0")),
+                (opath("/net/connman/iwd/1"), adapter_object(true, "phy1")),
+            ]);
+            if phy1_station {
+                managed.insert(opath("/net/connman/iwd/1/7"), station());
+            }
+            managed
+        };
+        type Row<'a> = (
+            &'a str,
+            ManagedObjects,
+            Option<&'a str>,
+            Option<&'a str>,
+            Option<&'a str>,
+        );
+        let rows: [Row<'_>; 8] = [
             (
                 "the station's own adapter",
                 HashMap::from([
                     (opath(ADAPTER), adapter_object(true, "phy0")),
                     (opath(STATION), station()),
                 ]),
+                None,
                 Some(STATION),
                 Some(ADAPTER),
             ),
             (
                 "the station's own adapter, though another sorts first",
-                HashMap::from([
-                    (opath("/net/connman/iwd/0"), adapter_object(true, "phy0")),
-                    (opath("/net/connman/iwd/1"), adapter_object(true, "phy1")),
-                    (opath("/net/connman/iwd/1/7"), station()),
-                ]),
+                two(true),
+                None,
                 Some("/net/connman/iwd/1/7"),
                 Some("/net/connman/iwd/1"),
             ),
             (
-                "no station: the lowest path",
+                "the station's own adapter, though another is published",
+                two(true),
+                Some("/net/connman/iwd/0"),
+                Some("/net/connman/iwd/1/7"),
+                Some("/net/connman/iwd/1"),
+            ),
+            (
+                "no station and none published: the lowest path",
                 HashMap::from([
                     (opath("/net/connman/iwd/3"), adapter_object(false, "phy3")),
                     (opath("/net/connman/iwd/1"), adapter_object(false, "phy1")),
                     (opath("/net/connman/iwd/2"), adapter_object(false, "phy2")),
                 ]),
                 None,
+                None,
                 Some("/net/connman/iwd/1"),
+            ),
+            (
+                "no station: the published adapter, though another sorts first",
+                two(false),
+                Some("/net/connman/iwd/1"),
+                None,
+                Some("/net/connman/iwd/1"),
+            ),
+            (
+                "no station, and the published adapter gone: the lowest path",
+                HashMap::from([
+                    (opath("/net/connman/iwd/3"), adapter_object(false, "phy3")),
+                    (opath("/net/connman/iwd/2"), adapter_object(false, "phy2")),
+                ]),
+                Some("/net/connman/iwd/1"),
+                None,
+                Some("/net/connman/iwd/2"),
             ),
             (
                 "a station whose parent is no adapter",
                 HashMap::from([(opath(STATION), station())]),
+                None,
                 Some(STATION),
                 None,
             ),
-            ("nothing at all", HashMap::new(), None, None),
+            ("nothing at all", HashMap::new(), None, None, None),
         ];
-        for (case, managed, station_expected, adapter_expected) in rows {
-            let found = discovered(managed);
+        for (case, managed, kept, station_expected, adapter_expected) in rows {
+            let found = discovered(managed, kept);
             assert_eq!(
                 found.station.as_ref().map(|p| p.as_str()),
                 station_expected,

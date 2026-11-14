@@ -253,6 +253,16 @@ pub(super) fn network_call_deadline(method: &str) -> Option<std::time::Duration>
 }
 
 /// Register our agent object with iwd's `AgentManager`.
+///
+/// Sent with `no_auto_start()` (#1657 review). The watcher's pump polls the
+/// registration beside its event loop ([`super::watcher`]'s
+/// `beside_registration`), so a retry on the ramp can go out while a handler
+/// awaits (a re-read, a network read, a removal's pause) with iwd's `Lost`
+/// queued unread behind it. A plain call to iwd's name with no owner
+/// D-Bus-activates the iwd that was just stopped (#1551, #1652). With the
+/// flag the bus answers [`is_no_owner`] instead, which ends the registration
+/// (`register_agent_until_accepted`). The registration never has to start
+/// iwd: it runs only after a snapshot iwd answered.
 pub(super) async fn register_iwd_agent(agent_path: &str) -> Result<(), hytte_bus::BusError> {
     let agent_obj_path = zbus::zvariant::ObjectPath::try_from(agent_path)
         .map_err(|e| hytte_bus::BusError::Permanent {
@@ -265,6 +275,7 @@ pub(super) async fn register_iwd_agent(agent_path: &str) -> Result<(), hytte_bus
         .at_path("/net/connman/iwd")
         .iface("net.connman.iwd.AgentManager")
         .method("RegisterAgent")
+        .no_auto_start()
         .args((agent_obj_path,))
         .send::<()>()
         .await
@@ -286,6 +297,23 @@ pub(super) fn is_already_registered(e: &hytte_bus::BusError) -> bool {
     )
 }
 
+/// Is this the bus's answer that nothing owns iwd's name, to a call sent
+/// `no_auto_start()`? `NameHasNoOwner` is what `dbus-daemon` and `dbus-broker`
+/// both answer; `ServiceUnknown` is accepted as the same answer from a bus
+/// that words it so, as `bluetooth`'s device fold does (#1651 review). Either
+/// is the bus's own and says nothing about iwd's objects.
+pub(super) fn is_no_owner(e: &hytte_bus::BusError) -> bool {
+    matches!(
+        e,
+        hytte_bus::BusError::Permanent { dbus_name: Some(name), .. }
+            if matches!(
+                name.as_str(),
+                "org.freedesktop.DBus.Error.NameHasNoOwner"
+                    | "org.freedesktop.DBus.Error.ServiceUnknown"
+            )
+    )
+}
+
 // ── Discovery ─────────────────────────────────────────────────────────────────
 
 /// Read iwd's object tree and find its `Station` and its `Adapter`
@@ -302,11 +330,17 @@ pub(super) fn is_already_registered(e: &hytte_bus::BusError) -> bool {
 /// paces a retry itself. This used to sleep 5 s and return, and the watcher
 /// called it again, so an iwd that was stopped cleanly (its station removed,
 /// its name released) was restarted by the next attempt.
-pub(super) async fn discover_station() -> Result<Discovered, hytte_bus::BusError> {
+///
+/// `kept` is the path of the adapter the watcher publishes now: a snapshot
+/// with no station keeps publishing that one while iwd still has it
+/// ([`super::parse::adapter_in`]).
+pub(super) async fn discover_station(
+    kept: Option<String>,
+) -> Result<Discovered, hytte_bus::BusError> {
     let managed = get_managed_objects().await.inspect_err(|e| {
         tracing::debug!(error = %e, "iwd GetManagedObjects failed (iwd not running?)");
     })?;
-    let found = discovered(managed);
+    let found = discovered(managed, kept.as_deref());
     if found.station.is_none() {
         tracing::debug!(
             adapter = ?found.adapter,
@@ -362,8 +396,41 @@ pub(super) async fn iwd_has_owner() -> Result<bool, hytte_bus::BusError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{IWD_AGENT_INPUT_TIMEOUT, is_already_registered, network_call_deadline};
+    use super::{
+        IWD_AGENT_INPUT_TIMEOUT, is_already_registered, is_no_owner, network_call_deadline,
+    };
     use hytte_bus::BusError;
+
+    /// Only the bus's own no-owner answers read as "iwd has no owner"; iwd's
+    /// refusals, and a failure with no D-Bus error name, do not (#1657
+    /// review).
+    ///
+    /// **Falsification:** match any `org.freedesktop.DBus.Error.*` and the
+    /// `NoReply` row reads as no owner.
+    #[test]
+    fn only_the_buss_no_owner_answers_read_as_no_owner() {
+        let named = |name: &str| BusError::Permanent {
+            reason: "x".to_owned(),
+            dbus_name: Some(name.to_owned()),
+        };
+        for name in [
+            "org.freedesktop.DBus.Error.NameHasNoOwner",
+            "org.freedesktop.DBus.Error.ServiceUnknown",
+        ] {
+            assert!(is_no_owner(&named(name)), "{name}");
+        }
+        for name in [
+            "org.freedesktop.DBus.Error.NoReply",
+            "org.freedesktop.DBus.Error.UnknownObject",
+            "net.connman.iwd.AlreadyExists",
+        ] {
+            assert!(!is_no_owner(&named(name)), "{name}");
+        }
+        assert!(!is_no_owner(&BusError::Permanent {
+            reason: "org.freedesktop.DBus.Error.NameHasNoOwner".to_owned(),
+            dbus_name: None,
+        }));
+    }
 
     /// Only iwd's own `AlreadyExists` reads as "registered". Any other
     /// refusal, and a failure with no D-Bus error name, is still a failure to

@@ -11,8 +11,8 @@ use std::time::Duration;
 use zbus::zvariant::OwnedValue;
 
 use super::client::{
-    discover_station, is_already_registered, iwd_has_owner, refresh_adapter, refresh_networks,
-    refresh_station, register_iwd_agent,
+    discover_station, is_already_registered, is_no_owner, iwd_has_owner, refresh_adapter,
+    refresh_networks, refresh_station, register_iwd_agent,
 };
 use super::parse::{
     Discovered, IWD_ADAPTER_IFACE, IWD_STATION_IFACE, Removed, adds_station_or_adapter,
@@ -313,6 +313,13 @@ where
 /// iwd's `AlreadyExists` counts as registered ([`is_already_registered`]):
 /// it is what iwd answers when it still holds this connection's agent.
 ///
+/// The bus's own no-owner answer ([`is_no_owner`]) ends the registration
+/// without a retry or a `warn!` (#1657 review). `RegisterAgent` is sent with
+/// `no_auto_start()` ([`register_iwd_agent`]), so that answer means iwd has
+/// left: its `Lost` reaches the pump, which clears and waits, and the pass
+/// that the next iwd's `Appeared` starts registers with that iwd. Retrying
+/// would only ask an empty name again until the pump read the `Lost`.
+///
 /// `register` and `policy` are injected so a test can script the answers and
 /// count attempts under paused time.
 async fn register_agent_until_accepted<R, F>(register: R, policy: retry::Policy)
@@ -329,6 +336,13 @@ where
             Err(e) if is_already_registered(&e) => {
                 tracing::debug!("iwd already holds this connection's agent");
                 Ok(())
+            }
+            Err(e) if is_no_owner(&e) => {
+                tracing::debug!(
+                    attempt,
+                    "iwd left before taking the agent; the next iwd's pass registers"
+                );
+                return;
             }
             other => other,
         };
@@ -626,13 +640,16 @@ async fn reread_adapter(adapter_path: Option<&str>, adapter_mutable: &Mutable<Op
 /// published before it waits ([`clear_published`], #1654). A pass whose
 /// snapshot has no station clears the station's side
 /// ([`clear_station_side`]) and publishes the snapshot's adapter, or clears
-/// it when the snapshot has none (#1656). Until #1654 an iwd or a station
-/// that went away while no pump was reading, or inside the hole that ended
-/// one, stayed on the panel until iwd came back; until #1656 a pass with no
-/// station cleared the adapter too, so a powered-off radio could not be
-/// switched back on from the panel. A pass that could not read iwd keeps the
-/// state, as a hole does, and so does the healthy rediscovery: its snapshot
-/// refreshes the state in place.
+/// it when the snapshot has none (#1656). With more than one adapter that is
+/// the one already published, while the snapshot still has it
+/// ([`super::parse::adapter_in`], #1657 review), so the radio the panel just
+/// switched off is the one its switch turns back on. Until #1654 an iwd or a
+/// station that went away while no pump was reading, or inside the hole that
+/// ended one, stayed on the panel until iwd came back; until #1656 a pass
+/// with no station cleared the adapter too, so a powered-off radio could not
+/// be switched back on from the panel. A pass that could not read iwd keeps
+/// the state, as a hole does, and so does the healthy rediscovery: its
+/// snapshot refreshes the state in place.
 ///
 /// A pass with no station does not retry on a timer: its pump watches the
 /// adapter and waits for iwd to add a station or an adapter
@@ -679,7 +696,8 @@ pub(super) async fn run_wifi_watcher(
             },
             || (added_sub.items(), removed_sub.items()),
             [&owner_sub, &added_sub, &removed_sub],
-            discover_station,
+            // Read when the snapshot is asked for, after the wait's clear.
+            || discover_station(adapter_mutable.lock_ref().as_ref().map(|a| a.path.clone())),
         )
         .await;
         // iwd did not answer. That says nothing about its station, so the
@@ -727,10 +745,10 @@ pub(super) async fn run_wifi_watcher(
             clear_station_side(&station_mutable, &networks_mutable, &prompts_mutable);
         }
 
-        // Returns when iwd changed hands, the adapter was removed, a pass
-        // with no station saw one (or an adapter) added, or a receiver had a
-        // hole — falls through to re-discover (and re-register the agent) on
-        // the next iteration of 'discovery.
+        // Returns when iwd changed hands, the station or the adapter was
+        // removed, a pass with no station saw one (or an adapter) added, or a
+        // receiver had a hole — falls through to re-discover (and re-register
+        // the agent) on the next iteration of 'discovery.
         pump_iwd_events(
             IwdStreams {
                 owner: &mut owner_items,
@@ -767,13 +785,12 @@ pub(super) async fn run_wifi_watcher(
 
 // ── Event pump ────────────────────────────────────────────────────────────────
 
-/// How long the pump waits after the adapter's object is removed before it
-/// rediscovers: what it always waited after the station's removal, before
-/// #1656 made that one keep the pass. It keeps the next pass's call to iwd
-/// from following the removal at once: an iwd that is stopping can remove its
-/// objects before it releases its name (#1551 saw it with the station), and
-/// [`wait_for_iwd`] asks the bus whether the name still has an owner before
-/// that call.
+/// How long the pump waits after the station's interface or the adapter's
+/// object is removed before it rediscovers: what it always waited after the
+/// station's removal. It keeps the next pass's call to iwd from following the
+/// removal at once: an iwd that is stopping can remove its objects before it
+/// releases its name (#1551 saw it with the station), and [`wait_for_iwd`]
+/// asks the bus whether the name still has an owner before that call.
 const REMOVAL_PAUSE: Duration = Duration::from_secs(2);
 
 /// `rule`'s handshake, or never when there is no rule.
@@ -787,9 +804,8 @@ async fn installed<H: Handshake>(rule: Option<&H>) {
 /// A watch's path, receiver and subscription, each `None` without a watch.
 type WatchParts<'a, E, H> = (Option<&'a str>, Option<&'a mut E>, Option<&'a H>);
 
-/// Take a watch apart, for the pump to drop its path and receiver when iwd
-/// removes the object while the handshake goes on borrowing the
-/// subscription.
+/// Take a watch apart, for the pump's arms to borrow its path, its receiver
+/// and its subscription's handshake separately.
 fn watch_parts<E, H>(watch: Option<PropsWatch<'_, E, H>>) -> WatchParts<'_, E, H> {
     match watch {
         Some(PropsWatch { path, items, rule }) => (Some(path), Some(items), Some(rule)),
@@ -822,27 +838,41 @@ where
 
 /// Drive the iwd event loop. Returns when the watcher needs to restart
 /// discovery: iwd changed hands (see [`owner_reaction`]), the published
-/// adapter's object was removed, a pass with no station saw iwd add a station
-/// or an adapter, or any receiver reported a hole.
+/// station's interface or adapter's object was removed, a pass with no
+/// station saw iwd add a station or an adapter, or any receiver reported a
+/// hole.
 ///
-/// **A station that goes keeps the pass** (#1656). When iwd removes the
+/// **A station that goes keeps the adapter** (#1656). When iwd removes the
 /// station's interface and not the adapter's object, which is what powering
 /// the adapter off does, the pump clears the station's side
-/// ([`clear_station_side`]), stops reading the station, and goes on watching
-/// the adapter: its `Powered` arrives live, both ways. A pass that started
-/// with no station runs the same way from the start. Either waits for an
-/// `InterfacesAdded` that brings a station or an adapter
-/// ([`adds_station_or_adapter`]) and then rediscovers, which is how a radio
-/// switched back on gets its station published. Until #1656 the station's
-/// removal cleared the adapter with it and rediscovered, and a pass with no
-/// station published no adapter and retried on a timer, so the panel's power
-/// switch went insensitive once the radio was off. Nothing in that state
-/// calls iwd, and no timer wakes it.
+/// ([`clear_station_side`]) and leaves the adapter published, so the panel's
+/// power switch stays live. Then it pauses ([`REMOVAL_PAUSE`]) and
+/// rediscovers, as it always did there: the next snapshot says whether the
+/// station is back, and with no station that pass publishes the snapshot's
+/// adapter, `Powered` included. Until #1656 the removal cleared the adapter
+/// too, and a pass with no station published none, so the power switch went
+/// insensitive once the radio was off.
+///
+/// The removal ends the pass rather than leave it running without the
+/// station (#1657 review). `InterfacesRemoved` and `InterfacesAdded` reach the
+/// pump on two receivers, each fed by its own subscription task, so nothing
+/// orders them: a station that flaps (a netdev down and straight back up) can
+/// be read add first, and a pass that went on without the station would wait
+/// for an add it had already read, with iwd connected and the panel empty.
+/// The pump that did that parked the panel 13 times in 1000 flaps emitted in
+/// iwd's own order. A snapshot cannot be overtaken that way.
+///
+/// A pass that **starts** with no station watches the adapter, its `Powered`
+/// live both ways, and waits for an `InterfacesAdded` that brings a station
+/// or an adapter ([`adds_station_or_adapter`]), then rediscovers: that is how
+/// a radio switched back on gets its station published. Nothing in that state
+/// calls iwd, and no timer wakes it. Until #1656 such a pass retried on a
+/// timer.
 ///
 /// The adapter's own removal clears everything, pauses ([`REMOVAL_PAUSE`])
-/// and rediscovers, as the station's removal used to: iwd removes the
-/// adapter only with the wiphy, so the station is gone too, and a snapshot
-/// says whether another adapter is there.
+/// and rediscovers: iwd removes the adapter only with the wiphy, so the
+/// station is gone too, and a snapshot says whether another adapter is
+/// there.
 ///
 /// A hole (`Resubscribed` or `Lagged`) is handled as a hole in the owner's
 /// ([`IwdOwner::Hole`]): rediscover, keeping the state. An object change was
@@ -880,17 +910,23 @@ where
 /// Each re-read is awaited inside its arm, so no event is applied while it is
 /// in flight and it never overwrites a newer one; an older event applied
 /// after it is an absolute value followed by every later change on the same
-/// receiver. Every call stops once iwd is gone: the re-reads' arms are no
-/// longer polled, and the registration is dropped.
+/// receiver. Every call stops once the pump has read iwd's `Lost`: the
+/// re-reads' arms are no longer polled, and the registration is dropped.
 ///
 /// The loop is `biased`, owner first, and [`beside_registration`] polls it
-/// before the registration, so an iwd exit that is already queued wins over
-/// every call to iwd: otherwise a pass that started with a `Lost` queued
-/// could send `RegisterAgent` or a re-read first, and a call to iwd's name
-/// with no owner D-Bus-activates the iwd that was just stopped. The other
-/// arms cannot starve: each but the one-shot re-reads is a bus signal taking
-/// one bounded step per item, with a bounded receiver whose overrun is a
-/// marker that ends the pass.
+/// before the registration, so an iwd exit that is already queued when the
+/// loop is polled wins over every call to iwd: otherwise a pass that started
+/// with a `Lost` queued could send `RegisterAgent` or a re-read first, and a
+/// call to iwd's name with no owner D-Bus-activates the iwd that was just
+/// stopped. A `Lost` that arrives while a handler awaits is not read until
+/// the handler returns, and the registration keeps running meanwhile (that is
+/// the point of running it beside the loop), so a retry can go out behind it
+/// (#1657 review). That is why `RegisterAgent` is sent with `no_auto_start()`
+/// ([`register_iwd_agent`]), and why the bus's no-owner answer ends the
+/// registration instead of being retried ([`register_agent_until_accepted`]).
+/// The other arms cannot starve: each but the one-shot re-reads is a bus
+/// signal taking one bounded step per item, with a bounded receiver whose
+/// overrun is a marker that ends the pass.
 async fn pump_iwd_events<O, E, H, R, RF, S, SF, A, AF>(
     streams: IwdStreams<'_, O, E, H>,
     calls: IwdCalls<R, S, A>,
@@ -951,8 +987,9 @@ impl Published<'_> {
 }
 
 /// Run the pump's event loop with the agent registration polled beside it
-/// (#1656), until the loop returns. The registration is dropped once iwd is
-/// gone or it is done, never left pending unpolled.
+/// (#1656), until the loop returns. The registration is dropped once the pump
+/// has read iwd's `Lost` or the registration is done, never left pending
+/// unpolled.
 ///
 /// It used to be one of the loop's arms, so it was not polled while another
 /// arm's handler awaited a call of its own (a re-read, a network read), and a
@@ -962,14 +999,17 @@ impl Published<'_> {
 /// `abstractions/async_lock.rs`), which are fair: they hand the lock to the
 /// first queued waiter whether or not that waiter is polled. A
 /// `RegisterAgent` queued behind another caller could be handed a lock while
-/// its arm sat unpolled, and the handler's own call then waited behind it
-/// until its 25 s deadline: #1656's W1 failed 3 of 40 runs that way, with
-/// neither call ever written, once the adapter's subscription put more
-/// traffic on the connection at the pump's start. A pending call's receiver
-/// on the connection's method-return queue (8 deep, zbus
-/// `connection/mod.rs`) is the same hazard for every reply on the
-/// connection, which is why a registration that iwd's exit leaves pending is
-/// dropped rather than kept.
+/// its arm sat unpolled, and the handler's own call then waited behind it:
+/// #1656's W1 failed 3 of 40 runs that way, with neither call ever written,
+/// once the adapter's subscription put more traffic on the connection at the
+/// pump's start. Those runs ended at the re-read's 25 s deadline only because
+/// they stalled on zbus's write lock, inside the call. `hytte_bus::call`'s
+/// deadline covers the call's send and reply (`proxy.call`) and nothing
+/// before it: `with_conn`'s lock and the proxy's construction have none
+/// (#1657 review). A pending call's receiver on the connection's
+/// method-return queue (8 deep, zbus `connection/mod.rs`) is the same hazard
+/// for every reply on the connection, which is why a registration that iwd's
+/// exit leaves pending is dropped rather than kept.
 async fn beside_registration(
     events: impl Future<Output = ()>,
     registration: Option<impl Future<Output = ()>>,
@@ -1021,10 +1061,9 @@ async fn pump_events<O, E, H, S, SF, A, AF>(
         prompts: prompts_mutable,
         adapter: adapter_mutable,
     } = published;
-    // What the pass publishes, by path, and the receivers for it. The
-    // station's go to `None` when iwd removes the station; the adapter's
-    // removal ends the pass.
-    let (mut station_path, mut station_items, station_rule) = watch_parts(streams.station);
+    // What the pass publishes, by path, and the receivers for it. Either
+    // object's removal ends the pass.
+    let (station_path, mut station_items, station_rule) = watch_parts(streams.station);
     let (adapter_path, mut adapter_items, adapter_rule) = watch_parts(streams.adapter);
     let mut station_installed = std::pin::pin!(installed(station_rule));
     let mut station_read = false;
@@ -1085,9 +1124,13 @@ async fn pump_events<O, E, H, S, SF, A, AF>(
                         return;
                     }
                     Removed::Station => {
-                        tracing::info!(path = station_path, "iwd station removed; keeping the adapter");
+                        tracing::info!(
+                            path = station_path,
+                            "iwd station removed; keeping the adapter and rewatching"
+                        );
                         clear_station_side(station_mutable, networks_mutable, prompts_mutable);
-                        (station_path, station_items) = (None, None);
+                        tokio::time::sleep(REMOVAL_PAUSE).await;
+                        return;
                     }
                     Removed::Other => if let Some(path) = station_path {
                         refresh_networks(path, station_mutable, networks_mutable).await;
@@ -1256,6 +1299,45 @@ mod tests {
         .await
         .expect("AlreadyExists must end the registration");
         assert_eq!(attempts.get(), 1);
+    }
+
+    /// The bus answering that nothing owns iwd's name ends the registration
+    /// at once, even after a refusal opened the retry ramp (#1657 review):
+    /// `RegisterAgent` is sent `no_auto_start()`, so iwd has left, and the
+    /// next iwd's pass registers. No retry knocks on the empty name while the
+    /// pump has yet to read the `Lost`.
+    ///
+    /// **Falsification:** drop the `is_no_owner` arm and the registration
+    /// retries the empty name on the ramp until the timeout.
+    #[tokio::test(start_paused = true)]
+    async fn iwd_gone_from_the_bus_ends_the_registration() {
+        let answers = RefCell::new(VecDeque::from([
+            Err(refused("org.freedesktop.DBus.Error.NoReply")),
+            Err(refused("org.freedesktop.DBus.Error.NameHasNoOwner")),
+        ]));
+        let attempts = Cell::new(0_u32);
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_mins(1),
+            register_agent_until_accepted(
+                || {
+                    attempts.set(attempts.get() + 1);
+                    let answer = answers.borrow_mut().pop_front().unwrap_or_else(|| {
+                        Err(refused("org.freedesktop.DBus.Error.NameHasNoOwner"))
+                    });
+                    async move { answer }
+                },
+                TEST_RAMP,
+            ),
+        )
+        .await
+        .expect("a name with no owner must end the registration");
+        assert_eq!(attempts.get(), 2, "one refusal, then the bus's no-owner");
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(1),
+            "one step of the ramp"
+        );
     }
 
     /// Waiting for iwd asks the bus until iwd has an owner, and asks again
@@ -2233,61 +2315,59 @@ mod tests {
         assert_eq!(log.into_inner(), ["adapter re-read"]);
     }
 
-    /// The pump's streams for the station-removal tests: the owner quiet,
-    /// the rest fed by the test.
-    struct Fed {
-        added: tokio::sync::mpsc::UnboundedSender<SignalItem>,
-        removed: tokio::sync::mpsc::UnboundedSender<SignalItem>,
-        adapter: tokio::sync::mpsc::UnboundedSender<SignalItem>,
-    }
-
     async fn settle() {
         for _ in 0..8 {
             tokio::task::yield_now().await;
         }
     }
 
+    /// An adapter `PropertiesChanged` setting `Powered` to `on`.
+    fn powered_to(on: bool) -> SignalItem {
+        SignalItem::Event(properties_changed_at(
+            ADAPTER,
+            "net.connman.iwd.Adapter",
+            &[("Powered", on.into())],
+        ))
+    }
+
     /// Powering the adapter off, as iwd does it: the station's interface is
-    /// removed and the adapter's `Powered` goes false at the adapter's path.
-    /// The pump clears the station's side, keeps the adapter and the pass,
-    /// and applies `Powered` both ways from the adapter's own receiver. An
-    /// `InterfacesAdded` with no station or adapter in it is not a reason to
-    /// rediscover; the station's return is (#1656). Until #1656 the removal
-    /// cleared the adapter and ended the pass, and nothing read the adapter's
-    /// path.
+    /// removed and the adapter's object stays. The pump clears the station's
+    /// side, leaves the adapter published as it was, and returns after
+    /// [`REMOVAL_PAUSE`], so the next snapshot says whether the station is
+    /// back (#1656, #1657 review). The adapter is watched the whole time, as
+    /// the panel's signal sees it: it is never cleared, not even for a
+    /// moment, so the power switch never goes insensitive. Before the removal
+    /// its `Powered` arrives live from its own receiver.
     ///
     /// Nothing here reaches a bus: the rules are refused, the registration
-    /// never answers, and with the station gone no event reads the networks.
+    /// never answers, and no event reads the networks.
     ///
     /// **Falsification:** clear the adapter on the station's removal and the
-    /// first assertion fails; end the pass there and the pump returns early;
-    /// drop the adapter arm or ignore its delta and `Powered` never moves;
-    /// rediscover on any `InterfacesAdded` and the pump returns on the known
-    /// network.
+    /// watch sees it gone; keep the pass running without the station (the
+    /// first #1657 head) and the pump never returns; drop the pause and the
+    /// elapsed time is short; ignore the adapter's delta and `Powered` never
+    /// moves.
     #[tokio::test(start_paused = true)]
-    async fn a_station_removal_keeps_the_adapter_and_its_live_powered() {
-        let (added_tx, added_rx) = tokio::sync::mpsc::unbounded_channel();
+    async fn a_station_removal_keeps_the_adapter_and_rediscovers() {
+        use futures_signals::signal::SignalExt;
+
         let (removed_tx, removed_rx) = tokio::sync::mpsc::unbounded_channel();
         let (adapter_tx, adapter_rx) = tokio::sync::mpsc::unbounded_channel();
-        let fed_by = Fed {
-            added: added_tx,
-            removed: removed_tx,
-            adapter: adapter_tx,
-        };
         let quiet = || futures_util::stream::pending::<SignalItem>().boxed_local();
-        let (mut owner, mut station) = (quiet(), quiet());
-        let (mut added, mut removed, mut adapter_items) =
-            (fed(added_rx), fed(removed_rx), fed(adapter_rx));
+        let (mut owner, mut added, mut station) = (quiet(), quiet(), quiet());
+        let (mut removed, mut adapter_items) = (fed(removed_rx), fed(adapter_rx));
         let station_state = Mutable::new(Some(Station {
             path: STATION.to_owned(),
             ..Station::default()
         }));
-        let networks = Mutable::new(Vec::new());
+        let (network, prompt) = network_and_prompt();
+        let (networks, prompts) = (Mutable::new(vec![network]), Mutable::new(Some(prompt)));
         let adapter = Mutable::new(Some(Adapter {
             powered: true,
             ..powered_off_adapter()
         }));
-        let returned = Cell::new(false);
+        let returned = Cell::new(None);
+        let seen = RefCell::new(Vec::new());
 
         let pump = async {
             pump_iwd_events(
@@ -2313,6 +2393,104 @@ mod tests {
                 },
                 &station_state,
                 &networks,
+                &prompts,
+                &adapter,
+            )
+            .await;
+            returned.set(Some(tokio::time::Instant::now()));
+        };
+        // Every value the adapter takes, as the panel's signal sees it.
+        let watch = async {
+            let mut values = adapter.signal_cloned().to_stream();
+            while let Some(value) = values.next().await {
+                seen.borrow_mut().push(value.map(|a| a.powered));
+            }
+        };
+        let powered = || adapter.get_cloned().map(|a| a.powered);
+        let drive = async {
+            adapter_tx
+                .send(powered_to(false))
+                .expect("the pump reads it");
+            settle().await;
+            assert_eq!(powered(), Some(false), "the radio's Powered arrives live");
+
+            let removal = tokio::time::Instant::now();
+            removed_tx
+                .send(interfaces_removed(STATION, &["net.connman.iwd.Station"]))
+                .expect("the pump reads it");
+            settle().await;
+            assert!(station_state.get_cloned().is_none(), "the station is gone");
+            assert!(networks.lock_ref().is_empty(), "its networks are gone");
+            assert!(prompts.lock_ref().is_none(), "its prompt is gone");
+            assert_eq!(powered(), Some(false), "the adapter stays, as it was");
+            assert!(returned.get().is_none(), "the pass ended before its pause");
+            removal
+        };
+        let (watch, both) = (
+            std::pin::pin!(watch),
+            std::pin::pin!(futures_util::future::join(pump, drive)),
+        );
+        let ended = tokio::time::timeout(
+            Duration::from_mins(1),
+            futures_util::future::select(watch, both),
+        )
+        .await
+        .expect("the station's removal sends the pump back to discovery");
+        let futures_util::future::Either::Right((((), removal), _)) = ended else {
+            unreachable!("the watch never ends");
+        };
+        assert_eq!(
+            returned.get().map(|at| at - removal),
+            Some(REMOVAL_PAUSE),
+            "the pump rediscovers after the pause"
+        );
+        assert_eq!(
+            *seen.borrow(),
+            [Some(true), Some(false)],
+            "the adapter left the panel, or took another value"
+        );
+    }
+
+    /// A pass that starts with no station (the radio is off): the adapter's
+    /// `Powered` arrives live, both ways, from its own receiver; an
+    /// `InterfacesAdded` that brings no station or adapter is no reason to
+    /// rediscover, and the station's return is (#1656). Until #1656 such a
+    /// pass published no adapter and retried on a timer.
+    ///
+    /// **Falsification:** drop the adapter arm or ignore its delta and
+    /// `Powered` never moves; rediscover on any `InterfacesAdded` and the
+    /// pump returns on the known network; never rediscover on the station's
+    /// return and the pump never returns.
+    #[tokio::test(start_paused = true)]
+    async fn a_pass_with_no_station_follows_powered_and_ends_on_the_stations_return() {
+        let (added_tx, added_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (adapter_tx, adapter_rx) = tokio::sync::mpsc::unbounded_channel();
+        let quiet = || futures_util::stream::pending::<SignalItem>().boxed_local();
+        let (mut owner, mut removed) = (quiet(), quiet());
+        let (mut added, mut adapter_items) = (fed(added_rx), fed(adapter_rx));
+        let adapter = Mutable::new(Some(powered_off_adapter()));
+        let returned = Cell::new(false);
+
+        let pump = async {
+            pump_iwd_events(
+                IwdStreams {
+                    owner: &mut owner,
+                    added: &mut added,
+                    removed: &mut removed,
+                    station: None,
+                    adapter: Some(PropsWatch {
+                        path: ADAPTER,
+                        items: &mut adapter_items,
+                        rule: &Refused,
+                    }),
+                },
+                IwdCalls {
+                    register: std::future::pending::<Result<(), BusError>>,
+                    reread_station: std::future::pending::<()>,
+                    reread_adapter: std::future::pending::<()>,
+                },
+                &Mutable::new(None),
+                &Mutable::new(Vec::new()),
                 &Mutable::new(None),
                 &adapter,
             )
@@ -2324,31 +2502,18 @@ mod tests {
             let send = |tx: &tokio::sync::mpsc::UnboundedSender<SignalItem>, item| {
                 tx.send(item).expect("the pump reads it");
             };
-            send(
-                &fed_by.removed,
-                interfaces_removed(STATION, &["net.connman.iwd.Station"]),
-            );
+            send(&adapter_tx, powered_to(true));
             settle().await;
-            assert!(station_state.get_cloned().is_none(), "the station is gone");
-            assert_eq!(powered(), Some(true), "the adapter stays, as it was");
-            assert!(!returned.get(), "the pass goes on without the station");
-
-            let powered_to = |on: bool| {
-                SignalItem::Event(properties_changed_at(
-                    ADAPTER,
-                    "net.connman.iwd.Adapter",
-                    &[("Powered", on.into())],
-                ))
-            };
-            send(&fed_by.adapter, powered_to(false));
+            assert_eq!(powered(), Some(true), "the radio is on");
+            send(&adapter_tx, powered_to(false));
             settle().await;
-            assert_eq!(powered(), Some(false), "the radio is off");
-            send(&fed_by.adapter, powered_to(true));
+            assert_eq!(powered(), Some(false), "the radio is off again");
+            send(&adapter_tx, powered_to(true));
             settle().await;
             assert_eq!(powered(), Some(true), "the radio is on again");
 
             send(
-                &fed_by.added,
+                &added_tx,
                 interfaces_added(
                     "/net/connman/iwd/686f6d65_psk",
                     &["net.connman.iwd.KnownNetwork"],
@@ -2357,7 +2522,7 @@ mod tests {
             settle().await;
             assert!(!returned.get(), "a known network brings no station");
             send(
-                &fed_by.added,
+                &added_tx,
                 interfaces_added(STATION, &["net.connman.iwd.Station"]),
             );
         };
@@ -2369,6 +2534,78 @@ mod tests {
         .expect("the station's return sends the pump back to discovery");
         assert!(returned.get());
         assert_eq!(powered(), Some(true), "rediscovering keeps the state");
+    }
+
+    /// (#1657 review) a pass with no station still follows iwd changing
+    /// hands. iwd leaving clears the adapter it published, so the switch
+    /// does not stay live for an iwd that is gone, and the pass waits; a new
+    /// iwd ends it, so the new one is snapshotted and registered with.
+    ///
+    /// **Falsification:** clear only the station's side on iwd's `Lost` and
+    /// the adapter stays.
+    #[tokio::test(start_paused = true)]
+    async fn a_pass_with_no_station_clears_on_lost_and_ends_on_a_new_iwd() {
+        let (owner_tx, owner_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut owner = fed(owner_rx);
+        let quiet = || futures_util::stream::pending::<SignalItem>().boxed_local();
+        let (mut added, mut removed, mut adapter_items) = (quiet(), quiet(), quiet());
+        let adapter = Mutable::new(Some(powered_off_adapter()));
+        let (station_state, networks, prompts) = (
+            Mutable::new(None),
+            Mutable::new(Vec::new()),
+            Mutable::new(None),
+        );
+        let returned = Cell::new(false);
+        let pump = async {
+            pump_iwd_events(
+                IwdStreams {
+                    owner: &mut owner,
+                    added: &mut added,
+                    removed: &mut removed,
+                    station: None,
+                    adapter: Some(PropsWatch {
+                        path: ADAPTER,
+                        items: &mut adapter_items,
+                        rule: &Refused,
+                    }),
+                },
+                IwdCalls {
+                    register: std::future::pending::<Result<(), BusError>>,
+                    reread_station: std::future::pending::<()>,
+                    reread_adapter: std::future::pending::<()>,
+                },
+                &station_state,
+                &networks,
+                &prompts,
+                &adapter,
+            )
+            .await;
+            returned.set(true);
+        };
+        let drive = async {
+            owner_tx
+                .send(noc_item("net.connman.iwd", ":1.7", ""))
+                .expect("the pump reads the owner");
+            settle().await;
+            assert!(
+                adapter.get_cloned().is_none(),
+                "iwd left and the panel kept its adapter"
+            );
+            assert!(
+                !returned.get(),
+                "a lost iwd is waited for, not rediscovered"
+            );
+            owner_tx
+                .send(noc_item("net.connman.iwd", "", ":1.8"))
+                .expect("the pump reads the owner");
+        };
+        tokio::time::timeout(
+            Duration::from_mins(1),
+            futures_util::future::join(pump, drive),
+        )
+        .await
+        .expect("a new iwd ends the pass");
+        assert!(returned.get());
     }
 
     /// The adapter's own object removed: the wiphy is gone, and the station

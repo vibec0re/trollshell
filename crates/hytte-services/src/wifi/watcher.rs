@@ -624,12 +624,12 @@ async fn reread_adapter(adapter_path: Option<&str>, adapter_mutable: &Mutable<Op
 /// snapshot. A broadcast receiver sees only what is sent after it exists, so
 /// everything older than the pass is gone without being read, and the
 /// snapshot supersedes it. The old receivers are dropped unread. Between
-/// discoveries nothing reads them (the pump's pause after the adapter's
-/// removal, a retry's [`DISCOVERY_RETRY`]), and iwd's per-network and per-BSS
-/// `InterfacesAdded`/`InterfacesRemoved` around a radio toggle can overrun one
-/// there; a receiver that is never polled again never reports that as a lag
-/// (#1573 review). Draining them instead polled the overrun and logged a
-/// `warn!` for it.
+/// discoveries nothing reads them (the pump's [`REMOVAL_PAUSE`] after the
+/// adapter's removal and after the station's, a retry's [`DISCOVERY_RETRY`]),
+/// and iwd's per-network and per-BSS `InterfacesAdded`/`InterfacesRemoved`
+/// around a radio toggle can overrun one there; a receiver that is never
+/// polled again never reports that as a lag (#1573 review). Draining them
+/// instead polled the overrun and logged a `warn!` for it.
 ///
 /// Only the watcher's first discovery calls iwd unasked: the backend probe
 /// chose iwd, maybe as an activatable name only, and that first call is what

@@ -6,7 +6,7 @@ use hytte_bus::BusKind;
 use std::collections::HashMap;
 use zbus::zvariant::OwnedValue;
 
-use super::parse::{ManagedObjects, parse_state, prop_bool, prop_str};
+use super::parse::{ManagedObjects, parse_state, prop_bool, prop_str, with_kept_ssid};
 use super::types::{Station, WifiNetwork};
 
 // ── ObjectManager ─────────────────────────────────────────────────────────────
@@ -176,22 +176,19 @@ pub(super) async fn refresh_station(
         .map(|p| p.as_str().to_string())
         .filter(|p| !p.is_empty() && p != "/");
 
-    let new_state = parse_state(&state_str);
-
+    let parsed = Station {
+        path: station_path.to_string(),
+        state: parse_state(&state_str),
+        scanning,
+        connected_network,
+        connected_ssid: None, // kept by `with_kept_ssid` below; the network read sets it
+    };
+    // Discovery's rule (#1654): the SSID survives only a read that finds the
+    // station on the same network. This used to keep it whatever the
+    // network, so a re-read that found another one named the old network.
     let mut guard = station_mutable.lock_mut();
-    if let Some(st) = guard.as_mut() {
-        st.state = new_state;
-        st.scanning = scanning;
-        st.connected_network = connected_network;
-    } else {
-        *guard = Some(Station {
-            path: station_path.to_string(),
-            state: new_state,
-            scanning,
-            connected_network,
-            connected_ssid: None,
-        });
-    }
+    let next = with_kept_ssid(guard.as_ref(), parsed);
+    *guard = Some(next);
 }
 
 /// Re-read the network list and update the mutable.
@@ -288,8 +285,10 @@ pub(super) fn is_already_registered(e: &hytte_bus::BusError) -> bool {
 
 // ── Discovery ─────────────────────────────────────────────────────────────────
 
-/// Read iwd's object tree and find its `Station`. `None` when iwd did not
-/// answer or has no station yet.
+/// Read iwd's object tree and find its `Station`. `Ok(None)` when iwd
+/// answered and has no station, an error when iwd did not answer. The
+/// watcher clears what it published on the first and keeps it on the second
+/// (#1654).
 ///
 /// This **calls `net.connman.iwd`**, and iwd is D-Bus-activatable
 /// (`SystemdService=iwd.service` in its activation file), so on a bus where
@@ -298,15 +297,11 @@ pub(super) fn is_already_registered(e: &hytte_bus::BusError) -> bool {
 /// paces a retry itself. This used to sleep 5 s and return, and the watcher
 /// called it again, so an iwd that was stopped cleanly (its station removed,
 /// its name released) was restarted by the next attempt.
-pub(super) async fn discover_station() -> Option<(ManagedObjects, zbus::zvariant::OwnedObjectPath)>
-{
-    let managed = match get_managed_objects().await {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::debug!(error = %e, "iwd GetManagedObjects failed (iwd not running?)");
-            return None;
-        }
-    };
+pub(super) async fn discover_station()
+-> Result<Option<(ManagedObjects, zbus::zvariant::OwnedObjectPath)>, hytte_bus::BusError> {
+    let managed = get_managed_objects().await.inspect_err(|e| {
+        tracing::debug!(error = %e, "iwd GetManagedObjects failed (iwd not running?)");
+    })?;
 
     let Some(station_path) = managed.iter().find_map(|(path, ifaces)| {
         ifaces
@@ -314,10 +309,10 @@ pub(super) async fn discover_station() -> Option<(ManagedObjects, zbus::zvariant
             .then(|| path.clone())
     }) else {
         tracing::debug!("iwd has no Station object yet");
-        return None;
+        return Ok(None);
     };
 
-    Some((managed, station_path))
+    Ok(Some((managed, station_path)))
 }
 
 /// Ask the bus whether anyone owns iwd's name. The bus answers this itself,

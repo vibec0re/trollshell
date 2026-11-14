@@ -193,11 +193,17 @@ const IWD_RECHECK: Duration = Duration::from_secs(10);
 /// than opening a subscription: that one's match rule is long in place, and
 /// the owner change that wakes this is consumed here instead of reaching the
 /// next pump as a change that predates its snapshot.
-async fn wait_for_iwd<S>(owner: &mut S)
+///
+/// `gone` clears what the watcher published, and runs once the bus says iwd
+/// has no owner, before the wait (#1654). The pump clears it when it sees
+/// iwd leave, but an iwd that leaves after a pump returned on a hole, or
+/// inside the hole, is seen by no pump: until #1654 the panel kept the old
+/// station while iwd was down.
+async fn wait_for_iwd<S>(owner: &mut S, gone: impl FnOnce())
 where
     S: Stream<Item = SignalItem> + Unpin,
 {
-    wait_for_owner(owner, iwd_has_owner, IWD_RECHECK).await;
+    wait_for_owner(owner, iwd_has_owner, IWD_RECHECK, gone).await;
 }
 
 /// [`wait_for_iwd`] with the bus question and the re-check interval injected,
@@ -207,21 +213,30 @@ where
 /// the next sign that iwd may be back ([`next_iwd_owner`]) or `recheck`,
 /// whichever comes first, and asks again. A failed question is asked again
 /// the same way.
-async fn wait_for_owner<S, H, F>(owner: &mut S, has_owner: H, recheck: Duration)
-where
+///
+/// `gone` runs on the first `Ok(false)`, before the wait, and never on a
+/// failed question: that one says nothing about iwd. An iwd that has an owner
+/// at the first question, the healthy rediscovery, never runs it.
+async fn wait_for_owner<S, H, F>(
+    owner: &mut S,
+    has_owner: H,
+    recheck: Duration,
+    gone: impl FnOnce(),
+) where
     S: Stream<Item = SignalItem> + Unpin,
     H: Fn() -> F,
     F: Future<Output = Result<bool, hytte_bus::BusError>>,
 {
-    let mut announced = false;
+    let mut gone = Some(gone);
     loop {
         match has_owner().await {
             Ok(true) => return,
-            Ok(false) if !announced => {
-                announced = true;
-                tracing::info!("wifi: iwd is not running; waiting for it to return");
+            Ok(false) => {
+                if let Some(gone) = gone.take() {
+                    tracing::info!("wifi: iwd is not running; waiting for it to return");
+                    gone();
+                }
             }
-            Ok(false) => {}
             Err(e) => {
                 tracing::debug!(error = %e, "wifi: NameHasOwner(net.connman.iwd) failed; asking again");
             }
@@ -337,6 +352,38 @@ fn log_registration(
 
 // ── Main watcher task ─────────────────────────────────────────────────────────
 
+/// Clear everything the watcher publishes about iwd: the station, its
+/// networks, a pending prompt and the adapter.
+///
+/// The pump does this when it sees iwd leave, a new iwd take its name or the
+/// station removed. Since #1654 a discovery pass does it too, when it finds
+/// iwd's name without an owner ([`wait_for_owner`]) or iwd without a station:
+/// either can happen while no pump is running, after one returned on a hole,
+/// and nothing else would clear what the last pass published.
+///
+/// A value that is already clear is left alone, so a pass that keeps
+/// finding no station (the radio is off, and discovery retries every
+/// [`DISCOVERY_RETRY`]) does not wake the panel each time.
+fn clear_published(
+    station: &Mutable<Option<Station>>,
+    networks: &Mutable<Vec<WifiNetwork>>,
+    prompts: &Mutable<Option<PromptRequest>>,
+    adapter: &Mutable<Option<Adapter>>,
+) {
+    if station.lock_ref().is_some() {
+        station.set(None);
+    }
+    if !networks.lock_ref().is_empty() {
+        networks.set(Vec::new());
+    }
+    if prompts.lock_ref().is_some() {
+        prompts.set(None);
+    }
+    if adapter.lock_ref().is_some() {
+        adapter.set(None);
+    }
+}
+
 /// What [`open_discovery`] hands the rest of a discovery pass.
 struct Opened<O, E, T> {
     /// The pass's owner receiver, after the wait (if any) read it.
@@ -345,8 +392,8 @@ struct Opened<O, E, T> {
     added: E,
     /// The pass's `InterfacesRemoved` receiver.
     removed: E,
-    /// The snapshot, or `None` when iwd did not answer or had no station.
-    snapshot: Option<T>,
+    /// The snapshot: [`discover_station`]'s answer in production.
+    snapshot: T,
 }
 
 /// Open one discovery pass, in the order #1551 needs, with every step
@@ -386,7 +433,7 @@ where
     W: FnOnce(O) -> WF,
     WF: Future<Output = O>,
     D: FnOnce() -> DF,
-    DF: Future<Output = Option<T>>,
+    DF: Future<Output = T>,
 {
     let mut owner = take_owner();
     if !std::mem::take(first) {
@@ -495,6 +542,14 @@ async fn reread_station(
 /// chose iwd, maybe as an activatable name only, and that first call is what
 /// starts it, as before. Every later discovery waits for iwd to have an owner
 /// first ([`wait_for_iwd`]).
+///
+/// A pass that finds iwd's name without an owner, or iwd without a station,
+/// clears what an earlier pass published before it waits or retries
+/// ([`clear_published`], #1654). Until then an iwd or a station that went
+/// away while no pump was reading, or inside the hole that ended one, stayed
+/// on the panel until iwd came back. A pass that could not read iwd keeps the
+/// state, as a hole does, and so does the healthy rediscovery: its snapshot
+/// refreshes the state in place.
 pub(super) async fn run_wifi_watcher(
     station_mutable: Mutable<Option<Station>>,
     networks_mutable: Mutable<Vec<WifiNetwork>>,
@@ -507,6 +562,14 @@ pub(super) async fn run_wifi_watcher(
     let removed_sub = object_manager_signal("InterfacesRemoved");
 
     let mut first_discovery = true;
+    let clear = || {
+        clear_published(
+            &station_mutable,
+            &networks_mutable,
+            &prompts_mutable,
+            &adapter_mutable,
+        );
+    };
 
     'discovery: loop {
         let Opened {
@@ -518,7 +581,7 @@ pub(super) async fn run_wifi_watcher(
             &mut first_discovery,
             || owner_sub.items(),
             |mut owner| async move {
-                wait_for_iwd(&mut owner).await;
+                wait_for_iwd(&mut owner, clear).await;
                 owner
             },
             || (added_sub.items(), removed_sub.items()),
@@ -526,9 +589,22 @@ pub(super) async fn run_wifi_watcher(
             discover_station,
         )
         .await;
-        let Some((managed, station_path)) = snapshot else {
-            tokio::time::sleep(DISCOVERY_RETRY).await;
-            continue 'discovery;
+        let (managed, station_path) = match snapshot {
+            Ok(Some(found)) => found,
+            // iwd says it has no station: whatever an earlier pass published
+            // is gone, whether the pump saw it go or not (#1654).
+            Ok(None) => {
+                clear();
+                tokio::time::sleep(DISCOVERY_RETRY).await;
+                continue 'discovery;
+            }
+            // iwd did not answer. That says nothing about its station, so
+            // the state is kept, as for a hole, for the next pass to refresh
+            // in place. An iwd that is gone is cleared by that pass's wait.
+            Err(_) => {
+                tokio::time::sleep(DISCOVERY_RETRY).await;
+                continue 'discovery;
+            }
         };
         let station_path_str = station_path.as_str().to_string();
 
@@ -662,10 +738,12 @@ async fn pump_iwd_events<O, E, H, R, RF, S, SF>(
     let mut station_read = false;
 
     let clear = || {
-        station_mutable.set(None);
-        networks_mutable.set(Vec::new());
-        prompts_mutable.set(None);
-        adapter_mutable.set(None);
+        clear_published(
+            station_mutable,
+            networks_mutable,
+            prompts_mutable,
+            adapter_mutable,
+        );
     };
     // Set once iwd has exited. From then on the other arms are not polled.
     // Anything still queued came from the dead daemon, and acting on it would
@@ -741,6 +819,14 @@ async fn pump_iwd_events<O, E, H, R, RF, S, SF>(
     }
 }
 
+/// The `(interface, changed, invalidated)` body of a `PropertiesChanged`
+/// signal, or `None` if it does not decode as one.
+fn decode_properties_changed(
+    msg: &zbus::Message,
+) -> Option<(String, HashMap<String, OwnedValue>, Vec<String>)> {
+    msg.body().deserialize().ok()
+}
+
 /// Decode `PropertiesChanged` body. Applies the delta directly for known
 /// interfaces (Station/Adapter) to avoid a full `GetAll` round-trip, and
 /// signals whether the caller should refresh the network list.
@@ -750,18 +836,17 @@ async fn handle_station_props_event(
     station_mutable: &Mutable<Option<Station>>,
     adapter_mutable: &Mutable<Option<Adapter>>,
 ) -> bool {
-    let Ok((iface, changed, _)) = evt
-        .body
-        .body()
-        .deserialize::<(String, HashMap<String, OwnedValue>, Vec<String>)>()
-    else {
+    let Some((iface, changed, invalidated)) = decode_properties_changed(&evt.body) else {
         // Can't decode — full refresh to be safe.
         refresh_station(station_path_str, station_mutable).await;
         return true;
     };
 
     if iface == "net.connman.iwd.Station" {
-        apply_station_props_delta(&changed, station_mutable);
+        // The invalidated list too: a disconnect's `ConnectedNetwork` is in
+        // it (#1654). The network list is read after any station delta, so
+        // its "Connected" row follows the station either way.
+        apply_station_props_delta(&changed, &invalidated, station_mutable);
         true
     } else if iface == IWD_ADAPTER_IFACE {
         apply_adapter_props_delta(&changed, adapter_mutable);
@@ -775,7 +860,8 @@ async fn handle_station_props_event(
 mod tests {
     use super::{
         Adapter, IWD_RECHECK, IwdCalls, IwdOwner, IwdStreams, Mutable, OwnerReaction, Station,
-        iwd_owner_change, next_iwd_owner, open_discovery, owner_reaction, pump_iwd_events,
+        StationState, decode_properties_changed, handle_station_props_event, iwd_owner_change,
+        next_iwd_owner, open_discovery, owner_reaction, pump_iwd_events,
         register_agent_until_accepted, wait_for_owner,
     };
     use crate::handshake::Handshake;
@@ -783,7 +869,7 @@ mod tests {
     use futures_util::StreamExt;
     use hytte_bus::{BusError, SignalEvent, SignalItem};
     use std::cell::{Cell, RefCell};
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::time::Duration;
 
     /// A ramp of the retry policy's shape with its own numbers, so tuning the
@@ -886,6 +972,7 @@ mod tests {
                 async move { answer }
             },
             IWD_RECHECK,
+            || {},
         )
         .await;
 
@@ -895,6 +982,67 @@ mod tests {
             IWD_RECHECK * 2,
             "with no wake, each re-ask waits out the re-check interval"
         );
+    }
+
+    /// The wait clears what the watcher published once the bus says iwd has
+    /// no owner, before it waits, and only then (#1654). An iwd that left
+    /// while no pump was reading used to stay on the panel until it came
+    /// back. An owner at the first question is the healthy rediscovery, and
+    /// a failed question says nothing about iwd: neither clears.
+    ///
+    /// **Falsification:** never run `gone` and the "no" rows fail; run it on
+    /// a failed question, or before the first question, and the rows with
+    /// no "no" fail; run it after the wait and the time assertion does; run
+    /// it on every "no" and the row with two does.
+    #[tokio::test(start_paused = true)]
+    async fn waiting_for_iwd_clears_once_iwd_has_no_owner() {
+        let failed = || Err(refused("org.freedesktop.DBus.Error.Timeout"));
+        // The answers, and the question whose "no" clears, if any.
+        let rows = [
+            ("an owner at once", vec![Ok(true)], None),
+            (
+                "a failed question, then an owner",
+                vec![failed(), Ok(true)],
+                None,
+            ),
+            ("no owner, then one", vec![Ok(false), Ok(true)], Some(1)),
+            (
+                "no owner twice, then one",
+                vec![Ok(false), Ok(false), Ok(true)],
+                Some(1),
+            ),
+            (
+                "a failure, then no owner",
+                vec![failed(), Ok(false), Ok(true)],
+                Some(2),
+            ),
+        ];
+        for (case, answers, clears_after) in rows {
+            let answers = RefCell::new(VecDeque::from(answers));
+            let asked = Cell::new(0_u32);
+            let cleared = RefCell::new(Vec::new());
+            let started = tokio::time::Instant::now();
+            let mut owner = futures_util::stream::pending::<SignalItem>();
+
+            wait_for_owner(
+                &mut owner,
+                || {
+                    asked.set(asked.get() + 1);
+                    let answer = answers.borrow_mut().pop_front().expect("scripted");
+                    async move { answer }
+                },
+                IWD_RECHECK,
+                || cleared.borrow_mut().push((asked.get(), started.elapsed())),
+            )
+            .await;
+
+            // Right after that question, before the re-check wait after it.
+            let expected: Vec<(u32, Duration)> = clears_after
+                .map(|question| (question, IWD_RECHECK * (question - 1)))
+                .into_iter()
+                .collect();
+            assert_eq!(cleared.into_inner(), expected, "{case}");
+        }
     }
 
     /// Waiting for iwd wakes on iwd's new owner, and only on that. Someone
@@ -1296,6 +1444,89 @@ mod tests {
         })
     }
 
+    /// iwd's station `PropertiesChanged`, `(s, a{sv}, as)`, as its signal
+    /// carries it.
+    fn station_properties_changed(
+        changed: &[(&str, zbus::zvariant::Value<'static>)],
+        invalidated: &[&str],
+    ) -> SignalEvent {
+        let changed: HashMap<&str, &zbus::zvariant::Value<'_>> =
+            changed.iter().map(|(k, x)| (*k, x)).collect();
+        let body = zbus::Message::signal(
+            STATION,
+            "org.freedesktop.DBus.Properties",
+            "PropertiesChanged",
+        )
+        .expect("signal builder")
+        .build(&("net.connman.iwd.Station", changed, invalidated))
+        .expect("build PropertiesChanged");
+        // The handler falls back to a live `GetAll` on a body it cannot
+        // decode, which would reach the host's system bus: refuse that here,
+        // through the handler's own decode.
+        assert!(
+            decode_properties_changed(&body).is_some(),
+            "the handler must decode this body without a bus"
+        );
+        SignalEvent {
+            body,
+            sender: None,
+            timestamp: std::time::SystemTime::now(),
+        }
+    }
+
+    const STATION: &str = "/net/connman/iwd/0/4";
+    /// iwd's paths for "home" and "work" on `STATION`, both `psk`.
+    const HOME: &str = "/net/connman/iwd/0/4/686f6d65_psk";
+    const WORK: &str = "/net/connman/iwd/0/4/776f726b_psk";
+
+    /// The pump's station handler hands the invalidated list on, and keeps
+    /// the SSID only on the same network (#1654). This is the call the pump
+    /// makes for every station `PropertiesChanged`; the rules themselves are
+    /// pinned in `parse`'s tests. A disconnect, as iwd sends it, takes the
+    /// network and its SSID; a move to another network takes the SSID until
+    /// the network read the handler asks for names the new one.
+    ///
+    /// **Falsification:** pass the handler's invalidated list on as empty
+    /// and the disconnect row keeps `HOME`; keep the SSID across a network
+    /// change and the second row names "home"; answer `false` for a station
+    /// delta and neither row reads the networks again.
+    #[tokio::test]
+    async fn the_station_handler_applies_a_disconnect_and_a_network_change() {
+        let disconnect = station_properties_changed(
+            &[("State", "disconnected".into())],
+            &["ConnectedNetwork", "ConnectedAccessPoint"],
+        );
+        let work = zbus::zvariant::ObjectPath::try_from(WORK).expect("an object path");
+        let another_network = station_properties_changed(&[("ConnectedNetwork", work.into())], &[]);
+        let rows = [
+            ("a disconnect", disconnect, StationState::Disconnected, None),
+            (
+                "another network",
+                another_network,
+                StationState::Connected,
+                Some(WORK),
+            ),
+        ];
+        for (case, evt, state, network) in rows {
+            let published = Mutable::new(Some(Station {
+                path: STATION.to_owned(),
+                state: StationState::Connected,
+                scanning: false,
+                connected_network: Some(HOME.to_owned()),
+                connected_ssid: Some("home".to_owned()),
+            }));
+            let adapter = Mutable::new(Some(Adapter::default()));
+
+            let refresh = handle_station_props_event(&evt, STATION, &published, &adapter).await;
+
+            assert!(refresh, "{case}: the network list is read again");
+            let st = published.get_cloned().expect("a station");
+            assert_eq!(st.state, state, "{case}");
+            assert_eq!(st.connected_network.as_deref(), network, "{case}");
+            assert_eq!(st.connected_ssid, None, "{case}");
+        }
+    }
+
     /// iwd's own name changing hands is read correctly, in both directions,
     /// and a replacement without a visible "lost" half counts as a new owner.
     #[test]
@@ -1379,6 +1610,82 @@ mod tests {
                 rediscover: false
             },
             "a lost iwd clears the panel and is not called"
+        );
+    }
+
+    /// `clear_published` empties all four slots, and wakes none that is
+    /// already clear (#1654 review). The pump, the wait for iwd and a pass that
+    /// finds no station all go through it, but the real-bus W6 tests read only
+    /// the station and the adapter, so dropping the network list from it left
+    /// every test green while the panel kept the old network's "Connected"
+    /// row with iwd gone. The skip is what keeps the 5 s no-station retry (the
+    /// radio off) from waking the panel on every pass.
+    ///
+    /// **Falsification:** drop any one slot from `clear_published` and the
+    /// first half fails; set the four unconditionally (the pump's pre-#1654
+    /// closure) and the second half sees a wake.
+    #[test]
+    fn clear_published_clears_every_slot_and_wakes_none_already_clear() {
+        use futures_signals::signal::SignalExt;
+        use futures_util::FutureExt;
+
+        let network = super::WifiNetwork {
+            path: "/net/connman/iwd/0/4/686f6d65_psk".to_owned(),
+            ssid: "home".to_owned(),
+            security: "psk".to_owned(),
+            known: true,
+            connected: true,
+            signal_dbm: -50,
+            known_network_path: None,
+            ap_count: 1,
+            active_signal_dbm: Some(-50),
+        };
+        let prompt = super::PromptRequest {
+            id: 1,
+            network_path: network.path.clone(),
+            ssid: "home".to_owned(),
+            security: "psk".to_owned(),
+            kind: crate::wifi::PromptKind::WifiPassphrase,
+            secret_keys: vec!["passphrase".to_owned()],
+            prior_failure: false,
+        };
+        let station = Mutable::new(Some(Station::default()));
+        let networks = Mutable::new(vec![network]);
+        let prompts = Mutable::new(Some(prompt));
+        let adapter = Mutable::new(Some(Adapter::default()));
+
+        super::clear_published(&station, &networks, &prompts, &adapter);
+        assert!(station.lock_ref().is_none(), "the station is kept");
+        assert!(networks.lock_ref().is_empty(), "the network list is kept");
+        assert!(prompts.lock_ref().is_none(), "the prompt is kept");
+        assert!(adapter.lock_ref().is_none(), "the adapter is kept");
+
+        let mut station_wakes = station.signal_cloned().to_stream();
+        let mut network_wakes = networks.signal_cloned().to_stream();
+        let mut prompt_wakes = prompts.signal_cloned().to_stream();
+        let mut adapter_wakes = adapter.signal_cloned().to_stream();
+        // A signal yields its current value first.
+        assert!(station_wakes.next().now_or_never().is_some());
+        assert!(network_wakes.next().now_or_never().is_some());
+        assert!(prompt_wakes.next().now_or_never().is_some());
+        assert!(adapter_wakes.next().now_or_never().is_some());
+
+        super::clear_published(&station, &networks, &prompts, &adapter);
+        assert!(
+            station_wakes.next().now_or_never().is_none(),
+            "the station woke"
+        );
+        assert!(
+            network_wakes.next().now_or_never().is_none(),
+            "the network list woke"
+        );
+        assert!(
+            prompt_wakes.next().now_or_never().is_none(),
+            "the prompt woke"
+        );
+        assert!(
+            adapter_wakes.next().now_or_never().is_none(),
+            "the adapter woke"
         );
     }
 }

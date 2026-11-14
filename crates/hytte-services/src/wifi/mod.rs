@@ -114,6 +114,12 @@ pub use types::{Adapter, PromptKind, PromptRequest, Station, StationState, WifiN
 /// An `RwLock` rather than a plain `String` because the watcher rewrites it
 /// whenever the station changes *within* one backend's lifetime (a USB dongle
 /// swap), which is a different event from a backend switch.
+///
+/// Each path names what the watcher publishes, and is empty while it
+/// publishes nothing there: the watcher's clears clear the paths too, before
+/// the panel's values (#1659). Until #1659 they kept the last paths forever,
+/// so after a station's removal or iwd's exit `scan` and `disconnect`
+/// addressed a station that was gone and `set_powered` an adapter that was.
 #[derive(Clone, Default)]
 pub(crate) struct IwdPaths {
     station: Arc<RwLock<String>>,
@@ -121,24 +127,24 @@ pub(crate) struct IwdPaths {
 }
 
 impl IwdPaths {
-    /// The current `net.connman.iwd.Station` object path, or empty before
-    /// discovery.
+    /// The published `net.connman.iwd.Station` object path, or empty.
     pub(super) async fn station_path(&self) -> String {
         self.station.read().await.clone()
     }
 
-    /// The current `net.connman.iwd.Adapter` object path, or empty before
-    /// discovery.
+    /// The published `net.connman.iwd.Adapter` object path, or empty.
     pub(super) async fn adapter_path(&self) -> String {
         self.adapter.read().await.clone()
     }
 
-    pub(super) async fn set_station_path(&self, path: &str) {
-        *self.station.write().await = path.to_string();
+    /// Name the station the watcher publishes; `None` when it publishes none.
+    pub(super) async fn set_station_path(&self, path: Option<&str>) {
+        *self.station.write().await = path.unwrap_or_default().to_owned();
     }
 
-    pub(super) async fn set_adapter_path(&self, path: &str) {
-        *self.adapter.write().await = path.to_string();
+    /// Name the adapter the watcher publishes; `None` when it publishes none.
+    pub(super) async fn set_adapter_path(&self, path: Option<&str>) {
+        *self.adapter.write().await = path.unwrap_or_default().to_owned();
     }
 }
 
@@ -1164,7 +1170,7 @@ pub fn scan() {
             runtime::handle().spawn(async move {
                 let path = paths.station_path().await;
                 if path.is_empty() {
-                    tracing::warn!("wifi::scan: no station path known");
+                    tracing::debug!("wifi::scan: no station published");
                     return;
                 }
                 if let Err(e) = do_station_call(&path, "Scan").await {
@@ -1265,7 +1271,7 @@ pub fn disconnect() {
             runtime::handle().spawn(async move {
                 let path = paths.station_path().await;
                 if path.is_empty() {
-                    tracing::warn!("wifi::disconnect: no station path known");
+                    tracing::debug!("wifi::disconnect: no station published");
                     return;
                 }
                 if let Err(e) = do_station_call(&path, "Disconnect").await {
@@ -1313,7 +1319,7 @@ pub fn set_powered(on: bool) {
             runtime::handle().spawn(async move {
                 let path = paths.adapter_path().await;
                 if path.is_empty() {
-                    tracing::warn!("wifi::set_powered: no adapter path known");
+                    tracing::debug!("wifi::set_powered: no adapter published");
                     return;
                 }
                 if let Err(e) = do_set_powered(&path, on).await {

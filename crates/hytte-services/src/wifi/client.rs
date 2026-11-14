@@ -331,16 +331,20 @@ pub(super) fn is_no_owner(e: &hytte_bus::BusError) -> bool {
 /// called it again, so an iwd that was stopped cleanly (its station removed,
 /// its name released) was restarted by the next attempt.
 ///
-/// `kept` is the path of the adapter the watcher publishes now: a snapshot
-/// with no station keeps publishing that one while iwd still has it
-/// ([`super::parse::adapter_in`]).
+/// `station` and `adapter` are what the watcher publishes, read before the
+/// call: a snapshot keeps publishing that station while iwd still has it
+/// ([`super::parse::station_in`], #1659), and a snapshot with no station that
+/// adapter ([`super::parse::adapter_in`]).
 pub(super) async fn discover_station(
-    kept: Option<String>,
+    station: &Mutable<Option<Station>>,
+    adapter: &Mutable<Option<Adapter>>,
 ) -> Result<Discovered, hytte_bus::BusError> {
+    let kept_station = station.lock_ref().as_ref().map(|st| st.path.clone());
+    let kept_adapter = adapter.lock_ref().as_ref().map(|a| a.path.clone());
     let managed = get_managed_objects().await.inspect_err(|e| {
         tracing::debug!(error = %e, "iwd GetManagedObjects failed (iwd not running?)");
     })?;
-    let found = discovered(managed, kept.as_deref());
+    let found = discovered(managed, kept_station.as_deref(), kept_adapter.as_deref());
     if found.station.is_none() {
         tracing::debug!(
             adapter = ?found.adapter,

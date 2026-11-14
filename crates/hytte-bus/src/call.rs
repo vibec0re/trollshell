@@ -111,50 +111,47 @@ where
     where
         R: DeserializeOwned + Type,
     {
+        // One budget for the whole attempt: getting the pooled connection,
+        // building the proxy and the call itself. Until #1658 the deadline
+        // wrapped only the call, so a caller queued behind the pool's lock
+        // waited for it with no bound (`with_conn_within` has why that wait
+        // can be indefinite).
         let answered = self
             .shared
-            .with_conn(|conn| {
+            .with_conn_within(self.timeout, |conn| {
                 let dest = self.destination.clone();
                 let path = self.path.clone();
                 let iface = self.iface.clone();
                 let method = self.method.clone();
                 let args = self.args.clone();
-                let timeout = self.timeout;
                 let auto_start = self.auto_start;
                 async move {
                     let proxy =
                         zbus::Proxy::new(&conn, dest.as_str(), path.as_str(), iface.as_str())
                             .await?;
-                    let fut = async {
-                        if auto_start {
-                            proxy.call::<_, _, R>(method.as_str(), &args).await
-                        } else {
-                            // `call_with_flags` answers `None` only for a
-                            // call sent with `NoReplyExpected`, which this
-                            // one is not.
-                            proxy
-                                .call_with_flags::<_, _, R>(
-                                    method.as_str(),
-                                    zbus::proxy::MethodFlags::NoAutoStart.into(),
-                                    &args,
-                                )
-                                .await?
-                                .ok_or(zbus::Error::InvalidReply)
-                        }
-                    };
-                    // The deadline is not a zbus error, so it does not travel
-                    // as one: it passes `with_conn` as `Ok(Err(elapsed))` and
-                    // becomes `BusError::Timeout` below. Until #1551 it was a
-                    // `zbus::Error::Failure("call timeout")`, which callers
-                    // could only recognise by that string. It never counted as
-                    // a lost connection either way.
-                    match tokio::time::timeout(timeout, fut).await {
-                        Ok(reply) => reply.map(Ok),
-                        Err(elapsed) => Ok(Err(elapsed)),
+                    if auto_start {
+                        proxy.call::<_, _, R>(method.as_str(), &args).await
+                    } else {
+                        // `call_with_flags` answers `None` only for a call
+                        // sent with `NoReplyExpected`, which this one is not.
+                        proxy
+                            .call_with_flags::<_, _, R>(
+                                method.as_str(),
+                                zbus::proxy::MethodFlags::NoAutoStart.into(),
+                                &args,
+                            )
+                            .await?
+                            .ok_or(zbus::Error::InvalidReply)
                     }
                 }
             })
             .await?;
+        // The deadline is not a zbus error, so it does not travel as one: it
+        // leaves `with_conn_within` as `Ok(Err(elapsed))` and becomes
+        // `BusError::Timeout` here. Until #1551 it was a
+        // `zbus::Error::Failure("call timeout")`, which callers could only
+        // recognise by that string. It never counted as a lost connection
+        // either way.
         answered.map_err(|_elapsed| BusError::call_timeout())
     }
 
@@ -239,6 +236,11 @@ impl<A> CallBuilder<A> {
     /// Override the call timeout (default: 25 s). A call that gets no reply
     /// within it returns [`BusError::Timeout`], which no [`RetryPolicy`]
     /// retries.
+    ///
+    /// It is one budget for the whole attempt: the time spent getting the
+    /// pooled connection counts against it as well as the wait for the reply
+    /// (#1658). A retry after a lost connection is a new attempt with a budget
+    /// of its own.
     #[must_use]
     pub fn timeout(mut self, d: Duration) -> Self {
         self.timeout = d;
@@ -463,9 +465,90 @@ async fn wait_for_reconnect(shared: &SharedConnection, issued_at: u64, timeout: 
 
 #[cfg(test)]
 mod tests {
-    use super::{BusError, retry_with_backoff};
+    use super::{BusError, RetryPolicy, call_with, retry_with_backoff};
+    use crate::BusKind;
+    use crate::test_support::SharedConnection;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
+    use tokio::time::Instant;
+
+    /// Far past every deadline below, so a call that waits with no bound fails
+    /// the test by name instead of hanging it. Paused time reaches it at once.
+    const NEVER: Duration = Duration::from_hours(1);
+
+    /// A ping to a peer nobody is serving: on an
+    /// [`unconnected_for_test`](SharedConnection::unconnected_for_test) pool
+    /// it never gets as far as being sent, so only what happens before the
+    /// connection is under test.
+    async fn ping(shared: &SharedConnection, retry: RetryPolicy) -> Result<(), BusError> {
+        let call = call_with(shared, "org.example.Peer")
+            .at_path("/org/example/Peer")
+            .iface("org.example.Peer")
+            .method("Ping")
+            .timeout(Duration::from_millis(100))
+            .retry(retry)
+            .send::<()>();
+        tokio::time::timeout(NEVER, call)
+            .await
+            .expect("a call must answer within its own deadline, not wait with no bound")
+    }
+
+    /// A call queued behind the pool's lock gives up when its own deadline
+    /// runs out, with the same `BusError::Timeout` a peer that never answers
+    /// gets, and the default `RetryPolicy::Once` does not retry it (#1658).
+    /// The lock is held for the whole test, as a waiter that was handed it and
+    /// is never polled again would hold it.
+    ///
+    /// **Falsification:** put `do_call`'s deadline back around the method
+    /// call alone, with the connection fetched outside it, and the call waits
+    /// for the lock until [`NEVER`].
+    #[tokio::test(start_paused = true)]
+    async fn a_call_waiting_for_the_pool_lock_times_out_at_its_own_deadline() {
+        let shared = SharedConnection::unconnected_for_test(BusKind::Session);
+        let _held = shared.hold_lock_for_test().await;
+
+        let started = Instant::now();
+        let err = ping(&shared, RetryPolicy::Once)
+            .await
+            .expect_err("a call that never got the connection cannot have answered");
+
+        assert!(
+            err.is_timeout() && !err.is_transient(),
+            "running out of time waiting for the connection is BusError::Timeout, got {err:?}"
+        );
+        assert_eq!(err.to_string(), "bus operation permanently failed: call timeout");
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_millis(100),
+            "the call must give up at its own deadline, with no retry after it"
+        );
+    }
+
+    /// The other side: a wait for the lock that ends inside the budget is not
+    /// a timeout. The call goes on to the connection and gets what it always
+    /// got there, here the `Transient` mid-reconnect sentinel (this pool has
+    /// no connection) at the moment the lock came free, so the retry policy
+    /// sees what it saw before #1658.
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_for_the_pool_lock_inside_the_budget_is_not_a_timeout() {
+        let shared = SharedConnection::unconnected_for_test(BusKind::Session);
+        let held = shared.hold_lock_for_test().await;
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            drop(held);
+        });
+
+        let started = Instant::now();
+        let err = ping(&shared, RetryPolicy::Never)
+            .await
+            .expect_err("a pool with no connection cannot answer");
+
+        assert!(
+            err.is_transient() && !err.is_timeout(),
+            "a call that got the lock in time reaches the mid-reconnect sentinel, got {err:?}"
+        );
+        assert_eq!(started.elapsed(), Duration::from_millis(60));
+    }
 
     /// The only failure class `Backoff` retries.
     fn transient() -> BusError {

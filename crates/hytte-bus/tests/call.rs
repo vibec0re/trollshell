@@ -323,6 +323,77 @@ async fn a_call_past_its_deadline_is_a_timeout() {
     );
 }
 
+/// A call's deadline is one budget for the whole attempt (#1658): the time it
+/// spends waiting for the pool's lock is time it no longer has to be answered.
+/// The lock is held for half the budget and then released, so the call gets
+/// the connection, reaches a peer that never answers, and must give up when
+/// the budget it started with runs out, not a full budget after it got the
+/// connection. `call.rs`'s unit tests cover a lock that is never released.
+///
+/// The bound is one-sided where it matters: a call cannot return before its
+/// sleep fires, so the per-stage answer is never under `HELD + BUDGET`, and the
+/// assertion leaves the right one a second of scheduling slack.
+///
+/// **Falsification:** give the call a fresh budget once it has the connection
+/// (a deadline per stage), or put the deadline back around the method call
+/// alone, and it answers at `HELD + BUDGET`.
+#[tokio::test(flavor = "multi_thread")]
+async fn time_spent_getting_the_connection_counts_against_the_deadline() {
+    const BUDGET: Duration = Duration::from_secs(3);
+    const HELD: Duration = Duration::from_millis(1500);
+
+    let (conn, guard) = ephemeral_bus().await;
+    let arrived = Arc::new(AtomicUsize::new(0));
+    let _peer = serve_stall(&guard.address, Some(arrived.clone())).await;
+
+    let shared = SharedConnection::for_test_session(conn);
+    shared.spawn_supervisor_for_test();
+    let epoch = shared.epoch();
+
+    let held = shared.hold_lock_for_test().await;
+    let started = Instant::now();
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(HELD).await;
+        drop(held);
+    });
+    let call = call_with(&shared, STALL)
+        .at_path(STALL_PATH)
+        .iface(STALL)
+        .method("Ping")
+        .timeout(BUDGET)
+        .send::<u32>();
+    let err = tokio::time::timeout(Duration::from_secs(20), call)
+        .await
+        .expect("the call must give up at its own deadline, not hang")
+        .expect_err("a peer that never answers cannot have answered");
+    let took = started.elapsed();
+    release.await.expect("the task holding the pool's lock panicked");
+
+    assert!(err.is_timeout(), "a call out of time is BusError::Timeout, got {err:?}");
+    assert!(
+        took >= BUDGET,
+        "the call gave up after {took:?}, before its {BUDGET:?} deadline"
+    );
+    assert!(
+        took + Duration::from_secs(1) < HELD + BUDGET,
+        "the call gave up after {took:?}: the {HELD:?} it waited for the connection did not \
+         count against its {BUDGET:?} deadline"
+    );
+    // What was left of the budget was the call's: it got the connection and
+    // was sent. The peer counts it when its handler runs, which a loaded
+    // runner can delay past the deadline.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while arrived.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline, "the call never reached the peer");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        shared.epoch(),
+        epoch,
+        "a deadline must not force a reconnect"
+    );
+}
+
 /// A call sent with `no_auto_start()` to a name nobody owns fails at the bus
 /// and starts nothing; the same call without it starts the service (#1551).
 /// That difference is the whole option: a watch that re-reads a daemon on its

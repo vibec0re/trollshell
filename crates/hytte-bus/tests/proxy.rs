@@ -173,3 +173,55 @@ async fn call_times_out_on_slow_peer() {
         "bus operation permanently failed: proxy call timeout"
     );
 }
+
+/// A `BusProxy::call` queued behind the cached proxy's write lock gives up at
+/// its own deadline, with the same `BusError::Timeout` a peer that never
+/// answers gets (#1658). The lock is held as the watcher holds it to rebuild
+/// or clear the cache, for the whole call, as a reader that was handed it and
+/// is never polled again would keep the next rebuild (and every reader behind
+/// that) waiting. Once it is released the same proxy answers as before.
+///
+/// **Falsification:** take the read lock outside the deadline again and the
+/// call waits for it until the test's own 5 s bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn call_waiting_for_the_cached_proxy_times_out_at_its_own_deadline() {
+    let (conn, _guard) = ephemeral_bus().await;
+    let shared = SharedConnection::for_test_session(conn);
+    shared.spawn_supervisor_for_test();
+
+    let proxy = proxy_with(&shared, "org.freedesktop.DBus")
+        .at_path("/org/freedesktop/DBus")
+        .iface("org.freedesktop.DBus")
+        .timeout(Duration::from_millis(150))
+        .build()
+        .await
+        .expect("build proxy");
+    let mut liveness = proxy.liveness().to_stream();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !matches!(liveness.next().await, Some(ProxyState::Live)) {}
+    })
+    .await
+    .expect("the proxy never went Live");
+
+    let held = proxy.hold_cache_for_test().await;
+    let waited: Result<Vec<String>, hytte_bus::BusError> =
+        tokio::time::timeout(Duration::from_secs(5), proxy.call("ListNames", &()))
+            .await
+            .expect("BusProxy::call must answer within its own timeout, not wait for the cache");
+    let err = waited.expect_err("a call that never got the cached proxy cannot have answered");
+    assert!(
+        err.is_timeout() && !err.is_transient(),
+        "running out of time waiting for the cached proxy is BusError::Timeout, got {err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "bus operation permanently failed: proxy call timeout"
+    );
+
+    drop(held);
+    let names: Vec<String> = proxy
+        .call("ListNames", &())
+        .await
+        .expect("with the cache free again the proxy answers");
+    assert!(names.iter().any(|n| n == "org.freedesktop.DBus"));
+}

@@ -39,6 +39,11 @@ pub enum BusError {
     /// [`ProxyBuilder`](crate::ProxyBuilder). It says nothing about what the
     /// peer did with the call, which may still be carried out.
     ///
+    /// It may also mean the call was never sent. Since #1658 the deadline
+    /// covers getting the connection (for a `BusProxy`, reading its cached
+    /// proxy) as well as the reply, and a call that ran out of time there
+    /// answers this same variant, with the same `reason`.
+    ///
     /// This is `hytte-bus`'s own timer only. The bus daemon's
     /// `org.freedesktop.DBus.Error.NoReply` is an answer from the bus, and
     /// arrives as [`Permanent`](Self::Permanent) with that `dbus_name`.

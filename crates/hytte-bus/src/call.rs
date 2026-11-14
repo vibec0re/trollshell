@@ -7,6 +7,7 @@ use crate::error::BusError;
 use futures_signals::signal::SignalExt;
 use futures_util::StreamExt;
 use serde::{Serialize, de::DeserializeOwned};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use zbus::zvariant::Type;
 
@@ -116,9 +117,16 @@ where
         // wrapped only the call, so a caller queued behind the pool's lock
         // waited for it with no bound (`with_conn_within` has why that wait
         // can be indefinite).
+        //
+        // Set once the pool hands over the connection, so the journal can say
+        // which stage a deadline ran out in: the `Timeout` reads the same
+        // either way, and "never got the connection" points at a wedged pool,
+        // not at a slow peer.
+        let got_connection = AtomicBool::new(false);
         let answered = self
             .shared
             .with_conn_within(self.timeout, |conn| {
+                got_connection.store(true, Ordering::Relaxed);
                 let dest = self.destination.clone();
                 let path = self.path.clone();
                 let iface = self.iface.clone();
@@ -152,7 +160,15 @@ where
         // `zbus::Error::Failure("call timeout")`, which callers could only
         // recognise by that string. It never counted as a lost connection
         // either way.
-        answered.map_err(|_elapsed| BusError::call_timeout())
+        answered.map_err(|_elapsed| {
+            tracing::debug!(
+                destination = %self.destination,
+                method = %self.method,
+                got_connection = got_connection.load(Ordering::Relaxed),
+                "call ran out of its deadline",
+            );
+            BusError::call_timeout()
+        })
     }
 
     async fn execute<R>(self) -> Result<R, BusError>
@@ -239,8 +255,16 @@ impl<A> CallBuilder<A> {
     ///
     /// It is one budget for the whole attempt: the time spent getting the
     /// pooled connection counts against it as well as the wait for the reply
-    /// (#1658). A retry after a lost connection is a new attempt with a budget
+    /// (#1658), so a [`BusError::Timeout`] may also mean the call was never
+    /// sent. A retry after a lost connection is a new attempt with a budget
     /// of its own.
+    ///
+    /// The cleanup after a lost connection is not under the deadline. A call
+    /// whose connection fails under it clears that connection and wakes the
+    /// supervisor before it answers, and waits for the pool's lock to do so
+    /// however long that takes: cancelling it would leave the dead connection
+    /// cached and turn a [`BusError::Transient`], which
+    /// [`RetryPolicy::Once`] retries, into a `Timeout`, which nothing retries.
     #[must_use]
     pub fn timeout(mut self, d: Duration) -> Self {
         self.timeout = d;

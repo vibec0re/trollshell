@@ -21,7 +21,9 @@
 //! every other primitive on that bus waiting, and a `BusProxy`'s cached-proxy
 //! lock is a fair tokio `RwLock`. Since #1658 a `call()` waiting for the first,
 //! or a `BusProxy::call` for the second, runs out its own deadline instead of
-//! hanging, but that bounds the victims, it does not free the lock.
+//! hanging, but that bounds the victims, it does not free the lock. The one
+//! wait left outside the deadline is the cleanup after a call's connection
+//! fails under it, on purpose: see [`CallBuilder::timeout`].
 
 #![doc(html_no_source)]
 

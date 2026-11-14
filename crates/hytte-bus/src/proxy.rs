@@ -130,7 +130,9 @@ impl BusProxy {
     /// (#1658), so a call queued behind the watcher's rebuild is bounded too.
     /// A transient (connection-level) failure additionally kicks the shared
     /// connection's reconnect path, so it is handled just like a `call()`
-    /// failure instead of being swallowed on the cached proxy.
+    /// failure instead of being swallowed on the cached proxy. That kick is
+    /// not under the timeout, as a `call()`'s is not
+    /// ([`CallBuilder::timeout`](crate::CallBuilder::timeout) has why).
     pub async fn call<A, R>(&self, method: &str, args: A) -> Result<R, BusError>
     where
         A: Serialize + Type,

@@ -1,7 +1,7 @@
 //! Live column bottom: Wi-Fi adapter, scan controls, and network list.
 
 use hytte::adw::{self, prelude::*};
-use hytte::futures_signals::map_ref;
+use hytte::futures_signals::{map_ref, signal::Signal};
 use hytte::gtk::{self};
 use hytte::prelude::*;
 use hytte::services::wifi;
@@ -126,16 +126,8 @@ fn build_wifi_header_suffix() -> gtk::Box {
 
     let scan_btn = gtk::Button::with_label("Scan");
     scan_btn.connect_clicked(|_| wifi::scan());
-    let scan_sensitive_signal = map_ref! {
-        let adapter = wifi::adapter(),
-        let station = wifi::station() => {
-            let powered = adapter.as_ref().is_some_and(|a| a.powered);
-            let scanning = station.as_ref().is_some_and(|s| s.scanning);
-            powered && !scanning
-        }
-    };
     bind(
-        scan_sensitive_signal,
+        scan_sensitive_signal(wifi::adapter(), wifi::station()),
         &scan_btn,
         gtk::prelude::WidgetExt::set_sensitive,
     );
@@ -154,6 +146,25 @@ fn build_wifi_header_suffix() -> gtk::Box {
     header.append(&spinner);
 
     header
+}
+
+/// Whether Scan can be clicked: the radio is on and has a station that is
+/// not scanning already. An adapter can be on with no station (AP mode, a
+/// deleted netdev, the moments around a power toggle), and a scan then has
+/// nothing to scan with (#1659).
+fn scan_sensitive(adapter: Option<&wifi::Adapter>, station: Option<&wifi::Station>) -> bool {
+    adapter.is_some_and(|a| a.powered) && station.is_some_and(|st| !st.scanning)
+}
+
+/// [`scan_sensitive`] over the service's signals: what the Scan button binds.
+fn scan_sensitive_signal(
+    adapter: impl Signal<Item = Option<wifi::Adapter>>,
+    station: impl Signal<Item = Option<wifi::Station>>,
+) -> impl Signal<Item = bool> {
+    map_ref! {
+        let adapter = adapter,
+        let station = station => scan_sensitive(adapter.as_ref(), station.as_ref())
+    }
 }
 
 /// [`wifi_description_text`], escaped for the Wi-Fi group's description.
@@ -405,7 +416,12 @@ fn signal_icon(dbm: i16) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{ap_count_suffix, wifi, wifi_description_markup, wifi_description_text};
+    use super::{
+        ap_count_suffix, scan_sensitive_signal, wifi, wifi_description_markup,
+        wifi_description_text,
+    };
+    use hytte::futures_signals::signal::{Signal, always};
+    use std::task::{Context, Poll, Waker};
 
     #[test]
     fn single_ap_gets_no_badge() {
@@ -441,6 +457,44 @@ mod tests {
             scanning: false,
             connected_network: None,
             connected_ssid: Some(ssid.to_string()),
+        }
+    }
+
+    /// Scan is clickable only with the radio on and a station that is not
+    /// scanning already, as the Scan button's binding sees it (#1659).
+    ///
+    /// **Falsification:** gate it on `powered && !scanning` alone (the
+    /// pre-#1659 binding) and the "on, no station" row fails; drop the
+    /// power check and the "off" row does.
+    #[test]
+    fn scan_needs_the_radio_on_and_an_idle_station() {
+        let off = wifi::Adapter {
+            powered: false,
+            ..powered_adapter()
+        };
+        let idle = || connected_station("home");
+        let scanning = wifi::Station {
+            scanning: true,
+            ..idle()
+        };
+        let rows = [
+            ("no adapter", None, Some(idle()), false),
+            ("off", Some(off), Some(idle()), false),
+            ("on, no station", Some(powered_adapter()), None, false),
+            (
+                "on, scanning",
+                Some(powered_adapter()),
+                Some(scanning),
+                false,
+            ),
+            ("on, idle", Some(powered_adapter()), Some(idle()), true),
+        ];
+        let mut cx = Context::from_waker(Waker::noop());
+        for (case, adapter, station, expected) in rows {
+            let mut sensitive =
+                std::pin::pin!(scan_sensitive_signal(always(adapter), always(station)));
+            let first = sensitive.as_mut().poll_change(&mut cx);
+            assert_eq!(first, Poll::Ready(Some(expected)), "{case}");
         }
     }
 

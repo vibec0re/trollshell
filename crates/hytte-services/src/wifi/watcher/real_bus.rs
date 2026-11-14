@@ -2,7 +2,8 @@
 //! connection, against a real `dbus-daemon` and a scripted `net.connman.iwd`
 //! (#1647 review: W1 and W2, and W3 for the network read a re-read can add;
 //! #1654: W5 for a disconnect, W6 for an iwd or station gone inside a hole;
-//! #1656: W7 for the adapter powered off and on again).
+//! #1656: W7 for the adapter powered off and on again; #1659: W8 for the
+//! commands' paths and a second station).
 //!
 //! Each test re-execs this test binary with `DBUS_SYSTEM_BUS_ADDRESS` set to
 //! a fresh broker, for the reason and in the shape `bluetooth::devices`'
@@ -2415,5 +2416,211 @@ async fn w7_an_adapter_unplugged_during_the_pause_leaves_the_panel() {
     .await;
     watcher.task.abort();
     fake.task.abort();
+    println!("{CHILD_OK} {}", test_name(TEST));
+}
+
+// ── W8: the commands' paths, and the station a pass keeps ───────────────────
+
+/// The station's and the adapter's path the watcher hands the commands.
+async fn w8_paths(watcher: &Watcher) -> (String, String) {
+    let paths = &watcher.paths;
+    (paths.station_path().await, paths.adapter_path().await)
+}
+
+/// The commands address what the panel shows and nothing else (#1659): with
+/// the station, its path and the adapter's; with the station removed, the
+/// adapter's only, so the power switch still reaches the radio; with iwd
+/// gone, neither. Until #1659 the paths were never cleared. iwd leaves while
+/// the pass with no station is pumping, so the pump's clear is the one read.
+///
+/// **Falsification:** hand the pump other paths than the watcher's, or keep
+/// them in `clear_published`, and the last step keeps the adapter's; clear
+/// the adapter's path with the station's side and the second step loses it.
+#[tokio::test(flavor = "multi_thread")]
+async fn w8_the_commands_paths_follow_the_panel() {
+    const TEST: &str = "w8_the_commands_paths_follow_the_panel";
+    let Some(address) = in_child(TEST) else {
+        return run_in_child(TEST, None).await;
+    };
+    let on = W7State {
+        powered: true,
+        station: true,
+        spare: false,
+    };
+    let (fake, watcher) = w7_start(&address, on).await;
+    w7_step(&watcher, &fake, "connected", |w| {
+        w.station.lock_ref().is_some() && w7_count(&fake.calls, "GetAll", ADAPTER) > 0
+    })
+    .await;
+    let both = (STATION.to_owned(), ADAPTER.to_owned());
+    assert_eq!(w8_paths(&watcher).await, both);
+
+    w7_remove_station(&fake.conn, &fake.state).await;
+    // The next pass, with no station, is pumping: it read the adapter again.
+    w7_step(&watcher, &fake, "the station removed", |w| {
+        w.station.lock_ref().is_none() && w7_count(&fake.calls, "GetAll", ADAPTER) > 1
+    })
+    .await;
+    let adapter_only = (String::new(), ADAPTER.to_owned());
+    assert_eq!(
+        w8_paths(&watcher).await,
+        adapter_only,
+        "the switch lost its radio"
+    );
+
+    fake.conn
+        .release_name("net.connman.iwd")
+        .await
+        .expect("release iwd's name");
+    w7_step(&watcher, &fake, "iwd gone", |w| {
+        w.adapter.lock_ref().is_none()
+    })
+    .await;
+    assert_eq!(w8_paths(&watcher).await, (String::new(), String::new()));
+    watcher.task.abort();
+    fake.task.abort();
+    println!("{CHILD_OK} {}", test_name(TEST));
+}
+
+/// W6's iwd leaving inside a hole: the next pass's wait clears, not a pump,
+/// and the commands' paths go with the panel's state there too (#1659).
+///
+/// **Falsification:** hand the wait's clear other paths than the watcher's
+/// and both paths stay.
+#[tokio::test(flavor = "multi_thread")]
+async fn w8_an_iwd_that_leaves_inside_a_hole_takes_the_paths_too() {
+    const TEST: &str = "w8_an_iwd_that_leaves_inside_a_hole_takes_the_paths_too";
+    let Some(address) = in_child(TEST) else {
+        return run_in_child(TEST, None).await;
+    };
+    let (watcher, fake) = w6_start(&address, W6Hole::IwdLeaves, None).await;
+    if let Err(kept) = w6_wait_cleared(&watcher).await {
+        panic!("iwd is gone and the panel kept {kept:?}");
+    }
+    assert_eq!(w8_paths(&watcher).await, (String::new(), String::new()));
+    watcher.task.abort();
+    fake.abort();
+    println!("{CHILD_OK} {}", test_name(TEST));
+}
+
+/// The adapter of [`W8_STATION`].
+const W8_ADAPTER: &str = "/net/connman/iwd/1";
+/// The station W8's iwd starts with. Its path sorts after [`STATION`]'s.
+const W8_STATION: &str = "/net/connman/iwd/1/9";
+
+/// W8's iwd: [`W8_STATION`] on [`W8_ADAPTER`], disconnected. Its first
+/// `RegisterAgent` brings up a second interface, [`STATION`] on [`ADAPTER`],
+/// and answers with a burst ([`w4_burst`]), so the watcher rediscovers,
+/// keeping what it published, from a snapshot with both stations.
+async fn w8_fake(
+    conn: zbus::Connection,
+    mut stream: zbus::MessageStream,
+    calls: Arc<Mutex<Vec<String>>>,
+) {
+    let path = |p: &str| OwnedObjectPath::try_from(p.to_owned()).expect("a path");
+    let object = |iface: &str, props| HashMap::from([(iface.to_owned(), props)]);
+    let mut both = false;
+    while let Some(Ok(msg)) = stream.next().await {
+        if msg.message_type() != zbus::message::Type::MethodCall {
+            continue;
+        }
+        let hdr = msg.header();
+        let at = hdr.path().map(ToString::to_string).unwrap_or_default();
+        let member = hdr.member().map(ToString::to_string).unwrap_or_default();
+        match member.as_str() {
+            "GetManagedObjects" => {
+                let up = if both { 2 } else { 1 };
+                let mut tree: HashMap<OwnedObjectPath, Ifaces> = HashMap::new();
+                for (adapter, station) in [(W8_ADAPTER, W8_STATION), (ADAPTER, STATION)]
+                    .into_iter()
+                    .take(up)
+                {
+                    let station_props = station_props("disconnected");
+                    tree.insert(
+                        path(adapter),
+                        object("net.connman.iwd.Adapter", adapter_props(true)),
+                    );
+                    tree.insert(
+                        path(station),
+                        object("net.connman.iwd.Station", station_props),
+                    );
+                }
+                let _ = conn.reply(&hdr, &tree).await;
+            }
+            "GetAll" if at == W8_ADAPTER || at == ADAPTER => {
+                let _ = conn.reply(&hdr, &adapter_props(true)).await;
+            }
+            "GetAll" => {
+                let _ = conn.reply(&hdr, &station_props("disconnected")).await;
+            }
+            "GetOrderedNetworks" => {
+                let _ = conn
+                    .reply(&hdr, &Vec::<(OwnedObjectPath, i16)>::new())
+                    .await;
+            }
+            "RegisterAgent" => {
+                let _ = conn.reply(&hdr, &()).await;
+                if !std::mem::replace(&mut both, true) {
+                    w4_burst(&conn).await;
+                }
+            }
+            _ => {
+                let _ = conn
+                    .reply_error(&hdr, "org.freedesktop.DBus.Error.UnknownMethod", &"no")
+                    .await;
+            }
+        }
+        calls.lock().expect("calls").push(format!("{member} {at}"));
+    }
+}
+
+/// Two Wi-Fi interfaces, and a rediscovery after the second came up (#1659):
+/// the next pass must keep the station it published, and its adapter, though
+/// the new station's path sorts first. Until #1659 a snapshot named the first
+/// station in its map's order, so the card could move from one interface to
+/// the other from pass to pass.
+///
+/// **Falsification:** pass `None` for the published station at the
+/// watcher's discovery call site, or ignore it in `station_in`, and the
+/// second pass publishes [`STATION`].
+#[tokio::test(flavor = "multi_thread")]
+async fn w8_with_two_stations_a_rediscovery_keeps_the_published_one() {
+    const TEST: &str = "w8_with_two_stations_a_rediscovery_keeps_the_published_one";
+    let Some(address) = in_child(TEST) else {
+        return run_in_child(TEST, None).await;
+    };
+    let conn = zbus::connection::Builder::address(address.as_str())
+        .expect("the broker's address")
+        .build()
+        .await
+        .expect("the scripted iwd connects");
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let stream = zbus::MessageStream::from(&conn);
+    let fake = tokio::spawn(w8_fake(conn.clone(), stream, calls.clone()));
+    conn.request_name("net.connman.iwd")
+        .await
+        .expect("own net.connman.iwd");
+    let watcher = spawn_watcher();
+
+    // A pass registers once it has published: the second one has.
+    let second = wait_for(&watcher, |_| {
+        w7_count(&calls, "RegisterAgent", "/net/connman/iwd") > 1
+    })
+    .await;
+    if let Err(state) = second {
+        let calls = calls.lock().expect("calls");
+        panic!("no second pass: the panel has {state}. Calls: {calls:?}");
+    }
+    let published = (
+        watcher.station.get_cloned().map(|st| st.path),
+        watcher.adapter.get_cloned().map(|a| a.path),
+    );
+    let kept = (Some(W8_STATION.to_owned()), Some(W8_ADAPTER.to_owned()));
+    assert_eq!(
+        published, kept,
+        "the second pass moved to the other interface"
+    );
+    watcher.task.abort();
+    fake.abort();
     println!("{CHILD_OK} {}", test_name(TEST));
 }

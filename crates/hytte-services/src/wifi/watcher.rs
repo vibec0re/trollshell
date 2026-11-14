@@ -233,9 +233,10 @@ const IWD_RECHECK: Duration = Duration::from_secs(10);
 /// iwd leave, but an iwd that leaves after a pump returned on a hole, or
 /// inside the hole, is seen by no pump: until #1654 the panel kept the old
 /// station while iwd was down.
-async fn wait_for_iwd<S>(owner: &mut S, gone: impl FnOnce())
+async fn wait_for_iwd<S, G>(owner: &mut S, gone: impl FnOnce() -> G)
 where
     S: Stream<Item = SignalItem> + Unpin,
+    G: Future<Output = ()>,
 {
     wait_for_owner(owner, iwd_has_owner, IWD_RECHECK, gone).await;
 }
@@ -251,15 +252,16 @@ where
 /// `gone` runs on the first `Ok(false)`, before the wait, and never on a
 /// failed question: that one says nothing about iwd. An iwd that has an owner
 /// at the first question, the healthy rediscovery, never runs it.
-async fn wait_for_owner<S, H, F>(
+async fn wait_for_owner<S, H, F, G>(
     owner: &mut S,
     has_owner: H,
     recheck: Duration,
-    gone: impl FnOnce(),
+    gone: impl FnOnce() -> G,
 ) where
     S: Stream<Item = SignalItem> + Unpin,
     H: Fn() -> F,
     F: Future<Output = Result<bool, hytte_bus::BusError>>,
+    G: Future<Output = ()>,
 {
     let mut gone = Some(gone);
     loop {
@@ -268,7 +270,7 @@ async fn wait_for_owner<S, H, F>(
             Ok(false) => {
                 if let Some(gone) = gone.take() {
                     tracing::info!("wifi: iwd is not running; waiting for it to return");
-                    gone();
+                    gone().await;
                 }
             }
             Err(e) => {
@@ -415,20 +417,26 @@ fn log_registration(
 ///
 /// A value that is already clear is left alone, so clearing a watcher that
 /// has nothing published wakes no part of the panel.
-fn clear_published(
+///
+/// The commands' paths go too, each before the panel's value it names
+/// (#1659), so no command addresses what the panel no longer shows.
+async fn clear_published(
     station: &Mutable<Option<Station>>,
     networks: &Mutable<Vec<WifiNetwork>>,
     prompts: &Mutable<Option<PromptRequest>>,
     adapter: &Mutable<Option<Adapter>>,
+    paths: &IwdPaths,
 ) {
-    clear_station_side(station, networks, prompts);
+    clear_station_side(station, networks, prompts, paths).await;
+    paths.set_adapter_path(None).await;
     if adapter.lock_ref().is_some() {
         adapter.set(None);
     }
 }
 
 /// Clear what the watcher publishes about iwd's station: the station, its
-/// networks and a pending prompt. The adapter stays (#1656).
+/// networks and a pending prompt, and the station's path the commands
+/// address, first (#1659). The adapter and its path stay (#1656).
 ///
 /// The pump does this when iwd removes the station's interface and not the
 /// adapter's object, and a discovery pass does it when its snapshot has no
@@ -439,11 +447,13 @@ fn clear_published(
 ///
 /// A value that is already clear is left alone, as in [`clear_published`]:
 /// a pass that finds no station again, after a hole say, wakes nothing.
-fn clear_station_side(
+async fn clear_station_side(
     station: &Mutable<Option<Station>>,
     networks: &Mutable<Vec<WifiNetwork>>,
     prompts: &Mutable<Option<PromptRequest>>,
+    paths: &IwdPaths,
 ) {
+    paths.set_station_path(None).await;
     if station.lock_ref().is_some() {
         station.set(None);
     }
@@ -643,7 +653,9 @@ async fn reread_adapter(adapter_path: Option<&str>, adapter_mutable: &Mutable<Op
 /// it when the snapshot has none (#1656). With more than one adapter that is
 /// the one already published, while the snapshot still has it
 /// ([`super::parse::adapter_in`], #1657 review), so the radio the panel just
-/// switched off is the one its switch turns back on. Until #1654 an iwd or a
+/// switched off is the one its switch turns back on. With more than one
+/// station a pass keeps the published one the same way
+/// ([`super::parse::station_in`], #1659). Until #1654 an iwd or a
 /// station that went away while no pump was reading, or inside the hole that
 /// ended one, stayed on the panel until iwd came back; until #1656 a pass
 /// with no station cleared the adapter too, so a powered-off radio could not
@@ -660,6 +672,8 @@ async fn reread_adapter(adapter_path: Option<&str>, adapter_mutable: &Mutable<Op
 /// a station or without one, so the power switch ([`super::set_powered`])
 /// can reach a radio that was off when the shell started (#1656). It used to
 /// be derived from the station's path, and a pass with no station set none.
+/// Every clear of the watcher's clears the paths it covers, and a pass with
+/// no adapter clears the adapter's (#1659).
 pub(super) async fn run_wifi_watcher(
     station_mutable: Mutable<Option<Station>>,
     networks_mutable: Mutable<Vec<WifiNetwork>>,
@@ -678,7 +692,8 @@ pub(super) async fn run_wifi_watcher(
             &networks_mutable,
             &prompts_mutable,
             &adapter_mutable,
-        );
+            &paths,
+        )
     };
 
     'discovery: loop {
@@ -697,7 +712,7 @@ pub(super) async fn run_wifi_watcher(
             || (added_sub.items(), removed_sub.items()),
             [&owner_sub, &added_sub, &removed_sub],
             // Read when the snapshot is asked for, after the wait's clear.
-            || discover_station(adapter_mutable.lock_ref().as_ref().map(|a| a.path.clone())),
+            || discover_station(&station_mutable, &adapter_mutable),
         )
         .await;
         // iwd did not answer. That says nothing about its station, so the
@@ -725,14 +740,13 @@ pub(super) async fn run_wifi_watcher(
         let mut adapter_items = adapter_sub.as_ref().map(SignalSubscription::items);
 
         // The power switch addresses the adapter this pass publishes, with a
-        // station or without one (#1656).
-        if let Some(path) = &adapter_path {
-            paths.set_adapter_path(path).await;
-        }
+        // station or without one (#1656), and none when it publishes none
+        // (#1659).
+        paths.set_adapter_path(adapter_path.as_deref()).await;
         adapter_mutable.set_neq(adapter);
         if let Some(station) = &station {
             let path = station.as_str();
-            paths.set_station_path(path).await;
+            paths.set_station_path(Some(path)).await;
             tracing::info!(path, "wifi station found");
             refresh_station_from_managed(&managed, station, &station_mutable);
             refresh_networks(path, &station_mutable, &networks_mutable).await;
@@ -742,7 +756,13 @@ pub(super) async fn run_wifi_watcher(
             // is gone, whether the pump saw it go or not (#1654); the adapter
             // is the snapshot's, published above (#1656).
             tracing::info!(adapter = ?adapter_path, "wifi: iwd has no station");
-            clear_station_side(&station_mutable, &networks_mutable, &prompts_mutable);
+            clear_station_side(
+                &station_mutable,
+                &networks_mutable,
+                &prompts_mutable,
+                &paths,
+            )
+            .await;
         }
 
         // Returns when iwd changed hands, the station or the adapter was
@@ -776,6 +796,7 @@ pub(super) async fn run_wifi_watcher(
             &networks_mutable,
             &prompts_mutable,
             &adapter_mutable,
+            &paths,
         )
         .await;
         drop(station_sub);
@@ -934,6 +955,7 @@ async fn pump_iwd_events<O, E, H, R, RF, S, SF, A, AF>(
     networks_mutable: &Mutable<Vec<WifiNetwork>>,
     prompts_mutable: &Mutable<Option<PromptRequest>>,
     adapter_mutable: &Mutable<Option<Adapter>>,
+    paths: &IwdPaths,
 ) where
     O: Stream<Item = SignalItem> + Unpin,
     E: Stream<Item = SignalItem> + Unpin,
@@ -960,6 +982,7 @@ async fn pump_iwd_events<O, E, H, R, RF, S, SF, A, AF>(
         networks: networks_mutable,
         prompts: prompts_mutable,
         adapter: adapter_mutable,
+        paths,
     };
     let events = pump_events(
         streams,
@@ -970,19 +993,28 @@ async fn pump_iwd_events<O, E, H, R, RF, S, SF, A, AF>(
     beside_registration(events, registration, &iwd_gone).await;
 }
 
-/// What the watcher publishes, borrowed for one pump.
+/// What the watcher publishes, and the paths the commands address it by,
+/// borrowed for one pump.
 #[derive(Clone, Copy)]
 struct Published<'m> {
     station: &'m Mutable<Option<Station>>,
     networks: &'m Mutable<Vec<WifiNetwork>>,
     prompts: &'m Mutable<Option<PromptRequest>>,
     adapter: &'m Mutable<Option<Adapter>>,
+    paths: &'m IwdPaths,
 }
 
 impl Published<'_> {
     /// [`clear_published`].
-    fn clear(self) {
-        clear_published(self.station, self.networks, self.prompts, self.adapter);
+    async fn clear(self) {
+        clear_published(
+            self.station,
+            self.networks,
+            self.prompts,
+            self.adapter,
+            self.paths,
+        )
+        .await;
     }
 }
 
@@ -1060,6 +1092,7 @@ async fn pump_events<O, E, H, S, SF, A, AF>(
         networks: networks_mutable,
         prompts: prompts_mutable,
         adapter: adapter_mutable,
+        paths,
     } = published;
     // What the pass publishes, by path, and the receivers for it. Either
     // object's removal ends the pass.
@@ -1081,7 +1114,7 @@ async fn pump_events<O, E, H, S, SF, A, AF>(
                 let reaction = owner_reaction(&change);
                 tracing::info!(?change, "iwd changed hands");
                 if reaction.clear {
-                    published.clear();
+                    published.clear().await;
                 }
                 if reaction.rediscover {
                     return;
@@ -1119,7 +1152,7 @@ async fn pump_events<O, E, H, S, SF, A, AF>(
                 match removed_from_event(&evt.body, station_path, adapter_path) {
                     Removed::Adapter => {
                         tracing::warn!(path = adapter_path, "iwd adapter removed — rewatching");
-                        published.clear();
+                        published.clear().await;
                         tokio::time::sleep(REMOVAL_PAUSE).await;
                         return;
                     }
@@ -1128,7 +1161,8 @@ async fn pump_events<O, E, H, S, SF, A, AF>(
                             path = station_path,
                             "iwd station removed; keeping the adapter and rewatching"
                         );
-                        clear_station_side(station_mutable, networks_mutable, prompts_mutable);
+                        clear_station_side(station_mutable, networks_mutable, prompts_mutable, paths)
+                            .await;
                         tokio::time::sleep(REMOVAL_PAUSE).await;
                         return;
                     }
@@ -1213,10 +1247,11 @@ fn apply_adapter_event(
 #[cfg(test)]
 mod tests {
     use super::{
-        Adapter, IWD_RECHECK, IwdCalls, IwdOwner, IwdStreams, Mutable, OwnerReaction, PropsWatch,
-        REMOVAL_PAUSE, Station, StationState, apply_adapter_event, decode_properties_changed,
-        handle_station_props_event, iwd_owner_change, next_iwd_owner, open_discovery,
-        owner_reaction, pump_iwd_events, register_agent_until_accepted, wait_for_owner,
+        Adapter, IWD_RECHECK, IwdCalls, IwdOwner, IwdPaths, IwdStreams, Mutable, OwnerReaction,
+        PropsWatch, REMOVAL_PAUSE, Station, StationState, apply_adapter_event,
+        decode_properties_changed, handle_station_props_event, iwd_owner_change, next_iwd_owner,
+        open_discovery, owner_reaction, pump_iwd_events, register_agent_until_accepted,
+        wait_for_owner,
     };
     use crate::handshake::Handshake;
     use crate::retry;
@@ -1365,7 +1400,7 @@ mod tests {
                 async move { answer }
             },
             IWD_RECHECK,
-            || {},
+            || async {},
         )
         .await;
 
@@ -1425,7 +1460,10 @@ mod tests {
                     async move { answer }
                 },
                 IWD_RECHECK,
-                || cleared.borrow_mut().push((asked.get(), started.elapsed())),
+                || {
+                    cleared.borrow_mut().push((asked.get(), started.elapsed()));
+                    async {}
+                },
             )
             .await;
 
@@ -1626,6 +1664,7 @@ mod tests {
             Mutable::new(Some(Adapter::default())),
         );
 
+        let paths = IwdPaths::default();
         let pump = pump_iwd_events(
             IwdStreams {
                 owner: &mut owner,
@@ -1656,6 +1695,7 @@ mod tests {
             &networks,
             &prompts,
             &adapter,
+            &paths,
         );
         let drive = async {
             for _ in 0..4 {
@@ -1716,6 +1756,7 @@ mod tests {
             Mutable::new(Some(Adapter::default())),
         );
 
+        let paths = IwdPaths::default();
         let pump = pump_iwd_events(
             IwdStreams {
                 owner: &mut owner,
@@ -1756,6 +1797,7 @@ mod tests {
             &networks,
             &prompts,
             &adapter,
+            &paths,
         );
         let drive = async {
             for _ in 0..16 {
@@ -1801,6 +1843,7 @@ mod tests {
             Mutable::new(None),
         );
 
+        let paths = IwdPaths::default();
         let pump = pump_iwd_events(
             IwdStreams {
                 owner: &mut owner,
@@ -1831,6 +1874,7 @@ mod tests {
             &networks,
             &prompts,
             &adapter,
+            &paths,
         );
         let drive = async {
             for _ in 0..4 {
@@ -1914,6 +1958,7 @@ mod tests {
                     &Mutable::new(Vec::new()),
                     &Mutable::new(None),
                     &adapter,
+                    &IwdPaths::default(),
                 ),
             )
             .await;
@@ -2006,6 +2051,7 @@ mod tests {
                         &Mutable::new(Vec::new()),
                         &Mutable::new(None),
                         &adapter_state,
+                        &IwdPaths::default(),
                     ),
                 )
                 .await
@@ -2308,6 +2354,7 @@ mod tests {
                 &networks,
                 &prompts,
                 &adapter,
+                &IwdPaths::default(),
             ),
         )
         .await;
@@ -2346,11 +2393,13 @@ mod tests {
     /// watch sees it gone; keep the pass running without the station (the
     /// first #1657 head) and the pump never returns; drop the pause and the
     /// elapsed time is short; ignore the adapter's delta and `Powered` never
-    /// moves.
+    /// moves; hand the station-side clear other paths than the pump's (#1659)
+    /// and the station's path stays.
     #[tokio::test(start_paused = true)]
     async fn a_station_removal_keeps_the_adapter_and_rediscovers() {
         use futures_signals::signal::SignalExt;
 
+        let paths = published_paths().await;
         let (removed_tx, removed_rx) = tokio::sync::mpsc::unbounded_channel();
         let (adapter_tx, adapter_rx) = tokio::sync::mpsc::unbounded_channel();
         let quiet = || futures_util::stream::pending::<SignalItem>().boxed_local();
@@ -2395,6 +2444,7 @@ mod tests {
                 &networks,
                 &prompts,
                 &adapter,
+                &paths,
             )
             .await;
             returned.set(Some(tokio::time::Instant::now()));
@@ -2423,6 +2473,7 @@ mod tests {
             assert!(networks.lock_ref().is_empty(), "its networks are gone");
             assert!(prompts.lock_ref().is_none(), "its prompt is gone");
             assert_eq!(powered(), Some(false), "the adapter stays, as it was");
+            assert_eq!(paths_of(&paths).await, (String::new(), ADAPTER.to_owned()));
             assert!(returned.get().is_none(), "the pass ended before its pause");
             removal
         };
@@ -2493,6 +2544,7 @@ mod tests {
                 &Mutable::new(Vec::new()),
                 &Mutable::new(None),
                 &adapter,
+                &IwdPaths::default(),
             )
             .await;
             returned.set(true);
@@ -2542,9 +2594,11 @@ mod tests {
     /// iwd ends it, so the new one is snapshotted and registered with.
     ///
     /// **Falsification:** clear only the station's side on iwd's `Lost` and
-    /// the adapter stays.
+    /// the adapter stays; hand the pump's clear other paths than its own
+    /// (#1659) and the adapter's path does.
     #[tokio::test(start_paused = true)]
     async fn a_pass_with_no_station_clears_on_lost_and_ends_on_a_new_iwd() {
+        let paths = published_paths().await;
         let (owner_tx, owner_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut owner = fed(owner_rx);
         let quiet = || futures_util::stream::pending::<SignalItem>().boxed_local();
@@ -2578,6 +2632,7 @@ mod tests {
                 &networks,
                 &prompts,
                 &adapter,
+                &paths,
             )
             .await;
             returned.set(true);
@@ -2591,6 +2646,7 @@ mod tests {
                 adapter.get_cloned().is_none(),
                 "iwd left and the panel kept its adapter"
             );
+            assert_eq!(paths_of(&paths).await, (String::new(), String::new()));
             assert!(
                 !returned.get(),
                 "a lost iwd is waited for, not rediscovered"
@@ -2650,6 +2706,7 @@ mod tests {
                 &Mutable::new(Vec::new()),
                 &Mutable::new(None),
                 &adapter,
+                &IwdPaths::default(),
             ),
         )
         .await
@@ -2706,6 +2763,7 @@ mod tests {
                 &Mutable::new(Vec::new()),
                 &Mutable::new(None),
                 &adapter,
+                &IwdPaths::default(),
             ),
         )
         .await;
@@ -2825,6 +2883,19 @@ mod tests {
         (network, prompt)
     }
 
+    /// The commands' paths with [`STATION`] and [`ADAPTER`] published.
+    async fn published_paths() -> IwdPaths {
+        let paths = IwdPaths::default();
+        paths.set_station_path(Some(STATION)).await;
+        paths.set_adapter_path(Some(ADAPTER)).await;
+        paths
+    }
+
+    /// The station's and the adapter's path the commands address.
+    async fn paths_of(paths: &IwdPaths) -> (String, String) {
+        (paths.station_path().await, paths.adapter_path().await)
+    }
+
     /// `clear_published` empties all four slots, and wakes none that is
     /// already clear (#1654 review). The pump and the wait for iwd go through
     /// it, but the real-bus W6 tests read only the station and the adapter,
@@ -2833,11 +2904,12 @@ mod tests {
     /// is what keeps a clear of a watcher with nothing published from waking
     /// the panel.
     ///
-    /// **Falsification:** drop any one slot from `clear_published` and the
-    /// first half fails; set the four unconditionally (the pump's pre-#1654
-    /// closure) and the second half sees a wake.
-    #[test]
-    fn clear_published_clears_every_slot_and_wakes_none_already_clear() {
+    /// **Falsification:** drop any one slot from `clear_published`, or keep
+    /// either of the commands' paths (#1659), and the first half fails; set
+    /// the four unconditionally (the pump's pre-#1654 closure) and the second
+    /// half sees a wake.
+    #[tokio::test]
+    async fn clear_published_clears_every_slot_and_wakes_none_already_clear() {
         use futures_signals::signal::SignalExt;
         use futures_util::FutureExt;
 
@@ -2846,12 +2918,14 @@ mod tests {
         let networks = Mutable::new(vec![network]);
         let prompts = Mutable::new(Some(prompt));
         let adapter = Mutable::new(Some(Adapter::default()));
+        let paths = published_paths().await;
 
-        super::clear_published(&station, &networks, &prompts, &adapter);
+        super::clear_published(&station, &networks, &prompts, &adapter, &paths).await;
         assert!(station.lock_ref().is_none(), "the station is kept");
         assert!(networks.lock_ref().is_empty(), "the network list is kept");
         assert!(prompts.lock_ref().is_none(), "the prompt is kept");
         assert!(adapter.lock_ref().is_none(), "the adapter is kept");
+        assert_eq!(paths_of(&paths).await, (String::new(), String::new()));
 
         let mut station_wakes = station.signal_cloned().to_stream();
         let mut network_wakes = networks.signal_cloned().to_stream();
@@ -2863,7 +2937,7 @@ mod tests {
         assert!(prompt_wakes.next().now_or_never().is_some());
         assert!(adapter_wakes.next().now_or_never().is_some());
 
-        super::clear_published(&station, &networks, &prompts, &adapter);
+        super::clear_published(&station, &networks, &prompts, &adapter, &paths).await;
         assert!(
             station_wakes.next().now_or_never().is_none(),
             "the station woke"
@@ -2888,11 +2962,16 @@ mod tests {
     /// snapshot with no station clear: the adapter they keep is what the
     /// panel's power switch turns the radio back on with.
     ///
-    /// **Falsification:** clear the adapter in it (the pre-#1656 clear) and
-    /// the adapter assertion fails; drop a station-side slot and its
-    /// assertion does; set them unconditionally and the second half wakes.
-    #[test]
-    fn clear_station_side_keeps_the_adapter_and_wakes_none_already_clear() {
+    /// The commands' paths go the same way (#1659): the station's is cleared,
+    /// so `scan` and `disconnect` address no station that is gone, and the
+    /// adapter's is kept, so the power switch can turn the radio back on.
+    ///
+    /// **Falsification:** clear the adapter or its path in it (the pre-#1656
+    /// clear) and its assertion fails; drop a station-side slot or keep the
+    /// station's path and its assertion does; set them unconditionally and
+    /// the second half wakes.
+    #[tokio::test]
+    async fn clear_station_side_keeps_the_adapter_and_wakes_none_already_clear() {
         use futures_signals::signal::SignalExt;
         use futures_util::FutureExt;
 
@@ -2903,12 +2982,14 @@ mod tests {
         let adapter = Mutable::new(Some(powered_off_adapter()));
         let mut adapter_wakes = adapter.signal_cloned().to_stream();
         assert!(adapter_wakes.next().now_or_never().is_some());
+        let paths = published_paths().await;
 
-        super::clear_station_side(&station, &networks, &prompts);
+        super::clear_station_side(&station, &networks, &prompts, &paths).await;
         assert!(station.lock_ref().is_none(), "the station is kept");
         assert!(networks.lock_ref().is_empty(), "the network list is kept");
         assert!(prompts.lock_ref().is_none(), "the prompt is kept");
         assert_eq!(adapter.get_cloned(), Some(powered_off_adapter()));
+        assert_eq!(paths_of(&paths).await, (String::new(), ADAPTER.to_owned()));
         assert!(
             adapter_wakes.next().now_or_never().is_none(),
             "the adapter woke"
@@ -2921,7 +3002,7 @@ mod tests {
         assert!(network_wakes.next().now_or_never().is_some());
         assert!(prompt_wakes.next().now_or_never().is_some());
 
-        super::clear_station_side(&station, &networks, &prompts);
+        super::clear_station_side(&station, &networks, &prompts, &paths).await;
         assert!(
             station_wakes.next().now_or_never().is_none(),
             "the station woke"

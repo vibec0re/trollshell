@@ -246,11 +246,16 @@ pub(super) struct Discovered {
 }
 
 /// Read a `GetManagedObjects` answer into what the watcher publishes.
-/// `kept` is the path of the adapter the watcher publishes now, if any
-/// ([`adapter_in`]).
-pub(super) fn discovered(managed: ManagedObjects, kept: Option<&str>) -> Discovered {
-    let station = station_in(&managed);
-    let adapter = adapter_in(&managed, station.as_ref().map(|p| p.as_str()), kept);
+/// `kept_station` and `kept_adapter` are the paths of the station and the
+/// adapter the watcher publishes now, if any ([`station_in`],
+/// [`adapter_in`]).
+pub(super) fn discovered(
+    managed: ManagedObjects,
+    kept_station: Option<&str>,
+    kept_adapter: Option<&str>,
+) -> Discovered {
+    let station = station_in(&managed, kept_station);
+    let adapter = adapter_in(&managed, station.as_ref().map(|p| p.as_str()), kept_adapter);
     Discovered {
         managed,
         station,
@@ -258,14 +263,26 @@ pub(super) fn discovered(managed: ManagedObjects, kept: Option<&str>) -> Discove
     }
 }
 
-/// The station a snapshot names: the first object carrying
-/// `net.connman.iwd.Station` in the answer's order, the rule discovery has
-/// always used. With more than one station that order is the map's, so which
-/// one wins is not specified.
-pub(super) fn station_in(managed: &ManagedObjects) -> Option<zbus::zvariant::OwnedObjectPath> {
-    managed
+/// The station a snapshot names: `kept`, the station the watcher publishes
+/// now, while the snapshot still has a `net.connman.iwd.Station` at its path,
+/// else the object carrying one with the lowest path (byte order), so the
+/// choice does not move from pass to pass: [`adapter_in`]'s rule without a
+/// station (#1659). Until #1659 this took the first station in the answer's
+/// order, which is the map's, so with two Wi-Fi interfaces the published
+/// station, and its adapter with it, could change from one pass to the next.
+pub(super) fn station_in(
+    managed: &ManagedObjects,
+    kept: Option<&str>,
+) -> Option<zbus::zvariant::OwnedObjectPath> {
+    let stations = managed
         .iter()
-        .find_map(|(path, ifaces)| ifaces.contains_key(IWD_STATION_IFACE).then(|| path.clone()))
+        .filter(|(_, ifaces)| ifaces.contains_key(IWD_STATION_IFACE))
+        .map(|(path, _)| path);
+    stations
+        .clone()
+        .find(|path| Some(path.as_str()) == kept)
+        .or_else(|| stations.min_by(|a, b| a.as_str().cmp(b.as_str())))
+        .cloned()
 }
 
 /// The adapter to publish for a snapshot whose station is `station`.
@@ -859,7 +876,7 @@ mod tests {
     /// discovery) and the first assertion fails.
     #[test]
     fn a_snapshot_with_an_adapter_and_no_station_publishes_the_adapter() {
-        let found = discovered(powered_off_tree(), None);
+        let found = discovered(powered_off_tree(), None, None);
         assert_eq!(
             found.adapter,
             Some(Adapter {
@@ -973,7 +990,7 @@ mod tests {
             ("nothing at all", HashMap::new(), None, None, None),
         ];
         for (case, managed, kept, station_expected, adapter_expected) in rows {
-            let found = discovered(managed, kept);
+            let found = discovered(managed, None, kept);
             assert_eq!(
                 found.station.as_ref().map(|p| p.as_str()),
                 station_expected,
@@ -984,6 +1001,62 @@ mod tests {
                 adapter_expected,
                 "{case}"
             );
+        }
+    }
+
+    /// Which station a snapshot publishes with two Wi-Fi interfaces or more
+    /// (#1659): the one already published while the snapshot still has it,
+    /// else the lowest path, and the adapter is that station's parent. Each
+    /// row reads 16 fresh maps, each iterating in its own order.
+    ///
+    /// **Falsification:** take the first station in the map's order (the
+    /// pre-#1659 rule) and a row varies across the maps; ignore the published
+    /// station and the second row names `/net/connman/iwd/0/4`; take the
+    /// highest path and the first row names `/net/connman/iwd/2/6`.
+    #[test]
+    fn the_station_a_snapshot_publishes() {
+        let three = || {
+            let mut managed = HashMap::new();
+            for phy in ["2/6", "0/4", "1/5"] {
+                let station = format!("/net/connman/iwd/{phy}");
+                let props = [("State", owned("connected"))];
+                managed.insert(opath(&station), object(&[IWD_STATION_IFACE], &props));
+                let adapter = adapter_path_from_station(&station);
+                managed.insert(opath(&adapter), adapter_object(true, "phy"));
+            }
+            managed
+        };
+        let rows = [
+            (
+                "none published: the lowest path",
+                None,
+                "/net/connman/iwd/0/4",
+            ),
+            (
+                "the published station, though another sorts first",
+                Some("/net/connman/iwd/1/5"),
+                "/net/connman/iwd/1/5",
+            ),
+            (
+                "the published station gone: the lowest path",
+                Some("/net/connman/iwd/3/7"),
+                "/net/connman/iwd/0/4",
+            ),
+        ];
+        for (case, kept, expected) in rows {
+            for _ in 0..16 {
+                let found = discovered(three(), kept, None);
+                assert_eq!(
+                    found.station.as_ref().map(|p| p.as_str()),
+                    Some(expected),
+                    "{case}"
+                );
+                assert_eq!(
+                    found.adapter.map(|a| a.path),
+                    Some(adapter_path_from_station(expected)),
+                    "{case}: the station's own adapter"
+                );
+            }
         }
     }
 

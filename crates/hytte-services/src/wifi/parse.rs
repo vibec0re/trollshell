@@ -635,43 +635,64 @@ mod tests {
     ///
     /// **Falsification:** keep the published SSID whatever the network (the
     /// pre-#1654 field update) and the first row names "home" for `WORK`;
-    /// blank it on every delta and the other rows lose it.
+    /// blank it on every delta and the other rows lose it; clear the network
+    /// on any invalidated key rather than `ConnectedNetwork` alone and the
+    /// last row loses `HOME`.
     #[test]
     fn a_delta_keeps_the_ssid_only_on_the_same_network() {
-        let rows = [
+        let rows: [(
+            &str,
+            Vec<(&str, OwnedValue)>,
+            &[&str],
+            Option<&str>,
+            Option<&str>,
+        ); 5] = [
             (
                 "another network",
                 vec![("ConnectedNetwork", object_path(WORK))],
+                &[],
                 Some(WORK),
                 None,
             ),
             (
                 "the same network again",
                 vec![("ConnectedNetwork", object_path(HOME))],
+                &[],
                 Some(HOME),
                 Some("home"),
             ),
             (
                 "a roam on the same network",
                 vec![("State", owned("roaming"))],
+                &[],
                 Some(HOME),
                 Some("home"),
             ),
             (
                 "a scan",
                 vec![("Scanning", owned(true))],
+                &[],
+                Some(HOME),
+                Some("home"),
+            ),
+            (
+                "another key invalidated: iwd lists `ConnectedAccessPoint` \
+                 only beside `ConnectedNetwork`, but only the latter clears \
+                 the network",
+                Vec::new(),
+                &["ConnectedAccessPoint"],
                 Some(HOME),
                 Some("home"),
             ),
         ];
-        for (case, changed, network, ssid) in rows {
+        for (case, changed, invalidated, network, ssid) in rows {
             let published = Mutable::new(Some(station(
                 STATION,
                 StationState::Connected,
                 Some(HOME),
                 Some("home"),
             )));
-            let (changed, invalidated) = delta(changed, &[]);
+            let (changed, invalidated) = delta(changed, invalidated);
             apply_station_props_delta(&changed, &invalidated, &published);
             let st = published.get_cloned().expect("a station");
             assert_eq!(st.connected_network.as_deref(), network, "{case}");

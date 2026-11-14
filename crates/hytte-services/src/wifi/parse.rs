@@ -192,16 +192,22 @@ pub(super) fn refresh_adapter_from_managed(
 /// - A station was published. The pump clears it when it sees iwd leave, a
 ///   new iwd take the name or the station removed, so no SSID crosses
 ///   those.
-/// - Both are the same station object. The adapter's path is a prefix of
-///   the station's ([`adapter_path_from_station`]).
+/// - Both are the same station object (the same path). Under iwd's own path
+///   scheme this decides nothing the next condition does not: a network's
+///   path extends its station's, so the same `ConnectedNetwork` already
+///   means the same station. It is kept as a cheap guard against a path that
+///   does not follow that scheme, and no fixture iwd could produce reaches it
+///   on its own, so no test pins it.
 /// - `parsed` names a `ConnectedNetwork`, and it is the one `previous`
 ///   named. iwd builds a network's path from the station's path, the SSID in
 ///   hex and the security (`iwd_network_get_path`, iwd 3.12
 ///   `src/station.c:435`), so one path is one SSID. That also covers an iwd
-///   that restarts between two passes, where no pump sees it go: the next
-///   pass's wait for iwd reads the owner change, so nothing clears the
-///   state, and a path the new iwd shares with the old one names the same
-///   network.
+///   that restarts between two passes, before the next pass takes its owner
+///   receiver: that owner change is sent before the receiver exists, so
+///   nothing reads it. The next pass's wait for iwd asks the bus whether the
+///   name has an owner and returns at once on yes ([`super::watcher`]'s
+///   `wait_for_owner`), reading nothing. So nothing clears the state, and a
+///   path the new iwd shares with the old one names the same network.
 /// - `parsed` is not `disconnected`.
 ///
 /// Anything else publishes no SSID until the network read: a blank for a
@@ -255,7 +261,7 @@ pub(super) fn refresh_station_from_managed(
         state: parse_state(&state_str),
         scanning,
         connected_network,
-        connected_ssid: None, // filled after network list is read
+        connected_ssid: None, // kept by `with_kept_ssid` below; the network read sets it
     };
     let mut published = station_mutable.lock_mut();
     let next = with_kept_ssid(published.as_ref(), parsed);
@@ -393,9 +399,11 @@ mod tests {
     /// publishes none. A blank for a few round trips is better than the
     /// wrong network's name.
     ///
-    /// **Falsification:** drop any one condition from `with_kept_ssid`
-    /// (the station path, the `Some` on both sides of the network match, the
-    /// `disconnected` check) and its row keeps "home".
+    /// **Falsification:** drop any one of `with_kept_ssid`'s network
+    /// conditions (the `Some` on both sides of the network match, the
+    /// `disconnected` check) and its row keeps "home". Dropping the station
+    /// path check keeps every row blank: each row uses a path iwd could
+    /// build, and there the network path already carries the station's.
     #[test]
     fn the_ssid_is_not_kept_when_it_may_name_another_network() {
         let home = station(STATION, StationState::Connected, Some(HOME), Some("home"));
@@ -422,12 +430,14 @@ mod tests {
                 station(STATION, StationState::Connected, Some(WORK), None),
             ),
             (
-                "another station, as after the adapter went and came back",
+                "another station on a network of the same name, as after the \
+                 adapter went and came back: iwd puts the network under the \
+                 new station's path, so it is not the same network",
                 Some(home),
                 station(
                     "/net/connman/iwd/1/5",
                     StationState::Connected,
-                    Some(HOME),
+                    Some("/net/connman/iwd/1/5/686f6d65_psk"),
                     None,
                 ),
             ),

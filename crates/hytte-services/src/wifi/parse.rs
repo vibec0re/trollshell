@@ -14,6 +14,9 @@ use crate::wifi::types::{Adapter, Station, StationState};
 /// with no version suffix (#1648).
 pub(super) const IWD_ADAPTER_IFACE: &str = "net.connman.iwd.Adapter";
 
+/// iwd's station D-Bus interface: iwd 3.12 `doc/station-api.txt:5`.
+pub(super) const IWD_STATION_IFACE: &str = "net.connman.iwd.Station";
+
 pub(super) type ManagedObjects =
     HashMap<zbus::zvariant::OwnedObjectPath, HashMap<String, HashMap<String, OwnedValue>>>;
 
@@ -77,19 +80,65 @@ pub(super) fn adapter_path_from_station(station_path: &str) -> String {
     format!("/net/connman/iwd/{}", parts[4])
 }
 
-/// Returns `true` when the `InterfacesRemoved` signal indicates the station was removed.
-pub(super) fn station_removed_from_event(msg: &zbus::Message, station_path: &str) -> bool {
+/// What one `InterfacesRemoved` takes away from what the watcher publishes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Removed {
+    /// The published adapter's object: its `net.connman.iwd.Adapter` at its
+    /// path. iwd removes it only with the wiphy itself (`wiphy_destroy`, iwd
+    /// 3.12 `src/wiphy.c:2478-2490`), and every netdev on that wiphy, the
+    /// station's included, goes with it.
+    Adapter,
+    /// The published station's `net.connman.iwd.Station` at its path, and
+    /// nothing at the adapter's. Powering the adapter off does this: the
+    /// soft rfkill takes the netdev down and iwd removes the station's
+    /// interface (`station_netdev_watch`, `src/station.c:5941-5945`), while
+    /// the adapter's object stays (#1656).
+    Station,
+    /// Anything else: a network, a BSS, a known network, another station.
+    Other,
+}
+
+/// Classify an `InterfacesRemoved` against the published station and adapter
+/// paths, `None` for one that is not published. A body that does not decode
+/// is [`Removed::Other`].
+pub(super) fn removed_from_event(
+    msg: &zbus::Message,
+    station_path: Option<&str>,
+    adapter_path: Option<&str>,
+) -> Removed {
     let Ok((path, removed_ifaces)) = msg
         .body()
         .deserialize::<(zbus::zvariant::OwnedObjectPath, Vec<String>)>()
     else {
-        return false;
+        return Removed::Other;
     };
+    let removes = |at: Option<&str>, iface: &str| {
+        at == Some(path.as_str()) && removed_ifaces.iter().any(|i| i == iface)
+    };
+    if removes(adapter_path, IWD_ADAPTER_IFACE) {
+        Removed::Adapter
+    } else if removes(station_path, IWD_STATION_IFACE) {
+        Removed::Station
+    } else {
+        Removed::Other
+    }
+}
 
-    path.as_str() == station_path
-        && removed_ifaces
-            .iter()
-            .any(|i| i == "net.connman.iwd.Station")
+/// Whether an `InterfacesAdded` may bring a station or an adapter: it adds
+/// `net.connman.iwd.Station` or `net.connman.iwd.Adapter` at any path, or its
+/// body does not decode, so only a snapshot can say. Powering the adapter on
+/// brings the netdev up and iwd adds the station's interface back
+/// (`station_netdev_watch`'s `NETDEV_WATCH_EVENT_UP`, `src/station.c:5936-5939`).
+pub(super) fn adds_station_or_adapter(msg: &zbus::Message) -> bool {
+    type Added = (
+        zbus::zvariant::OwnedObjectPath,
+        HashMap<String, HashMap<String, OwnedValue>>,
+    );
+    msg.body()
+        .deserialize::<Added>()
+        .map_or(true, |(_, ifaces)| {
+            ifaces.contains_key(IWD_STATION_IFACE) || ifaces.contains_key(IWD_ADAPTER_IFACE)
+        })
 }
 
 // ── Delta application ─────────────────────────────────────────────────────────
@@ -175,32 +224,91 @@ pub(super) fn apply_adapter_props_delta(
 
 // ── Managed-objects refresh helpers ───────────────────────────────────────────
 
-/// Refresh Adapter from the managed-objects map (called once on discovery).
-pub(super) fn refresh_adapter_from_managed(
-    managed: &ManagedObjects,
-    station_path: &str,
-    adapter_mutable: &Mutable<Option<Adapter>>,
-) {
-    let adapter_path = adapter_path_from_station(station_path);
-    if adapter_path.is_empty() {
-        adapter_mutable.set(None);
-        return;
+/// The adapter at `path`, from its `net.connman.iwd.Adapter` properties: a
+/// snapshot's, or a re-read's ([`super::client::refresh_adapter`]).
+pub(super) fn adapter_from_props(path: &str, props: &HashMap<String, OwnedValue>) -> Adapter {
+    Adapter {
+        path: path.to_owned(),
+        powered: prop_bool(props, "Powered"),
+        name: prop_str(props, "Name"),
     }
+}
 
-    let adapter_props = managed
+/// What one discovery snapshot holds for the watcher to publish.
+pub(super) struct Discovered {
+    /// iwd's whole object tree, for the station's own properties.
+    pub(super) managed: ManagedObjects,
+    /// The station ([`station_in`]), `None` while iwd has none: the adapter
+    /// is powered off, or iwd has no netdev up at all.
+    pub(super) station: Option<zbus::zvariant::OwnedObjectPath>,
+    /// The adapter ([`adapter_in`]), `None` when iwd has none to publish.
+    pub(super) adapter: Option<Adapter>,
+}
+
+/// Read a `GetManagedObjects` answer into what the watcher publishes.
+/// `kept` is the path of the adapter the watcher publishes now, if any
+/// ([`adapter_in`]).
+pub(super) fn discovered(managed: ManagedObjects, kept: Option<&str>) -> Discovered {
+    let station = station_in(&managed);
+    let adapter = adapter_in(&managed, station.as_ref().map(|p| p.as_str()), kept);
+    Discovered {
+        managed,
+        station,
+        adapter,
+    }
+}
+
+/// The station a snapshot names: the first object carrying
+/// `net.connman.iwd.Station` in the answer's order, the rule discovery has
+/// always used. With more than one station that order is the map's, so which
+/// one wins is not specified.
+pub(super) fn station_in(managed: &ManagedObjects) -> Option<zbus::zvariant::OwnedObjectPath> {
+    managed
         .iter()
-        .find(|(p, _)| p.as_str() == adapter_path)
-        .and_then(|(_, ifaces)| ifaces.get(IWD_ADAPTER_IFACE));
+        .find_map(|(path, ifaces)| ifaces.contains_key(IWD_STATION_IFACE).then(|| path.clone()))
+}
 
-    if let Some(props) = adapter_props {
-        adapter_mutable.set(Some(Adapter {
-            path: adapter_path,
-            powered: prop_bool(props, "Powered"),
-            name: prop_str(props, "Name"),
-        }));
-    } else {
-        adapter_mutable.set(None);
-    }
+/// The adapter to publish for a snapshot whose station is `station`.
+///
+/// - **With a station**: the adapter at the station's parent path
+///   ([`adapter_path_from_station`]), the rule discovery has always used, or
+///   none if that object has no `net.connman.iwd.Adapter`.
+/// - **Without one**: `kept`, the adapter the watcher publishes now, while
+///   the snapshot still has a `net.connman.iwd.Adapter` at its path (#1657
+///   review). Switching the radio off removes the station, and the pass that
+///   follows has none: with two adapters it must go on publishing the one
+///   the panel's switch just turned off, so the switch turns that one back
+///   on. Otherwise the object carrying `net.connman.iwd.Adapter` with the
+///   lowest path (byte order), so the choice does not move from pass to pass.
+///   That fallback is a guess on a machine with two adapters and no station:
+///   a shell that starts with both off, or a pass after iwd left (which
+///   clears the adapter), publishes the lowest. Until #1656 a snapshot with
+///   no station published no adapter at all. iwd keeps the adapter's object
+///   while the adapter is powered off (it removes it only with the wiphy,
+///   `wiphy_destroy`, iwd 3.12 `src/wiphy.c:2478-2490`), but not the station,
+///   so the panel read "No adapter" and its power switch went insensitive:
+///   Wi-Fi could be switched off from the panel and never on again.
+pub(super) fn adapter_in(
+    managed: &ManagedObjects,
+    station: Option<&str>,
+    kept: Option<&str>,
+) -> Option<Adapter> {
+    let mut adapters = managed.iter().filter_map(|(path, ifaces)| {
+        ifaces
+            .get(IWD_ADAPTER_IFACE)
+            .map(|props| (path.as_str(), props))
+    });
+    let (path, props) = match station {
+        Some(station) => {
+            let parent = adapter_path_from_station(station);
+            adapters.find(|(path, _)| *path == parent)?
+        }
+        None => adapters
+            .clone()
+            .find(|(path, _)| Some(*path) == kept)
+            .or_else(|| adapters.min_by(|(a, _), (b, _)| a.cmp(b)))?,
+    };
+    Some(adapter_from_props(path, props))
 }
 
 /// The station to publish for a freshly parsed one: `parsed`, keeping the
@@ -691,6 +799,341 @@ mod tests {
             let st = published.get_cloned().expect("a station");
             assert_eq!(st.connected_network.as_deref(), network, "{case}");
             assert_eq!(st.connected_ssid.as_deref(), ssid, "{case}");
+        }
+    }
+
+    const ADAPTER: &str = "/net/connman/iwd/0";
+
+    fn opath(p: &str) -> zbus::zvariant::OwnedObjectPath {
+        zbus::zvariant::OwnedObjectPath::try_from(p).expect("an object path")
+    }
+
+    /// An object with each of `ifaces`, with `props` on every one.
+    fn object(
+        ifaces: &[&str],
+        props: &[(&str, OwnedValue)],
+    ) -> HashMap<String, HashMap<String, OwnedValue>> {
+        ifaces
+            .iter()
+            .map(|iface| {
+                let props = props
+                    .iter()
+                    .map(|(k, x)| ((*k).to_owned(), x.try_clone().expect("a cloneable value")))
+                    .collect();
+                ((*iface).to_owned(), props)
+            })
+            .collect()
+    }
+
+    fn adapter_object(powered: bool, name: &str) -> HashMap<String, HashMap<String, OwnedValue>> {
+        object(
+            &["net.connman.iwd.Adapter"],
+            &[("Powered", owned(powered)), ("Name", owned(name))],
+        )
+    }
+
+    /// iwd's tree with the adapter powered off, as iwd 3.12 leaves it: the
+    /// adapter's object stays (it goes only with the wiphy,
+    /// `src/wiphy.c:2478-2490`), the netdev's `Device` stays (it goes only
+    /// with the netdev, `src/device.c:362-364`), and the `Station` is gone
+    /// (`src/station.c:5941-5945`). An iwd that starts with the radio
+    /// already off never adds it (`:5928-5934`).
+    fn powered_off_tree() -> ManagedObjects {
+        HashMap::from([
+            (opath(ADAPTER), adapter_object(false, "phy0")),
+            (
+                opath(STATION),
+                object(
+                    &["net.connman.iwd.Device"],
+                    &[("Name", owned("wlan0")), ("Powered", owned(false))],
+                ),
+            ),
+        ])
+    }
+
+    /// A snapshot with an adapter and no station publishes the adapter,
+    /// powered off, and no station (#1656). It used to publish neither, so
+    /// the panel read "No adapter" and its power switch went insensitive.
+    ///
+    /// **Falsification:** return no adapter without a station (the pre-#1656
+    /// discovery) and the first assertion fails.
+    #[test]
+    fn a_snapshot_with_an_adapter_and_no_station_publishes_the_adapter() {
+        let found = discovered(powered_off_tree(), None);
+        assert_eq!(
+            found.adapter,
+            Some(Adapter {
+                path: ADAPTER.to_owned(),
+                powered: false,
+                name: "phy0".to_owned(),
+            })
+        );
+        assert_eq!(found.station, None);
+    }
+
+    /// Which adapter a snapshot publishes. With a station, the station's
+    /// parent, as discovery always took it, even when another adapter sorts
+    /// first or another is published. Without one, the adapter already
+    /// published while the snapshot still has it (#1657 review), else the
+    /// lowest path. With none, none (#1656).
+    ///
+    /// **Falsification:** pick the lowest path with a station too and the
+    /// second row names `/net/connman/iwd/0`; prefer the published adapter
+    /// with a station too and the third row does; ignore the published one
+    /// without a station and the fifth row names `/net/connman/iwd/0`; pick
+    /// by map order without a station and the fourth or sixth row varies
+    /// between runs of the process.
+    #[test]
+    fn the_adapter_a_snapshot_publishes() {
+        /// A case, the snapshot, the published adapter's path, and the
+        /// station's and adapter's paths the snapshot must publish.
+        type Row<'a> = (
+            &'a str,
+            ManagedObjects,
+            Option<&'a str>,
+            Option<&'a str>,
+            Option<&'a str>,
+        );
+        let station = || {
+            object(
+                &["net.connman.iwd.Device", "net.connman.iwd.Station"],
+                &[("State", owned("connected"))],
+            )
+        };
+        let two = |phy1_station: bool| {
+            let mut managed = HashMap::from([
+                (opath("/net/connman/iwd/0"), adapter_object(false, "phy0")),
+                (opath("/net/connman/iwd/1"), adapter_object(true, "phy1")),
+            ]);
+            if phy1_station {
+                managed.insert(opath("/net/connman/iwd/1/7"), station());
+            }
+            managed
+        };
+        let rows: [Row<'_>; 8] = [
+            (
+                "the station's own adapter",
+                HashMap::from([
+                    (opath(ADAPTER), adapter_object(true, "phy0")),
+                    (opath(STATION), station()),
+                ]),
+                None,
+                Some(STATION),
+                Some(ADAPTER),
+            ),
+            (
+                "the station's own adapter, though another sorts first",
+                two(true),
+                None,
+                Some("/net/connman/iwd/1/7"),
+                Some("/net/connman/iwd/1"),
+            ),
+            (
+                "the station's own adapter, though another is published",
+                two(true),
+                Some("/net/connman/iwd/0"),
+                Some("/net/connman/iwd/1/7"),
+                Some("/net/connman/iwd/1"),
+            ),
+            (
+                "no station and none published: the lowest path",
+                HashMap::from([
+                    (opath("/net/connman/iwd/3"), adapter_object(false, "phy3")),
+                    (opath("/net/connman/iwd/1"), adapter_object(false, "phy1")),
+                    (opath("/net/connman/iwd/2"), adapter_object(false, "phy2")),
+                ]),
+                None,
+                None,
+                Some("/net/connman/iwd/1"),
+            ),
+            (
+                "no station: the published adapter, though another sorts first",
+                two(false),
+                Some("/net/connman/iwd/1"),
+                None,
+                Some("/net/connman/iwd/1"),
+            ),
+            (
+                "no station, and the published adapter gone: the lowest path",
+                HashMap::from([
+                    (opath("/net/connman/iwd/3"), adapter_object(false, "phy3")),
+                    (opath("/net/connman/iwd/2"), adapter_object(false, "phy2")),
+                ]),
+                Some("/net/connman/iwd/1"),
+                None,
+                Some("/net/connman/iwd/2"),
+            ),
+            (
+                "a station whose parent is no adapter",
+                HashMap::from([(opath(STATION), station())]),
+                None,
+                Some(STATION),
+                None,
+            ),
+            ("nothing at all", HashMap::new(), None, None, None),
+        ];
+        for (case, managed, kept, station_expected, adapter_expected) in rows {
+            let found = discovered(managed, kept);
+            assert_eq!(
+                found.station.as_ref().map(|p| p.as_str()),
+                station_expected,
+                "{case}"
+            );
+            assert_eq!(
+                found.adapter.as_ref().map(|a| a.path.as_str()),
+                adapter_expected,
+                "{case}"
+            );
+        }
+    }
+
+    fn removed(path: &str, ifaces: &[&str]) -> zbus::Message {
+        let path = zbus::zvariant::ObjectPath::try_from(path).expect("an object path");
+        zbus::Message::signal(
+            "/",
+            "org.freedesktop.DBus.ObjectManager",
+            "InterfacesRemoved",
+        )
+        .expect("signal builder")
+        .build(&(path, ifaces))
+        .expect("build InterfacesRemoved")
+    }
+
+    /// An `InterfacesRemoved` is the station's only when it takes the
+    /// published station's `Station` interface, and the adapter's only when
+    /// it takes the published adapter's `Adapter` (#1656). Powering off
+    /// removes the first and not the second, and the watcher keeps the
+    /// adapter for it.
+    ///
+    /// **Falsification:** read any removal at the station's path as the
+    /// adapter's (the pre-#1656 clear) and the first row fails; read the
+    /// adapter's by path alone and the `Properties`-only row does.
+    #[test]
+    fn a_removal_is_the_stations_or_the_adapters_by_path_and_interface() {
+        let published = (Some(STATION), Some(ADAPTER));
+        let rows = [
+            (
+                "the station's interface: powering off",
+                removed(STATION, &["net.connman.iwd.Station"]),
+                published,
+                Removed::Station,
+            ),
+            (
+                "the station's netdev, with its station",
+                removed(
+                    STATION,
+                    &["net.connman.iwd.Device", "net.connman.iwd.Station"],
+                ),
+                published,
+                Removed::Station,
+            ),
+            (
+                "the adapter's object: the wiphy is gone",
+                removed(
+                    ADAPTER,
+                    &["net.connman.iwd.Adapter", "org.freedesktop.DBus.Properties"],
+                ),
+                published,
+                Removed::Adapter,
+            ),
+            (
+                "the adapter removed while no station is published",
+                removed(ADAPTER, &["net.connman.iwd.Adapter"]),
+                (None, Some(ADAPTER)),
+                Removed::Adapter,
+            ),
+            (
+                "another interface at the adapter's path",
+                removed(ADAPTER, &["org.freedesktop.DBus.Properties"]),
+                published,
+                Removed::Other,
+            ),
+            (
+                "another adapter",
+                removed("/net/connman/iwd/1", &["net.connman.iwd.Adapter"]),
+                published,
+                Removed::Other,
+            ),
+            (
+                "another station",
+                removed("/net/connman/iwd/1/7", &["net.connman.iwd.Station"]),
+                published,
+                Removed::Other,
+            ),
+            (
+                "the station's path with no station published",
+                removed(STATION, &["net.connman.iwd.Station"]),
+                (None, Some(ADAPTER)),
+                Removed::Other,
+            ),
+            (
+                "a network",
+                removed(HOME, &["net.connman.iwd.Network"]),
+                published,
+                Removed::Other,
+            ),
+        ];
+        for (case, msg, (station, adapter), expected) in rows {
+            assert_eq!(
+                removed_from_event(&msg, station, adapter),
+                expected,
+                "{case}"
+            );
+        }
+    }
+
+    /// Without a station the watcher rediscovers on an `InterfacesAdded`
+    /// that brings a station or an adapter, and on one it cannot read, and
+    /// on nothing else (#1656).
+    ///
+    /// **Falsification:** answer `true` for every add and the known-network
+    /// row fails; answer `false` for an undecodable one and its row does.
+    #[test]
+    fn an_add_may_bring_a_station_or_an_adapter() {
+        let added = |path: &str, ifaces: &[&str]| {
+            let path = zbus::zvariant::ObjectPath::try_from(path).expect("an object path");
+            let ifaces: HashMap<&str, HashMap<&str, zbus::zvariant::Value<'_>>> =
+                ifaces.iter().map(|i| (*i, HashMap::new())).collect();
+            zbus::Message::signal("/", "org.freedesktop.DBus.ObjectManager", "InterfacesAdded")
+                .expect("signal builder")
+                .build(&(path, ifaces))
+                .expect("build InterfacesAdded")
+        };
+        let rows = [
+            (
+                "the station, back with the radio",
+                added(STATION, &["net.connman.iwd.Station"]),
+                true,
+            ),
+            (
+                "a new adapter",
+                added("/net/connman/iwd/1", &["net.connman.iwd.Adapter"]),
+                true,
+            ),
+            (
+                "a device without its station",
+                added(STATION, &["net.connman.iwd.Device"]),
+                false,
+            ),
+            (
+                "a known network",
+                added(
+                    "/net/connman/iwd/686f6d65_psk",
+                    &["net.connman.iwd.KnownNetwork"],
+                ),
+                false,
+            ),
+            (
+                "a body that is not InterfacesAdded's",
+                zbus::Message::signal("/", "org.freedesktop.DBus.ObjectManager", "InterfacesAdded")
+                    .expect("signal builder")
+                    .build(&(7_u32,))
+                    .expect("build"),
+                true,
+            ),
+        ];
+        for (case, msg, expected) in rows {
+            assert_eq!(adds_station_or_adapter(&msg), expected, "{case}");
         }
     }
 

@@ -2085,3 +2085,335 @@ async fn w7_with_two_adapters_the_switch_keeps_the_one_it_turned_off() {
     fake.task.abort();
     println!("{CHILD_OK} {}", test_name(TEST));
 }
+
+/// (#1657 second review) a W7 iwd, on, whose first `RegisterAgent`
+/// is refused (so the registration backs off on its ramp) and which leaves
+/// the bus as soon as the pump's station re-read reaches it, holding that
+/// read's answer for 2 s: the registration's retry goes out while the
+/// handler awaits, with iwd's `Lost` queued unread.
+async fn w7_leaving_fake(
+    conn: zbus::Connection,
+    mut stream: zbus::MessageStream,
+    calls: Arc<Mutex<Vec<String>>>,
+) {
+    let state = W7State {
+        powered: true,
+        station: true,
+        spare: false,
+    };
+    let (mut refused, mut left) = (false, false);
+    while let Some(Ok(msg)) = stream.next().await {
+        if msg.message_type() != zbus::message::Type::MethodCall {
+            continue;
+        }
+        let hdr = msg.header();
+        let at = hdr.path().map(ToString::to_string).unwrap_or_default();
+        let member = hdr.member().map(ToString::to_string).unwrap_or_default();
+        match member.as_str() {
+            "GetManagedObjects" => {
+                let _ = conn.reply(&hdr, &w7_tree(state)).await;
+            }
+            "GetAll" if at == ADAPTER => {
+                let _ = conn.reply(&hdr, &adapter_props(true)).await;
+            }
+            "GetAll" if at == STATION && !left => {
+                left = true;
+                let conn = conn.clone();
+                let msg = msg.clone();
+                tokio::spawn(async move {
+                    conn.release_name("net.connman.iwd")
+                        .await
+                        .expect("release iwd's name");
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    let _ = conn.reply(&msg.header(), &w7_station_props()).await;
+                });
+            }
+            "GetAll" if at == STATION => {
+                let _ = conn.reply(&hdr, &w7_station_props()).await;
+            }
+            "GetAll" => {
+                let props: Props = HashMap::from([
+                    ("Name".to_owned(), v("home".to_owned())),
+                    ("Type".to_owned(), v("psk")),
+                ]);
+                let _ = conn.reply(&hdr, &props).await;
+            }
+            "GetOrderedNetworks" => {
+                let ordered: Vec<(OwnedObjectPath, i16)> =
+                    vec![(OwnedObjectPath::try_from(HOME_NET).expect("a path"), -5000)];
+                let _ = conn.reply(&hdr, &ordered).await;
+            }
+            "RegisterAgent" if !refused => {
+                refused = true;
+                let _ = conn
+                    .reply_error(&hdr, "net.connman.iwd.Failed", &"not yet")
+                    .await;
+            }
+            "RegisterAgent" => {
+                let _ = conn.reply(&hdr, &()).await;
+            }
+            _ => {
+                let _ = conn
+                    .reply_error(&hdr, "org.freedesktop.DBus.Error.UnknownMethod", &"no")
+                    .await;
+            }
+        }
+        calls.lock().expect("calls").push(format!("{member} {at}"));
+    }
+}
+
+/// (#1657 second review) iwd leaves while the pump's station re-read is held and
+/// the registration is backing off: the registration's retry reaches the bus
+/// with nobody owning iwd's name. It must start nothing (the broker here can
+/// activate iwd and counts it), and the next iwd must still get the agent:
+/// the registration that ended on the bus's no-owner answer is armed again
+/// by the next iwd's pass.
+///
+/// **Falsification:** drop `no_auto_start()` from `register_iwd_agent` and
+/// the retries start iwd (2 activations measured); remember the no-owner end
+/// process-wide and never register again, and the second iwd never gets
+/// `RegisterAgent`.
+#[tokio::test(flavor = "multi_thread")]
+async fn w7_a_registration_iwd_left_behind_starts_nothing_and_the_next_iwd_gets_the_agent() {
+    const TEST: &str =
+        "w7_a_registration_iwd_left_behind_starts_nothing_and_the_next_iwd_gets_the_agent";
+    if in_child(TEST).is_none() {
+        return run_in_activating_child(TEST).await;
+    }
+    let address = std::env::var("DBUS_SYSTEM_BUS_ADDRESS").expect("the broker's address");
+    let conn = zbus::connection::Builder::address(address.as_str())
+        .expect("the broker's address")
+        .build()
+        .await
+        .expect("the first iwd connects");
+    let first_calls = Arc::new(Mutex::new(Vec::new()));
+    let stream = zbus::MessageStream::from(&conn);
+    let first_task = tokio::spawn(w7_leaving_fake(conn.clone(), stream, first_calls.clone()));
+    conn.request_name("net.connman.iwd")
+        .await
+        .expect("the first iwd owns the name");
+    let watcher = spawn_watcher();
+
+    // The re-read held, iwd gone; then the held answer, then the `Lost`.
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    while w7_count(&first_calls, "GetAll", STATION) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the re-read never came: {:?}",
+            first_calls.lock().expect("calls")
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    if let Err(state) = wait_for(&watcher, |w| {
+        w.station.lock_ref().is_none() && w.adapter.lock_ref().is_none()
+    })
+    .await
+    {
+        panic!(
+            "the first iwd's exit never cleared the panel: {state}. Calls: {:?}",
+            first_calls.lock().expect("calls")
+        );
+    }
+    assert_eq!(activations(), 0, "a call while iwd was gone started it");
+    assert!(
+        w7_count(&first_calls, "RegisterAgent", "/net/connman/iwd") <= 1,
+        "the first iwd took more than one RegisterAgent: {:?}",
+        first_calls.lock().expect("calls")
+    );
+    first_task.abort();
+
+    let second = zbus::connection::Builder::address(address.as_str())
+        .expect("the broker's address")
+        .build()
+        .await
+        .expect("the second iwd connects");
+    let on = W7State {
+        powered: true,
+        station: true,
+        spare: false,
+    };
+    let state = Arc::new(Mutex::new(on));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let stream = zbus::MessageStream::from(&second);
+    let task = tokio::spawn(w7_fake(
+        second.clone(),
+        stream,
+        state.clone(),
+        calls.clone(),
+    ));
+    second
+        .request_name("net.connman.iwd")
+        .await
+        .expect("the second iwd owns the name");
+    let fake = W7Fake {
+        conn: second,
+        state,
+        calls,
+        task,
+    };
+    w7_step(&watcher, &fake, "registered with the second iwd", |w| {
+        w.station.lock_ref().is_some()
+            && w7_count(&fake.calls, "RegisterAgent", "/net/connman/iwd") == 1
+    })
+    .await;
+    assert_eq!(activations(), 0, "a call started iwd");
+    watcher.task.abort();
+    fake.task.abort();
+    println!("{CHILD_OK} {}", test_name(TEST));
+}
+
+/// (#1657 second review) W7's iwd, on, whose adapter and netdev can
+/// be unplugged (`gone`): from then on its tree has neither, and reads of
+/// either are refused, as for a USB adapter pulled out.
+async fn w7_unplug_fake(
+    conn: zbus::Connection,
+    mut stream: zbus::MessageStream,
+    gone: Arc<std::sync::atomic::AtomicBool>,
+    calls: Arc<Mutex<Vec<String>>>,
+) {
+    let on = W7State {
+        powered: true,
+        station: true,
+        spare: false,
+    };
+    let unknown = "org.freedesktop.DBus.Error.UnknownObject";
+    while let Some(Ok(msg)) = stream.next().await {
+        if msg.message_type() != zbus::message::Type::MethodCall {
+            continue;
+        }
+        let hdr = msg.header();
+        let at = hdr.path().map(ToString::to_string).unwrap_or_default();
+        let member = hdr.member().map(ToString::to_string).unwrap_or_default();
+        let unplugged = gone.load(std::sync::atomic::Ordering::SeqCst);
+        match member.as_str() {
+            "GetManagedObjects" if unplugged => {
+                let empty: HashMap<OwnedObjectPath, Ifaces> = HashMap::new();
+                let _ = conn.reply(&hdr, &empty).await;
+            }
+            "GetManagedObjects" => {
+                let _ = conn.reply(&hdr, &w7_tree(on)).await;
+            }
+            "GetAll" | "GetOrderedNetworks" if unplugged => {
+                let _ = conn.reply_error(&hdr, unknown, &"unplugged").await;
+            }
+            "GetAll" if at == ADAPTER => {
+                let _ = conn.reply(&hdr, &adapter_props(true)).await;
+            }
+            "GetAll" if at == STATION => {
+                let _ = conn.reply(&hdr, &w7_station_props()).await;
+            }
+            "GetAll" => {
+                let props: Props = HashMap::from([
+                    ("Name".to_owned(), v("home".to_owned())),
+                    ("Type".to_owned(), v("psk")),
+                ]);
+                let _ = conn.reply(&hdr, &props).await;
+            }
+            "GetOrderedNetworks" => {
+                let ordered: Vec<(OwnedObjectPath, i16)> =
+                    vec![(OwnedObjectPath::try_from(HOME_NET).expect("a path"), -5000)];
+                let _ = conn.reply(&hdr, &ordered).await;
+            }
+            "RegisterAgent" => {
+                let _ = conn.reply(&hdr, &()).await;
+            }
+            _ => {
+                let _ = conn
+                    .reply_error(&hdr, "org.freedesktop.DBus.Error.UnknownMethod", &"no")
+                    .await;
+            }
+        }
+        calls.lock().expect("calls").push(format!("{member} {at}"));
+    }
+}
+
+/// (#1657 second review) A USB adapter pulled out: iwd removes the netdev (the
+/// station's interfaces) and then the wiphy (the adapter's object). The pump
+/// reads the station's removal and pauses, so the adapter's removal lands
+/// while nothing reads it; the snapshot after the pause has no adapter, and
+/// the panel must drop the one it kept through the pause, or its switch
+/// stays live for a radio that is gone.
+///
+/// **Falsification:** publish the snapshot's adapter only when it has one
+/// (`if adapter.is_some() { adapter_mutable.set_neq(adapter) }`) and the
+/// panel keeps `/net/connman/iwd/0`, powered.
+#[tokio::test(flavor = "multi_thread")]
+async fn w7_an_adapter_unplugged_during_the_pause_leaves_the_panel() {
+    const TEST: &str = "w7_an_adapter_unplugged_during_the_pause_leaves_the_panel";
+    let Some(address) = in_child(TEST) else {
+        return run_in_child(TEST, None).await;
+    };
+    let conn = zbus::connection::Builder::address(address.as_str())
+        .expect("the broker's address")
+        .build()
+        .await
+        .expect("the scripted iwd connects");
+    let gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let stream = zbus::MessageStream::from(&conn);
+    let task = tokio::spawn(w7_unplug_fake(
+        conn.clone(),
+        stream,
+        gone.clone(),
+        calls.clone(),
+    ));
+    conn.request_name("net.connman.iwd")
+        .await
+        .expect("own net.connman.iwd");
+    let watcher = spawn_watcher();
+    let fake = W7Fake {
+        conn,
+        state: Arc::new(Mutex::new(W7State {
+            powered: true,
+            station: true,
+            spare: false,
+        })),
+        calls,
+        task,
+    };
+    w7_step(&watcher, &fake, "connected", |w| {
+        w.station.lock_ref().is_some() && !w.networks.lock_ref().is_empty() && adapter_is(w, true)
+    })
+    .await;
+
+    let station = OwnedObjectPath::try_from(STATION).expect("a path");
+    fake.conn
+        .emit_signal(
+            None::<zbus::names::BusName<'_>>,
+            "/",
+            "org.freedesktop.DBus.ObjectManager",
+            "InterfacesRemoved",
+            &(
+                station,
+                vec![
+                    "net.connman.iwd.Station".to_owned(),
+                    "net.connman.iwd.Device".to_owned(),
+                ],
+            ),
+        )
+        .await
+        .expect("emit InterfacesRemoved");
+    w7_step(&watcher, &fake, "the station removed", |w| {
+        w.station.lock_ref().is_none()
+    })
+    .await;
+    gone.store(true, std::sync::atomic::Ordering::SeqCst);
+    let adapter = OwnedObjectPath::try_from(ADAPTER).expect("a path");
+    fake.conn
+        .emit_signal(
+            None::<zbus::names::BusName<'_>>,
+            "/",
+            "org.freedesktop.DBus.ObjectManager",
+            "InterfacesRemoved",
+            &(adapter, vec!["net.connman.iwd.Adapter".to_owned()]),
+        )
+        .await
+        .expect("emit InterfacesRemoved");
+    w7_step(&watcher, &fake, "the adapter gone from the panel", |w| {
+        w.adapter.lock_ref().is_none() && w.station.lock_ref().is_none()
+    })
+    .await;
+    watcher.task.abort();
+    fake.task.abort();
+    println!("{CHILD_OK} {}", test_name(TEST));
+}

@@ -1612,6 +1612,82 @@ mod tests {
             "a lost iwd clears the panel and is not called"
         );
     }
+
+    /// `clear_published` empties all four slots, and wakes none that is
+    /// already clear (#1654 review). The pump, the wait for iwd and a pass that
+    /// finds no station all go through it, but the real-bus W6 tests read only
+    /// the station and the adapter, so dropping the network list from it left
+    /// every test green while the panel kept the old network's "Connected"
+    /// row with iwd gone. The skip is what keeps the 5 s no-station retry (the
+    /// radio off) from waking the panel on every pass.
+    ///
+    /// **Falsification:** drop any one slot from `clear_published` and the
+    /// first half fails; set the four unconditionally (the pump's pre-#1654
+    /// closure) and the second half sees a wake.
+    #[test]
+    fn clear_published_clears_every_slot_and_wakes_none_already_clear() {
+        use futures_signals::signal::SignalExt;
+        use futures_util::FutureExt;
+
+        let network = super::WifiNetwork {
+            path: "/net/connman/iwd/0/4/686f6d65_psk".to_owned(),
+            ssid: "home".to_owned(),
+            security: "psk".to_owned(),
+            known: true,
+            connected: true,
+            signal_dbm: -50,
+            known_network_path: None,
+            ap_count: 1,
+            active_signal_dbm: Some(-50),
+        };
+        let prompt = super::PromptRequest {
+            id: 1,
+            network_path: network.path.clone(),
+            ssid: "home".to_owned(),
+            security: "psk".to_owned(),
+            kind: crate::wifi::PromptKind::WifiPassphrase,
+            secret_keys: vec!["passphrase".to_owned()],
+            prior_failure: false,
+        };
+        let station = Mutable::new(Some(Station::default()));
+        let networks = Mutable::new(vec![network]);
+        let prompts = Mutable::new(Some(prompt));
+        let adapter = Mutable::new(Some(Adapter::default()));
+
+        super::clear_published(&station, &networks, &prompts, &adapter);
+        assert!(station.lock_ref().is_none(), "the station is kept");
+        assert!(networks.lock_ref().is_empty(), "the network list is kept");
+        assert!(prompts.lock_ref().is_none(), "the prompt is kept");
+        assert!(adapter.lock_ref().is_none(), "the adapter is kept");
+
+        let mut station_wakes = station.signal_cloned().to_stream();
+        let mut network_wakes = networks.signal_cloned().to_stream();
+        let mut prompt_wakes = prompts.signal_cloned().to_stream();
+        let mut adapter_wakes = adapter.signal_cloned().to_stream();
+        // A signal yields its current value first.
+        assert!(station_wakes.next().now_or_never().is_some());
+        assert!(network_wakes.next().now_or_never().is_some());
+        assert!(prompt_wakes.next().now_or_never().is_some());
+        assert!(adapter_wakes.next().now_or_never().is_some());
+
+        super::clear_published(&station, &networks, &prompts, &adapter);
+        assert!(
+            station_wakes.next().now_or_never().is_none(),
+            "the station woke"
+        );
+        assert!(
+            network_wakes.next().now_or_never().is_none(),
+            "the network list woke"
+        );
+        assert!(
+            prompt_wakes.next().now_or_never().is_none(),
+            "the prompt woke"
+        );
+        assert!(
+            adapter_wakes.next().now_or_never().is_none(),
+            "the adapter woke"
+        );
+    }
 }
 
 // The production `run_wifi_watcher`, through the process-global system

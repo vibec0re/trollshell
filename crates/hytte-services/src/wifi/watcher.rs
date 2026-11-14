@@ -5,6 +5,8 @@ use futures_signals::signal::Mutable;
 use futures_util::{Stream, StreamExt};
 use hytte_bus::{BusKind, SignalItem, SignalSubscription};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::Poll;
 use std::time::Duration;
 use zbus::zvariant::OwnedValue;
 
@@ -854,13 +856,15 @@ where
 /// there comes with a reconnect of our own bus connection, which hands the
 /// other receivers a marker of their own anyway.
 ///
-/// Three calls to iwd run as arms of the loop rather than before it, so none
+/// Three calls to iwd run beside the events rather than before them, so none
 /// holds up another or the events (`calls`, injected so a test can drive the
 /// pump without a bus):
 ///
 /// - **The agent registration** ([`register_iwd_agent`] in production),
 ///   retried until iwd takes it ([`register_agent_until_accepted`]). Events
-///   keep flowing while it backs off. A pass with no station does not
+///   keep flowing while it backs off. It is polled beside the event loop, not
+///   as one of its arms ([`beside_registration`]), so it keeps moving while a
+///   handler awaits a call of its own. A pass with no station does not
 ///   register: iwd has nothing to ask a passphrase for, and the pass that
 ///   finds the station registers.
 /// - **The station re-read** ([`reread_station`] in production), once the
@@ -904,39 +908,130 @@ async fn pump_iwd_events<O, E, H, R, RF, S, SF, A, AF>(
     A: Fn() -> AF,
     AF: Future<Output = ()>,
 {
+    // Set once iwd has exited. From then on nothing that would call iwd is
+    // polled. Anything still queued came from the dead daemon, and acting on
+    // it would call `net.connman.iwd`, which D-Bus-activates a stopped iwd.
+    // An atomic only because the watcher's future must be `Send`: one task
+    // reads and writes it.
+    let iwd_gone = AtomicBool::new(false);
+    // Nothing to register for without a station: see this function's doc.
+    let registration = streams.station.is_some().then(|| {
+        register_agent_until_accepted(calls.register, super::nm_registrar::REGISTER_RETRY)
+    });
+    let published = Published {
+        station: station_mutable,
+        networks: networks_mutable,
+        prompts: prompts_mutable,
+        adapter: adapter_mutable,
+    };
+    let events = pump_events(
+        streams,
+        (calls.reread_station, calls.reread_adapter),
+        published,
+        &iwd_gone,
+    );
+    beside_registration(events, registration, &iwd_gone).await;
+}
+
+/// What the watcher publishes, borrowed for one pump.
+#[derive(Clone, Copy)]
+struct Published<'m> {
+    station: &'m Mutable<Option<Station>>,
+    networks: &'m Mutable<Vec<WifiNetwork>>,
+    prompts: &'m Mutable<Option<PromptRequest>>,
+    adapter: &'m Mutable<Option<Adapter>>,
+}
+
+impl Published<'_> {
+    /// [`clear_published`].
+    fn clear(self) {
+        clear_published(self.station, self.networks, self.prompts, self.adapter);
+    }
+}
+
+/// Run the pump's event loop with the agent registration polled beside it
+/// (#1656), until the loop returns. The registration is dropped once iwd is
+/// gone or it is done, never left pending unpolled.
+///
+/// It used to be one of the loop's arms, so it was not polled while another
+/// arm's handler awaited a call of its own (a re-read, a network read), and a
+/// zbus call holds its connection's resources between polls. The socket's
+/// write half is a `tokio::sync::Mutex` (zbus 5.14 with `tokio`,
+/// `abstractions/async_lock.rs`), which is fair: it hands the lock to the
+/// first queued waiter whether or not that waiter is polled. A
+/// `RegisterAgent` queued behind another writer was handed the lock while its
+/// arm sat unpolled, and the handler's own call then waited behind it until
+/// its 25 s deadline. The adapter's subscription (#1656) added writes at the
+/// pump's start, and #1656's W1 runs measured it at 3 of 40 until this. A
+/// pending call's receiver on the connection's method-return queue (8 deep,
+/// `connection/mod.rs`) is the same hazard for every reply on the
+/// connection, which is why a registration that iwd's exit leaves pending is
+/// dropped rather than kept.
+async fn beside_registration(
+    events: impl Future<Output = ()>,
+    registration: Option<impl Future<Output = ()>>,
+    iwd_gone: &AtomicBool,
+) {
+    let mut events = std::pin::pin!(events);
+    let mut registration = std::pin::pin!(registration);
+    std::future::poll_fn(|cx| {
+        // The events first, so a queued `Lost` is read before the
+        // registration is polled (see `pump_iwd_events`' doc).
+        if events.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(());
+        }
+        if iwd_gone.load(Ordering::Relaxed) {
+            registration.set(None);
+        }
+        let done = registration
+            .as_mut()
+            .as_pin_mut()
+            .is_some_and(|registration| registration.poll(cx).is_ready());
+        if done {
+            registration.set(None);
+        }
+        Poll::Pending
+    })
+    .await;
+}
+
+/// [`pump_iwd_events`]' event loop: every arm but the registration, which
+/// runs beside it ([`beside_registration`]). Returns when the pump does; see
+/// that function's doc for why each arm does what it does.
+async fn pump_events<O, E, H, S, SF, A, AF>(
+    streams: IwdStreams<'_, O, E, H>,
+    (reread_station, reread_adapter): (S, A),
+    published: Published<'_>,
+    iwd_gone: &AtomicBool,
+) where
+    O: Stream<Item = SignalItem> + Unpin,
+    E: Stream<Item = SignalItem> + Unpin,
+    H: Handshake,
+    S: Fn() -> SF,
+    SF: Future<Output = ()>,
+    A: Fn() -> AF,
+    AF: Future<Output = ()>,
+{
+    let Published {
+        station: station_mutable,
+        networks: networks_mutable,
+        prompts: prompts_mutable,
+        adapter: adapter_mutable,
+    } = published;
     // What the pass publishes, by path, and the receivers for it. The
     // station's go to `None` when iwd removes the station; the adapter's
     // removal ends the pass.
     let (mut station_path, mut station_items, station_rule) = watch_parts(streams.station);
     let (adapter_path, mut adapter_items, adapter_rule) = watch_parts(streams.adapter);
-
-    let mut registering = std::pin::pin!(register_agent_until_accepted(
-        calls.register,
-        super::nm_registrar::REGISTER_RETRY,
-    ));
-    // Nothing to register for without a station: see this function's doc.
-    let mut registered = station_path.is_none();
     let mut station_installed = std::pin::pin!(installed(station_rule));
     let mut station_read = false;
     let mut adapter_installed = std::pin::pin!(installed(adapter_rule));
     let mut adapter_read = false;
 
-    let clear = || {
-        clear_published(
-            station_mutable,
-            networks_mutable,
-            prompts_mutable,
-            adapter_mutable,
-        );
-    };
-    // Set once iwd has exited. From then on the other arms are not polled.
-    // Anything still queued came from the dead daemon, and acting on it would
-    // call `net.connman.iwd`, which D-Bus-activates a stopped iwd.
-    let mut iwd_gone = false;
-
     loop {
+        let gone = iwd_gone.load(Ordering::Relaxed);
         tokio::select! {
-            // Owner first: see this function's doc.
+            // Owner first: see `pump_iwd_events`' doc.
             biased;
 
             Some(item) = streams.owner.next() => {
@@ -944,52 +1039,45 @@ async fn pump_iwd_events<O, E, H, R, RF, S, SF, A, AF>(
                 let reaction = owner_reaction(&change);
                 tracing::info!(?change, "iwd changed hands");
                 if reaction.clear {
-                    clear();
+                    published.clear();
                 }
                 if reaction.rediscover {
                     return;
                 }
-                iwd_gone = change == IwdOwner::Lost;
+                iwd_gone.store(change == IwdOwner::Lost, Ordering::Relaxed);
             }
-            () = &mut station_installed,
-                if station_path.is_some() && !station_read && !iwd_gone =>
-            {
+            () = &mut station_installed, if station_path.is_some() && !station_read && !gone => {
                 station_read = true;
-                (calls.reread_station)().await;
+                reread_station().await;
             }
-            () = &mut adapter_installed,
-                if adapter_path.is_some() && !adapter_read && !iwd_gone =>
-            {
+            () = &mut adapter_installed, if adapter_path.is_some() && !adapter_read && !gone => {
                 adapter_read = true;
-                (calls.reread_adapter)().await;
-            }
-            () = &mut registering, if !registered && !iwd_gone => {
-                registered = true;
+                reread_adapter().await;
             }
             // A marker on any receiver below: rediscover, keeping the state,
-            // as for `IwdOwner::Hole` (see this function's doc).
-            Some(item) = next_item(&mut station_items), if !iwd_gone => {
+            // as for `IwdOwner::Hole` (see `pump_iwd_events`' doc).
+            Some(item) = next_item(&mut station_items), if !gone => {
                 let Some(evt) = event_or_hole(&item, "station PropertiesChanged") else { return };
                 let Some(path) = station_path else { continue; };
                 handle_station_props_event(evt, path, station_mutable).await;
                 refresh_networks(path, station_mutable, networks_mutable).await;
             }
             // The adapter's own (#1656).
-            Some(item) = next_item(&mut adapter_items), if !iwd_gone => {
+            Some(item) = next_item(&mut adapter_items), if !gone => {
                 let Some(evt) = event_or_hole(&item, "adapter PropertiesChanged") else { return };
                 if !apply_adapter_event(evt, adapter_mutable) {
-                    (calls.reread_adapter)().await;
+                    reread_adapter().await;
                 }
             }
             // The removal first, so a queued removal of the station stops the
             // pass reading it before a queued add would read the station that
             // left.
-            Some(item) = streams.removed.next(), if !iwd_gone => {
+            Some(item) = streams.removed.next(), if !gone => {
                 let Some(evt) = event_or_hole(&item, "InterfacesRemoved") else { return };
                 match removed_from_event(&evt.body, station_path, adapter_path) {
                     Removed::Adapter => {
                         tracing::warn!(path = adapter_path, "iwd adapter removed — rewatching");
-                        clear();
+                        published.clear();
                         tokio::time::sleep(REMOVAL_PAUSE).await;
                         return;
                     }
@@ -1003,7 +1091,7 @@ async fn pump_iwd_events<O, E, H, R, RF, S, SF, A, AF>(
                     },
                 }
             }
-            Some(item) = streams.added.next(), if !iwd_gone => {
+            Some(item) = streams.added.next(), if !gone => {
                 let Some(evt) = event_or_hole(&item, "InterfacesAdded") else { return };
                 match station_path {
                     Some(path) => refresh_networks(path, station_mutable, networks_mutable).await,
@@ -1513,6 +1601,95 @@ mod tests {
             ["register", "station re-read"],
             "the station is read again once, and a pass with no adapter reads none"
         );
+    }
+
+    /// The registration keeps moving while a handler awaits a call of its own
+    /// (#1656). Here the station's re-read can only finish once the
+    /// registration has been polled through its own call, the shape of zbus
+    /// handing the socket's write lock to a queued `RegisterAgent`: with the
+    /// registration as one of the loop's arms it was not polled while the
+    /// re-read's arm awaited, and the two waited on each other (#1656's W1, 3
+    /// of 40 runs, each until the re-read's 25 s deadline).
+    ///
+    /// **Falsification:** poll the registration as an arm of the event loop
+    /// again (the pre-#1656 pump), or not at all, and the re-read never ends.
+    #[tokio::test]
+    async fn the_registration_moves_while_a_handler_awaits_a_call() {
+        let (sent, arrived) = tokio::sync::oneshot::channel::<()>();
+        let (sent, arrived) = (RefCell::new(Some(sent)), RefCell::new(Some(arrived)));
+        let read = Cell::new(false);
+        let (_install, installed) = tokio::sync::watch::channel(true);
+        let station_rule = StationRule(installed);
+        let (owner_tx, owner_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut owner = fed(owner_rx);
+        let quiet = || futures_util::stream::pending::<SignalItem>().boxed_local();
+        let (mut added, mut removed, mut station) = (quiet(), quiet(), quiet());
+        let (station_state, networks, prompts, adapter) = (
+            Mutable::new(Some(Station::default())),
+            Mutable::new(Vec::new()),
+            Mutable::new(None),
+            Mutable::new(Some(Adapter::default())),
+        );
+
+        let pump = pump_iwd_events(
+            IwdStreams {
+                owner: &mut owner,
+                added: &mut added,
+                removed: &mut removed,
+                station: Some(PropsWatch {
+                    path: STATION,
+                    items: &mut station,
+                    rule: &station_rule,
+                }),
+                adapter: None,
+            },
+            IwdCalls {
+                register: || {
+                    let sent = sent.borrow_mut().take();
+                    async move {
+                        // In flight: it finishes only if polled again.
+                        tokio::task::yield_now().await;
+                        if let Some(sent) = sent {
+                            let _ = sent.send(());
+                        }
+                        Ok::<(), BusError>(())
+                    }
+                },
+                reread_station: || {
+                    let arrived = arrived.borrow_mut().take();
+                    let read = &read;
+                    async move {
+                        if let Some(arrived) = arrived {
+                            let _ = arrived.await;
+                        }
+                        read.set(true);
+                    }
+                },
+                reread_adapter: || std::future::ready(()),
+            },
+            &station_state,
+            &networks,
+            &prompts,
+            &adapter,
+        );
+        let drive = async {
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                read.get(),
+                "the re-read waited on a registration nobody polled"
+            );
+            owner_tx
+                .send(SignalItem::Resubscribed)
+                .expect("the pump reads the owner");
+        };
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            futures_util::future::join(pump, drive),
+        )
+        .await
+        .expect("a hole in the owner's receiver ends the pump");
     }
 
     /// A pass with an adapter and no station (the radio is off) reads the

@@ -1544,3 +1544,55 @@ async fn w7_a_radio_off_at_start_is_published_and_switched_on() {
     fake.task.abort();
     println!("{CHILD_OK} {}", test_name(TEST));
 }
+
+/// The radio off at start, on a bus that refuses the adapter's `AddMatch`
+/// (W2's per-connection limit at 4: the watcher's three discovery rules and
+/// the connection's own fit, the adapter's does not). With no rule there is
+/// no re-read, so the adapter on the panel is the snapshot's own: a pass
+/// that publishes it and then clears it would leave the panel at "No
+/// adapter", where with the rule the re-read would put it back and hide that
+/// (#1656).
+///
+/// The premise is checked too: the adapter is never read again. If it is,
+/// the limit no longer refuses its rule and the test says so.
+///
+/// **Falsification:** clear the adapter with the station's side on a
+/// snapshot with no station (the #1654 clear at the call site), or publish
+/// no adapter from it, and the panel never shows the adapter.
+#[tokio::test(flavor = "multi_thread")]
+async fn w7_a_snapshot_with_no_station_publishes_its_adapter_itself() {
+    const TEST: &str = "w7_a_snapshot_with_no_station_publishes_its_adapter_itself";
+    let Some(address) = in_child(TEST) else {
+        return run_in_child(TEST, Some(4)).await;
+    };
+    let off = W7State {
+        powered: false,
+        station: false,
+    };
+    let (fake, watcher) = w7_start(&address, off).await;
+
+    w7_step(&watcher, &fake, "off at start", |w| {
+        w.station.lock_ref().is_none()
+            && adapter_is(w, false)
+            && w7_count(&fake.calls, "GetManagedObjects", "/") > 0
+    })
+    .await;
+    // A bounded negative, for the premise: a re-read would follow the rule
+    // within a round trip or two.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        w7_count(&fake.calls, "GetAll", ADAPTER),
+        0,
+        "the adapter was read again, so its rule was installed: this limit no longer \
+         refuses it"
+    );
+    assert!(
+        adapter_is(&watcher, false),
+        "the adapter went: {:?}",
+        watcher.adapter.get_cloned()
+    );
+
+    watcher.task.abort();
+    fake.task.abort();
+    println!("{CHILD_OK} {}", test_name(TEST));
+}

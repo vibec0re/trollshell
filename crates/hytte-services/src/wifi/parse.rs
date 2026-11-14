@@ -212,9 +212,7 @@ pub(super) fn with_kept_ssid(previous: Option<&Station>, parsed: Station) -> Sta
             (&previous.connected_network, &parsed.connected_network),
             (Some(was), Some(is)) if was == is
         );
-        (previous.path == parsed.path
-            && same_network
-            && parsed.state != StationState::Disconnected)
+        (previous.path == parsed.path && same_network && parsed.state != StationState::Disconnected)
             .then(|| previous.connected_ssid.clone())
             .flatten()
     });

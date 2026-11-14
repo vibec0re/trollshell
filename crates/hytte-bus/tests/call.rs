@@ -367,9 +367,14 @@ async fn time_spent_getting_the_connection_counts_against_the_deadline() {
         .expect("the call must give up at its own deadline, not hang")
         .expect_err("a peer that never answers cannot have answered");
     let took = started.elapsed();
-    release.await.expect("the task holding the pool's lock panicked");
+    release
+        .await
+        .expect("the task holding the pool's lock panicked");
 
-    assert!(err.is_timeout(), "a call out of time is BusError::Timeout, got {err:?}");
+    assert!(
+        err.is_timeout(),
+        "a call out of time is BusError::Timeout, got {err:?}"
+    );
     assert!(
         took >= BUDGET,
         "the call gave up after {took:?}, before its {BUDGET:?} deadline"

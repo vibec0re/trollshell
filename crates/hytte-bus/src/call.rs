@@ -516,7 +516,10 @@ mod tests {
             err.is_timeout() && !err.is_transient(),
             "running out of time waiting for the connection is BusError::Timeout, got {err:?}"
         );
-        assert_eq!(err.to_string(), "bus operation permanently failed: call timeout");
+        assert_eq!(
+            err.to_string(),
+            "bus operation permanently failed: call timeout"
+        );
         assert_eq!(
             started.elapsed(),
             Duration::from_millis(100),

@@ -339,9 +339,10 @@ async fn a_call_past_its_deadline_is_a_timeout() {
 /// the budget it started with runs out, not a full budget after it got the
 /// connection. `call.rs`'s unit tests cover a lock that is never released.
 ///
-/// The bound is one-sided where it matters: a call cannot return before its
-/// sleep fires, so the per-stage answer is never under `HELD + BUDGET`, and the
-/// assertion leaves the right one a second of scheduling slack.
+/// The bound is one-sided where it matters: both sleeps start after `started`
+/// and a tokio timer never fires early, so a per-stage answer is never under
+/// `HELD + BUDGET`. Bounding the right answer by exactly that gives it `HELD`
+/// (1.5 s) of scheduling slack and still catches every wrong placement.
 ///
 /// **Falsification:** give the call a fresh budget once it has the connection
 /// (a deadline per stage), or put the deadline back around the method call
@@ -389,7 +390,7 @@ async fn time_spent_getting_the_connection_counts_against_the_deadline() {
         "the call gave up after {took:?}, before its {BUDGET:?} deadline"
     );
     assert!(
-        took + Duration::from_secs(1) < HELD + BUDGET,
+        took < HELD + BUDGET,
         "the call gave up after {took:?}: the {HELD:?} it waited for the connection did not \
          count against its {BUDGET:?} deadline"
     );

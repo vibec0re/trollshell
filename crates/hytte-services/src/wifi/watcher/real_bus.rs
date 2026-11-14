@@ -2337,7 +2337,8 @@ async fn w7_unplug_fake(
 ///
 /// **Falsification:** publish the snapshot's adapter only when it has one
 /// (`if adapter.is_some() { adapter_mutable.set_neq(adapter) }`) and the
-/// panel keeps `/net/connman/iwd/0`, powered.
+/// panel keeps `/net/connman/iwd/0`, powered; set the adapter's path only when
+/// the pass has one and the switch keeps addressing it (#1659).
 #[tokio::test(flavor = "multi_thread")]
 async fn w7_an_adapter_unplugged_during_the_pause_leaves_the_panel() {
     const TEST: &str = "w7_an_adapter_unplugged_during_the_pause_leaves_the_panel";
@@ -2414,6 +2415,12 @@ async fn w7_an_adapter_unplugged_during_the_pause_leaves_the_panel() {
         w.adapter.lock_ref().is_none() && w.station.lock_ref().is_none()
     })
     .await;
+    // #1659: the pass with no adapter takes the adapter's path with it.
+    assert_eq!(
+        w8_paths(&watcher).await,
+        (String::new(), String::new()),
+        "the switch still names the radio that was pulled out"
+    );
     watcher.task.abort();
     fake.task.abort();
     println!("{CHILD_OK} {}", test_name(TEST));
@@ -2435,7 +2442,9 @@ async fn w8_paths(watcher: &Watcher) -> (String, String) {
 ///
 /// **Falsification:** hand the pump other paths than the watcher's, or keep
 /// them in `clear_published`, and the last step keeps the adapter's; clear
-/// the adapter's path with the station's side and the second step loses it.
+/// the adapter's path with the station's side and the second step loses it;
+/// set the station's path after the pass's network read and the first step
+/// reads an empty one.
 #[tokio::test(flavor = "multi_thread")]
 async fn w8_the_commands_paths_follow_the_panel() {
     const TEST: &str = "w8_the_commands_paths_follow_the_panel";
@@ -2448,10 +2457,34 @@ async fn w8_the_commands_paths_follow_the_panel() {
         spare: false,
     };
     let (fake, watcher) = w7_start(&address, on).await;
+    // The station's path the commands read whenever the first pass hands the
+    // panel a station: named before the panel shows it (#1661 review).
+    let (shown_tx, mut shown) = tokio::sync::mpsc::unbounded_channel();
+    let observer = tokio::spawn({
+        let paths = watcher.paths.clone();
+        watcher.station.signal_ref(Option::is_some).for_each(move |some| {
+            let (paths, shown_tx) = (paths.clone(), shown_tx.clone());
+            async move {
+                if some {
+                    let _ = shown_tx.send(paths.station_path().await);
+                }
+            }
+        })
+    });
     w7_step(&watcher, &fake, "connected", |w| {
         w.station.lock_ref().is_some() && w7_count(&fake.calls, "GetAll", ADAPTER) > 0
     })
     .await;
+    let first = tokio::time::timeout(Duration::from_secs(5), shown.recv()).await;
+    observer.abort();
+    let mut read = vec![first.ok().flatten().unwrap_or_else(|| "no station".to_owned())];
+    while let Ok(path) = shown.try_recv() {
+        read.push(path);
+    }
+    assert!(
+        read.iter().all(|path| path == STATION),
+        "the panel showed a station the commands could not address: {read:?}"
+    );
     let both = (STATION.to_owned(), ADAPTER.to_owned());
     assert_eq!(w8_paths(&watcher).await, both);
 

@@ -1113,13 +1113,15 @@ async fn pump_events<O, E, H, S, SF, A, AF>(
                 let Some(change) = iwd_owner_change(&item) else { continue; };
                 let reaction = owner_reaction(&change);
                 tracing::info!(?change, "iwd changed hands");
+                // Before the clear, which can wait for the paths' lock: the
+                // registration beside this loop is polled meanwhile (#1661).
+                iwd_gone.store(change == IwdOwner::Lost, Ordering::Relaxed);
                 if reaction.clear {
                     published.clear().await;
                 }
                 if reaction.rediscover {
                     return;
                 }
-                iwd_gone.store(change == IwdOwner::Lost, Ordering::Relaxed);
             }
             () = &mut station_installed, if station_path.is_some() && !station_read && !gone => {
                 station_read = true;
@@ -1975,6 +1977,77 @@ mod tests {
         }
     }
 
+    /// iwd's `Lost` read while a command (`scan`, `disconnect`, `set_powered`)
+    /// is reading one of the paths: since #1659 the clear takes the paths'
+    /// write lock, so the `Lost` handler can wait there, and
+    /// `beside_registration` polls the registration meanwhile. `iwd_gone` must
+    /// be set before that wait, or the registration calls iwd after its `Lost`
+    /// was read (#1661 review).
+    ///
+    /// **Falsification:** set `iwd_gone` after `published.clear().await` (the
+    /// #1661 head) and `RegisterAgent` is called.
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_read_while_a_command_reads_a_path_calls_iwd_no_more() {
+        let calls = RefCell::new(Vec::new());
+        let lost = noc_item("net.connman.iwd", ":1.7", "");
+        let mut owner = futures_util::stream::iter([lost])
+            .chain(futures_util::stream::pending())
+            .boxed_local();
+        let quiet = || futures_util::stream::pending::<SignalItem>().boxed_local();
+        let (mut added, mut removed, mut station) = (quiet(), quiet(), quiet());
+        let (_install, installed) = tokio::sync::watch::channel(false);
+        let station_state = Mutable::new(Some(Station::default()));
+        let adapter = Mutable::new(Some(Adapter::default()));
+        let (networks, prompts) = (Mutable::new(Vec::new()), Mutable::new(None));
+        let rule = StationRule(installed);
+        let paths = IwdPaths::default();
+        // A command's `paths.station_path()`, caught between its read lock
+        // and its clone.
+        let command = paths.station.clone().read_owned().await;
+
+        let pump = tokio::time::timeout(
+            Duration::from_secs(5),
+            pump_iwd_events(
+                IwdStreams {
+                    owner: &mut owner,
+                    added: &mut added,
+                    removed: &mut removed,
+                    station: Some(PropsWatch {
+                        path: STATION,
+                        items: &mut station,
+                        rule: &rule,
+                    }),
+                    adapter: None,
+                },
+                IwdCalls {
+                    register: || {
+                        calls.borrow_mut().push("RegisterAgent");
+                        std::future::ready(Ok(()))
+                    },
+                    reread_station: || std::future::ready(()),
+                    reread_adapter: || std::future::ready(()),
+                },
+                &station_state,
+                &networks,
+                &prompts,
+                &adapter,
+                &paths,
+            ),
+        );
+        let drive = async {
+            tokio::task::yield_now().await;
+            drop(command);
+        };
+        let (pumped, ()) = futures_util::future::join(pump, drive).await;
+        assert!(pumped.is_err(), "a lost iwd is waited for, not rediscovered");
+        assert!(
+            calls.borrow().is_empty(),
+            "iwd was called after its Lost was read: {:?}",
+            calls.borrow()
+        );
+        assert!(station_state.get_cloned().is_none(), "the state is cleared");
+    }
+
     /// A hole in iwd's `InterfacesAdded` or `InterfacesRemoved` receiver
     /// sends the pump back to discovery and keeps the state, as a hole in
     /// the owner's does (#1645 review). Those two used to be read with
@@ -2669,7 +2742,8 @@ mod tests {
     /// [`REMOVAL_PAUSE`], what the station's removal used to do (#1656).
     ///
     /// **Falsification:** treat it as the station's removal and the adapter
-    /// stays; drop the pause and the elapsed time is short.
+    /// stays; drop the pause and the elapsed time is short; hand this clear
+    /// other paths than the pump's and the commands keep both (#1659).
     #[tokio::test(start_paused = true)]
     async fn the_adapters_removal_clears_everything_and_rediscovers() {
         let quiet = || futures_util::stream::pending::<SignalItem>().boxed_local();
@@ -2681,6 +2755,7 @@ mod tests {
         .chain(futures_util::stream::pending())
         .boxed_local();
         let adapter = Mutable::new(Some(powered_off_adapter()));
+        let paths = published_paths().await;
         let started = tokio::time::Instant::now();
 
         tokio::time::timeout(
@@ -2706,12 +2781,13 @@ mod tests {
                 &Mutable::new(Vec::new()),
                 &Mutable::new(None),
                 &adapter,
-                &IwdPaths::default(),
+                &paths,
             ),
         )
         .await
         .expect("the adapter's removal sends the pump back to discovery");
         assert!(adapter.get_cloned().is_none(), "the adapter is cleared");
+        assert_eq!(paths_of(&paths).await, (String::new(), String::new()));
         assert_eq!(started.elapsed(), REMOVAL_PAUSE);
     }
 

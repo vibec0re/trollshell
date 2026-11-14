@@ -173,3 +173,119 @@ async fn call_times_out_on_slow_peer() {
         "bus operation permanently failed: proxy call timeout"
     );
 }
+
+/// A `BusProxy::call` queued behind the cached proxy's write lock gives up at
+/// its own deadline, with the same `BusError::Timeout` a peer that never
+/// answers gets (#1658). The lock is held as the watcher holds it to rebuild
+/// or clear the cache, for the whole call, as a reader that was handed it and
+/// is never polled again would keep the next rebuild (and every reader behind
+/// that) waiting. Once it is released the same proxy answers as before.
+///
+/// **Falsification:** take the read lock outside the deadline again and the
+/// call waits for it until the test's own 5 s bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn call_waiting_for_the_cached_proxy_times_out_at_its_own_deadline() {
+    let (conn, _guard) = ephemeral_bus().await;
+    let shared = SharedConnection::for_test_session(conn);
+    shared.spawn_supervisor_for_test();
+
+    let proxy = proxy_with(&shared, "org.freedesktop.DBus")
+        .at_path("/org/freedesktop/DBus")
+        .iface("org.freedesktop.DBus")
+        .timeout(Duration::from_millis(150))
+        .build()
+        .await
+        .expect("build proxy");
+    let mut liveness = proxy.liveness().to_stream();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !matches!(liveness.next().await, Some(ProxyState::Live)) {}
+    })
+    .await
+    .expect("the proxy never went Live");
+
+    let held = proxy.hold_cache_for_test().await;
+    let waited: Result<Vec<String>, hytte_bus::BusError> =
+        tokio::time::timeout(Duration::from_secs(5), proxy.call("ListNames", &()))
+            .await
+            .expect("BusProxy::call must answer within its own timeout, not wait for the cache");
+    let err = waited.expect_err("a call that never got the cached proxy cannot have answered");
+    assert!(
+        err.is_timeout() && !err.is_transient(),
+        "running out of time waiting for the cached proxy is BusError::Timeout, got {err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "bus operation permanently failed: proxy call timeout"
+    );
+
+    drop(held);
+    let names: Vec<String> = proxy
+        .call("ListNames", &())
+        .await
+        .expect("with the cache free again the proxy answers");
+    assert!(names.iter().any(|n| n == "org.freedesktop.DBus"));
+}
+
+/// `BusProxy::call`'s transient tail runs outside the deadline too (#1658):
+/// a call whose connection dies under it is reported `Transient` and clears
+/// that connection even when the pool's lock, which the tail needs, is only
+/// free after the proxy's timeout has passed. No supervisor loop runs, so a
+/// cleared connection cannot reconnect to `$DBUS_SESSION_BUS_ADDRESS`.
+///
+/// **Falsification:** move the `invalidate_if_generation` tail inside the
+/// timed block and the call answers `Timeout`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_proxy_transport_error_is_settled_even_once_the_deadline_has_passed() {
+    const BUDGET: Duration = Duration::from_secs(1);
+
+    let (conn, guard) = ephemeral_bus().await;
+    let peer = zbus::connection::Builder::address(guard.address.as_str())
+        .unwrap()
+        .name("mov.vibec0re.test.Slowpoke")
+        .unwrap()
+        .serve_at("/", Slowpoke)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let shared = SharedConnection::for_test_session(conn);
+    let woken = shared.supervisor_notify_for_test();
+    let proxy = proxy_with(&shared, "mov.vibec0re.test.Slowpoke")
+        .at_path("/")
+        .iface("mov.vibec0re.test.Slowpoke")
+        .timeout(BUDGET)
+        .build()
+        .await
+        .expect("build proxy");
+
+    let call = tokio::spawn({
+        let proxy = proxy.clone();
+        async move { proxy.call::<_, String>("Slow", &()).await }
+    });
+    // In flight: `Slow` sleeps 3 s before it answers.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let held = shared.hold_lock_for_test().await;
+    drop(peer);
+    drop(guard);
+    tokio::time::sleep(BUDGET * 3).await;
+    drop(held);
+
+    let err = tokio::time::timeout(Duration::from_secs(10), call)
+        .await
+        .expect("the call must answer once the lock is free")
+        .expect("the call task panicked")
+        .expect_err("a call whose broker died cannot have answered");
+    assert!(
+        err.is_transient() && !err.is_timeout(),
+        "a transport error that arrived inside the deadline is Transient however long \
+         its tail waited for the lock, got {err:?}"
+    );
+    assert!(
+        !shared.is_connected_for_test().await,
+        "the dead connection must be cleared"
+    );
+    tokio::time::timeout(Duration::from_secs(1), woken.notified())
+        .await
+        .expect("the supervisor must be woken");
+}

@@ -126,9 +126,13 @@ impl BusProxy {
     /// The call is bounded by the proxy's timeout (default 25 s, overridable
     /// with [`ProxyBuilder::timeout`]): a peer that never replies surfaces
     /// [`BusError::Timeout`] rather than hanging the caller's task forever.
+    /// The timeout covers getting the cached proxy as well as the reply
+    /// (#1658), so a call queued behind the watcher's rebuild is bounded too.
     /// A transient (connection-level) failure additionally kicks the shared
     /// connection's reconnect path, so it is handled just like a `call()`
-    /// failure instead of being swallowed on the cached proxy.
+    /// failure instead of being swallowed on the cached proxy. That kick is
+    /// not under the timeout, as a `call()`'s is not
+    /// ([`CallBuilder::timeout`](crate::CallBuilder::timeout) has why).
     pub async fn call<A, R>(&self, method: &str, args: A) -> Result<R, BusError>
     where
         A: Serialize + Type,
@@ -141,24 +145,32 @@ impl BusProxy {
         // the connection the call was actually issued on — not one a reconnect
         // installed since, which an epoch snapshot taken here could not tell
         // apart from it (`SharedConnection::invalidate_if_generation`).
-        let CachedProxy { proxy, built_on } = {
-            let guard = self.inner.cached.read().await;
-            guard.as_ref().cloned().ok_or_else(|| {
-                let sentinel = zbus::Error::FDO(Box::new(zbus::fdo::Error::Disconnected(
-                    "proxy mid-reconnect".into(),
-                )));
-                BusError::Transient { source: sentinel }
-            })?
+        //
+        // The read lock is taken under the call's deadline, as `call()` takes
+        // the pool's lock under its own (#1658): tokio's `RwLock` is fair, so
+        // a reader queued behind the watcher's rebuild waits for it, and a
+        // reader that was handed the lock but is never polled again holds the
+        // next rebuild, and every reader after it, for as long as it sits.
+        let attempt = async {
+            let CachedProxy { proxy, built_on } = {
+                let guard = self.inner.cached.read().await;
+                guard.as_ref().cloned().ok_or_else(|| {
+                    let sentinel = zbus::Error::FDO(Box::new(zbus::fdo::Error::Disconnected(
+                        "proxy mid-reconnect".into(),
+                    )));
+                    BusError::Transient { source: sentinel }
+                })?
+            };
+            Ok::<_, BusError>((proxy.call::<_, _, R>(method, &args).await, built_on))
         };
-
-        let fut = proxy.call::<_, _, R>(method, &args);
         // The deadline is not a lost connection, so it returns before the
         // reconnect kick below, which only a transient error reaches. Until
         // #1551 it was a `zbus::Error::Failure("proxy call timeout")` mapped to
         // `Permanent`, which skipped that kick the same way.
-        let Ok(outcome) = tokio::time::timeout(self.inner.timeout, fut).await else {
+        let Ok(attempt) = tokio::time::timeout(self.inner.timeout, attempt).await else {
             return Err(BusError::proxy_call_timeout());
         };
+        let (outcome, built_on) = attempt?;
 
         match outcome.map_err(BusError::from_zbus) {
             Ok(v) => Ok(v),
@@ -178,6 +190,21 @@ impl BusProxy {
     #[doc(hidden)]
     pub async fn task_done_receiver(&self) -> Option<tokio::sync::oneshot::Receiver<()>> {
         self.inner.task_done_rx.lock().await.take()
+    }
+
+    /// Test-only: take the cached proxy's write lock, as the watcher does to
+    /// rebuild or clear it, and keep it until the returned value is dropped.
+    /// Every [`call`](Self::call) then waits to read the cache, which is what
+    /// its deadline is bounded against since #1658.
+    ///
+    /// Compiled only for this crate's own tests (`cfg(test)` or the
+    /// `system-tests` feature): a production holder of this proxy could
+    /// otherwise park every call on it and the watcher's rebuild.
+    #[doc(hidden)]
+    #[must_use = "the lock is released as soon as this is dropped"]
+    #[cfg(any(test, feature = "system-tests"))]
+    pub async fn hold_cache_for_test(&self) -> impl Sized {
+        self.inner.cached.write().await
     }
 }
 

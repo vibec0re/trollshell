@@ -265,7 +265,8 @@ async fn calls_in_flight_across_a_broker_restart_answer_promptly() {
 /// `Permanent` recognisable only by its `reason` string. Three things it must
 /// keep from that: the call is not retried (the peer may still carry it out,
 /// so the default `RetryPolicy::Once` must not issue it twice), it is not a
-/// lost connection (the epoch stays put), and it reads as it always did.
+/// lost connection (the connection stays installed and the epoch stays put),
+/// and it reads as it always did.
 ///
 /// **Falsification:** put `do_call`'s elapsed timer back on
 /// `zbus::Error::Failure("call timeout")` and the first assertion fails with
@@ -320,6 +321,96 @@ async fn a_call_past_its_deadline_is_a_timeout() {
         shared.epoch(),
         epoch,
         "a deadline must not force a reconnect"
+    );
+    // The epoch moves only once the supervisor has reconnected, which goes
+    // through `$DBUS_SESSION_BUS_ADDRESS`: nothing there in the nix sandbox,
+    // the host's bus on a dev box. Whether the connection is still installed
+    // is the deterministic half.
+    assert!(
+        shared.is_connected_for_test().await,
+        "a deadline must not clear the connection"
+    );
+}
+
+/// A call's deadline is one budget for the whole attempt (#1658): the time it
+/// spends waiting for the pool's lock is time it no longer has to be answered.
+/// The lock is held for half the budget and then released, so the call gets
+/// the connection, reaches a peer that never answers, and must give up when
+/// the budget it started with runs out, not a full budget after it got the
+/// connection. `call.rs`'s unit tests cover a lock that is never released.
+///
+/// The bound is one-sided where it matters: both sleeps start after `started`
+/// and a tokio timer never fires early, so a per-stage answer is never under
+/// `HELD + BUDGET`. Bounding the right answer by exactly that gives it `HELD`
+/// (1.5 s) of scheduling slack and still catches every wrong placement.
+///
+/// **Falsification:** give the call a fresh budget once it has the connection
+/// (a deadline per stage), or put the deadline back around the method call
+/// alone, and it answers at `HELD + BUDGET`.
+#[tokio::test(flavor = "multi_thread")]
+async fn time_spent_getting_the_connection_counts_against_the_deadline() {
+    const BUDGET: Duration = Duration::from_secs(3);
+    const HELD: Duration = Duration::from_millis(1500);
+
+    let (conn, guard) = ephemeral_bus().await;
+    let arrived = Arc::new(AtomicUsize::new(0));
+    let _peer = serve_stall(&guard.address, Some(arrived.clone())).await;
+
+    let shared = SharedConnection::for_test_session(conn);
+    shared.spawn_supervisor_for_test();
+    let epoch = shared.epoch();
+
+    let held = shared.hold_lock_for_test().await;
+    let started = Instant::now();
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(HELD).await;
+        drop(held);
+    });
+    let call = call_with(&shared, STALL)
+        .at_path(STALL_PATH)
+        .iface(STALL)
+        .method("Ping")
+        .timeout(BUDGET)
+        .send::<u32>();
+    let err = tokio::time::timeout(Duration::from_secs(20), call)
+        .await
+        .expect("the call must give up at its own deadline, not hang")
+        .expect_err("a peer that never answers cannot have answered");
+    let took = started.elapsed();
+    release
+        .await
+        .expect("the task holding the pool's lock panicked");
+
+    assert!(
+        err.is_timeout(),
+        "a call out of time is BusError::Timeout, got {err:?}"
+    );
+    assert!(
+        took >= BUDGET,
+        "the call gave up after {took:?}, before its {BUDGET:?} deadline"
+    );
+    assert!(
+        took < HELD + BUDGET,
+        "the call gave up after {took:?}: the {HELD:?} it waited for the connection did not \
+         count against its {BUDGET:?} deadline"
+    );
+    // What was left of the budget was the call's: it got the connection and
+    // was sent. The peer counts it when its handler runs, which a loaded
+    // runner can delay past the deadline.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while arrived.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline, "the call never reached the peer");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        shared.epoch(),
+        epoch,
+        "a deadline must not force a reconnect"
+    );
+    // The deterministic half, as in `a_call_past_its_deadline_is_a_timeout`.
+    assert!(
+        shared.is_connected_for_test().await,
+        "a deadline must not clear the connection"
     );
 }
 
@@ -466,4 +557,74 @@ async fn no_auto_start_holds_on_the_retry_after_a_reconnect() {
             other => panic!("{policy:?}: expected the retry's NameHasNoOwner, got {other:?}"),
         }
     }
+}
+
+/// The transient tail runs outside the deadline (#1658): a call whose
+/// connection dies under it is reported `Transient` and clears that connection
+/// even when the lock the tail needs is only free after the deadline has
+/// passed. Cancelling the tail instead would turn the `Transient` (which
+/// `RetryPolicy::Once` retries) into a `Timeout` (which nothing retries) and
+/// leave the dead connection cached with the supervisor never woken, which is
+/// `with_conn_within`'s own stated reason for keeping it outside.
+///
+/// No supervisor loop runs: `supervisor_notify_for_test` observes the wake, so
+/// a cleared connection cannot send a reconnect to `$DBUS_SESSION_BUS_ADDRESS`.
+///
+/// **Falsification:** move `settle` inside `with_conn_within`'s `timeout` and
+/// the call answers `Timeout` with the dead connection still installed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transport_error_is_settled_even_once_the_deadline_has_passed() {
+    const BUDGET: Duration = Duration::from_millis(500);
+
+    let (conn, guard) = ephemeral_bus().await;
+    let arrived = Arc::new(AtomicUsize::new(0));
+    let peer = serve_stall(&guard.address, Some(arrived.clone())).await;
+    let shared = SharedConnection::for_test_session(conn);
+    let woken = shared.supervisor_notify_for_test();
+
+    let call = tokio::spawn({
+        let shared = shared.clone();
+        async move {
+            call_with(&shared, STALL)
+                .at_path(STALL_PATH)
+                .iface(STALL)
+                .method("Ping")
+                .timeout(BUDGET)
+                .retry(RetryPolicy::Never)
+                .send::<u32>()
+                .await
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while arrived.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline, "the call never reached the peer");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // The call has its connection and is waiting for a reply. Take the pool's
+    // lock, then kill the broker: the call's transport error arrives at once,
+    // and its tail queues for the lock until well past the call's deadline.
+    let held = shared.hold_lock_for_test().await;
+    drop(peer);
+    drop(guard);
+    tokio::time::sleep(BUDGET * 3).await;
+    drop(held);
+
+    let err = tokio::time::timeout(Duration::from_secs(10), call)
+        .await
+        .expect("the call must answer once the lock is free")
+        .expect("the call task panicked")
+        .expect_err("a call whose broker died cannot have answered");
+    assert!(
+        err.is_transient() && !err.is_timeout(),
+        "a transport error that arrived inside the deadline is Transient however long \
+         its tail waited for the lock, got {err:?}"
+    );
+    assert!(
+        !shared.is_connected_for_test().await,
+        "the call's tail must clear the dead connection"
+    );
+    tokio::time::timeout(Duration::from_secs(1), woken.notified())
+        .await
+        .expect("the call's tail must wake the supervisor");
 }

@@ -2,6 +2,28 @@
 //!
 //! See `docs/superpowers/specs/2026-04-27-shared-bus-connections-design.md`
 //! for the design.
+//!
+//! ## Never leave a call unpolled while awaiting another on the same bus
+//!
+//! A task that starts a call on a pooled connection and then awaits a second
+//! call on the same bus, without polling the first, can deadlock itself. zbus's
+//! write lock is a fair tokio mutex, which hands the lock to the first waiter
+//! even if that waiter is never polled, and its method-return queue is 8 deep,
+//! so a reply nobody reads stalls the socket reader for every call on the
+//! connection. That is the hang #1657 fixed in the iwd watcher: an in-flight
+//! `RegisterAgent` held as one `select!` arm while another arm's handler
+//! awaited a read. It hung 3 runs in 60.
+//!
+//! So never hold an in-flight call future unpolled while the same task awaits
+//! another call on the same bus: poll both (`join!`, or a `select!` that keeps
+//! polling the first) or spawn one. The pool's own lock is a fair tokio mutex
+//! too, so a call queued for the connection and then left unpolled can keep
+//! every other primitive on that bus waiting, and a `BusProxy`'s cached-proxy
+//! lock is a fair tokio `RwLock`. Since #1658 a `call()` waiting for the first,
+//! or a `BusProxy::call` for the second, runs out its own deadline instead of
+//! hanging, but that bounds the victims, it does not free the lock. The one
+//! wait left outside the deadline is the cleanup after a call's connection
+//! fails under it, on purpose: see [`CallBuilder::timeout`].
 
 #![doc(html_no_source)]
 

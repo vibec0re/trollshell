@@ -32,7 +32,9 @@ use futures_signals::signal::Mutable;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex, OnceLock};
+use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio::time::error::Elapsed;
 use zbus::Connection;
 use zbus::connection::Builder;
 
@@ -231,20 +233,83 @@ impl SharedConnection {
         F: FnOnce(Connection) -> Fut,
         Fut: std::future::Future<Output = Result<R, zbus::Error>>,
     {
-        let (conn, generation) = {
-            let guard = self.inner.lock().await;
-            if let Some(c) = guard.conn.as_ref() {
-                (c.clone(), guard.generation)
-            } else {
-                // No cached connection — mid-reconnect.
-                let sentinel = zbus::Error::FDO(Box::new(zbus::fdo::Error::Disconnected(
-                    "no cached connection (mid-reconnect)".into(),
-                )));
-                return Err(BusError::Transient { source: sentinel });
-            }
-        };
-
+        let (conn, generation) = self.current().await?;
         let result = f(conn).await;
+        self.settle(result, generation).await
+    }
+
+    /// [`with_conn`](Self::with_conn) under a deadline: `budget` bounds
+    /// acquiring the connection **and** running `f` on it, as one budget, so
+    /// time spent waiting for this pool's lock is time `f` no longer has.
+    /// Returns `Ok(Err(elapsed))` once it runs out, whichever stage it was in;
+    /// the deadline is not a zbus error, so it never reaches the transient
+    /// tail and never clears the connection.
+    ///
+    /// For [`CallBuilder`](crate::CallBuilder), whose deadline until #1658
+    /// started only once it had the connection: a call queued behind this
+    /// pool's lock waited for it with no bound. Nothing outside `test_support`
+    /// holds that lock across an `.await`, but tokio's mutex is fair, so a release
+    /// hands it to the first waiter in the queue, and a waiter whose future is
+    /// never polled again keeps it — see the crate docs' unpolled-call
+    /// hazard.
+    ///
+    /// The tail ([`settle`](Self::settle)) stays outside the budget on
+    /// purpose. It runs only once `f` has come back with a transport error,
+    /// i.e. once the answer is known, and cancelling it would leave a dead
+    /// connection cached with the supervisor never woken, and would turn that
+    /// `Transient` (which `RetryPolicy::Once` retries) into a timeout (which
+    /// nothing retries).
+    pub(crate) async fn with_conn_within<F, R, Fut>(
+        &self,
+        budget: Duration,
+        f: F,
+    ) -> Result<Result<R, Elapsed>, BusError>
+    where
+        F: FnOnce(Connection) -> Fut,
+        Fut: std::future::Future<Output = Result<R, zbus::Error>>,
+    {
+        let attempt = tokio::time::timeout(budget, async {
+            let (conn, generation) = self.current().await?;
+            Ok::<_, BusError>((f(conn).await, generation))
+        })
+        .await;
+        match attempt {
+            Err(elapsed) => Ok(Err(elapsed)),
+            Ok(ran) => {
+                let (result, generation) = ran?;
+                self.settle(result, generation).await.map(|(r, _)| Ok(r))
+            }
+        }
+    }
+
+    /// The cached connection and the generation it was installed as, or the
+    /// `Transient` mid-reconnect sentinel when none is cached.
+    ///
+    /// Cancel-safe: the lock is released before this returns, and dropping it
+    /// while it waits gives up its place in the lock's queue, handing back a
+    /// lock it was assigned but had not yet taken.
+    async fn current(&self) -> Result<(Connection, u64), BusError> {
+        let guard = self.inner.lock().await;
+        if let Some(c) = guard.conn.as_ref() {
+            Ok((c.clone(), guard.generation))
+        } else {
+            // No cached connection — mid-reconnect.
+            let sentinel = zbus::Error::FDO(Box::new(zbus::fdo::Error::Disconnected(
+                "no cached connection (mid-reconnect)".into(),
+            )));
+            Err(BusError::Transient { source: sentinel })
+        }
+    }
+
+    /// The tail every operation run on a connection [`current`](Self::current)
+    /// handed out goes through: map `result` to a [`BusError`], and on a
+    /// transport-level failure clear the cached connection and wake the
+    /// supervisor — if it is still the one `generation` names.
+    async fn settle<R>(
+        &self,
+        result: Result<R, zbus::Error>,
+        generation: u64,
+    ) -> Result<(R, Generation), BusError> {
         if let Err(ref e) = result
             && is_transient_zbus_error(e)
         {
@@ -458,6 +523,45 @@ pub mod test_support {
                 epoch: Arc::new(AtomicU64::new(1)),
                 epoch_signal: Mutable::new(1),
             }
+        }
+
+        /// Test-only: a `SharedConnection` with **no** connection installed
+        /// and no supervisor, built without a bus: the "bus is mid-reconnect"
+        /// state from the start, so every `with_conn` on it returns its
+        /// `Transient` sentinel once it has the lock. For hermetic tests of
+        /// what a primitive does before it reaches a connection — with
+        /// [`Self::hold_lock_for_test`], of how long it waits to get there
+        /// (#1658).
+        #[doc(hidden)]
+        #[must_use]
+        #[cfg(any(test, feature = "system-tests"))]
+        pub fn unconnected_for_test(kind: BusKind) -> Self {
+            Self {
+                kind,
+                inner: Arc::new(Mutex::new(Inner {
+                    conn: None,
+                    generation: 0,
+                })),
+                epoch: Arc::new(AtomicU64::new(0)),
+                epoch_signal: Mutable::new(0),
+            }
+        }
+
+        /// Test-only: take this pool's lock and keep it until the returned
+        /// value is dropped. Every primitive on the pool then waits to get
+        /// the connection, as it would behind a waiter that was handed the
+        /// lock and is never polled again — the wedge a `call()`'s deadline
+        /// is bounded against since #1658.
+        ///
+        /// Compiled only for this crate's own tests (`cfg(test)` or the
+        /// `system-tests` feature), as is [`Self::unconnected_for_test`]:
+        /// anything holding a [`pooled`] singleton could otherwise wedge every
+        /// primitive on that bus, the supervisor included.
+        #[doc(hidden)]
+        #[must_use = "the lock is released as soon as this is dropped"]
+        #[cfg(any(test, feature = "system-tests"))]
+        pub async fn hold_lock_for_test(&self) -> impl Send + 'static {
+            Arc::clone(&self.inner).lock_owned().await
         }
 
         /// Test-only: install a fresh connection exactly as the supervisor does
